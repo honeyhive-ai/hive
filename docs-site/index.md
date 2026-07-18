@@ -5,14 +5,6 @@
 collaborate with peers on real work — code, commits, reviews — and
 keep your data local-first.
 
-![Hive workspace overview](images/overview.png){ width="900" }
-/// caption
-Hive's three-pane layout: sidebar navigator (left), conversation
-canvas (center), right-rail utility pane (right). The chat header
-carries the chat title, a context-usage pill, and the Chat/Diff
-tabs; git status lives in Settings → Workspace.
-///
-
 ---
 
 ## Why Hive

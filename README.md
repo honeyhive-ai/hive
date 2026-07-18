@@ -18,8 +18,6 @@ relay, end-to-end encrypted. Your code and keys stay on your machine.
 
 [**Download**](#install) · [**Documentation**](https://docs.apiaryhq.ai/) · [**Build from source**](#build-from-source) · [**Contributing**](CONTRIBUTING.md)
 
-<img src="docs-site/images/overview.png" alt="Hive workspace — sidebar, transcript, and the Tools pane with runtimes, agents, and MCP servers" width="860">
-
 </div>
 
 ---
