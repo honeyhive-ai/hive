@@ -712,6 +712,19 @@ export const getClaudeCodeModel = () => invoke<string>("get_claude_code_model");
 export const setClaudeCodeModel = (model: string) =>
   invoke<void>("set_claude_code_model", { model });
 
+/// A model to offer for the local Claude Code CLI. `value` is passed to
+/// `--model` verbatim (empty = the CLI's own default).
+export interface ClaudeModelOption {
+  value: string;
+  label: string;
+  description: string | null;
+}
+/// Base aliases merged with whatever Claude Code has cached as available for
+/// this account (Fable, …), so the picker mirrors the CLI's own `/model` list.
+/// Falls back to the base aliases if the CLI cache isn't present.
+export const listClaudeCodeModels = () =>
+  invoke<ClaudeModelOption[]>("list_claude_code_models");
+
 /// Set the Primary Runtime's model (the default Anthropic model shown in
 /// Settings → Models). Persisted; applies immediately.
 export const setDefaultModel = (model: string) =>

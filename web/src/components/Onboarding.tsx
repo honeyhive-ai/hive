@@ -8,6 +8,7 @@ import {
   addRuntime,
   setClaudeCodeModel,
   setDefaultModel,
+  listClaudeCodeModels,
   updateConnectionSettings,
   getConnectionSettings,
   detectEnvironment,
@@ -23,6 +24,7 @@ import {
   probeRelayAt,
   createRelayUser,
   type EnvDetectDto,
+  type ClaudeModelOption,
   type ClaudePermissionMode,
   type DeviceStartDto,
   type RelayProbeDto,
@@ -34,14 +36,29 @@ type RuntimeChoice = "claudeCode" | "openai" | "anthropic" | "ollama";
 const inputStyle = { borderColor: "var(--hive-line)", background: "var(--hive-panel)" };
 const field = "w-full rounded-xl border px-3 py-2.5 text-sm outline-none";
 
-// The Claude Code `--model` dropdown uses short aliases; the synthesized
-// "Primary Runtime" (default_model) wants full ids. Keep these in sync with the
-// catalog in SettingsView's DEFAULT_MODELS.
-const CLAUDE_CODE_DEFAULT_MODEL: Record<string, string> = {
+// The Claude Code `--model` value can be a short alias (opus) or a full id
+// (claude-fable-5[1m]); the synthesized "Primary Runtime" (default_model) wants
+// a full id for its label, so new chats show the same model that was picked.
+const CLAUDE_ALIAS_TO_ID: Record<string, string> = {
+  "": "claude-sonnet-4-6", // CLI default is usually Sonnet
   sonnet: "claude-sonnet-4-6",
   opus: "claude-opus-4-8",
   haiku: "claude-haiku-4-5-20251001",
 };
+// Shown if the backend model list can't be read (Claude Code not installed, or
+// the CLI cache absent). The CLI always understands these aliases.
+const CLAUDE_BASE_MODELS: ClaudeModelOption[] = [
+  { value: "", label: "Default (CLI decides — usually Sonnet)", description: null },
+  { value: "sonnet", label: "Sonnet", description: null },
+  { value: "opus", label: "Opus", description: null },
+  { value: "haiku", label: "Haiku", description: null },
+];
+function claudeDefaultModelFor(value: string): string {
+  const v = value.trim();
+  if (v in CLAUDE_ALIAS_TO_ID) return CLAUDE_ALIAS_TO_ID[v];
+  // A full value like "claude-fable-5[1m]" → drop the context-window suffix.
+  return v.replace(/\[[^\]]*\]$/, "");
+}
 
 /// First-run wizard: identity → project folder → agent + file access → optional
 /// team. Detects what's installed (Claude Code, Ollama, API keys) to default
@@ -70,6 +87,8 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1/chat/completions");
   const [model, setModel] = useState("gpt-4o");
   const [claudeModel, setClaudeModel] = useState(""); // "" = CLI default
+  const [claudeModels, setClaudeModels] = useState<ClaudeModelOption[]>([]);
+  const [claudeCustom, setClaudeCustom] = useState(false);
   const [letEdit, setLetEdit] = useState(true); // Accept edits by default
 
   // Step 4 — team / relay connection
@@ -111,6 +130,11 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
         setRelayUrl(c.relayUrl);
       } catch {
         /* ignore */
+      }
+      try {
+        setClaudeModels(await listClaudeCodeModels());
+      } catch {
+        /* ignore — the dropdown falls back to base aliases */
       }
     })();
   }, []);
@@ -249,11 +273,10 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
     } else if (choice === "claudeCode") {
       // Claude Code uses the built-in runtime; persist the chosen --model.
       await setClaudeCodeModel(claudeModel);
-      // The dropdown's short alias (opus/sonnet/haiku) also drives the
-      // synthesized "Primary Runtime" the chat header shows and new chats
-      // default to — otherwise it stays on the hardcoded Sonnet default and
-      // silently overrides the user's pick. "" (CLI default) → Sonnet.
-      await setDefaultModel(CLAUDE_CODE_DEFAULT_MODEL[claudeModel] ?? "claude-sonnet-4-6");
+      // The picked model also drives the synthesized "Primary Runtime" the chat
+      // header shows and new chats default to — otherwise it stays on the
+      // hardcoded Sonnet default and silently overrides the user's pick.
+      await setDefaultModel(claudeDefaultModelFor(claudeModel));
     }
     const needsKey = choice === "openai" || choice === "anthropic";
     await updateConnectionSettings({
@@ -490,20 +513,47 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
             <div className="text-sm font-medium">Choose your agent</div>
             <div className="space-y-1.5">
               <RuntimeOption v="claudeCode" choice={choice} setChoice={setChoice} label="Claude Code" note={env?.claudeCode ? "detected · no API key" : "not found on PATH — install the claude CLI"} />
-              {choice === "claudeCode" && (
-                <select
-                  value={claudeModel}
-                  onChange={(e) => setClaudeModel(e.target.value)}
-                  className={field}
-                  style={inputStyle}
-                  aria-label="Claude Code model"
-                >
-                  <option value="">Model: Default (CLI decides — usually Sonnet)</option>
-                  <option value="sonnet">Model: Sonnet</option>
-                  <option value="opus">Model: Opus</option>
-                  <option value="haiku">Model: Haiku</option>
-                </select>
-              )}
+              {choice === "claudeCode" && (() => {
+                const opts = claudeModels.length ? claudeModels : CLAUDE_BASE_MODELS;
+                const known = opts.some((o) => o.value === claudeModel);
+                const showCustom = claudeCustom || (!known && claudeModel !== "");
+                return (
+                  <>
+                    <select
+                      value={showCustom ? "__custom__" : claudeModel}
+                      onChange={(e) => {
+                        if (e.target.value === "__custom__") {
+                          setClaudeCustom(true);
+                          setClaudeModel("");
+                        } else {
+                          setClaudeCustom(false);
+                          setClaudeModel(e.target.value);
+                        }
+                      }}
+                      className={field}
+                      style={inputStyle}
+                      aria-label="Claude Code model"
+                    >
+                      {opts.map((m) => (
+                        <option key={m.value || "default"} value={m.value}>
+                          Model: {m.label}
+                        </option>
+                      ))}
+                      <option value="__custom__">Model: Custom…</option>
+                    </select>
+                    {showCustom && (
+                      <input
+                        value={claudeModel}
+                        onChange={(e) => setClaudeModel(e.target.value)}
+                        placeholder="Model alias or id (e.g. fable, claude-fable-5)"
+                        className={field}
+                        style={inputStyle}
+                        aria-label="Custom Claude Code model"
+                      />
+                    )}
+                  </>
+                );
+              })()}
               <RuntimeOption v="openai" choice={choice} setChoice={setChoice} label="OpenAI-compatible API" note="OpenAI, OpenRouter, or any local OpenAI-style server" />
               <RuntimeOption v="anthropic" choice={choice} setChoice={setChoice} label="Anthropic API key" note={env?.anthropicEnv ? "ANTHROPIC_API_KEY detected" : "claude.ai API key"} />
               {env?.ollama && <RuntimeOption v="ollama" choice={choice} setChoice={setChoice} label="Ollama (local)" note="detected · local models, no key" />}
