@@ -1,0 +1,23 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Hive App Icon</title>
+  <defs>
+    
+      <linearGradient id="cool-asset-icon" x1="0" y1="0" x2="0.4" y2="1">
+        <stop offset="0" stop-color="#f0c25a"/>
+        <stop offset="1" stop-color="#c8881f"/>
+      </linearGradient>
+      <linearGradient id="warm-asset-icon" x1="0" y1="0" x2="0.4" y2="1">
+        <stop offset="0" stop-color="#f0b878"/>
+        <stop offset="1" stop-color="#d98a44"/>
+      </linearGradient>
+    
+    <linearGradient id="tile-asset-icon" x1="0" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#9a6620"/>
+      <stop offset="1" stop-color="#4a2e12"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="184.3288" ry="184.3288" fill="url(#tile-asset-icon)" />
+  <g transform="translate(512,512) scale(5.373913043478261)">
+    <path d="M0.00 -12.60 L 10.91 -6.30 L 10.91 6.30 L 0.00 12.60 L -10.91 6.30 L -10.91 -6.30 Z" fill="url(#warm-asset-icon)"/><path d="M24.25 -12.60 L 35.16 -6.30 L 35.16 6.30 L 24.25 12.60 L 13.34 6.30 L 13.34 -6.30 Z" fill="url(#warm-asset-icon)"/><path d="M12.12 8.40 L 23.04 14.70 L 23.04 27.30 L 12.12 33.60 L 1.21 27.30 L 1.21 14.70 Z" fill="#f0e0b8"/><path d="M-12.12 8.40 L -1.21 14.70 L -1.21 27.30 L -12.12 33.60 L -23.04 27.30 L -23.04 14.70 Z" fill="#fbf1d8"/><path d="M-24.25 -12.60 L -13.34 -6.30 L -13.34 6.30 L -24.25 12.60 L -35.16 6.30 L -35.16 -6.30 Z" fill="#f0e0b8"/><path d="M-12.12 -33.60 L -1.21 -27.30 L -1.21 -14.70 L -12.12 -8.40 L -23.04 -14.70 L -23.04 -27.30 Z" fill="url(#warm-asset-icon)"/><path d="M12.12 -33.60 L 23.04 -27.30 L 23.04 -14.70 L 12.12 -8.40 L 1.21 -14.70 L 1.21 -27.30 Z" fill="#f0e0b8"/>
+  </g>
+</svg>

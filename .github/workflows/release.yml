@@ -1,0 +1,144 @@
+name: Release (desktop app)
+
+# Builds the Hive desktop app for macOS, Linux, and Windows on GitHub runners
+# and attaches the installers to a GitHub Release. Artifacts live as release
+# assets — never committed to source control. The (private) hive-site Netlify
+# build pulls the latest assets at deploy time (see that repo's
+# scripts/fetch-downloads.sh).
+#
+# Trigger: push a tag like `v0.1.1`, or run manually (workflow_dispatch).
+#
+# Signing is wired but inert until the secrets exist (private beta ships
+# unsigned — see task: "Auto-updater + code signing"):
+#   macOS:   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
+#            APPLE_API_KEY, APPLE_API_ISSUER, APPLE_API_KEY_PATH  (notarization)
+#   updater: TAURI_SIGNING_PRIVATE_KEY, TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+#   Windows: Azure Trusted Signing via a signCommand (added later)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.1)"
+        required: true
+      platforms:
+        description: "Which OSes to build (comma-sep: macos,windows,linux). macOS bills at 10x — skip it (build the .dmg locally) to save minutes."
+        default: "macos,windows,linux"
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  # Cheap Linux job that turns the `platforms` input into a build matrix, so a
+  # dispatch can skip the 10x-billed macOS runner (or any OS) on demand. Tag
+  # pushes still build all three.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          PLATFORMS: ${{ github.event.inputs.platforms || 'macos,windows,linux' }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          req = {p.strip().lower() for p in os.environ["PLATFORMS"].split(",") if p.strip()}
+          runner = {"macos": "macos-latest", "windows": "windows-latest", "linux": "ubuntu-22.04"}
+          include = [{"platform": runner[k]} for k in ["macos", "windows", "linux"] if k in req]
+          print("matrix=" + json.dumps({"include": include}))
+          PY
+
+  build:
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build deps
+        if: matrix.platform == 'ubuntu-22.04'
+        # Canonical Tauri v2 deps. Use ayatana appindicator only — the older
+        # libappindicator3-dev conflicts with it (held-broken-packages).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev \
+            libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          # Fresh namespace (the first run's apt failure poisoned the old cache
+          # → "can't find crate"), and never save a cache from a failed build.
+          prefix-key: "rel-v2"
+          cache-on-failure: false
+
+      - uses: oven-sh/setup-bun@v2
+      - name: Build the web frontend deps
+        run: bun install
+        working-directory: web
+
+      # macOS signing + notarization — ONLY activates when the secrets exist
+      # (otherwise the build stays unsigned; empty APPLE_* vars would make tauri
+      # try and fail to codesign, so we export them only when present).
+      - name: Configure macOS signing
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ]; then
+            echo "No APPLE_CERTIFICATE secret — building unsigned."
+            exit 0
+          fi
+          # The App Store Connect key must be a file for notarization.
+          KEY_PATH="$RUNNER_TEMP/asc_api_key.p8"
+          printf '%s' "$APPLE_API_KEY_P8" > "$KEY_PATH"
+          {
+            echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+            echo "APPLE_API_KEY=$APPLE_API_KEY"
+            echo "APPLE_API_KEY_PATH=$KEY_PATH"
+          } >> "$GITHUB_ENV"
+          echo "macOS signing + notarization configured."
+
+      - name: Build + release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Hive's GitHub OAuth App client id, baked in by build.rs so GitHub
+          # sign-in (device flow) works in release builds. The id is public (not
+          # a secret) but lives in a repo var/secret so it's not committed.
+          # Without it, sign-in errors "needs a github oauth client id".
+          HIVE_GITHUB_CLIENT_ID: ${{ secrets.HIVE_GITHUB_CLIENT_ID }}
+          # Bake the release tag so the app can detect a newer published version
+          # (the "update available" banner). Local/dev builds get "dev" and never
+          # prompt. Bump docs-site/version.json to this tag when publishing.
+          HIVE_RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          # APPLE_* (when present) come from the "Configure macOS signing" step
+          # via $GITHUB_ENV. tauri-action signs + notarizes + staples on macOS.
+          # Auto-updater signing (scaffolded, #144): inert until these secrets
+          # exist AND bundle.createUpdaterArtifacts is enabled + the conf pubkey
+          # is set. When all three are in place, tauri-action emits the signed
+          # update artifacts + latest.json onto the release.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # cargo tauri build discovers app/tauri.conf.json from the repo root.
+          tagName: ${{ github.event.inputs.tag || github.ref_name }}
+          releaseName: "Hive ${{ github.event.inputs.tag || github.ref_name }}"
+          releaseBody: "Installers attached below."
+          releaseDraft: true
+          prerelease: true

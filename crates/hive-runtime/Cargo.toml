@@ -1,0 +1,42 @@
+[package]
+name = "hive-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hive-core.workspace = true
+hive-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+base64 = "0.22"
+# MCP OAuth 2.1 (PKCE): SHA-256 challenge + random verifier/state. Versions
+# already in the tree (hive-core uses them), so no new crates are pulled.
+sha2 = "0.10"
+getrandom = "0.2"
+iroh = { version = "1.0.0-rc.1", optional = true }
+
+[features]
+# P2P is ON by default. The Windows *cross-compile* (cargo-xwin) is the one
+# build that must drop it — iroh pulls the `wmi` crate (Windows COM) which can't
+# cross-compile — via `--no-default-features`, which works because the workspace
+# root declares this crate with default-features = false. Native builds (incl.
+# native Windows) keep P2P.
+default = ["p2p"]
+# Direct peer-to-peer transport (iroh).
+p2p = ["dep:iroh"]
+
+[dev-dependencies]
+tempfile = "3"
+hive-relay = { path = "../hive-relay" }
+axum = "0.7"

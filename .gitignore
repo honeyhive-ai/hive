@@ -1,0 +1,37 @@
+build/
+
+# macOS
+.DS_Store
+
+# Docs site
+dist/
+.venv-docs/
+site/
+
+# Local workspace runtime state
+.hive/
+
+# Rust / Cargo
+/target/
+
+# Cross-build outputs / containers
+/target-docker/
+/dist-windows/
+/dist-linux/
+
+# Agent + editor state
+.claude/
+.vscode/
+CLAUDE.md
+AGENTS.md
+RESUME.md
+
+# Tauri-generated schemas/permissions
+app/gen/
+
+# Node / web
+node_modules/
+web/.vite/
+
+# Baked GitHub OAuth client id for official builds (build.rs reads it); not committed
+app/github_client_id

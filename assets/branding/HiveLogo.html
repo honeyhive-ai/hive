@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="studio">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Hive — Logo</title>
+<style>
+:root{
+  --bg:#f4f1ea; --panel:#fff; --ink:#221f1a; --soft:#8a8073; --line:rgba(40,30,20,.12);
+  --cool-1:#f0c25a; --cool-2:#c8881f; --cool-deep:#8a5a14;
+  --warm-1:#e3a460; --warm-2:#c6713a;
+}
+*{box-sizing:border-box;}
+body{margin:0; font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text",system-ui,sans-serif;
+  background:var(--bg); color:var(--ink); -webkit-font-smoothing:antialiased;}
+.wrap{max-width:1080px; margin:0 auto; padding:56px 32px 120px;}
+.eyebrow{font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--soft); font-weight:600;}
+h1{font-size:30px; font-weight:600; letter-spacing:-.02em; margin:.3em 0 .2em;}
+h2{font-size:13px; letter-spacing:.06em; text-transform:uppercase; color:var(--soft); font-weight:600; margin:0 0 16px;}
+.lead{color:var(--soft); font-size:15px; max-width:64ch; margin:0;}
+.sect{margin-top:64px;}
+.hr{height:1px; background:var(--line); border:0; margin:0;}
+
+/* hero */
+.hero{display:flex; align-items:center; gap:48px; flex-wrap:wrap; padding:52px; border-radius:24px;
+  background:linear-gradient(160deg,#fbf9f5,#efe9df); border:1px solid var(--line); margin-top:28px;}
+.wordmark{display:flex; align-items:center; gap:5px; font-weight:680; letter-spacing:-.04em; color:var(--ink);}
+.wordmark .dot{color:var(--cool-2);}
+.tagline{color:var(--soft); font-size:15px; margin-top:10px; letter-spacing:-.01em;}
+
+/* grid of swatch tiles */
+.grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:18px;}
+.tile{border:1px solid var(--line); border-radius:16px; overflow:hidden; background:var(--panel);}
+.tile .disp{height:180px; display:grid; place-items:center;}
+.tile .cap{padding:11px 14px; border-top:1px solid var(--line); font-size:12px; color:var(--soft);}
+.tile .cap b{color:var(--ink); font-weight:600; display:block; font-size:12.5px; letter-spacing:-.01em;}
+.bg-light{background:#f3eee6;} .bg-dark{background:#1a1d23;} .bg-blue{background:linear-gradient(160deg,#9a6620,#4a2e12);}
+.bg-paper{background:#fbf9f5;} .bg-grid{background:
+  linear-gradient(#eee8dd 1px,transparent 1px) 0 0/22px 22px,
+  linear-gradient(90deg,#eee8dd 1px,transparent 1px) 0 0/22px 22px, #f6f2ea;}
+
+/* scale row */
+.scalerow{display:flex; align-items:flex-end; gap:32px; flex-wrap:wrap; padding:36px; border:1px solid var(--line); border-radius:16px; background:var(--panel);}
+.scaleitem{display:flex; flex-direction:column; align-items:center; gap:10px;}
+.scaleitem .n{font-size:11px; color:var(--soft); font-family:ui-monospace,Menlo,monospace;}
+
+/* dock mock */
+.dock{display:flex; align-items:flex-end; gap:14px; padding:14px 22px; border-radius:22px;
+  background:rgba(255,255,255,.16); border:1px solid rgba(255,255,255,.3); backdrop-filter:blur(20px);}
+.dock .app{width:58px; height:58px; border-radius:14px;}
+.dock .ph{background:linear-gradient(160deg,#cfd6df,#aeb7c2);}
+.dockstage{height:230px; border-radius:16px; display:grid; place-items:end center; padding-bottom:26px;
+  background:linear-gradient(160deg,#c2a05e,#6e4a1e); border:1px solid var(--line); overflow:hidden;}
+
+/* construction */
+.constr{display:flex; gap:40px; flex-wrap:wrap; align-items:center;}
+.swrow{display:flex; gap:12px; flex-wrap:wrap;}
+.sw{display:flex; align-items:center; gap:10px; border:1px solid var(--line); border-radius:11px; padding:8px 12px 8px 8px; background:var(--panel);}
+.sw .chip{width:30px; height:30px; border-radius:8px;}
+.sw .meta{font-size:11px;} .sw .meta b{display:block; font-size:12px; letter-spacing:-.01em;}
+.sw .meta span{color:var(--soft); font-family:ui-monospace,Menlo,monospace;}
+
+.btnrow{display:flex; gap:10px; flex-wrap:wrap; margin-top:18px;}
+.btn{font:inherit; font-size:13px; font-weight:600; padding:9px 16px; border-radius:10px; border:1px solid var(--line);
+  background:var(--panel); color:var(--ink); cursor:pointer; display:inline-flex; gap:8px; align-items:center;}
+.btn:hover{background:#f0ebe2;}
+.btn.primary{background:var(--cool-2); color:#fff; border-color:transparent;}
+.note{font-size:12.5px; color:var(--soft); margin-top:12px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="eyebrow">Brand · App identity</div>
+  <h1>Hive logo</h1>
+  <p class="lead">A honeycomb rosette — one workspace, seven chambers, agents at work. Golden comb cells ring a lit core, with two more chambers lit in an upward lean: the active hands of the hive. Earthy honey tones, soft gradients, scales to a 16px favicon.</p>
+
+  <!-- HERO -->
+  <div class="hero">
+    <div id="hero-icon"></div>
+    <div>
+      <div class="wordmark" style="font-size:64px"><span id="hero-mark-sm"></span><span>hive</span></div>
+      <div class="tagline">The multi-agent workspace for developers.</div>
+    </div>
+  </div>
+
+  <!-- APP ICON VARIANTS -->
+  <div class="sect">
+    <h2>App icon</h2>
+    <div class="grid">
+      <div class="tile"><div class="disp bg-paper" id="i-primary"></div><div class="cap"><b>Primary</b>gradient tile · warm accent cells</div></div>
+      <div class="tile"><div class="disp bg-dark" id="i-onblue"></div><div class="cap"><b>On dark</b>same tile, dark surface</div></div>
+      <div class="tile"><div class="disp bg-light" id="i-mono"></div><div class="cap"><b>Monochrome</b>single ink, no gradient</div></div>
+      <div class="tile"><div class="disp bg-blue" id="i-inverted"></div><div class="cap"><b>Knockout</b>white on brand amber</div></div>
+    </div>
+  </div>
+
+  <!-- DARK TONES -->
+  <div class="sect">
+    <h2>Dark tones — earthy &amp; black</h2>
+    <p class="lead" style="margin-bottom:22px;">Same rosette, deeper surfaces. The three lit cells stay as the only accent — they read as active chambers against charcoal, and tie the icon to the product without a second bright color. Tiles run from deep umber through walnut to near-black.</p>
+    <div class="grid">
+      <div class="tile"><div class="disp bg-paper" id="d-navy"></div><div class="cap"><b>Deep umber</b>#1A1206 → #3A2812</div></div>
+      <div class="tile"><div class="disp bg-paper" id="d-slate"></div><div class="cap"><b>Walnut</b>#241A0E → #48381E</div></div>
+      <div class="tile"><div class="disp bg-paper" id="d-graphite"></div><div class="cap"><b>Bark brown</b>#221B12 → #3E3424</div></div>
+      <div class="tile"><div class="disp bg-paper" id="d-black"></div><div class="cap"><b>Near-black</b>#050402 → #1C150C</div></div>
+    </div>
+    <h2 style="margin-top:36px;">All-tone — no warm</h2>
+    <p class="lead" style="margin-bottom:22px;">If you want zero warm: the lit cells become the lightest tone, the rest step down in value. Quietest, most utilitarian — closest to a terminal.</p>
+    <div class="grid">
+      <div class="tile"><div class="disp bg-paper" id="t-navy"></div><div class="cap"><b>Umber mono</b>tonal apex</div></div>
+      <div class="tile"><div class="disp bg-paper" id="t-slate"></div><div class="cap"><b>Walnut mono</b>tonal apex</div></div>
+      <div class="tile"><div class="disp bg-paper" id="t-black"></div><div class="cap"><b>Black mono</b>tonal apex</div></div>
+      <div class="tile"><div class="disp bg-dark" id="t-onblack"></div><div class="cap"><b>On black</b>white cells, black tile</div></div>
+    </div>
+  </div>
+
+  <!-- MARK / WORDMARK -->
+  <div class="sect">
+    <h2>Mark &amp; wordmark</h2>
+    <div class="grid">
+      <div class="tile"><div class="disp bg-paper" id="m-color"></div><div class="cap"><b>Mark — color</b>standalone, transparent</div></div>
+      <div class="tile"><div class="disp bg-grid" id="m-clear"></div><div class="cap"><b>Clear space</b>½ cell-height on all sides</div></div>
+      <div class="tile"><div class="disp bg-paper" id="w-horiz"></div><div class="cap"><b>Lockup — horizontal</b>mark + wordmark</div></div>
+      <div class="tile"><div class="disp bg-paper" id="w-stack"></div><div class="cap"><b>Lockup — stacked</b>centered</div></div>
+    </div>
+  </div>
+
+  <!-- SCALE -->
+  <div class="sect">
+    <h2>Scales cleanly</h2>
+    <div class="scalerow">
+      <div class="scaleitem"><span id="s-128"></span><span class="n">128</span></div>
+      <div class="scaleitem"><span id="s-64"></span><span class="n">64</span></div>
+      <div class="scaleitem"><span id="s-32"></span><span class="n">32</span></div>
+      <div class="scaleitem"><span id="s-16"></span><span class="n">16 · favicon</span></div>
+    </div>
+  </div>
+
+  <!-- IN CONTEXT -->
+  <div class="sect">
+    <h2>In context</h2>
+    <div class="grid" style="grid-template-columns:1fr;">
+      <div class="dockstage">
+        <div class="dock">
+          <div class="app ph"></div><div class="app ph"></div>
+          <div class="app" id="dock-icon"></div>
+          <div class="app ph"></div><div class="app ph"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PALETTE -->
+  <div class="sect">
+    <h2>Palette</h2>
+    <div class="swrow">
+      <div class="sw"><span class="chip" style="background:linear-gradient(160deg,#f0c25a,#c8881f)"></span><span class="meta"><b>Honey comb</b><span>#C8881F → #F0C25A</span></span></div>
+      <div class="sw"><span class="chip" style="background:linear-gradient(160deg,#e3a460,#c6713a)"></span><span class="meta"><b>Warm accent</b><span>#C6713A → #E3A460</span></span></div>
+      <div class="sw"><span class="chip" style="background:linear-gradient(160deg,#9a6620,#4a2e12)"></span><span class="meta"><b>Comb tile</b><span>#4A2E12 → #9A6620</span></span></div>
+      <div class="sw"><span class="chip" style="background:#fff;border:1px solid var(--line)"></span><span class="meta"><b>Knockout</b><span>#FFFFFF</span></span></div>
+    </div>
+    <p class="note">Cool + warm map straight to the product's <code>accentCool</code> / <code>accentWarm</code> tokens, so the icon and the UI share one language.</p>
+    <div class="btnrow">
+      <button class="btn primary" onclick="dl('icon')">Download app icon · SVG</button>
+      <button class="btn" onclick="dl('mark')">Download mark · SVG</button>
+      <button class="btn" onclick="dlPng(1024)">App icon · PNG 1024</button>
+    </div>
+    <p class="note">SVG is infinitely scalable; PNG export renders at the requested size.</p>
+  </div>
+</div>
+
+<script>
+const SQ = 0.8660254;
+// pointy-top hexagon path, center (cx,cy), radius R, gap scale g
+function hex(cx,cy,R,g=0.9){
+  const s=R*g;
+  const p=[[0,-s],[SQ*s,-0.5*s],[SQ*s,0.5*s],[0,s],[-SQ*s,0.5*s],[-SQ*s,-0.5*s]];
+  return 'M'+p.map(d=>(cx+d[0]).toFixed(2)+' '+(cy+d[1]).toFixed(2)).join(' L ')+' Z';
+}
+// three-cell apex-up cluster, recentred on origin. R=base radius.
+/* rosette: lit core + 6 ring cells. Active (amber) = core + up-left + right
+   cells — the chosen "up-right lean". Inactive ring cells alternate honey/cream. */
+function cells(R){
+  const d=Math.sqrt(3)*R;
+  const lit=[0,240];                  // ring angles (deg) that stay lit: right + up-left
+  const out=[{cx:0,cy:0,active:true,ord:-1}];
+  for(let deg=0,k=0;deg<360;deg+=60,k++){
+    const a=deg*Math.PI/180;
+    out.push({cx:d*Math.cos(a),cy:d*Math.sin(a),active:lit.includes(deg),ord:k});
+  }
+  return out;
+}
+/* build the mark <svg> string.
+   mode: 'color' | 'mono' | 'knockout' | 'tilemarks' */
+function markSVG(size, mode, idns){
+  const R=14, c=cells(R), uid=idns||('u'+Math.random().toString(36).slice(2,7));
+  const defs=`
+    <linearGradient id="cool-${uid}" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#f0c25a"/><stop offset="1" stop-color="#c8881f"/></linearGradient>
+    <linearGradient id="warm-${uid}" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#e3a460"/><stop offset="1" stop-color="#c6713a"/></linearGradient>`;
+  const fill = cell => {
+    if(mode==='mono') return '#c8881f';
+    if(mode==='knockout') return '#ffffff';
+    if(mode==='tilemarks') return cell.active ? `url(#warm-${uid})` : (cell.ord%2?'#f0e0b8':'#fbf1d8');
+    return cell.active ? `url(#warm-${uid})` : `url(#cool-${uid})`;
+  };
+  const paths = c.map(cell=>`<path d="${hex(cell.cx,cell.cy,R)}" fill="${fill(cell)}"/>`).join('');
+  return `<svg width="${size}" height="${size}" viewBox="-46 -46 92 92" xmlns="http://www.w3.org/2000/svg">
+    <defs>${defs}</defs><g>${paths}</g></svg>`;
+}
+// squircle app tile containing the rosette
+function iconSVG(size, opt={}){
+  const uid='t'+Math.random().toString(36).slice(2,7);
+  const bg = opt.bg || `url(#tile-${uid})`;
+  const r = size*0.225;
+  const R=14, c=cells(R);
+  const defs=`
+    <linearGradient id="tile-${uid}" x1="0" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#9a6620"/><stop offset="1" stop-color="#4a2e12"/></linearGradient>
+    <linearGradient id="warm-${uid}" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#f0b878"/><stop offset="1" stop-color="#d98a44"/></linearGradient>`;
+  const fill = cell => {
+    if(opt.markMode==='mono') return '#c8881f';
+    if(opt.markMode==='knockout') return '#ffffff';
+    return cell.active ? `url(#warm-${uid})` : (cell.ord%2?'#f0e0b8':'#fbf1d8');
+  };
+  const paths = c.map(cell=>`<path d="${hex(cell.cx,cell.cy,R)}" fill="${fill(cell)}"/>`).join('');
+  const scale = size/92*0.60;
+  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
+    <defs>${defs}</defs>
+    <rect x="0" y="0" width="${size}" height="${size}" rx="${r}" ry="${r}" fill="${bg}"/>
+    <g transform="translate(${size/2},${size/2}) scale(${scale})">${paths}</g>
+  </svg>`;
+}
+
+/* configurable dark tile.
+   opt = { from, to,                 // tile gradient stops
+           apex:'warm'|'#hex',       // active cells: warm gradient, or a flat tone
+           cellHi, cellLo }          // inactive cell fills (default cream) */
+function darkIcon(size, opt={}){
+  const uid='d'+Math.random().toString(36).slice(2,7);
+  const R=14, c=cells(R), r=size*0.225;
+  const cellHi = opt.cellHi || '#f7ecd0';
+  const cellLo = opt.cellLo || '#ead9b0';
+  const useWarm = opt.apex==='warm';
+  const defs=`
+    <linearGradient id="bg-${uid}" x1="0" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="${opt.to||'#3a4452'}"/><stop offset="1" stop-color="${opt.from||'#1e242e'}"/></linearGradient>
+    <linearGradient id="warm-${uid}" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#f0b878"/><stop offset="1" stop-color="#d98a44"/></linearGradient>`;
+  const apexFill = useWarm ? `url(#warm-${uid})` : (opt.apex || cellHi);
+  const fill = cell => cell.active ? apexFill : (cell.ord%2 ? cellLo : cellHi);
+  const paths = c.map(cell=>`<path d="${hex(cell.cx,cell.cy,R)}" fill="${fill(cell)}"/>`).join('');
+  const scale = size/92*0.60;
+  return `<svg width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" xmlns="http://www.w3.org/2000/svg">
+    <defs>${defs}</defs>
+    <rect x="0" y="0" width="${size}" height="${size}" rx="${r}" ry="${r}" fill="url(#bg-${uid})"/>
+    <g transform="translate(${size/2},${size/2}) scale(${scale})">${paths}</g>
+  </svg>`;
+}
+function set(id,html){ const el=document.getElementById(id); if(el) el.innerHTML=html; }
+
+// hero
+set('hero-icon', iconSVG(180));
+set('hero-mark-sm', markSVG(60,'color'));
+
+// app icon variants
+set('i-primary', iconSVG(124));
+set('i-onblue', iconSVG(124));
+set('i-mono', iconSVG(124,{bg:'#fff', markMode:'mono'}));
+set('i-inverted', iconSVG(124,{bg:'none', markMode:'knockout'}));
+
+// dark tones — warm accent retained
+const DT={navy:{from:'#1a1206',to:'#3a2812'}, slate:{from:'#241a0e',to:'#48381e'}, graphite:{from:'#221b12',to:'#3e3424'}, black:{from:'#050402',to:'#1c150c'}};
+set('d-navy', darkIcon(124,{...DT.navy, apex:'warm'}));
+set('d-slate', darkIcon(124,{...DT.slate, apex:'warm'}));
+set('d-graphite', darkIcon(124,{...DT.graphite, apex:'warm'}));
+set('d-black', darkIcon(124,{...DT.black, apex:'warm'}));
+// all-tone — no warm; apex is the lightest value
+set('t-navy', darkIcon(124,{...DT.navy, apex:'rgba(255,255,255,0.97)', cellHi:'rgba(255,255,255,0.62)', cellLo:'rgba(255,255,255,0.40)'}));
+set('t-slate', darkIcon(124,{...DT.slate, apex:'rgba(255,255,255,0.97)', cellHi:'rgba(255,255,255,0.62)', cellLo:'rgba(255,255,255,0.40)'}));
+set('t-black', darkIcon(124,{...DT.black, apex:'rgba(255,255,255,0.95)', cellHi:'rgba(255,255,255,0.55)', cellLo:'rgba(255,255,255,0.32)'}));
+set('t-onblack', darkIcon(124,{from:'#000000', to:'#141414', apex:'rgba(255,255,255,0.95)', cellHi:'rgba(255,255,255,0.78)', cellLo:'rgba(255,255,255,0.52)'}));
+
+// mark / wordmark
+set('m-color', markSVG(120,'color'));
+set('m-clear', `<div style="outline:1px dashed rgba(200,136,31,.5); padding:18px; border-radius:8px;">${markSVG(96,'color')}</div>`);
+set('w-horiz', `<div style="display:flex;align-items:center;gap:12px;font-weight:680;font-size:42px;letter-spacing:-.04em;color:#221f1a">${markSVG(52,'color')}<span>hive</span></div>`);
+set('w-stack', `<div style="display:flex;flex-direction:column;align-items:center;gap:10px;font-weight:680;font-size:30px;letter-spacing:-.04em;color:#221f1a">${markSVG(64,'color')}<span>hive</span></div>`);
+
+// scale
+set('s-128', iconSVG(128)); set('s-64', iconSVG(64)); set('s-32', iconSVG(32)); set('s-16', iconSVG(16));
+// dock
+set('dock-icon', iconSVG(58));
+
+// downloads
+function download(name, str, type){
+  const b=new Blob([str],{type}); const u=URL.createObjectURL(b);
+  const a=document.createElement('a'); a.href=u; a.download=name; a.click(); URL.revokeObjectURL(u);
+}
+function dl(which){
+  if(which==='icon') download('hive-app-icon.svg', iconSVG(1024), 'image/svg+xml');
+  else download('hive-mark.svg', markSVG(512,'color','export'), 'image/svg+xml');
+}
+function dlPng(size){
+  const svg=iconSVG(size); const img=new Image();
+  const blob=new Blob([svg],{type:'image/svg+xml'}); const url=URL.createObjectURL(blob);
+  img.onload=()=>{ const cv=document.createElement('canvas'); cv.width=size; cv.height=size;
+    cv.getContext('2d').drawImage(img,0,0); cv.toBlob(b=>{ const u=URL.createObjectURL(b);
+      const a=document.createElement('a'); a.href=u; a.download='hive-app-icon-'+size+'.png'; a.click(); }); URL.revokeObjectURL(url); };
+  img.src=url;
+}
+</script>
+</body>
+</html>

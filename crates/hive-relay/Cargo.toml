@@ -1,0 +1,34 @@
+[package]
+name = "hive-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "hive_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hive-relay"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+axum = "0.7"
+# Used to verify GitHub tokens for the identity directory (register/lookup).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# Verify signed entitlement tokens (the relay holds only the issuer public key).
+ed25519-dalek = "2"
+base64 = "0.22"
+# Random seed for the `hive-relay keygen` operator command.
+getrandom = "0.2"
+# Async trait for the `WriteGuard` extension seam (paid builds plug in here).
+async-trait = "0.1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

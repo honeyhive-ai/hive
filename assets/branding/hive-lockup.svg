@@ -1,0 +1,25 @@
+<svg width="720" height="220" viewBox="0 0 720 220" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Hive Documentation Logo</title>
+  <defs>
+    <clipPath id="clip-asset-lockup">
+      <rect x="36" y="52" width="76" height="76" rx="0" ry="0"/>
+    </clipPath>
+  </defs>
+  <g transform="translate(36 52)">
+    
+  <title>Hive Brand Mark</title>
+  <defs>
+      <linearGradient id="cool-asset-lockup-mark" x1="0" y1="0" x2="0.4" y2="1">
+        <stop offset="0" stop-color="#f0c25a"/>
+        <stop offset="1" stop-color="#c8881f"/>
+      </linearGradient>
+      <linearGradient id="warm-asset-lockup-mark" x1="0" y1="0" x2="0.4" y2="1">
+        <stop offset="0" stop-color="#f0b878"/>
+        <stop offset="1" stop-color="#d98a44"/>
+      </linearGradient>
+    </defs>
+  <g><path d="M0.00 -12.60 L 10.91 -6.30 L 10.91 6.30 L 0.00 12.60 L -10.91 6.30 L -10.91 -6.30 Z" fill="url(#warm-asset-lockup-mark)"/><path d="M24.25 -12.60 L 35.16 -6.30 L 35.16 6.30 L 24.25 12.60 L 13.34 6.30 L 13.34 -6.30 Z" fill="url(#warm-asset-lockup-mark)"/><path d="M12.12 8.40 L 23.04 14.70 L 23.04 27.30 L 12.12 33.60 L 1.21 27.30 L 1.21 14.70 Z" fill="#f0e0b8"/><path d="M-12.12 8.40 L -1.21 14.70 L -1.21 27.30 L -12.12 33.60 L -23.04 27.30 L -23.04 14.70 Z" fill="#fbf1d8"/><path d="M-24.25 -12.60 L -13.34 -6.30 L -13.34 6.30 L -24.25 12.60 L -35.16 6.30 L -35.16 -6.30 Z" fill="#f0e0b8"/><path d="M-12.12 -33.60 L -1.21 -27.30 L -1.21 -14.70 L -12.12 -8.40 L -23.04 -14.70 L -23.04 -27.30 Z" fill="url(#warm-asset-lockup-mark)"/><path d="M12.12 -33.60 L 23.04 -27.30 L 23.04 -14.70 L 12.12 -8.40 L 1.21 -14.70 L 1.21 -27.30 Z" fill="#f0e0b8"/></g>
+
+  </g>
+  <text x="146" y="124" fill="#221f1a" font-family="Inter, &quot;SF Pro Display&quot;, system-ui, sans-serif" font-size="84" font-weight="700" letter-spacing="-3">hive</text>
+</svg>

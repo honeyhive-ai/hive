@@ -1,0 +1,122 @@
+site_name: Hive
+site_description: Shared LLM workspace for devs — bring your own subscription, your own agents.
+site_url: https://docs.apiaryhq.ai/
+repo_url: https://github.com/honeyhive-ai/hive
+repo_name: honeyhive-ai/hive
+copyright: MIT-licensed
+docs_dir: docs-site
+site_dir: site
+
+theme:
+  name: material
+  logo: images/hive-logo.svg
+  favicon: images/hive-favicon.png
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - navigation.indexes
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  # Material icon/emoji shortcodes (:material-…:, :octicons-…:) → inline SVGs.
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - tables
+  - toc:
+      permalink: true
+
+plugins:
+  - search
+
+extra_css:
+  - stylesheets/brand.css
+
+extra_javascript:
+  - https://unpkg.com/mermaid@10/dist/mermaid.min.js
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Install with Homebrew: getting-started/homebrew.md
+      - First launch: getting-started/first-launch.md
+      - Configuring a runtime: getting-started/configuring-a-runtime.md
+      - Your first chat: getting-started/first-chat.md
+  - Concepts:
+      - Workspaces & chats: concepts/workspaces.md
+      - Agents (built-in vs BYO): concepts/agents.md
+      - Tools & permissions: concepts/tools-and-consent.md
+      - Vaults & knowledge sources: concepts/vaults.md
+      - Identity & devices: concepts/identity.md
+  - Features:
+      - Settings: features/settings.md
+      - Right Rail: features/right-rail.md
+      - Multi-agent collaboration: features/multi-agent.md
+      - Agentic workflows: features/workflows.md
+      - Scheduled agents: features/scheduling.md
+      - Managing context: features/voice-and-slash.md
+      - Git integration: features/git.md
+      - Invites & joining: features/invites.md
+      - Collaborators, presence & DMs: features/collaborators.md
+      - Collaborative editing: features/collaboration.md
+      - Onboarding: features/onboarding.md
+  - Networking:
+      - LAN discovery: networking/lan.md
+      - Rendezvous relay: networking/rendezvous.md
+      - Self-hosting a relay: networking/self-host.md
+      - TURN fallback: networking/turn.md
+  - Addons:
+      - Bring-your-own agents: addons/byo-agents.md
+      - Skills: addons/skills.md
+      - MCP servers: addons/mcp.md
+      - Linear & remote MCP (OAuth): addons/linear.md
+  - Operations:
+      - Building the dist: ops/build.md
+      - Deploying for a small team: ops/deployment.md
+      - Pricing tiers: ops/pricing.md
+      - Tiering (open-core model): ops/tiering.md
+      - Managed service plan: ops/managed-service.md
+      - Server-side membership: ops/server-side-membership.md
+      - Troubleshooting: ops/troubleshooting.md
+  - Reference:
+      - Configuration (TOML): reference/config-toml.md
+      - Invite payload format: reference/invite-payload.md
+      - Wire protocols: reference/wire-protocols.md

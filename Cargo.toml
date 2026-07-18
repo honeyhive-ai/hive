@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hive-core",
+    "crates/hive-proto",
+    "crates/hive-runtime",
+    "crates/hive-relay",
+    "app",
+]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["Hive"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+ts-rs = "10"
+
+# Internal crates
+hive-core = { path = "crates/hive-core" }
+hive-proto = { path = "crates/hive-proto" }
+# default-features = false MUST be set here at the workspace root (not just on
+# the member dep) or cargo silently ignores it. This lets the app's own `p2p`
+# feature gate whether hive-runtime pulls iroh, so the Windows cross-build can
+# drop it via `--no-default-features` while native builds keep P2P on.
+hive-runtime = { path = "crates/hive-runtime", default-features = false }
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

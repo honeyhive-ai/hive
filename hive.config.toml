@@ -1,0 +1,68 @@
+[app]
+name = "Hive"
+local_mode = false
+sync_mode = "workspace"
+default_runtime = "primary-runtime"
+default_model = "qwen3.6"
+
+[transport]
+kind = "local"
+
+[sync]
+enabled = false
+server = ""
+device_name = "local-mac"
+end_to_end_encryption = true
+
+[permissions]
+default_policy = "always_ask"
+allow_network = true
+
+[permissions.presets.default]
+read_files = true
+write_files = true
+run_commands = true
+access_vaults = true
+access_remote_runtime = true
+
+[retrieval]
+mode = "manual"
+top_k = 8
+chunk_size = 1200
+keyword_weight = 0.35
+semantic_weight = 0.65
+recency_bias = false
+
+[[runtimes]]
+id = "primary-runtime"
+name = "Primary Runtime"
+kind = "remote"
+provider = "ollama"
+endpoint = "http://localhost:11434"
+metrics_endpoint = "http://localhost:8000/metrics"
+models = ["qwen3.5:latest", "gemma3"]
+preferred_model = "qwen3.5:latest"
+keep_alive = "-1"
+supports_embeddings = true
+supports_tools = true
+performance_score = 7.5
+cost_per_1m_input_tokens_usd = 0.0
+
+[[runtime_pools]]
+id = "default-pool"
+name = "Default Pool"
+runtimes = ["primary-runtime"]
+routing_strategy = "latencyOptimized"
+fallback_strategy = "priorityPerformance"
+prefer_local_for_low_priority = true
+reserve_paid_capacity_for_high_priority = false
+minimum_requests_reserve = 0
+minimum_spend_reserve_usd = 0.0
+
+[chat_defaults]
+permission_preset = "default"
+retrieval_mode = "manual"
+runtime_pool = "default-pool"
+show_context_panel = true
+show_activity_panel = true
+

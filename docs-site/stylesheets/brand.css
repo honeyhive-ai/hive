@@ -1,0 +1,32 @@
+/* Hive brand palette for the Material docs theme — honey / amber, matching the
+   app's "pollen" identity and the logo. Applies to both light and dark schemes. */
+:root {
+  --md-primary-fg-color: #c8881f;
+  --md-primary-fg-color--light: #e3a460;
+  --md-primary-fg-color--dark: #8a5a14;
+  --md-accent-fg-color: #c6713a;
+}
+
+/* Keep the header logo badge crisp at small sizes. */
+.md-header__button.md-logo img {
+  height: 1.6rem;
+  width: auto;
+}
+
+/* Landing-page hero lockup (light/dark variants via #only-light / #only-dark). */
+.hero-lockup {
+  display: block;
+  width: 260px;
+  max-width: 70%;
+  height: auto;
+  margin: 0.5rem 0 1.5rem;
+}
+
+/* The home hero H1 is the lockup image only — drop its (empty-looking)
+   permalink pilcrow and the oversized heading margins. */
+.md-typeset h1:has(.hero-lockup) {
+  margin: 0;
+}
+.md-typeset h1:has(.hero-lockup) .headerlink {
+  display: none;
+}
