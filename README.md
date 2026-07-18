@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/branding/hive-app-icon-1024.png" alt="Hive" width="112" height="112">
+
 # Hive
 
 **A collaborative, multi-agent workspace for developers.**
