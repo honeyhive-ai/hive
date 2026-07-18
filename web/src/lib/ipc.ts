@@ -548,6 +548,10 @@ export interface RelayProbeDto {
 /// to `sync_status` which only reflects whether a URL is set.
 export const probeRelay = () => invoke<RelayProbeDto>("probe_relay");
 
+/// Probe a URL + token being entered (onboarding/settings), before saving it.
+export const probeRelayAt = (url: string, accessToken: string | null) =>
+  invoke<RelayProbeDto>("probe_relay_at", { url, accessToken });
+
 export interface WorkspaceInfoDto {
   id: string;
   name: string;

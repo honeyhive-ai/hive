@@ -44,7 +44,11 @@ vi.mock("@/lib/ipc", () => ({
   githubClientConfigured: vi.fn(async () => false),
   githubLoginStart: vi.fn(),
   githubLoginPoll: vi.fn(),
-  createWorkspace: vi.fn(async () => ({ id: "w", name: "Acme", kind: "room", active: true })),
+  joinWorkspace: vi.fn(async () => ({ id: "w", name: "Acme", kind: "room", active: true })),
+  redeemShortCode: vi.fn(async () => ({ kind: "workspace", label: "Acme" })),
+  probeRelay: vi.fn(async () => ({ status: "ok", detail: "" })),
+  probeRelayAt: vi.fn(async () => ({ status: "ok", detail: "" })),
+  createRelayUser: vi.fn(async () => ({ userId: "u", userName: "Sam", raw: "tok" })),
 }));
 
 beforeEach(() => vi.clearAllMocks());
@@ -80,11 +84,15 @@ describe("Onboarding wizard flow", () => {
       ),
     );
 
-    // Step 4: solo (no relay) → Finish.
-    await screen.findByText("Team up (optional)");
+    // Step 4: "Just me" is the default → Finish clears any relay (local-only).
+    await screen.findByText("Team & sync");
     await clickByName("Finish");
     await waitFor(() => expect(onComplete).toHaveBeenCalled());
-    expect(ipc.createWorkspace).not.toHaveBeenCalled();
+    expect(ipc.updateConnectionSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ relayUrl: "" }),
+    );
+    // No team-join happened on the solo path.
+    expect(ipc.joinWorkspace).not.toHaveBeenCalled();
   });
 
   it("adds an OpenAI-compatible runtime with key + base URL", async () => {
@@ -115,5 +123,38 @@ describe("Onboarding wizard flow", () => {
     expect(ipc.updateConnectionSettings).toHaveBeenCalledWith(
       expect.objectContaining({ apiKey: "sk-test-123", permissionMode: "acceptEdits" }),
     );
+  });
+
+  it("blocks Finish when a host relay is unauthorized, allows it once connected", async () => {
+    const onComplete = vi.fn();
+    // First probe: unauthorized; after a token, ok.
+    (ipc.probeRelayAt as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce({ status: "unauthorized", detail: "token rejected" })
+      .mockResolvedValueOnce({ status: "ok", detail: "" });
+
+    render(<Onboarding onComplete={onComplete} />);
+    await screen.findByPlaceholderText("Continue with a name");
+    await clickByName("Next"); // identity
+    await clickByName("Next"); // project
+    await screen.findByText("Choose your agent");
+    await clickByName("Next"); // runtime → step 4
+    await screen.findByText("Team & sync");
+
+    // Choose "Connect to a relay", enter a URL, test → unauthorized.
+    await clickByName(/Connect to a relay/);
+    await userEvent.type(
+      screen.getByPlaceholderText(/Relay URL/),
+      "https://relay.example",
+    );
+    await clickByName("Test connection");
+    await screen.findByText("token rejected");
+    // Finish is disabled — a broken relay can't complete onboarding.
+    expect(screen.getByRole("button", { name: "Finish" })).toBeDisabled();
+
+    // Paste a token + re-test → connected → Finish enabled.
+    await userEvent.type(screen.getByPlaceholderText(/access token/i), "good-token");
+    await clickByName("Test connection");
+    await screen.findByText("✓ Connected");
+    expect(screen.getByRole("button", { name: "Finish" })).toBeEnabled();
   });
 });
