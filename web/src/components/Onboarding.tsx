@@ -46,6 +46,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
   const [name, setName] = useState("");
   const [gh, setGh] = useState<{ login: string; name?: string | null } | null>(null);
   const [ghFlow, setGhFlow] = useState<DeviceStartDto | null>(null);
+  const [codeCopied, setCodeCopied] = useState(false);
   const [ghConfigured, setGhConfigured] = useState(false);
   const [showClientId, setShowClientId] = useState(false);
   const [clientId, setClientId] = useState("");
@@ -141,12 +142,33 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
     try {
       const s = await githubLoginStart();
       setGhFlow(s);
-      // Open the OS browser via the backend — window.open() doesn't reach it
-      // from the Tauri webview. Best-effort; the URL is also shown to copy.
-      void openExternal(s.verificationUri).catch(() => {});
+      // Don't auto-open the browser — that yanks focus away while the code
+      // is still back here, forcing a switch-back-to-copy. Instead pre-copy
+      // the code so it's ready to paste, and let the user open GitHub when
+      // they're ready (the button below copies + opens in one click).
+      void navigator.clipboard?.writeText(s.userCode).then(
+        () => setCodeCopied(true),
+        () => {},
+      );
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  async function copyCode(code: string) {
+    try {
+      await navigator.clipboard?.writeText(code);
+      setCodeCopied(true);
+    } catch {
+      /* clipboard may be unavailable; the code is still shown to type */
+    }
+  }
+
+  /// Copy the device code and open GitHub in one action, so the code is on the
+  /// clipboard the moment the browser lands on the verification page.
+  async function copyCodeAndOpenGithub(code: string, uri: string) {
+    await copyCode(code);
+    void openExternal(uri).catch(() => {});
   }
 
   async function pickFolder() {
@@ -347,9 +369,29 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
                 {gh.name ? ` (${gh.name})` : ""} — one identity across all your devices.
               </div>
             ) : ghFlow ? (
-              <div className="space-y-2 rounded-xl border px-3 py-3 text-sm" style={{ borderColor: "var(--hive-accent-cool)" }}>
-                <div>
-                  Enter <code className="font-bold tracking-widest">{ghFlow.userCode}</code> at{" "}
+              <div className="space-y-3 rounded-xl border px-3 py-3 text-sm" style={{ borderColor: "var(--hive-accent-cool)" }}>
+                <div className="text-xs opacity-70">Your one-time code — enter it on GitHub:</div>
+                {/* The code, big + monospace, with an inline copy affordance. */}
+                <button
+                  type="button"
+                  onClick={() => void copyCode(ghFlow!.userCode)}
+                  className="flex w-full items-center justify-between rounded-lg border px-3 py-2"
+                  style={inputStyle}
+                  title="Copy code"
+                >
+                  <code className="text-lg font-bold tracking-[0.3em]">{ghFlow.userCode}</code>
+                  <span className="text-xs opacity-60">{codeCopied ? "Copied ✓" : "Copy"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="w-full rounded-lg px-3 py-2 text-xs font-semibold text-white hover:brightness-110"
+                  style={{ background: "var(--hive-accent-cool)" }}
+                  onClick={() => void copyCodeAndOpenGithub(ghFlow.userCode, ghFlow.verificationUri)}
+                >
+                  Copy code &amp; open GitHub ↗
+                </button>
+                <div className="text-xs opacity-50">
+                  The code is copied to your clipboard — paste it at{" "}
                   <button
                     type="button"
                     className="underline hover:opacity-80"
@@ -358,16 +400,8 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
                   >
                     {ghFlow.verificationUri}
                   </button>
+                  . Waiting for you to authorize…
                 </div>
-                <button
-                  type="button"
-                  className="rounded-lg px-3 py-1.5 text-xs font-semibold text-white hover:brightness-110"
-                  style={{ background: "var(--hive-accent-cool)" }}
-                  onClick={() => void openExternal(ghFlow.verificationUri).catch(() => {})}
-                >
-                  Open GitHub ↗
-                </button>
-                <div className="text-xs opacity-50">Waiting for you to authorize on GitHub…</div>
               </div>
             ) : (
               <>

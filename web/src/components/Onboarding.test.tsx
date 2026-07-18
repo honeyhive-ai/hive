@@ -125,6 +125,31 @@ describe("Onboarding wizard flow", () => {
     );
   });
 
+  it("GitHub sign-in pre-copies the device code instead of auto-opening the browser", async () => {
+    const writeText = vi.fn(async () => {});
+    Object.assign(navigator, { clipboard: { writeText } });
+    (ipc.githubClientConfigured as ReturnType<typeof vi.fn>).mockResolvedValue(true);
+    (ipc.githubLoginStart as ReturnType<typeof vi.fn>).mockResolvedValue({
+      deviceCode: "dev",
+      userCode: "ABCD-1234",
+      verificationUri: "https://github.com/login/device",
+      interval: 5,
+    });
+
+    render(<Onboarding onComplete={vi.fn()} />);
+    await screen.findByPlaceholderText("Continue with a name");
+    await clickByName(/Sign in with GitHub/);
+
+    // The code is shown and copied to the clipboard — no auto-open.
+    await screen.findByText("ABCD-1234");
+    expect(writeText).toHaveBeenCalledWith("ABCD-1234");
+    expect(ipc.openExternal).not.toHaveBeenCalled();
+
+    // The primary button both copies and opens GitHub.
+    await clickByName(/Copy code & open GitHub/);
+    expect(ipc.openExternal).toHaveBeenCalledWith("https://github.com/login/device");
+  });
+
   it("blocks Finish when a host relay is unauthorized, allows it once connected", async () => {
     const onComplete = vi.fn();
     // First probe: unauthorized; after a token, ok.
