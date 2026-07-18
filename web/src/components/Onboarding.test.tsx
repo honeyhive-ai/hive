@@ -16,6 +16,7 @@ vi.mock("@/lib/ipc", () => ({
   // applyRuntime() throw (undefined is not a function), silently stranding
   // the wizard on step 3 — the long-standing "pre-existing failure".
   setClaudeCodeModel: vi.fn(async () => {}),
+  setDefaultModel: vi.fn(async () => {}),
   setGithubClientId: vi.fn(async () => {}),
   openExternal: vi.fn(async () => {}),
   updateConnectionSettings: vi.fn(async () => ({
@@ -77,6 +78,11 @@ describe("Onboarding wizard flow", () => {
     await clickByName("Next");
     // The claude-code path persists the --model choice ("" = CLI default)…
     await waitFor(() => expect(ipc.setClaudeCodeModel).toHaveBeenCalledWith(""));
+    // …and syncs the Primary Runtime's default model so the chat header matches
+    // the pick (CLI-default → Sonnet).
+    await waitFor(() =>
+      expect(ipc.setDefaultModel).toHaveBeenCalledWith("claude-sonnet-4-6"),
+    );
     // …and default permission = acceptEdits ("let agents edit files" on).
     await waitFor(() =>
       expect(ipc.updateConnectionSettings).toHaveBeenCalledWith(
@@ -93,6 +99,29 @@ describe("Onboarding wizard flow", () => {
     );
     // No team-join happened on the solo path.
     expect(ipc.joinWorkspace).not.toHaveBeenCalled();
+  });
+
+  it("picks Claude Code + Opus and makes Opus the Primary Runtime default", async () => {
+    render(<Onboarding onComplete={vi.fn()} />);
+
+    await screen.findByPlaceholderText("Continue with a name");
+    await clickByName("Next"); // identity
+    await clickByName("Next"); // project
+
+    await screen.findByText("Choose your agent");
+    // Claude Code is preselected; choose Opus in its model dropdown.
+    await userEvent.selectOptions(
+      screen.getByLabelText("Claude Code model"),
+      "opus",
+    );
+    await clickByName("Next");
+
+    // The CLI --model flag AND the displayed/default Primary Runtime both move to
+    // Opus — otherwise the chat header silently falls back to Sonnet.
+    await waitFor(() => expect(ipc.setClaudeCodeModel).toHaveBeenCalledWith("opus"));
+    await waitFor(() =>
+      expect(ipc.setDefaultModel).toHaveBeenCalledWith("claude-opus-4-8"),
+    );
   });
 
   it("adds an OpenAI-compatible runtime with key + base URL", async () => {
