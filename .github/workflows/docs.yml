@@ -35,7 +35,7 @@ jobs:
         # yet (see docs-site images/CAPTURE_GUIDE.md). Warnings stay visible
         # without failing the build; re-enable --strict once the images land.
         run: mkdocs build
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
