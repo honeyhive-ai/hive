@@ -39,4 +39,4 @@ p2p = ["dep:iroh"]
 [dev-dependencies]
 tempfile = "3"
 hive-relay = { path = "../hive-relay" }
-axum = "0.7"
+axum = "0.8"
