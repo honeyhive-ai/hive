@@ -17,6 +17,13 @@ vi.mock("@/lib/ipc", () => ({
   // the wizard on step 3 — the long-standing "pre-existing failure".
   setClaudeCodeModel: vi.fn(async () => {}),
   setDefaultModel: vi.fn(async () => {}),
+  listClaudeCodeModels: vi.fn(async () => [
+    { value: "", label: "Default", description: null },
+    { value: "sonnet", label: "Sonnet", description: null },
+    { value: "opus", label: "Opus", description: null },
+    { value: "haiku", label: "Haiku", description: null },
+    { value: "claude-fable-5[1m]", label: "Fable", description: "Fable 5" },
+  ]),
   setGithubClientId: vi.fn(async () => {}),
   openExternal: vi.fn(async () => {}),
   updateConnectionSettings: vi.fn(async () => ({
@@ -121,6 +128,34 @@ describe("Onboarding wizard flow", () => {
     await waitFor(() => expect(ipc.setClaudeCodeModel).toHaveBeenCalledWith("opus"));
     await waitFor(() =>
       expect(ipc.setDefaultModel).toHaveBeenCalledWith("claude-opus-4-8"),
+    );
+  });
+
+  it("surfaces a cached Claude Code model (Fable) and wires the default from it", async () => {
+    render(<Onboarding onComplete={vi.fn()} />);
+
+    await screen.findByPlaceholderText("Continue with a name");
+    await clickByName("Next"); // identity
+    await clickByName("Next"); // project
+
+    await screen.findByText("Choose your agent");
+    // The dropdown is populated from listClaudeCodeModels — Fable (cached,
+    // account-specific) is present even though it isn't hardcoded.
+    const select = screen.getByLabelText("Claude Code model");
+    await waitFor(() =>
+      expect(
+        Array.from((select as HTMLSelectElement).options).map((o) => o.value),
+      ).toContain("claude-fable-5[1m]"),
+    );
+    await userEvent.selectOptions(select, "claude-fable-5[1m]");
+    await clickByName("Next");
+
+    await waitFor(() =>
+      expect(ipc.setClaudeCodeModel).toHaveBeenCalledWith("claude-fable-5[1m]"),
+    );
+    // The Primary Runtime default uses the full id with the [1m] suffix stripped.
+    await waitFor(() =>
+      expect(ipc.setDefaultModel).toHaveBeenCalledWith("claude-fable-5"),
     );
   });
 

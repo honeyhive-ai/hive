@@ -5452,6 +5452,83 @@ fn set_claude_code_model(state: State<AppState>, model: String) -> Result<(), St
     Ok(())
 }
 
+/// A model the user can pick for the local Claude Code CLI: the built-in aliases
+/// plus whatever Claude Code has cached as available for this account.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClaudeModelOption {
+    /// Passed to `claude --model` verbatim — an alias ("opus") or a full value
+    /// ("claude-fable-5[1m]"). Empty = the CLI's own default.
+    value: String,
+    label: String,
+    description: Option<String>,
+}
+
+/// Models to offer for the local `claude` CLI. The base aliases (which the CLI
+/// always understands) merged with `additionalModelOptionsCache` from
+/// `~/.claude.json` — the same account-specific list Claude Code's own `/model`
+/// picker shows, so new models (Fable, …) appear without a Hive release. That
+/// file is an undocumented CLI cache; if it's absent or its shape changes we
+/// just return the base aliases.
+#[tauri::command]
+fn list_claude_code_models() -> Vec<ClaudeModelOption> {
+    let base = |value: &str, label: &str| ClaudeModelOption {
+        value: value.to_string(),
+        label: label.to_string(),
+        description: None,
+    };
+    let mut opts = vec![
+        base("", "Default (CLI's own setting)"),
+        base("sonnet", "Sonnet"),
+        base("opus", "Opus"),
+        base("haiku", "Haiku"),
+    ];
+    for extra in claude_cached_model_options() {
+        if !opts.iter().any(|o| o.value == extra.value) {
+            opts.push(extra);
+        }
+    }
+    opts
+}
+
+/// Parse `additionalModelOptionsCache` out of `~/.claude.json`. Best-effort:
+/// any read/parse/shape failure yields an empty list (callers fall back to the
+/// base aliases).
+fn claude_cached_model_options() -> Vec<ClaudeModelOption> {
+    let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) else {
+        return Vec::new();
+    };
+    let path = PathBuf::from(home).join(".claude.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(arr) = json.get("additionalModelOptionsCache").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|item| {
+            let value = item.get("value")?.as_str()?.trim().to_string();
+            if value.is_empty() {
+                return None;
+            }
+            let label = item
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| value.clone());
+            let description = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            Some(ClaudeModelOption { value, label, description })
+        })
+        .collect()
+}
+
 #[cfg(target_os = "macos")]
 fn build_tray_icon(app: &AppHandle) -> Result<TrayIcon<tauri::Wry>, Box<dyn std::error::Error>> {
     let show_item = MenuItem::with_id(app, "tray-show", "Show Hive", true, None::<&str>)?;
@@ -6894,6 +6971,7 @@ pub fn run() {
             update_connection_settings,
             get_claude_code_model,
             set_claude_code_model,
+            list_claude_code_models,
             get_context_commands,
             set_context_commands,
             set_default_model,
