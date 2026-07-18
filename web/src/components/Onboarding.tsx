@@ -7,6 +7,7 @@ import {
   setWorkspaceRoot,
   addRuntime,
   setClaudeCodeModel,
+  setDefaultModel,
   updateConnectionSettings,
   getConnectionSettings,
   detectEnvironment,
@@ -32,6 +33,15 @@ type RuntimeChoice = "claudeCode" | "openai" | "anthropic" | "ollama";
 
 const inputStyle = { borderColor: "var(--hive-line)", background: "var(--hive-panel)" };
 const field = "w-full rounded-xl border px-3 py-2.5 text-sm outline-none";
+
+// The Claude Code `--model` dropdown uses short aliases; the synthesized
+// "Primary Runtime" (default_model) wants full ids. Keep these in sync with the
+// catalog in SettingsView's DEFAULT_MODELS.
+const CLAUDE_CODE_DEFAULT_MODEL: Record<string, string> = {
+  sonnet: "claude-sonnet-4-6",
+  opus: "claude-opus-4-8",
+  haiku: "claude-haiku-4-5-20251001",
+};
 
 /// First-run wizard: identity → project folder → agent + file access → optional
 /// team. Detects what's installed (Claude Code, Ollama, API keys) to default
@@ -230,12 +240,20 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
       const id = `openai-${Date.now().toString(36)}`;
       await addRuntime(id, "OpenAI-compatible", "openAI", "remote", baseUrl.trim(), model.trim() || "gpt-4o", true, false);
     } else if (choice === "anthropic") {
-      await addRuntime("anthropic-api", "Anthropic API", "anthropic", "remote", "https://api.anthropic.com/v1/messages", model.trim() || "claude-sonnet-4-6", true, false);
+      // The `model` field is only shown for the OpenAI-compatible choice, so it
+      // still holds its "gpt-4o" default here — don't leak it into an Anthropic
+      // runtime; default to Sonnet.
+      await addRuntime("anthropic-api", "Anthropic API", "anthropic", "remote", "https://api.anthropic.com/v1/messages", "claude-sonnet-4-6", true, false);
     } else if (choice === "ollama") {
       await addRuntime("ollama-local", "Ollama (local)", "ollama", "local", "http://localhost:11434", model.trim() || "llama3.1", true, false);
     } else if (choice === "claudeCode") {
       // Claude Code uses the built-in runtime; persist the chosen --model.
       await setClaudeCodeModel(claudeModel);
+      // The dropdown's short alias (opus/sonnet/haiku) also drives the
+      // synthesized "Primary Runtime" the chat header shows and new chats
+      // default to — otherwise it stays on the hardcoded Sonnet default and
+      // silently overrides the user's pick. "" (CLI default) → Sonnet.
+      await setDefaultModel(CLAUDE_CODE_DEFAULT_MODEL[claudeModel] ?? "claude-sonnet-4-6");
     }
     const needsKey = choice === "openai" || choice === "anthropic";
     await updateConnectionSettings({
