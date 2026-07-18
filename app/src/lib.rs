@@ -4939,6 +4939,9 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
     // Settings UI can connect, reconnect, or go local-only without a restart.
     type ConnSig = (String, String, Option<[u8; 32]>);
     let mut engine: Option<(hive_runtime::SyncEngine, ConnSig)> = None;
+    // Suppress repeated identical sync errors so a persistent condition (e.g. an
+    // unauthorized relay) logs once, not on every tick.
+    let mut last_sync_err: Option<String> = None;
     loop {
         let (relay_url, room, passphrase_key, access_token, github_token) = {
             let s = settings.lock().unwrap();
@@ -4994,11 +4997,31 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                     }
                     .await;
                     match outcome {
-                        Ok(pulled) if pulled > 0 => {
-                            let _ = app.emit("workspace://synced", pulled);
+                        Ok(pulled) => {
+                            if last_sync_err.take().is_some() {
+                                eprintln!("sync: recovered");
+                            }
+                            if pulled > 0 {
+                                let _ = app.emit("workspace://synced", pulled);
+                            }
                         }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("sync error: {e}"),
+                        Err(e) => {
+                            // Log a persistent error only once (until it changes
+                            // or recovers). Unauthorized gets an actionable line.
+                            let msg = match &e {
+                                hive_runtime::SyncError::Relay(
+                                    hive_runtime::RelayError::Unauthorized,
+                                ) => "sync paused: the relay rejected this device's access token \
+                                      — add yourself in Settings → Team (or clear the relay URL \
+                                      to work local-only)"
+                                    .to_string(),
+                                other => format!("sync error: {other}"),
+                            };
+                            if last_sync_err.as_deref() != Some(msg.as_str()) {
+                                eprintln!("{msg}");
+                                last_sync_err = Some(msg);
+                            }
+                        }
                     }
                 }
             }
