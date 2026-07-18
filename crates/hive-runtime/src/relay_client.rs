@@ -16,6 +16,28 @@ pub enum RelayError {
     Http(#[from] reqwest::Error),
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
+    /// The relay rejected the access token (401/403). Surfaced distinctly so the
+    /// sync loop can show an actionable message instead of a JSON-decode error
+    /// (a plain-text 401 body would otherwise fail to parse and read as garbage).
+    #[error("relay rejected the access token — set a valid one in Settings → Team")]
+    Unauthorized,
+    /// The relay returned an unexpected non-2xx status.
+    #[error("relay returned HTTP {0}")]
+    Status(u16),
+}
+
+/// Decode a JSON response, mapping non-2xx to a typed error *before* attempting
+/// to parse the body — so a plain-text 401/error page never surfaces as a
+/// confusing "error decoding response body".
+async fn json_ok<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Result<T, RelayError> {
+    let status = resp.status();
+    if status.is_success() {
+        Ok(resp.json().await?)
+    } else if matches!(status.as_u16(), 401 | 403) {
+        Err(RelayError::Unauthorized)
+    } else {
+        Err(RelayError::Status(status.as_u16()))
+    }
 }
 
 /// Outcome of a cheap connectivity/auth probe. Every failure maps to a variant
@@ -283,7 +305,7 @@ impl RelayClient {
     ) -> Result<u64, RelayError> {
         let url = format!("{}/v1/workspaces/{}/envelopes", self.base, workspace);
         let resp = self.authed(self.http.post(url)).json(body).send().await?;
-        let value: serde_json::Value = resp.json().await?;
+        let value: serde_json::Value = json_ok(resp).await?;
         Ok(value.get("seq").and_then(serde_json::Value::as_u64).unwrap_or(0))
     }
 
@@ -316,7 +338,7 @@ impl RelayClient {
             "{}/v1/workspaces/{}/envelopes?after={}",
             self.base, workspace, after
         );
-        let rows: Vec<serde_json::Value> = self.authed(self.http.get(url)).send().await?.json().await?;
+        let rows: Vec<serde_json::Value> = json_ok(self.authed(self.http.get(url)).send().await?).await?;
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -337,7 +359,7 @@ impl RelayClient {
             "{}/v1/workspaces/{}/envelopes?after={}",
             self.base, workspace, after
         );
-        let rows: Vec<serde_json::Value> = self.authed(self.http.get(url)).send().await?.json().await?;
+        let rows: Vec<serde_json::Value> = json_ok(self.authed(self.http.get(url)).send().await?).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let seq = row.get("seq").and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -419,7 +441,7 @@ impl RelayClient {
         workspace: &str,
     ) -> Result<Vec<hive_core::e2ee::WorkspaceKeyRotation>, RelayError> {
         let url = format!("{}/v1/workspaces/{}/keyring", self.base, workspace);
-        let rows: Vec<serde_json::Value> = self.authed(self.http.get(url)).send().await?.json().await?;
+        let rows: Vec<serde_json::Value> = json_ok(self.authed(self.http.get(url)).send().await?).await?;
         Ok(rows
             .into_iter()
             .filter_map(|v| serde_json::from_value(v).ok())
