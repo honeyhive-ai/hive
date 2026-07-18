@@ -5061,6 +5061,47 @@ struct RelayProbeDto {
     detail: String,
 }
 
+/// Probe a specific relay URL + token (the caller's GitHub token is attached
+/// from settings). Shared by `probe_relay` (configured) and `probe_relay_at`
+/// (a URL/token being entered in onboarding/settings, before it's saved).
+async fn probe_relay_inner(
+    url: String,
+    token: Option<String>,
+    github: Option<String>,
+    room: String,
+) -> RelayProbeDto {
+    if url.trim().is_empty() {
+        return RelayProbeDto {
+            status: "unconfigured".into(),
+            detail: "No relay URL set — you're local-only.".into(),
+        };
+    }
+    let workspace = if room.trim().is_empty() { "_probe".to_string() } else { room };
+    let probe = hive_runtime::RelayClient::new(url)
+        .with_auth(token)
+        .with_github_token(github)
+        .probe(&workspace)
+        .await;
+    match probe {
+        hive_runtime::RelayProbe::Ok => RelayProbeDto {
+            status: "ok".into(),
+            detail: "Reachable and the access token was accepted.".into(),
+        },
+        hive_runtime::RelayProbe::Unauthorized => RelayProbeDto {
+            status: "unauthorized".into(),
+            detail: "Reached the relay, but it rejected the access token.".into(),
+        },
+        hive_runtime::RelayProbe::HttpStatus(c) => RelayProbeDto {
+            status: "httpError".into(),
+            detail: format!("Relay returned HTTP {c}. Check the URL — use the base origin, no /v1."),
+        },
+        hive_runtime::RelayProbe::Unreachable(e) => RelayProbeDto {
+            status: "unreachable".into(),
+            detail: format!("Couldn't reach the relay: {e}"),
+        },
+    }
+}
+
 /// Actually hit the configured relay and report whether it's reachable and the
 /// token is accepted — distinct from `sync_status`, which only reflects whether
 /// a URL is set, not whether it works.
@@ -5075,38 +5116,23 @@ async fn probe_relay(state: State<'_, AppState>) -> Result<RelayProbeDto, String
             s.sync_room.clone(),
         )
     };
-    if url.trim().is_empty() {
-        return Ok(RelayProbeDto {
-            status: "unconfigured".into(),
-            detail: "No relay URL set — you're local-only.".into(),
-        });
-    }
-    let workspace = if room.trim().is_empty() { "_probe".to_string() } else { room };
-    let probe = hive_runtime::RelayClient::new(url)
-        .with_auth(token)
-        .with_github_token(github)
-        .probe(&workspace)
-        .await;
-    Ok(match probe {
-        hive_runtime::RelayProbe::Ok => RelayProbeDto {
-            status: "ok".into(),
-            detail: "Reachable and the access token was accepted.".into(),
-        },
-        hive_runtime::RelayProbe::Unauthorized => RelayProbeDto {
-            status: "unauthorized".into(),
-            detail: "Reached the relay, but it rejected the access token. Paste only the \
-                     token value (drop any `name:` prefix)."
-                .into(),
-        },
-        hive_runtime::RelayProbe::HttpStatus(c) => RelayProbeDto {
-            status: "httpError".into(),
-            detail: format!("Relay returned HTTP {c}. Check the URL — use the base origin, no /v1."),
-        },
-        hive_runtime::RelayProbe::Unreachable(e) => RelayProbeDto {
-            status: "unreachable".into(),
-            detail: format!("Couldn't reach the relay: {e}"),
-        },
-    })
+    Ok(probe_relay_inner(url, token, github, room).await)
+}
+
+/// Probe a URL + token the user is *entering* (onboarding / Settings), before
+/// committing it — so the flow can validate a relay connection and only save a
+/// working one. The GitHub identity comes from settings.
+#[tauri::command]
+async fn probe_relay_at(
+    state: State<'_, AppState>,
+    url: String,
+    access_token: Option<String>,
+) -> Result<RelayProbeDto, String> {
+    let (github, room) = {
+        let s = state.settings.lock().unwrap();
+        (s.github_token.clone(), s.sync_room.clone())
+    };
+    Ok(probe_relay_inner(url, access_token.filter(|t| !t.trim().is_empty()), github, room).await)
 }
 
 /// The selectable workspaces: always "My workspace" (local), plus the joined
@@ -6818,6 +6844,7 @@ pub fn run() {
             remove_mcp_server,
             sync_status,
             probe_relay,
+            probe_relay_at,
             export_chat,
             save_attachment,
             set_git_email,

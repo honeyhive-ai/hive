@@ -16,10 +16,15 @@ import {
   githubLoginStart,
   githubLoginPoll,
   openExternal,
-  createWorkspace,
+  joinWorkspace,
+  redeemShortCode,
+  probeRelay,
+  probeRelayAt,
+  createRelayUser,
   type EnvDetectDto,
   type ClaudePermissionMode,
   type DeviceStartDto,
+  type RelayProbeDto,
 } from "@/lib/ipc";
 import { HiveBrandIcon } from "@/components/HiveBrand";
 
@@ -41,6 +46,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
   const [name, setName] = useState("");
   const [gh, setGh] = useState<{ login: string; name?: string | null } | null>(null);
   const [ghFlow, setGhFlow] = useState<DeviceStartDto | null>(null);
+  const [codeCopied, setCodeCopied] = useState(false);
   const [ghConfigured, setGhConfigured] = useState(false);
   const [showClientId, setShowClientId] = useState(false);
   const [clientId, setClientId] = useState("");
@@ -56,9 +62,17 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
   const [claudeModel, setClaudeModel] = useState(""); // "" = CLI default
   const [letEdit, setLetEdit] = useState(true); // Accept edits by default
 
-  // Step 4 — team (optional)
-  const [teamName, setTeamName] = useState("");
+  // Step 4 — team / relay connection
+  type TeamMode = "local" | "join" | "host";
+  const [teamMode, setTeamMode] = useState<TeamMode>("local");
+  const [inviteCode, setInviteCode] = useState("");
   const [relayUrl, setRelayUrl] = useState("");
+  const [accessToken, setAccessToken] = useState("");
+  const [probe, setProbe] = useState<RelayProbeDto | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [issuing, setIssuing] = useState(false);
+  // A connection is "good enough to finish" only when the last probe was ok.
+  const connectionOk = probe?.status === "ok";
 
   useEffect(() => {
     void (async () => {
@@ -128,12 +142,33 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
     try {
       const s = await githubLoginStart();
       setGhFlow(s);
-      // Open the OS browser via the backend — window.open() doesn't reach it
-      // from the Tauri webview. Best-effort; the URL is also shown to copy.
-      void openExternal(s.verificationUri).catch(() => {});
+      // Don't auto-open the browser — that yanks focus away while the code
+      // is still back here, forcing a switch-back-to-copy. Instead pre-copy
+      // the code so it's ready to paste, and let the user open GitHub when
+      // they're ready (the button below copies + opens in one click).
+      void navigator.clipboard?.writeText(s.userCode).then(
+        () => setCodeCopied(true),
+        () => {},
+      );
     } catch (e) {
       setError(String(e));
     }
+  }
+
+  async function copyCode(code: string) {
+    try {
+      await navigator.clipboard?.writeText(code);
+      setCodeCopied(true);
+    } catch {
+      /* clipboard may be unavailable; the code is still shown to type */
+    }
+  }
+
+  /// Copy the device code and open GitHub in one action, so the code is on the
+  /// clipboard the moment the browser lands on the verification page.
+  async function copyCodeAndOpenGithub(code: string, uri: string) {
+    await copyCode(code);
+    void openExternal(uri).catch(() => {});
   }
 
   async function pickFolder() {
@@ -149,11 +184,18 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
     }
   }
 
+  const pickMode = (m: TeamMode) => {
+    setTeamMode(m);
+    setProbe(null);
+    setError(null);
+  };
+
   const canNext =
     (step === 1 && (gh != null || name.trim().length > 0)) ||
     (step === 2) ||
     (step === 3 && (choice === "claudeCode" || choice === "ollama" || apiKey.trim().length > 0)) ||
-    step === 4;
+    // Step 4: local is always fine; join/host must have a verified connection.
+    (step === 4 && (teamMode === "local" || connectionOk));
 
   async function next() {
     setError(null);
@@ -171,7 +213,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
         await applyRuntime();
         setStep(4);
       } else {
-        await finishTeam();
+        await finishStep4();
         onComplete();
       }
     } catch (e) {
@@ -206,21 +248,99 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
     });
   }
 
-  async function finishTeam() {
-    const c = await getConnectionSettings();
-    if (relayUrl.trim() && relayUrl.trim() !== c.relayUrl) {
+  const permMode: ClaudePermissionMode = letEdit ? "acceptEdits" : "default";
+
+  /// Test the relay connection for the current mode, without finishing.
+  /// - join: redeem the invite/short code (sets relay+room+key), apply any
+  ///   token, then probe the now-configured relay.
+  /// - host: probe the entered URL+token *without* saving it yet.
+  async function testConnection() {
+    setError(null);
+    setProbe(null);
+    setTesting(true);
+    try {
+      if (teamMode === "join") {
+        const code = inviteCode.trim();
+        if (!code) return;
+        if (code.toLowerCase().startsWith("hivews1:")) {
+          await joinWorkspace(code);
+        } else {
+          await redeemShortCode(code);
+        }
+        const c = await getConnectionSettings();
+        if (accessToken.trim()) {
+          await updateConnectionSettings({
+            relayUrl: c.relayUrl,
+            room: c.room,
+            workspaceKey: null, // preserve the key the invite set
+            apiKey: null,
+            relayAccessToken: accessToken.trim(),
+            permissionMode: permMode,
+          });
+        }
+        setProbe(await probeRelay());
+      } else if (teamMode === "host") {
+        setProbe(await probeRelayAt(relayUrl.trim(), accessToken.trim() || null));
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  /// Host path, unauthorized + you're a relay admin: mint yourself a token.
+  async function issueMyToken() {
+    setError(null);
+    setIssuing(true);
+    try {
+      // Save the URL first so the admin call targets it.
+      const c = await getConnectionSettings();
       await updateConnectionSettings({
         relayUrl: relayUrl.trim(),
         room: c.room,
         workspaceKey: null,
         apiKey: null,
         relayAccessToken: null,
-        permissionMode: letEdit ? "acceptEdits" : "default",
+        permissionMode: permMode,
+      });
+      const login = gh?.login ?? "";
+      const display = gh?.name ?? name.trim() ?? login;
+      const issued = await createRelayUser(display || login || "me", login);
+      setAccessToken(issued.raw);
+      setProbe(await probeRelayAt(relayUrl.trim(), issued.raw));
+    } catch (e) {
+      setError(
+        `Couldn't issue a token — you may not be an admin on this relay. Ask your relay admin for one. (${String(e)})`,
+      );
+    } finally {
+      setIssuing(false);
+    }
+  }
+
+  async function finishStep4() {
+    const c = await getConnectionSettings();
+    if (teamMode === "local") {
+      // Clear any relay so we never finish half-configured.
+      await updateConnectionSettings({
+        relayUrl: "",
+        room: c.room,
+        workspaceKey: null,
+        apiKey: null,
+        relayAccessToken: "",
+        permissionMode: permMode,
+      });
+    } else if (teamMode === "host") {
+      await updateConnectionSettings({
+        relayUrl: relayUrl.trim(),
+        room: c.room,
+        workspaceKey: null,
+        apiKey: null,
+        relayAccessToken: accessToken.trim() || "",
+        permissionMode: permMode,
       });
     }
-    if (relayUrl.trim() && teamName.trim()) {
-      await createWorkspace(teamName.trim());
-    }
+    // join already applied its settings during testConnection().
   }
 
   return (
@@ -249,9 +369,29 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
                 {gh.name ? ` (${gh.name})` : ""} — one identity across all your devices.
               </div>
             ) : ghFlow ? (
-              <div className="space-y-2 rounded-xl border px-3 py-3 text-sm" style={{ borderColor: "var(--hive-accent-cool)" }}>
-                <div>
-                  Enter <code className="font-bold tracking-widest">{ghFlow.userCode}</code> at{" "}
+              <div className="space-y-3 rounded-xl border px-3 py-3 text-sm" style={{ borderColor: "var(--hive-accent-cool)" }}>
+                <div className="text-xs opacity-70">Your one-time code — enter it on GitHub:</div>
+                {/* The code, big + monospace, with an inline copy affordance. */}
+                <button
+                  type="button"
+                  onClick={() => void copyCode(ghFlow!.userCode)}
+                  className="flex w-full items-center justify-between rounded-lg border px-3 py-2"
+                  style={inputStyle}
+                  title="Copy code"
+                >
+                  <code className="text-lg font-bold tracking-[0.3em]">{ghFlow.userCode}</code>
+                  <span className="text-xs opacity-60">{codeCopied ? "Copied ✓" : "Copy"}</span>
+                </button>
+                <button
+                  type="button"
+                  className="w-full rounded-lg px-3 py-2 text-xs font-semibold text-white hover:brightness-110"
+                  style={{ background: "var(--hive-accent-cool)" }}
+                  onClick={() => void copyCodeAndOpenGithub(ghFlow.userCode, ghFlow.verificationUri)}
+                >
+                  Copy code &amp; open GitHub ↗
+                </button>
+                <div className="text-xs opacity-50">
+                  The code is copied to your clipboard — paste it at{" "}
                   <button
                     type="button"
                     className="underline hover:opacity-80"
@@ -260,16 +400,8 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
                   >
                     {ghFlow.verificationUri}
                   </button>
+                  . Waiting for you to authorize…
                 </div>
-                <button
-                  type="button"
-                  className="rounded-lg px-3 py-1.5 text-xs font-semibold text-white hover:brightness-110"
-                  style={{ background: "var(--hive-accent-cool)" }}
-                  onClick={() => void openExternal(ghFlow.verificationUri).catch(() => {})}
-                >
-                  Open GitHub ↗
-                </button>
-                <div className="text-xs opacity-50">Waiting for you to authorize on GitHub…</div>
               </div>
             ) : (
               <>
@@ -382,11 +514,85 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
 
         {step === 4 && (
           <div className="space-y-3">
-            <div className="text-sm font-medium">Team up (optional)</div>
-            <div className="text-xs opacity-50">Solo? Skip this — add a team anytime from the ＋ in the rail. To sync with others, set a relay and name a team.</div>
-            <input value={relayUrl} onChange={(e) => setRelayUrl(e.target.value)} placeholder="Relay URL (blank = solo / local)" className={field + " font-mono text-xs"} style={inputStyle} />
-            {relayUrl.trim() && (
-              <input value={teamName} onChange={(e) => setTeamName(e.target.value)} placeholder="New team name (optional)" className={field} style={inputStyle} />
+            <div className="text-sm font-medium">Team &amp; sync</div>
+            <div className="text-xs opacity-50">
+              How do you want to sync? You can always change this later in Settings → Team.
+            </div>
+
+            <div className="space-y-1.5">
+              <TeamModeOption v="local" mode={teamMode} set={pickMode} title="Just me" note="Local-only. Nothing leaves this machine." />
+              <TeamModeOption v="join" mode={teamMode} set={pickMode} title="Join a team" note="Paste an invite or short code someone shared." />
+              <TeamModeOption v="host" mode={teamMode} set={pickMode} title="Connect to a relay" note="Point at a relay you (or your org) host." />
+            </div>
+
+            {teamMode === "join" && (
+              <div className="space-y-2 rounded-xl border p-3" style={{ borderColor: "var(--hive-line)" }}>
+                <input
+                  value={inviteCode}
+                  onChange={(e) => { setInviteCode(e.target.value); setProbe(null); }}
+                  placeholder="Invite code (hivews1:…) or short code"
+                  className={field + " font-mono text-xs"}
+                  style={inputStyle}
+                />
+                {probe?.status === "unauthorized" && (
+                  <input
+                    value={accessToken}
+                    onChange={(e) => { setAccessToken(e.target.value); setProbe(null); }}
+                    placeholder="Relay access token (from your team admin)"
+                    className={field + " font-mono text-xs"}
+                    style={inputStyle}
+                  />
+                )}
+              </div>
+            )}
+
+            {teamMode === "host" && (
+              <div className="space-y-2 rounded-xl border p-3" style={{ borderColor: "var(--hive-line)" }}>
+                <input
+                  value={relayUrl}
+                  onChange={(e) => { setRelayUrl(e.target.value); setProbe(null); }}
+                  placeholder="Relay URL (https base origin, no /v1)"
+                  className={field + " font-mono text-xs"}
+                  style={inputStyle}
+                />
+                <input
+                  value={accessToken}
+                  onChange={(e) => { setAccessToken(e.target.value); setProbe(null); }}
+                  placeholder="Access token (blank for an open relay)"
+                  className={field + " font-mono text-xs"}
+                  style={inputStyle}
+                />
+              </div>
+            )}
+
+            {teamMode !== "local" && (
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={testConnection}
+                  disabled={testing || (teamMode === "join" ? !inviteCode.trim() : !relayUrl.trim())}
+                  className="rounded-lg border px-3 py-1.5 text-xs font-medium disabled:opacity-40"
+                  style={inputStyle}
+                >
+                  {testing ? "Testing…" : "Test connection"}
+                </button>
+                {probe && (
+                  <span className="text-xs" style={{ color: connectionOk ? "var(--hive-success)" : "var(--hive-accent-warm)" }}>
+                    {connectionOk ? "✓ Connected" : probe.detail}
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Host + unauthorized + you're signed in: offer to mint your own token. */}
+            {teamMode === "host" && probe?.status === "unauthorized" && gh && (
+              <button
+                onClick={issueMyToken}
+                disabled={issuing}
+                className="text-xs underline opacity-80 hover:opacity-100"
+                style={{ color: "var(--hive-accent-cool)" }}
+              >
+                {issuing ? "Creating…" : "I'm an admin on this relay — create my access token"}
+              </button>
             )}
           </div>
         )}
@@ -398,8 +604,8 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
             ← Back
           </button>
           <div className="flex items-center gap-3">
-            {(step === 2 || step === 4) && (
-              <button className="text-xs opacity-50 hover:opacity-100" disabled={busy} onClick={() => (step === 4 ? onComplete() : setStep(step + 1))}>
+            {step === 2 && (
+              <button className="text-xs opacity-50 hover:opacity-100" disabled={busy} onClick={() => setStep(step + 1)}>
                 Skip
               </button>
             )}
@@ -448,6 +654,32 @@ function RuntimeOption({
     >
       <span className="font-medium">{label}</span>
       <span className="ml-2 text-xs opacity-50">{note}</span>
+    </button>
+  );
+}
+
+function TeamModeOption<T extends string>({
+  v,
+  mode,
+  set,
+  title,
+  note,
+}: {
+  v: T;
+  mode: T;
+  set: (m: T) => void;
+  title: string;
+  note: string;
+}) {
+  const active = mode === v;
+  return (
+    <button
+      onClick={() => set(v)}
+      className="flex w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left"
+      style={{ borderColor: active ? "var(--hive-accent-cool)" : "var(--hive-line)", background: active ? "var(--hive-mist)" : "transparent" }}
+    >
+      <span className="text-sm font-medium">{title}</span>
+      <span className="text-xs opacity-50">{note}</span>
     </button>
   );
 }
