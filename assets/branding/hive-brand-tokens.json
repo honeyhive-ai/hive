@@ -1,0 +1,22 @@
+{
+  "studio": {
+    "bg": "#f4f1ea",
+    "panel": "#ffffff",
+    "ink": "#221f1a",
+    "soft": "#8a8073",
+    "line": "rgba(40,30,20,.12)",
+    "honeyLight": "#f0c25a",
+    "honeyDark": "#c8881f",
+    "honeyDeep": "#8a5a14",
+    "warmLight": "#e3a460",
+    "warmDark": "#c6713a",
+    "tileTop": "#9a6620",
+    "tileBottom": "#4a2e12",
+    "tileTopDark": "#3a2812",
+    "tileBottomDark": "#1a1206",
+    "cellLight": "#fbf1d8",
+    "cellMid": "#f0e0b8",
+    "activeLight": "#f0b878",
+    "activeDark": "#d98a44"
+  }
+}

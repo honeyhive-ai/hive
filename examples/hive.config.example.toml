@@ -1,0 +1,164 @@
+# Hive example configuration
+
+[app]
+name = "Hive"
+local_mode = true
+sync_mode = "account"
+default_runtime = "local-ollama"
+default_model = "llama3:latest"
+
+[transport]
+kind = "local"
+
+[transport.relay]
+endpoint = "wss://relay.hive.example/v1"
+account_token_env = "HIVE_RELAY_TOKEN"
+
+[sync]
+enabled = true
+server = "https://sync.example.com"
+device_name = "my-macbook"
+end_to_end_encryption = true
+
+[permissions]
+default_policy = "always_ask"
+allow_network = false
+
+[permissions.presets.safe_readonly]
+read_files = true
+write_files = false
+run_commands = false
+access_vaults = true
+access_remote_runtime = false
+
+[permissions.presets.workspace_agent]
+read_files = true
+write_files = true
+run_commands = true
+access_vaults = true
+access_remote_runtime = true
+
+[retrieval]
+mode = "manual"
+top_k = 8
+chunk_size = 1200
+keyword_weight = 0.35
+semantic_weight = 0.65
+recency_bias = false
+
+[[runtimes]]
+id = "local-ollama"
+kind = "local"
+provider = "ollama"
+endpoint = "http://localhost:11434"
+metrics_endpoint = "http://localhost:8000/metrics"
+models = ["llama3:latest", "qwen3.5:latest", "mistral:latest"]
+preferred_model = "llama3:latest"
+keep_alive = "-1"
+supports_embeddings = true
+supports_tools = true
+performance_score = 7.8
+
+[[runtimes]]
+id = "home-lab"
+kind = "remote"
+provider = "hive-daemon"
+endpoint = "https://home-lab.your-tailnet.ts.net:9443"
+network = "tailnet"
+device_id = "runtime-home-lab"
+auth_token_env = "HIVE_DAEMON_TOKEN"
+models = ["deepseek-coder", "llama3.3-70b"]
+supports_embeddings = true
+supports_tools = true
+performance_score = 8.6
+
+[[runtimes]]
+id = "openai-priority"
+kind = "remote"
+provider = "openai"
+endpoint = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+models = ["gpt-5", "gpt-5-mini"]
+supports_embeddings = true
+supports_tools = true
+performance_score = 9.7
+cost_per_1m_input_tokens_usd = 5.0
+requests_remaining = 240
+daily_spend_remaining_usd = 18.0
+
+[[runtimes]]
+id = "anthropic-backup"
+kind = "remote"
+provider = "anthropic"
+endpoint = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+models = ["claude-opus-4.1", "claude-sonnet-4"]
+supports_embeddings = true
+supports_tools = true
+performance_score = 9.3
+cost_per_1m_input_tokens_usd = 6.0
+requests_remaining = 42
+daily_spend_remaining_usd = 6.0
+
+[[runtimes]]
+id = "claude-code-pro"
+kind = "local"
+provider = "claude-code"
+endpoint = "claude-code://local"
+models = ["sonnet", "opus"]
+preferred_model = "sonnet"
+supports_embeddings = true
+supports_tools = true
+performance_score = 9.1
+cost_per_1m_input_tokens_usd = 0.0
+
+[[runtime_pools]]
+id = "default-mixed-pool"
+name = "Default Mixed Pool"
+runtimes = ["local-ollama", "home-lab", "openai-priority", "anthropic-backup", "claude-code-pro"]
+routing_strategy = "latencyOptimized"
+fallback_strategy = "priorityPerformance"
+prefer_local_for_low_priority = true
+reserve_paid_capacity_for_high_priority = true
+minimum_requests_reserve = 40
+minimum_spend_reserve_usd = 5.0
+
+[[vaults]]
+id = "obsidian-local"
+kind = "obsidian"
+location = "~/Documents/Knowledge"
+mode = "local"
+enabled = true
+index = true
+include = ["Projects", "Notes", "Research"]
+exclude = ["Archive", "Templates"]
+tags = ["coding", "product"]
+
+[[vaults]]
+id = "obsidian-remote"
+kind = "obsidian"
+location = "/srv/knowledge"
+mode = "remote"
+runtime_id = "home-lab"
+enabled = true
+index = true
+include = ["Docs", "Playbooks"]
+
+[[skills]]
+id = "coding-core"
+source = "~/.hive/skills/coding-core"
+autoload = true
+scope = "workspace"
+
+[[skills]]
+id = "obsidian-research"
+source = "~/.hive/skills/obsidian-research"
+autoload = false
+scope = "chat"
+
+[chat_defaults]
+permission_preset = "safe_readonly"
+retrieval_mode = "manual"
+runtime_pool = "default-mixed-pool"
+show_context_panel = true
+show_activity_panel = true

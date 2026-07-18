@@ -1,0 +1,57 @@
+[package]
+name = "Hive"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Hive desktop shell (Tauri v2)"
+
+[lib]
+name = "hive_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+hive-core.workspace = true
+hive-proto.workspace = true
+# Inherits default-features = false from the workspace root, so this app's own
+# `p2p` feature is what enables hive-runtime's iroh-backed P2P.
+hive-runtime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+# join_all for parallel workflow stages (already in the graph via tauri).
+futures = "0.3"
+# `devtools` enables the web inspector in release builds too (right-click →
+# Inspect) — kept on through the beta so testers can profile perf.
+tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
+tauri-plugin-notification = "2"
+# Auto-updater (scaffolded; inert until updater keys + createUpdaterArtifacts
+# are enabled at public launch — see #144).
+tauri-plugin-updater = "2"
+rfd = "0.15"
+toml = "0.8"
+base64 = "0.22"
+# Like std::fs::canonicalize but strips Windows's `\\?\` verbatim prefix for
+# normal drive paths (keeps it only for genuinely long/UNC paths) — so the
+# workspace root shows as `C:\…`, not `\\?\C:\…`. Already in the tree.
+dunce = "1"
+# Used by check_for_app_update to fetch the public version manifest (in Rust, so
+# there's no webview CORS issue). Same features as hive-runtime; already built.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Windows-only: themed native title bar (DWM caption color) so the title bar
+# matches the app background. Version pinned to what Tauri 2.11 already pulls,
+# so this adds no new crate to the build graph.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+
+[features]
+# P2P on by default. Only the Windows cross-compile turns it off, via
+# `--no-default-features` (iroh's `wmi` dep can't cross-compile via cargo-xwin).
+default = ["p2p"]
+# Direct peer-to-peer (iroh).
+p2p = ["hive-runtime/p2p"]

@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+/* Default Hive design tokens (pollen palette — the launch default).
+   `applyTheme()` overrides these on :root at runtime; these defaults cover
+   first paint before the theme JS runs. Full palette set lives in
+   src/lib/theme.ts. */
+:root {
+  font-size: 14px;
+  --hive-canvas: rgb(249, 243, 228);
+  --hive-ink: rgb(38, 29, 16);
+  --hive-panel: rgb(255, 252, 244);
+  --hive-mist: rgb(243, 233, 212);
+  --hive-line: rgba(120, 84, 24, 0.12);
+  --hive-accent-warm: rgb(214, 130, 56);
+  --hive-accent-cool: rgb(216, 150, 32);
+  --hive-sidebar-top: rgb(74, 46, 18);
+  --hive-sidebar-bottom: rgb(154, 102, 32);
+  --hive-sidebar-ink: rgb(252, 242, 216);
+  --hive-sidebar-ink-muted: rgb(222, 196, 150);
+  /* Status + overlay tokens (light defaults; applyTheme overrides per scheme).
+     Replace hardcoded #34c759 / #ff5a5f / rgba(0,0,0,…) literals with these so
+     every palette (esp. light variants) stays legible. */
+  --hive-success: rgb(34, 140, 80);
+  --hive-danger: rgb(198, 55, 55);
+  --hive-warn: rgb(170, 116, 24);
+  --hive-overlay: rgba(0, 0, 0, 0.05);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  background: var(--hive-canvas);
+  color: var(--hive-ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+    sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+button,
+input,
+textarea,
+select,
+option {
+  font: inherit;
+}
+
+/* Markdown rendering for chat messages (Tailwind preflight strips these). */
+.hive-md > :first-child { margin-top: 0; }
+.hive-md > :last-child { margin-bottom: 0; }
+.hive-md p { margin: 0.5em 0; }
+.hive-md ul,
+.hive-md ol { margin: 0.5em 0; padding-left: 1.4em; }
+.hive-md ul { list-style: disc; }
+.hive-md ol { list-style: decimal; }
+.hive-md li { margin: 0.2em 0; }
+.hive-md h1,
+.hive-md h2,
+.hive-md h3,
+.hive-md h4 { margin: 0.8em 0 0.4em; font-weight: 600; line-height: 1.3; }
+.hive-md h1 { font-size: 1.4em; }
+.hive-md h2 { font-size: 1.25em; }
+.hive-md h3 { font-size: 1.1em; }
+.hive-md blockquote {
+  margin: 0.5em 0;
+  padding-left: 0.9em;
+  border-left: 3px solid var(--hive-line);
+  opacity: 0.85;
+}
+.hive-md table { border-collapse: collapse; margin: 0.5em 0; display: block; overflow-x: auto; }
+.hive-md th,
+.hive-md td { border: 1px solid var(--hive-line); padding: 0.3em 0.6em; }
+.hive-md hr { border: none; border-top: 1px solid var(--hive-line); margin: 0.8em 0; }
+.hive-md a { word-break: break-word; }
+
+/* Native <select> popups (esp. Windows/Chromium) inherit a light text color
+   that ends up light-on-white. Force theme-legible colors on the POPUP only
+   (option/optgroup). The closed control gets no background here — this rule
+   is unlayered so it would override Tailwind's bg-transparent and paint a
+   dark box inside every styled select wrapper. Controls that want a fill set
+   it explicitly. */
+select {
+  color: var(--hive-ink);
+}
+select option,
+select optgroup {
+  color: var(--hive-ink);
+  background-color: var(--hive-panel);
+}
+
+/* Workflow builder canvas (react-flow): token-theme the parts we don't own.
+   Custom stage nodes style themselves; this covers edges + chrome. */
+.workflow-canvas .react-flow__edge.selected path.react-flow__edge-path,
+.workflow-canvas .react-flow__edge:focus path.react-flow__edge-path {
+  stroke: var(--hive-accent-cool);
+}
+.workflow-canvas .react-flow__node {
+  cursor: grab;
+}
+.workflow-canvas .react-flow__attribution {
+  background: transparent;
+  color: var(--hive-ink);
+  opacity: 0.35;
+}
