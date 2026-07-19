@@ -296,7 +296,17 @@ impl EventStore {
     /// Project a session into its current state, replaying only from the latest
     /// `sessionSnapshot` so cost stays bounded on long chats (#3).
     pub fn load_session(&self, session_id: Uuid) -> Result<Option<ChatSession>> {
-        let envelopes = self.envelopes_from_latest_snapshot(session_id)?;
+        // Project the full stream. `project` folds in canonical (lamport,
+        // event_id) order and seeds from the canonical-latest snapshot, so the
+        // result is independent of *this device's* ingestion order. A row_id
+        // slice from the latest snapshot would feed `project` a different subset
+        // when a snapshot is ingested after its own deltas — reintroducing
+        // cross-device divergence. Bounded-cost compaction (canonical
+        // lamport-ordered slicing) is a follow-up; correctness comes first.
+        let envelopes = self.query_envelopes(
+            "SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY row_id ASC",
+            [session_id.to_string()],
+        )?;
         Ok(project(&envelopes))
     }
 
@@ -451,6 +461,48 @@ mod tests {
         assert_eq!(e2.sequence, 2);
         assert_eq!(e3.sequence, 3);
         assert_eq!(store.max_sequence(sid).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn load_session_converges_regardless_of_ingest_order() {
+        use hive_core::identity::{ActorIdentity, ActorKind, WorkspaceMember, WorkspaceRole};
+        use hive_core::time_util::Timestamp;
+
+        let base = ChatSession::new("Demo", Uuid::nil(), "anthropic");
+        let (sid, wid) = (base.id, base.workspace_id);
+        let member = WorkspaceMember {
+            id: "m1".into(),
+            actor: ActorIdentity::new("u1", "U1", ActorKind::Human),
+            role: WorkspaceRole::Contributor,
+            title: String::new(),
+            index: 0,
+            joined_at: Timestamp::epoch(),
+        };
+        let events = vec![
+            SessionEventEnvelope::new(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            SessionEventEnvelope::new(sid, wid, 2, SessionEvent::SessionTitleChanged { title: "First".into() }),
+            SessionEventEnvelope::new(sid, wid, 3, SessionEvent::MemberAdded { member }),
+            SessionEventEnvelope::new(sid, wid, 4, SessionEvent::SessionTitleChanged { title: "Second".into() }),
+            SessionEventEnvelope::new(sid, wid, 5, SessionEvent::MemberRemoved { member_id: "m1".into() }),
+        ];
+
+        // Device A ingests forward; device B ingests in reverse — so B stores the
+        // snapshot LAST (highest row_id). The old row_id-sliced load would have
+        // projected only the snapshot on B and diverged.
+        let mut a = EventStore::open_in_memory().unwrap();
+        for e in &events {
+            a.ingest(e).unwrap();
+        }
+        let mut b = EventStore::open_in_memory().unwrap();
+        for e in events.iter().rev() {
+            b.ingest(e).unwrap();
+        }
+
+        let sa = a.load_session(sid).unwrap().expect("a");
+        let sb = b.load_session(sid).unwrap().expect("b");
+        assert_eq!(sa, sb, "stores diverged under different ingest order");
+        assert_eq!(sa.title, "Second", "canonical-latest title wins");
+        assert!(sa.members.is_empty(), "m1 added then removed");
     }
 
     #[test]
