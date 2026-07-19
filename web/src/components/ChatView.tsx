@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   exportChat,
+  getAppSettings,
   getChat,
   listAgents,
   listMembers,
@@ -114,6 +115,12 @@ export function ChatView({
     queryKey: ["chat", sessionId],
     queryFn: () => getChat(sessionId),
   });
+
+  // The local user's display name — the same author the backend stamps on a
+  // persisted message. Used to label the optimistic bubble so it doesn't flip
+  // from "You" to the display name once the message lands.
+  const appSettings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
+  const selfName = appSettings.data?.displayName?.trim() || "You";
 
   // Live presence (other users' typing + online), polled while the chat is open
   // — but only when a relay is configured. Solo/relay-less workspaces skip the
@@ -533,7 +540,7 @@ export function ChatView({
               onRegenerate={m.id === lastAssistantId && !sending && streams.size === 0 ? handleRegenerate : undefined}
             />
           ))}
-          {optimisticUser && <Bubble role="user" author="You" body={optimisticUser} />}
+          {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} />}
           {[...streams.entries()].map(([id, text]) => (
             <Bubble key={id} role="assistant" author="Hive" body={text} streaming />
           ))}
