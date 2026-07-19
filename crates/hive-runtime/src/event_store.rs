@@ -94,6 +94,24 @@ impl EventStore {
         Ok(seq)
     }
 
+    /// The highest Lamport timestamp among a session's stored events (0 if none),
+    /// read from the envelope JSON. Used to assign a **causal** clock to newly
+    /// authored events: strictly greater than everything this device has seen —
+    /// locally authored *or* ingested from a peer — so causal order is preserved
+    /// across devices, not just a per-device authoring count.
+    pub fn max_lamport(&self, session_id: Uuid) -> Result<u64> {
+        let max: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(json_extract(envelope_json, '$.lamport')) FROM events WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(max.unwrap_or(0).max(0) as u64)
+    }
+
     /// Append a pre-built envelope verbatim. Fails if its
     /// `(session_id, sequence)` already exists (the append-only invariant).
     pub fn append_envelope(&self, env: &SessionEventEnvelope) -> Result<()> {
@@ -461,6 +479,22 @@ mod tests {
         assert_eq!(e2.sequence, 2);
         assert_eq!(e3.sequence, 3);
         assert_eq!(store.max_sequence(sid).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn max_lamport_reflects_stored_events_including_ingested() {
+        let (mut store, sid, wid) = seeded_store(); // snapshot @ lamport 1
+        for l in [5i64, 100, 30] {
+            let mut e = SessionEventEnvelope::new(
+                sid,
+                wid,
+                l,
+                SessionEvent::SessionTitleChanged { title: format!("t{l}") },
+            );
+            e.lamport = l as u64;
+            store.ingest(&e).unwrap();
+        }
+        assert_eq!(store.max_lamport(sid).unwrap(), 100, "max over authored + ingested");
     }
 
     #[test]

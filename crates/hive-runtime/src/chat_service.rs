@@ -143,6 +143,12 @@ impl ChatService {
         }
         let next_seq = self.store.max_sequence(session_id)?.unwrap_or(0) + 1;
         let mut env = SessionEventEnvelope::new(session_id, workspace_id, next_seq, payload);
+        // Causal Lamport clock: strictly greater than every event this device has
+        // seen for the session (locally authored or ingested from a peer), so the
+        // canonical fold order (lamport, event_id) respects causality — a reply
+        // never sorts before the message it answers. `new` seeded lamport from the
+        // local sequence; override it with the causal value before signing.
+        env.lamport = self.store.max_lamport(session_id)?.saturating_add(1);
         env.actor_stamp = Some(ActorStamp {
             actor: self.author.clone(),
             recorded_at: Timestamp::now(),
@@ -798,6 +804,31 @@ mod tests {
         let device_id = Uuid::new_v4();
         let author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
         (ChatService::new(store, device_id, kp, author), public)
+    }
+
+    #[test]
+    fn authoring_uses_a_causal_lamport_clock() {
+        let (mut svc, pk) = service();
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let (sid, wid) = (chat.id, chat.workspace_id);
+
+        // A peer's event arrives with a far-ahead Lamport clock.
+        let mut foreign = SessionEventEnvelope::new(
+            sid,
+            wid,
+            1,
+            SessionEvent::SessionTitleChanged { title: "from peer".into() },
+        );
+        foreign.lamport = 500;
+        assert!(svc.store.ingest(&foreign).unwrap());
+
+        // The next locally-authored event is causally after everything seen (>500),
+        // not just the local authoring count — and is signed with the v2 preimage.
+        let env = svc
+            .append_signed(sid, wid, SessionEvent::SessionTitleChanged { title: "local".into() })
+            .unwrap();
+        assert!(env.lamport > 500, "authored lamport {} not causal", env.lamport);
+        assert!(verify_envelope(&env, &pk).is_ok());
     }
 
     #[test]

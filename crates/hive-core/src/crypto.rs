@@ -90,19 +90,26 @@ pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<(),
 // Canonical preimages (deterministic bytes that get signed)
 // ---------------------------------------------------------------------------
 
-/// Deterministic bytes signed for an event envelope. Covers the routing fields
-/// plus the payload so neither can be tampered with. The payload JSON is stable
-/// because serde serializes struct fields and the tagged enum in declaration
-/// order.
+/// Deterministic bytes signed for an event envelope. Covers the routing fields,
+/// the ordering key (`lamport`), the claimed authorship (`actor_stamp`,
+/// `timestamp`, `scope`), and the payload — so none can be tampered with. In
+/// particular, binding `lamport` and `actor_stamp` closes two gaps: a peer can no
+/// longer forge another member's authorship, nor rewrite an event's position in
+/// the canonical order. JSON encodings are stable because serde serializes
+/// struct fields and tagged enums in declaration order.
 pub fn envelope_preimage(env: &SessionEventEnvelope) -> Vec<u8> {
-    let mut out = Vec::with_capacity(128);
-    out.extend_from_slice(b"hive-envelope-v1\0");
+    let mut out = Vec::with_capacity(160);
+    // v2: added lamport + timestamp + actor_stamp + scope to the signed bytes.
+    out.extend_from_slice(b"hive-envelope-v2\0");
     out.extend_from_slice(env.workspace_id.as_bytes());
     out.extend_from_slice(env.session_id.as_bytes());
     out.extend_from_slice(&env.sequence.to_le_bytes());
+    out.extend_from_slice(&env.lamport.to_le_bytes());
     out.extend_from_slice(env.event_id.as_bytes());
-    let payload = serde_json::to_vec(&env.payload).unwrap_or_default();
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(&serde_json::to_vec(&env.scope).unwrap_or_default());
+    out.extend_from_slice(&serde_json::to_vec(&env.timestamp).unwrap_or_default());
+    out.extend_from_slice(&serde_json::to_vec(&env.actor_stamp).unwrap_or_default());
+    out.extend_from_slice(&serde_json::to_vec(&env.payload).unwrap_or_default());
     out
 }
 
@@ -317,6 +324,20 @@ mod tests {
         let mut tampered = env.clone();
         tampered.sequence = 8;
         assert!(verify_envelope(&tampered, &kp.public_key_bytes()).is_err());
+
+        // v2 preimage: mutating the ordering key (lamport) breaks the signature,
+        // so a peer can't rewrite an event's position in the canonical order.
+        let mut reordered = env.clone();
+        reordered.lamport = env.lamport.wrapping_add(1);
+        assert!(verify_envelope(&reordered, &kp.public_key_bytes()).is_err());
+
+        // v2 preimage: forging the claimed author (actor_stamp) breaks it too.
+        let mut spoofed = env.clone();
+        spoofed.actor_stamp = Some(crate::identity::ActorStamp {
+            actor: crate::identity::ActorIdentity::new("mallory", "Mallory", crate::identity::ActorKind::Human),
+            recorded_at: crate::time_util::Timestamp::epoch(),
+        });
+        assert!(verify_envelope(&spoofed, &kp.public_key_bytes()).is_err());
 
         // wrong key -> fails
         let other = SigningKeypair::generate().unwrap();
