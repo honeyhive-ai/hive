@@ -455,33 +455,36 @@ mod tests {
     #[test]
     fn export_bindings() {
         const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../web/src/bindings");
-        AppInfo::export_all_to(DIR).unwrap();
-        ChatMessageDto::export_all_to(DIR).unwrap();
-        ToolCallDto::export_all_to(DIR).unwrap();
-        ToolResultDto::export_all_to(DIR).unwrap();
-        ChatSummaryDto::export_all_to(DIR).unwrap();
-        ChatSessionDto::export_all_to(DIR).unwrap();
-        ChatStreamEvent::export_all_to(DIR).unwrap();
-        GitFileDiffDto::export_all_to(DIR).unwrap();
-        AppSettingsDto::export_all_to(DIR).unwrap();
-        RuntimeSummaryDto::export_all_to(DIR).unwrap();
-        ContextTelemetryDto::export_all_to(DIR).unwrap();
-        WorkspaceAgentDto::export_all_to(DIR).unwrap();
-        SkillDto::export_all_to(DIR).unwrap();
-        McpServerDto::export_all_to(DIR).unwrap();
-        ReactionDto::export_all_to(DIR).unwrap();
-        ProposalDto::export_all_to(DIR).unwrap();
-        ApprovalDto::export_all_to(DIR).unwrap();
-        WorkspaceMemberDto::export_all_to(DIR).unwrap();
-        WorkspaceInfoDto::export_all_to(DIR).unwrap();
-        VaultSourceDto::export_all_to(DIR).unwrap();
-        WorkflowNodeDto::export_all_to(DIR).unwrap();
-        WorkflowDefinitionDto::export_all_to(DIR).unwrap();
-        WorkflowNodeRunDto::export_all_to(DIR).unwrap();
-        WorkflowRunDto::export_all_to(DIR).unwrap();
-        WorkflowRunEvent::export_all_to(DIR).unwrap();
-        RelayTokenDto::export_all_to(DIR).unwrap();
-        RelayUserDto::export_all_to(DIR).unwrap();
-        IssuedRelayTokenDto::export_all_to(DIR).unwrap();
+        // ts-rs 12: export methods take a Config carrying the output dir (was
+        // `export_all_to(DIR)` in ts-rs 10).
+        let cfg = ts_rs::Config::new().with_out_dir(DIR);
+        AppInfo::export_all(&cfg).unwrap();
+        ChatMessageDto::export_all(&cfg).unwrap();
+        ToolCallDto::export_all(&cfg).unwrap();
+        ToolResultDto::export_all(&cfg).unwrap();
+        ChatSummaryDto::export_all(&cfg).unwrap();
+        ChatSessionDto::export_all(&cfg).unwrap();
+        ChatStreamEvent::export_all(&cfg).unwrap();
+        GitFileDiffDto::export_all(&cfg).unwrap();
+        AppSettingsDto::export_all(&cfg).unwrap();
+        RuntimeSummaryDto::export_all(&cfg).unwrap();
+        ContextTelemetryDto::export_all(&cfg).unwrap();
+        WorkspaceAgentDto::export_all(&cfg).unwrap();
+        SkillDto::export_all(&cfg).unwrap();
+        McpServerDto::export_all(&cfg).unwrap();
+        ReactionDto::export_all(&cfg).unwrap();
+        ProposalDto::export_all(&cfg).unwrap();
+        ApprovalDto::export_all(&cfg).unwrap();
+        WorkspaceMemberDto::export_all(&cfg).unwrap();
+        WorkspaceInfoDto::export_all(&cfg).unwrap();
+        VaultSourceDto::export_all(&cfg).unwrap();
+        WorkflowNodeDto::export_all(&cfg).unwrap();
+        WorkflowDefinitionDto::export_all(&cfg).unwrap();
+        WorkflowNodeRunDto::export_all(&cfg).unwrap();
+        WorkflowRunDto::export_all(&cfg).unwrap();
+        WorkflowRunEvent::export_all(&cfg).unwrap();
+        RelayTokenDto::export_all(&cfg).unwrap();
+        RelayUserDto::export_all(&cfg).unwrap();
+        IssuedRelayTokenDto::export_all(&cfg).unwrap();
     }
 }
