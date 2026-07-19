@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { RuntimeSummaryDto } from "@/bindings/RuntimeSummaryDto";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addRuntime,
@@ -18,6 +19,7 @@ import {
   openInEditor,
   removeMcpServer,
   removeRuntime,
+  setDefaultRuntime,
   setDisplayName,
   setGitEmail,
   p2pMyCode,
@@ -633,7 +635,7 @@ function DefaultModelPicker() {
       </select>
       <p className="mt-1 text-xs opacity-50">
         Used when a chat has no specific runtime selected. Separate from the local Claude Code model
-        (Account → Agent file access).
+        (set on its runtime row above).
       </p>
     </div>
   );
@@ -658,7 +660,38 @@ function RuntimesSection() {
   const [runtimeSupportsTools, setRuntimeSupportsTools] = useState(true);
   const [runtimeSupportsEmbeddings, setRuntimeSupportsEmbeddings] = useState(false);
   const [runtimeContextWindow, setRuntimeContextWindow] = useState("");
+  // null = the form is adding; an id = editing that runtime in place (add_runtime
+  // upserts by id, so the same form both adds and edits).
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const formRef = useRef<HTMLDivElement>(null);
   const presets = useQuery({ queryKey: ["provider-presets"], queryFn: listProviderPresets });
+
+  function resetRuntimeForm() {
+    setEditingId(null);
+    setRuntimeId("");
+    setRuntimeName("");
+    setRuntimeProvider("ollama");
+    setRuntimeEndpoint("");
+    setRuntimeBaseUrl("");
+    setRuntimeModel("");
+    setRuntimeContextWindow("");
+    setRuntimeSupportsTools(true);
+    setRuntimeSupportsEmbeddings(false);
+  }
+
+  function startEdit(runtime: RuntimeSummaryDto) {
+    setEditingId(runtime.id);
+    setRuntimeId(runtime.id);
+    setRuntimeName(runtime.name);
+    setRuntimeProvider(runtime.provider);
+    setRuntimeEndpoint(runtime.endpoint);
+    setRuntimeBaseUrl(runtime.modelBaseUrl ?? "");
+    setRuntimeModel(runtime.model);
+    setRuntimeContextWindow(runtime.contextWindow ? String(runtime.contextWindow) : "");
+    setRuntimeSupportsTools(runtime.supportsTools);
+    setRuntimeSupportsEmbeddings(runtime.supportsEmbeddings);
+    formRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
 
   const addRuntimeMutation = useMutation({
     mutationFn: () =>
@@ -677,30 +710,38 @@ function RuntimesSection() {
         Number(runtimeContextWindow) > 0 ? Number(runtimeContextWindow) : null,
       ),
     onSuccess: () => {
-      setRuntimeId("");
-      setRuntimeName("");
-      setRuntimeEndpoint("");
-      setRuntimeBaseUrl("");
-      setRuntimeModel("");
-      setRuntimeContextWindow("");
+      const wasEditing = editingId !== null;
+      resetRuntimeForm();
       qc.invalidateQueries({ queryKey: ["runtimes"] });
-      toast.success("Runtime added.");
+      toast.success(wasEditing ? "Runtime updated." : "Runtime added.");
     },
-    onError: (e) => toast.error(`Couldn't add runtime: ${errMsg(e)}`),
+    onError: (e) => toast.error(`Couldn't save runtime: ${errMsg(e)}`),
   });
   const removeRuntimeMutation = useMutation({
     mutationFn: (id: string) => removeRuntime(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["runtimes"] }),
     onError: (e) => toast.error(`Couldn't remove runtime: ${errMsg(e)}`),
   });
+  const setDefaultMutation = useMutation({
+    mutationFn: (id: string) => setDefaultRuntime(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["runtimes"] });
+      toast.success("Default runtime updated.");
+    },
+    onError: (e) => toast.error(`Couldn't set default: ${errMsg(e)}`),
+  });
 
   return (
     <Section title="Models (runtimes)">
       <p className="text-xs opacity-50">
         A model on a provider (above) — what powers a chat or agent. Pick a provider kind + model;
-        the key/base URL come from the provider.
+        the key/base URL come from the provider. Mark one <strong>default</strong> for new chats.
       </p>
-      <DefaultModelPicker />
+      {/* The "Default model" picker only configures the synthesized Anthropic
+          Primary Runtime, which is surfaced only when no real runtime is
+          configured. Once you have runtimes, the default is chosen per-row
+          below, so this picker would point at a runtime that isn't listed. */}
+      {(runtimes.data ?? []).some((r) => r.name === "Primary Runtime") && <DefaultModelPicker />}
       <div className="space-y-2">
         {(runtimes.data ?? []).map((runtime) => (
           <div
@@ -715,8 +756,17 @@ function RuntimesSection() {
                   {runtime.location} · {runtime.provider}
                   {runtime.endpoint ? ` · ${runtime.endpoint}` : ""}
                 </div>
+                {runtime.provider === "claude-code" && !runtime.isManaged && <ClaudeCodeRowModel />}
               </div>
               <div className="flex items-center gap-2">
+                {runtime.isManaged && (
+                  <button
+                    onClick={() => startEdit(runtime)}
+                    className="text-xs hover:opacity-80"
+                  >
+                    Edit
+                  </button>
+                )}
                 {runtime.isManaged && (
                   <button
                     onClick={() => confirmThen(`Remove runtime "${runtime.label}"?`, () => removeRuntimeMutation.mutate(runtime.id))}
@@ -725,10 +775,19 @@ function RuntimesSection() {
                     Remove
                   </button>
                 )}
-                {runtime.isDefault && (
+                {runtime.isDefault ? (
                   <span className="rounded-full px-2 py-1 text-xs" style={{ background: "var(--hive-mist)" }}>
                     default
                   </span>
+                ) : (
+                  <button
+                    onClick={() => setDefaultMutation.mutate(runtime.id)}
+                    disabled={setDefaultMutation.isPending}
+                    className="rounded-full border px-2 py-1 text-xs hover:opacity-80 disabled:opacity-50"
+                    style={{ borderColor: "var(--hive-line)" }}
+                  >
+                    Set default
+                  </button>
                 )}
               </div>
             </div>
@@ -736,10 +795,13 @@ function RuntimesSection() {
         ))}
       </div>
       <div
+        ref={formRef}
         className="space-y-2 rounded-2xl border p-4"
         style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
       >
-        <h3 className="text-sm font-semibold uppercase tracking-wide opacity-60">Add runtime</h3>
+        <h3 className="text-sm font-semibold uppercase tracking-wide opacity-60">
+          {editingId ? `Edit runtime · ${editingId}` : "Add runtime"}
+        </h3>
         <div className="grid gap-2 md:grid-cols-2">
           <input
             value={runtimeName}
@@ -752,7 +814,9 @@ function RuntimesSection() {
             value={runtimeId}
             onChange={(e) => setRuntimeId(e.target.value)}
             placeholder="ID (optional)"
-            className="rounded-xl border px-3 py-2 font-mono text-sm"
+            readOnly={editingId !== null}
+            title={editingId !== null ? "The id is fixed while editing" : undefined}
+            className="rounded-xl border px-3 py-2 font-mono text-sm read-only:opacity-60"
             style={inputStyle}
           />
           <select
@@ -856,8 +920,20 @@ function RuntimesSection() {
           />
           Supports embeddings
         </label>
-        <div>
-          <SaveButton onClick={() => addRuntimeMutation.mutate()} label="Add runtime" />
+        <div className="flex items-center gap-2">
+          <SaveButton
+            onClick={() => addRuntimeMutation.mutate()}
+            label={editingId ? "Update runtime" : "Add runtime"}
+          />
+          {editingId && (
+            <button
+              onClick={resetRuntimeForm}
+              className="rounded-xl border px-3 py-2 text-sm hover:opacity-80"
+              style={{ borderColor: "var(--hive-line)" }}
+            >
+              Cancel
+            </button>
+          )}
         </div>
       </div>
     </Section>
@@ -1320,7 +1396,6 @@ function SyncSection() {
             workspace without asking.
           </p>
         )}
-        <ClaudeModelPicker />
         <SaveButton onClick={() => save.mutate()} label="Save" />
       </Section>
     </>
@@ -1335,7 +1410,14 @@ const CLAUDE_MODELS = [
   { value: "opus", label: "Opus" },
   { value: "haiku", label: "Haiku" },
 ];
-function ClaudeModelPicker() {
+
+// Compact model selector shown inline on the Claude Code runtime row. Claude
+// Code isn't a config runtime (it's the local `claude` CLI), so its "model" is
+// the `--model` alias in settings, not something the generic Edit form touches —
+// this edits it in place where the runtime is listed. Options come from
+// listClaudeCodeModels (the CLI's own `/model` list: Fable, etc.), with a
+// free-text escape hatch for anything unlisted.
+function ClaudeCodeRowModel() {
   const qc = useQueryClient();
   const model = useQuery({ queryKey: ["claude-model"], queryFn: getClaudeCodeModel });
   const models = useQuery({ queryKey: ["claude-model-options"], queryFn: listClaudeCodeModels });
@@ -1344,6 +1426,8 @@ function ClaudeModelPicker() {
     mutationFn: setClaudeCodeModel,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["claude-model"] });
+      qc.invalidateQueries({ queryKey: ["claude-model-options"] });
+      qc.invalidateQueries({ queryKey: ["runtimes"] });
       toast.success("Claude Code model updated.");
     },
     onError: (e) => toast.error(`Couldn't set model: ${errMsg(e)}`),
@@ -1353,43 +1437,35 @@ function ClaudeModelPicker() {
   const known = options.some((m) => m.value === current);
   const showCustom = custom || (!known && current !== "");
   return (
-    <div className="mt-3">
-      <label className="block text-xs opacity-60">Claude Code model</label>
+    <div className="mt-2 flex items-center gap-2">
       <select
         value={showCustom ? "__custom__" : current}
         onChange={(e) => {
-          if (e.target.value === "__custom__") {
-            setCustom(true);
-          } else {
+          if (e.target.value === "__custom__") setCustom(true);
+          else {
             setCustom(false);
             save.mutate(e.target.value);
           }
         }}
-        className="w-full rounded-xl border px-3 py-2 text-sm"
+        className="rounded-lg border px-2 py-1 text-xs"
         style={inputStyle}
+        aria-label="Claude Code model"
       >
         {options.map((m) => (
-          <option key={m.value || "default"} value={m.value}>
-            {m.label}
-            {"description" in m && m.description ? ` — ${m.description}` : ""}
-          </option>
+          <option key={m.value || "default"} value={m.value}>{`Model: ${m.label}`}</option>
         ))}
-        <option value="__custom__">Custom…</option>
+        <option value="__custom__">Model: Custom…</option>
       </select>
       {showCustom && (
         <input
           defaultValue={known ? "" : current}
           onBlur={(e) => save.mutate(e.target.value.trim())}
-          placeholder="Model alias or id (e.g. fable, claude-fable-5)"
-          className="mt-2 w-full rounded-xl border px-3 py-2 text-sm"
+          placeholder="alias or id (e.g. fable)"
+          className="rounded-lg border px-2 py-1 text-xs"
           style={inputStyle}
+          aria-label="Custom Claude Code model"
         />
       )}
-      <p className="text-xs opacity-50">
-        Which model your local <code>claude</code> uses — the list mirrors your <code>claude</code>{" "}
-        <code>/model</code> options. “Default” lets the CLI decide (usually Sonnet); type your own if
-        it isn’t listed. Models require your Claude subscription to include them.
-      </p>
     </div>
   );
 }
