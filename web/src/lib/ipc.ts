@@ -730,6 +730,11 @@ export const listClaudeCodeModels = () =>
 export const setDefaultModel = (model: string) =>
   invoke<void>("set_default_model", { model });
 
+/// Set which runtime new chats default to (the per-row "Set default" in
+/// Settings → Models). Persisted; drives `isDefault` in listRuntimes.
+export const setDefaultRuntime = (runtimeId: string) =>
+  invoke<void>("set_default_runtime", { runtimeId });
+
 // --- Agentic workflows -------------------------------------------------------
 
 export type { WorkflowDefinitionDto } from "@/bindings/WorkflowDefinitionDto";

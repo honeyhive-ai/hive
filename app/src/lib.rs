@@ -137,6 +137,11 @@ struct LiveSettings {
     /// runtime is configured). `None` = fall back to env/DEFAULT_MODEL.
     #[serde(default)]
     default_model: Option<String>,
+    /// Runtime id new chats default to (set via the UI's "Set default"). `None`
+    /// = fall back to the config `default_runtime`. May name a synthesized
+    /// runtime (e.g. "claude-code") that isn't a config `[[runtimes]]` entry.
+    #[serde(default)]
+    default_runtime_id: Option<String>,
     /// Stable id for the local "My workspace" (solo/local-only chats). Generated
     /// once and persisted, so local chats keep a consistent home across launches.
     #[serde(default)]
@@ -289,6 +294,7 @@ impl Default for LiveSettings {
             summarize_prompt: None,
             compact_prompt: None,
             default_model: None,
+            default_runtime_id: None,
             local_workspace_id: None,
             joined_rooms: Vec::new(),
             git_email: None,
@@ -4181,7 +4187,40 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
         })
         .collect();
 
+    // Claude Code (the local `claude` CLI) is a bring-your-own runtime, not a
+    // config `[[runtimes]]` entry, so it wouldn't otherwise appear once any other
+    // runtime is added — which made it impossible to switch back to. Always
+    // surface it when the CLI is on PATH so it stays selectable (and settable as
+    // the default). Its id "claude-code" resolves to the CLI fallback in
+    // `resolve_runtime`.
+    if !runtimes.iter().any(|r| r.provider == "claude-code") && on_path("claude") {
+        let model = state.settings.lock().unwrap().claude_code_model.trim().to_string();
+        let label = if model.is_empty() {
+            "Claude Code · CLI default".to_string()
+        } else {
+            format!("Claude Code · {model}")
+        };
+        runtimes.insert(
+            0,
+            RuntimeSummaryDto {
+                id: "claude-code".to_string(),
+                name: "Claude Code".to_string(),
+                label,
+                provider: "claude-code".to_string(),
+                location: "local".to_string(),
+                model,
+                endpoint: "claude".to_string(),
+                supports_tools: true,
+                supports_embeddings: false,
+                is_default: default_runtime_id == "claude-code",
+                is_managed: false,
+            },
+        );
+    }
+
     if runtimes.is_empty() {
+        // No configured runtimes and no Claude Code CLI: synthesize the Anthropic
+        // Primary Runtime (needs an API key).
         let fallback_model = state.fallback_model.lock().unwrap().clone();
         runtimes.push(RuntimeSummaryDto {
             id: default_runtime_id.clone(),
@@ -4198,7 +4237,33 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
         });
     }
 
+    // Guarantee exactly one runtime is flagged default, even if `default_runtime_id`
+    // points at something no longer listed (e.g. the config default "anthropic"
+    // while the user only has Claude Code + OpenAI). Fall back to the first.
+    if !runtimes.iter().any(|r| r.is_default) {
+        if let Some(first) = runtimes.first_mut() {
+            first.is_default = true;
+        }
+    }
+
     Ok(runtimes)
+}
+
+/// Set which runtime new chats default to (the UI's per-row "Set default").
+/// Persisted; drives `is_default` in `list_runtimes` and the runtime new chats
+/// are created with. An id that isn't a configured runtime (e.g. "claude-code")
+/// resolves to the Claude Code CLI fallback in `resolve_runtime`.
+#[tauri::command]
+fn set_default_runtime(state: State<AppState>, runtime_id: String) -> Result<(), String> {
+    let id = runtime_id.trim().to_string();
+    if id.is_empty() {
+        return Err("a runtime id is required".to_string());
+    }
+    *state.default_runtime_id.lock().unwrap() = id.clone();
+    let mut s = state.settings.lock().unwrap();
+    s.default_runtime_id = Some(id);
+    save_settings(&state.data_dir, &s);
+    Ok(())
 }
 
 #[tauri::command]
@@ -4649,6 +4714,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
             summarize_prompt: None,
             compact_prompt: None,
             default_model: None,
+            default_runtime_id: None,
         local_workspace_id: None,
         joined_rooms: Vec::new(),
         git_email: None,
@@ -4676,6 +4742,16 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or(fallback_model);
+
+    // A persisted default-runtime (set via the UI's "Set default") overrides the
+    // config `default_runtime` computed above.
+    let default_runtime_id = settings
+        .lock()
+        .unwrap()
+        .default_runtime_id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(default_runtime_id);
 
     // Carry the user's git email on their identity so commits made on their
     // behalf (on a host) are attributed to them.
@@ -6972,6 +7048,7 @@ pub fn run() {
             get_claude_code_model,
             set_claude_code_model,
             list_claude_code_models,
+            set_default_runtime,
             get_context_commands,
             set_context_commands,
             set_default_model,

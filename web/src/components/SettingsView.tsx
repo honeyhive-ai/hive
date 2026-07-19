@@ -18,6 +18,7 @@ import {
   openInEditor,
   removeMcpServer,
   removeRuntime,
+  setDefaultRuntime,
   setDisplayName,
   setGitEmail,
   p2pMyCode,
@@ -693,6 +694,14 @@ function RuntimesSection() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["runtimes"] }),
     onError: (e) => toast.error(`Couldn't remove runtime: ${errMsg(e)}`),
   });
+  const setDefaultMutation = useMutation({
+    mutationFn: (id: string) => setDefaultRuntime(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["runtimes"] });
+      toast.success("Default runtime updated.");
+    },
+    onError: (e) => toast.error(`Couldn't set default: ${errMsg(e)}`),
+  });
 
   return (
     <Section title="Models (runtimes)">
@@ -725,10 +734,19 @@ function RuntimesSection() {
                     Remove
                   </button>
                 )}
-                {runtime.isDefault && (
+                {runtime.isDefault ? (
                   <span className="rounded-full px-2 py-1 text-xs" style={{ background: "var(--hive-mist)" }}>
                     default
                   </span>
+                ) : (
+                  <button
+                    onClick={() => setDefaultMutation.mutate(runtime.id)}
+                    disabled={setDefaultMutation.isPending}
+                    className="rounded-full border px-2 py-1 text-xs hover:opacity-80 disabled:opacity-50"
+                    style={{ borderColor: "var(--hive-line)" }}
+                  >
+                    Set default
+                  </button>
                 )}
               </div>
             </div>
