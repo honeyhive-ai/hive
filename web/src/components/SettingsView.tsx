@@ -735,9 +735,13 @@ function RuntimesSection() {
     <Section title="Models (runtimes)">
       <p className="text-xs opacity-50">
         A model on a provider (above) — what powers a chat or agent. Pick a provider kind + model;
-        the key/base URL come from the provider.
+        the key/base URL come from the provider. Mark one <strong>default</strong> for new chats.
       </p>
-      <DefaultModelPicker />
+      {/* The "Default model" picker only configures the synthesized Anthropic
+          Primary Runtime, which is surfaced only when no real runtime is
+          configured. Once you have runtimes, the default is chosen per-row
+          below, so this picker would point at a runtime that isn't listed. */}
+      {(runtimes.data ?? []).some((r) => r.name === "Primary Runtime") && <DefaultModelPicker />}
       <div className="space-y-2">
         {(runtimes.data ?? []).map((runtime) => (
           <div
