@@ -129,41 +129,67 @@ impl SyncEngine {
     }
 
     /// Push pre-collected envelopes to the relay, sealing them if a key is set
-    /// (async; no store).
-    pub async fn push_envelopes(&self, envelopes: &[SessionEventEnvelope]) -> Result<(), SyncError> {
-        for env in envelopes {
+    /// (async; no store). `take_unpushed` optimistically marked these seen; if a
+    /// push fails mid-batch we **roll back** `seen` for the failed envelope and
+    /// every one after it, so the next round re-pushes them instead of silently
+    /// dropping the tail.
+    pub async fn push_envelopes(&mut self, envelopes: &[SessionEventEnvelope]) -> Result<(), SyncError> {
+        for (i, env) in envelopes.iter().enumerate() {
             let body = self.encode(env)?;
-            self.relay.push_value(&self.workspace, &body).await?;
+            if let Err(e) = self.relay.push_value(&self.workspace, &body).await {
+                for unsent in &envelopes[i..] {
+                    self.seen.remove(&unsent.event_id);
+                }
+                return Err(e.into());
+            }
         }
         Ok(())
     }
 
-    /// Fetch raw remote bodies past the cursor, advancing it (async; no store).
-    pub async fn fetch_new(&mut self) -> Result<Vec<(u64, Value)>, SyncError> {
-        let fetched = self.relay.fetch_values(&self.workspace, self.last_fetched_seq).await?;
-        for (seq, _) in &fetched {
-            self.last_fetched_seq = self.last_fetched_seq.max(*seq);
-        }
-        Ok(fetched)
+    /// Fetch raw remote bodies past the cursor (async; no store). The cursor is
+    /// **not** advanced here — it only moves in `apply_fetched` once events are
+    /// durably ingested, so an event fetched before its decryption key is
+    /// available can't be permanently skipped.
+    pub async fn fetch_new(&self) -> Result<Vec<(u64, Value)>, SyncError> {
+        Ok(self.relay.fetch_values(&self.workspace, self.last_fetched_seq).await?)
     }
 
-    /// Decode + ingest fetched bodies into the store (sync; no IO awaits).
-    /// Sealed bodies we can't open are skipped. Returns how many were applied.
+    /// Decode + ingest fetched bodies into the store (sync; no IO awaits), then
+    /// advance the cursor. A body we can't open (missing/incorrect key — e.g. it
+    /// arrived before a key rotation reached us) **stops** the batch: the cursor
+    /// is left before it so a later round retries, rather than skipping it for
+    /// good. Returns how many were newly applied.
     pub fn apply_fetched(
         &mut self,
         store: &mut EventStore,
         fetched: &[(u64, Value)],
     ) -> Result<usize, SyncError> {
         let mut applied = 0;
-        for (_seq, body) in fetched {
-            if let Some(env) = self.decode(body)? {
-                self.seen.insert(env.event_id);
-                if store.ingest(&env)? {
-                    applied += 1;
+        for (seq, body) in fetched {
+            match self.decode(body)? {
+                Some(env) => {
+                    self.seen.insert(env.event_id);
+                    if store.ingest(&env)? {
+                        applied += 1;
+                    }
+                    // Durably ingested (or a known duplicate) — safe to advance.
+                    self.last_fetched_seq = self.last_fetched_seq.max(*seq);
                 }
+                None => break,
             }
         }
         Ok(applied)
+    }
+
+    /// The current fetch cursor (highest relay sequence durably applied).
+    pub fn cursor(&self) -> u64 {
+        self.last_fetched_seq
+    }
+
+    /// Swap the workspace key (e.g. a rotation reached us). Lets previously
+    /// undecodable events decode on the next pull.
+    pub fn set_key(&mut self, key: [u8; 32]) {
+        self.key = Some(key);
     }
 }
 
@@ -279,6 +305,59 @@ mod tests {
         let mut sync_c = SyncEngine::new(RelayClient::new(&base), &workspace)
             .with_key(hive_core::derive_workspace_key("wrong"));
         assert_eq!(sync_c.pull(&mut store_c).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_push_rolls_back_so_events_retry() {
+        // Relay pointed at a closed port → every push errors mid-batch.
+        let mut store = EventStore::open_in_memory().unwrap();
+        seed_chat(&mut store); // one event (the snapshot)
+        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:9"), Uuid::new_v4().to_string());
+
+        let batch = eng.take_unpushed(&store).unwrap();
+        assert_eq!(batch.len(), 1);
+        // The push fails — the optimistically-marked events must roll back to
+        // unseen so the next round re-pushes them instead of dropping the tail.
+        assert!(eng.push_envelopes(&batch).await.is_err());
+        let retry = eng.take_unpushed(&store).unwrap();
+        assert_eq!(retry.len(), 1, "unsent events must be retryable after a failed push");
+    }
+
+    #[tokio::test]
+    async fn undecodable_events_do_not_advance_the_cursor() {
+        let base = spawn_relay().await;
+        let workspace = Uuid::new_v4().to_string();
+        let key = hive_core::derive_workspace_key("real room key");
+
+        // A publishes two sealed events.
+        let mut store_a = EventStore::open_in_memory().unwrap();
+        let (sid, wid) = seed_chat(&mut store_a);
+        store_a
+            .ingest(&SessionEventEnvelope::new(
+                sid,
+                wid,
+                2,
+                SessionEvent::MessageAppended {
+                    message: ChatMessage::new(MessageRole::User, "A", "hi"),
+                },
+            ))
+            .unwrap();
+        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        sync_a.push_new(&store_a).await.unwrap();
+
+        // B pulls with the WRONG key: it can't open anything, applies nothing —
+        // and crucially does NOT advance its cursor past the events.
+        let mut store_b = EventStore::open_in_memory().unwrap();
+        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace)
+            .with_key(hive_core::derive_workspace_key("wrong"));
+        assert_eq!(sync_b.pull(&mut store_b).await.unwrap(), 0);
+        assert_eq!(sync_b.cursor(), 0, "undecodable events must not be skipped");
+
+        // The correct key arrives (e.g. a rotation reaches B). The previously
+        // undecodable events are still fetched and now converge — not lost.
+        sync_b.set_key(key);
+        assert_eq!(sync_b.pull(&mut store_b).await.unwrap(), 2);
+        assert_eq!(store_b.load_session(sid).unwrap().unwrap().messages.len(), 1);
     }
 
     #[tokio::test]
