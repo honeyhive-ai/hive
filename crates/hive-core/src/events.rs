@@ -144,6 +144,14 @@ pub struct SessionEventEnvelope {
     pub session_id: Uuid,
     pub workspace_id: Uuid,
     pub sequence: i64,
+    /// Lamport timestamp assigned at authoring; it travels with the event and is
+    /// never reassigned on ingest. The canonical fold order is
+    /// `(lamport, event_id)` — a deterministic total order every device shares,
+    /// so projection converges regardless of arrival/insertion order. Absent on
+    /// legacy events (`#[serde(default)]` → 0, so they sort first, tie-broken by
+    /// `event_id`).
+    #[serde(default)]
+    pub lamport: u64,
     #[serde(default)]
     pub timestamp: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +184,10 @@ impl SessionEventEnvelope {
             session_id,
             workspace_id,
             sequence,
+            // Default Lamport = the authoring sequence (monotonic on the author
+            // device). Cross-device correctness comes from the runtime stamping a
+            // true Lamport clock (bumped on receive) before signing.
+            lamport: sequence.max(0) as u64,
             timestamp: Timestamp::now(),
             actor_stamp: None,
             payload,
@@ -183,6 +195,14 @@ impl SessionEventEnvelope {
             signer_device_id: None,
             signature: None,
         }
+    }
+
+    /// The canonical, device-independent ordering key. Every device folds events
+    /// by this key, so projection is a pure function of the event *set*, not of
+    /// arrival order. The `event_id` is the deterministic tie-break for events
+    /// that share a Lamport value (concurrent or legacy-zero).
+    pub fn canonical_key(&self) -> (u64, Uuid) {
+        (self.lamport, self.event_id)
     }
 }
 
@@ -292,28 +312,32 @@ impl ChatSession {
     }
 }
 
-/// Fold an ordered envelope stream into the current session state. The state
-/// is seeded by the first `SessionSnapshot`; deltas before any snapshot are
-/// ignored (nothing to apply them to). `updated_at` tracks the last applied
-/// envelope's timestamp so projection is deterministic.
+/// Fold an envelope set into the current session state.
+///
+/// Convergence contract: projection is a pure function of the event **set**, not
+/// of arrival or insertion order. Events are folded in the canonical total order
+/// `(lamport, event_id)` (see [`SessionEventEnvelope::canonical_key`]), so two
+/// devices that hold the same events — in any order — project identical state.
+/// The state is seeded by the *latest* `SessionSnapshot` in canonical order;
+/// deltas ordered before that snapshot are considered folded into it and are
+/// dropped. Returns `None` if the set contains no snapshot to seed from.
 pub fn project(envelopes: &[SessionEventEnvelope]) -> Option<ChatSession> {
-    let mut session: Option<ChatSession> = None;
-    for env in envelopes {
-        match &env.payload {
-            SessionEvent::SessionSnapshot { session: snap } => {
-                let mut s = (**snap).clone();
-                s.updated_at = env.timestamp;
-                session = Some(s);
-            }
-            other => {
-                if let Some(s) = session.as_mut() {
-                    s.apply(other);
-                    s.updated_at = env.timestamp;
-                }
-            }
-        }
+    let mut ordered: Vec<&SessionEventEnvelope> = envelopes.iter().collect();
+    ordered.sort_by_key(|e| e.canonical_key());
+
+    let base = ordered
+        .iter()
+        .rposition(|e| matches!(e.payload, SessionEvent::SessionSnapshot { .. }))?;
+    let mut session = match &ordered[base].payload {
+        SessionEvent::SessionSnapshot { session } => (**session).clone(),
+        _ => unreachable!("rposition matched a snapshot"),
+    };
+    session.updated_at = ordered[base].timestamp;
+    for env in &ordered[base + 1..] {
+        session.apply(&env.payload);
+        session.updated_at = env.timestamp;
     }
-    session
+    Some(session)
 }
 
 #[cfg(test)]
