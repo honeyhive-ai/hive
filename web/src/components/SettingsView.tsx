@@ -635,7 +635,7 @@ function DefaultModelPicker() {
       </select>
       <p className="mt-1 text-xs opacity-50">
         Used when a chat has no specific runtime selected. Separate from the local Claude Code model
-        (Account → Agent file access).
+        (set on its runtime row above).
       </p>
     </div>
   );
@@ -1396,7 +1396,6 @@ function SyncSection() {
             workspace without asking.
           </p>
         )}
-        <ClaudeModelPicker />
         <SaveButton onClick={() => save.mutate()} label="Save" />
       </Section>
     </>
@@ -1467,65 +1466,6 @@ function ClaudeCodeRowModel() {
           aria-label="Custom Claude Code model"
         />
       )}
-    </div>
-  );
-}
-
-function ClaudeModelPicker() {
-  const qc = useQueryClient();
-  const model = useQuery({ queryKey: ["claude-model"], queryFn: getClaudeCodeModel });
-  const models = useQuery({ queryKey: ["claude-model-options"], queryFn: listClaudeCodeModels });
-  const [custom, setCustom] = useState(false);
-  const save = useMutation({
-    mutationFn: setClaudeCodeModel,
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["claude-model"] });
-      toast.success("Claude Code model updated.");
-    },
-    onError: (e) => toast.error(`Couldn't set model: ${errMsg(e)}`),
-  });
-  const options = models.data?.length ? models.data : CLAUDE_MODELS;
-  const current = model.data ?? "";
-  const known = options.some((m) => m.value === current);
-  const showCustom = custom || (!known && current !== "");
-  return (
-    <div className="mt-3">
-      <label className="block text-xs opacity-60">Claude Code model</label>
-      <select
-        value={showCustom ? "__custom__" : current}
-        onChange={(e) => {
-          if (e.target.value === "__custom__") {
-            setCustom(true);
-          } else {
-            setCustom(false);
-            save.mutate(e.target.value);
-          }
-        }}
-        className="w-full rounded-xl border px-3 py-2 text-sm"
-        style={inputStyle}
-      >
-        {options.map((m) => (
-          <option key={m.value || "default"} value={m.value}>
-            {m.label}
-            {"description" in m && m.description ? ` — ${m.description}` : ""}
-          </option>
-        ))}
-        <option value="__custom__">Custom…</option>
-      </select>
-      {showCustom && (
-        <input
-          defaultValue={known ? "" : current}
-          onBlur={(e) => save.mutate(e.target.value.trim())}
-          placeholder="Model alias or id (e.g. fable, claude-fable-5)"
-          className="mt-2 w-full rounded-xl border px-3 py-2 text-sm"
-          style={inputStyle}
-        />
-      )}
-      <p className="text-xs opacity-50">
-        Which model your local <code>claude</code> uses — the list mirrors your <code>claude</code>{" "}
-        <code>/model</code> options. “Default” lets the CLI decide (usually Sonnet); type your own if
-        it isn’t listed. Models require your Claude subscription to include them.
-      </p>
     </div>
   );
 }
