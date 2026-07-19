@@ -3,4 +3,17 @@
 /**
  * A configured runtime surfaced to the desktop shell.
  */
-export type RuntimeSummaryDto = { id: string, name: string, label: string, provider: string, location: string, model: string, endpoint: string, supportsTools: boolean, supportsEmbeddings: boolean, isDefault: boolean, isManaged: boolean, };
+export type RuntimeSummaryDto = { id: string, name: string, label: string, provider: string, location: string, model: string, endpoint: string, supportsTools: boolean, supportsEmbeddings: boolean, isDefault: boolean, isManaged: boolean, 
+/**
+ * OpenAI-compatible base URL (pi → local backends). None for providers that
+ * don't use one. Carried so an edit form can round-trip it.
+ */
+modelBaseUrl: string | null, 
+/**
+ * Sub-provider id for pi-style bridges (e.g. "ollama"). None otherwise.
+ */
+modelProviderId: string | null, 
+/**
+ * Explicit context-window override (Ollama/custom endpoints). None = inferred.
+ */
+contextWindow: number | null, };

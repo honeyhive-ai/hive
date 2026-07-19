@@ -161,6 +161,13 @@ pub struct RuntimeSummaryDto {
     pub supports_embeddings: bool,
     pub is_default: bool,
     pub is_managed: bool,
+    /// OpenAI-compatible base URL (pi → local backends). None for providers that
+    /// don't use one. Carried so an edit form can round-trip it.
+    pub model_base_url: Option<String>,
+    /// Sub-provider id for pi-style bridges (e.g. "ollama"). None otherwise.
+    pub model_provider_id: Option<String>,
+    /// Explicit context-window override (Ollama/custom endpoints). None = inferred.
+    pub context_window: Option<u32>,
 }
 
 /// Actual context-budget telemetry computed by the backend planner.

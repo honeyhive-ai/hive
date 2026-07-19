@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { RuntimeSummaryDto } from "@/bindings/RuntimeSummaryDto";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addRuntime,
@@ -659,7 +660,38 @@ function RuntimesSection() {
   const [runtimeSupportsTools, setRuntimeSupportsTools] = useState(true);
   const [runtimeSupportsEmbeddings, setRuntimeSupportsEmbeddings] = useState(false);
   const [runtimeContextWindow, setRuntimeContextWindow] = useState("");
+  // null = the form is adding; an id = editing that runtime in place (add_runtime
+  // upserts by id, so the same form both adds and edits).
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const formRef = useRef<HTMLDivElement>(null);
   const presets = useQuery({ queryKey: ["provider-presets"], queryFn: listProviderPresets });
+
+  function resetRuntimeForm() {
+    setEditingId(null);
+    setRuntimeId("");
+    setRuntimeName("");
+    setRuntimeProvider("ollama");
+    setRuntimeEndpoint("");
+    setRuntimeBaseUrl("");
+    setRuntimeModel("");
+    setRuntimeContextWindow("");
+    setRuntimeSupportsTools(true);
+    setRuntimeSupportsEmbeddings(false);
+  }
+
+  function startEdit(runtime: RuntimeSummaryDto) {
+    setEditingId(runtime.id);
+    setRuntimeId(runtime.id);
+    setRuntimeName(runtime.name);
+    setRuntimeProvider(runtime.provider);
+    setRuntimeEndpoint(runtime.endpoint);
+    setRuntimeBaseUrl(runtime.modelBaseUrl ?? "");
+    setRuntimeModel(runtime.model);
+    setRuntimeContextWindow(runtime.contextWindow ? String(runtime.contextWindow) : "");
+    setRuntimeSupportsTools(runtime.supportsTools);
+    setRuntimeSupportsEmbeddings(runtime.supportsEmbeddings);
+    formRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }
 
   const addRuntimeMutation = useMutation({
     mutationFn: () =>
@@ -678,16 +710,12 @@ function RuntimesSection() {
         Number(runtimeContextWindow) > 0 ? Number(runtimeContextWindow) : null,
       ),
     onSuccess: () => {
-      setRuntimeId("");
-      setRuntimeName("");
-      setRuntimeEndpoint("");
-      setRuntimeBaseUrl("");
-      setRuntimeModel("");
-      setRuntimeContextWindow("");
+      const wasEditing = editingId !== null;
+      resetRuntimeForm();
       qc.invalidateQueries({ queryKey: ["runtimes"] });
-      toast.success("Runtime added.");
+      toast.success(wasEditing ? "Runtime updated." : "Runtime added.");
     },
-    onError: (e) => toast.error(`Couldn't add runtime: ${errMsg(e)}`),
+    onError: (e) => toast.error(`Couldn't save runtime: ${errMsg(e)}`),
   });
   const removeRuntimeMutation = useMutation({
     mutationFn: (id: string) => removeRuntime(id),
@@ -728,6 +756,14 @@ function RuntimesSection() {
               <div className="flex items-center gap-2">
                 {runtime.isManaged && (
                   <button
+                    onClick={() => startEdit(runtime)}
+                    className="text-xs hover:opacity-80"
+                  >
+                    Edit
+                  </button>
+                )}
+                {runtime.isManaged && (
+                  <button
                     onClick={() => confirmThen(`Remove runtime "${runtime.label}"?`, () => removeRuntimeMutation.mutate(runtime.id))}
                     className="text-xs text-[color:var(--hive-danger)] hover:opacity-80"
                   >
@@ -754,10 +790,13 @@ function RuntimesSection() {
         ))}
       </div>
       <div
+        ref={formRef}
         className="space-y-2 rounded-2xl border p-4"
         style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
       >
-        <h3 className="text-sm font-semibold uppercase tracking-wide opacity-60">Add runtime</h3>
+        <h3 className="text-sm font-semibold uppercase tracking-wide opacity-60">
+          {editingId ? `Edit runtime · ${editingId}` : "Add runtime"}
+        </h3>
         <div className="grid gap-2 md:grid-cols-2">
           <input
             value={runtimeName}
@@ -770,7 +809,9 @@ function RuntimesSection() {
             value={runtimeId}
             onChange={(e) => setRuntimeId(e.target.value)}
             placeholder="ID (optional)"
-            className="rounded-xl border px-3 py-2 font-mono text-sm"
+            readOnly={editingId !== null}
+            title={editingId !== null ? "The id is fixed while editing" : undefined}
+            className="rounded-xl border px-3 py-2 font-mono text-sm read-only:opacity-60"
             style={inputStyle}
           />
           <select
@@ -874,8 +915,20 @@ function RuntimesSection() {
           />
           Supports embeddings
         </label>
-        <div>
-          <SaveButton onClick={() => addRuntimeMutation.mutate()} label="Add runtime" />
+        <div className="flex items-center gap-2">
+          <SaveButton
+            onClick={() => addRuntimeMutation.mutate()}
+            label={editingId ? "Update runtime" : "Add runtime"}
+          />
+          {editingId && (
+            <button
+              onClick={resetRuntimeForm}
+              className="rounded-xl border px-3 py-2 text-sm hover:opacity-80"
+              style={{ borderColor: "var(--hive-line)" }}
+            >
+              Cancel
+            </button>
+          )}
         </div>
       </div>
     </Section>

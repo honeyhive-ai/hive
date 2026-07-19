@@ -1298,6 +1298,9 @@ fn runtime_dto(rt: &RuntimeTarget, is_default: bool) -> RuntimeSummaryDto {
         supports_embeddings: rt.capabilities.supports_embeddings,
         is_default,
         is_managed: false,
+        model_base_url: rt.model_base_url.clone().filter(|s| !s.is_empty()),
+        model_provider_id: rt.model_provider_id.clone().filter(|s| !s.is_empty()),
+        context_window: rt.capabilities.context_window_tokens,
     }
 }
 
@@ -4214,6 +4217,9 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
                 supports_embeddings: false,
                 is_default: default_runtime_id == "claude-code",
                 is_managed: false,
+                model_base_url: None,
+                model_provider_id: None,
+                context_window: None,
             },
         );
     }
@@ -4234,6 +4240,9 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
             supports_embeddings: false,
             is_default: true,
             is_managed: false,
+            model_base_url: None,
+            model_provider_id: None,
+            context_window: None,
         });
     }
 
@@ -4332,9 +4341,13 @@ fn add_runtime(
     upsert_runtime_in_config(&state.data_dir, &root, &runtime)?;
     let runtimes = {
         let mut managed = state.managed_runtimes.lock().unwrap();
-        managed.retain(|candidate| candidate.id != runtime.id);
+        // Upsert by id: replace an existing entry (edit) or append (add). The
+        // previous version retained-then-found, which dropped the runtime on
+        // edit — the config copy masked it, but the managed list went stale.
         if let Some(existing) = managed.iter_mut().find(|candidate| candidate.id == runtime.id) {
             *existing = runtime;
+        } else {
+            managed.push(runtime);
         }
         managed.clone()
     };
