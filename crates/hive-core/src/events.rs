@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::agent::WorkspaceAgent;
 use crate::chat::{ChatMessage, MessageReaction};
 use crate::identity::{ActorStamp, WorkspaceMember, WorkspaceRole};
-use crate::proposals::ActionProposal;
+use crate::proposals::{ActionProposal, ProposalApproval};
 use crate::session::ChatSession;
 use crate::skills::SkillProfile;
 use crate::time_util::Timestamp;
@@ -68,7 +68,19 @@ pub enum SessionEvent {
     /// Replace the session's loaded skill set.
     SkillsUpdated { skills: Vec<SkillProfile> },
     /// Create or update a proposal (upsert by id) — carries the full snapshot.
+    /// Used for creation/metadata only; votes ride `ProposalVoteCast` so they
+    /// don't clobber each other.
     ProposalUpserted { proposal: ActionProposal },
+    /// A single vote on a proposal (a delta, not a whole-object snapshot). It
+    /// merges into the proposal's approvals set — per-actor last-writer-wins by
+    /// canonical order, with quorum recomputed deterministically — so concurrent
+    /// votes from different actors are all preserved. Replaces the former
+    /// read-modify-write-full-snapshot vote, which silently dropped one of two
+    /// concurrent votes.
+    ProposalVoteCast {
+        proposal_id: Uuid,
+        approval: ProposalApproval,
+    },
     /// Replace the session's vault source set.
     VaultSourcesUpdated { sources: Vec<VaultSource> },
     /// Replace the session's workflow definition set.
@@ -112,6 +124,7 @@ impl SessionEvent {
             SessionEvent::SessionArchivedChanged { .. } => "sessionArchivedChanged",
             SessionEvent::SkillsUpdated { .. } => "skillsUpdated",
             SessionEvent::ProposalUpserted { .. } => "proposalUpserted",
+            SessionEvent::ProposalVoteCast { .. } => "proposalVoteCast",
             SessionEvent::VaultSourcesUpdated { .. } => "vaultSourcesUpdated",
             SessionEvent::WorkflowDefinitionsUpdated { .. } => "workflowDefinitionsUpdated",
             SessionEvent::WorkflowRunUpserted { .. } => "workflowRunUpserted",
@@ -269,6 +282,13 @@ impl ChatSession {
                     *slot = proposal.clone();
                 } else {
                     self.proposals.push(proposal.clone());
+                }
+            }
+            SessionEvent::ProposalVoteCast { proposal_id, approval } => {
+                if let Some(p) = self.proposals.iter_mut().find(|p| p.id == *proposal_id) {
+                    // Per-actor LWW + quorum recompute; folded in canonical order
+                    // so the latest vote per actor wins on every device.
+                    p.cast_vote(approval.clone());
                 }
             }
             SessionEvent::VaultSourcesUpdated { sources } => {
@@ -617,6 +637,43 @@ mod tests {
         for seed in 0..500u64 {
             let permuted = shuffled(events.clone(), seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             assert_eq!(project(&permuted).expect("session"), expected, "divergence at seed {seed}");
+        }
+    }
+
+    /// Concurrent votes from different actors must all survive (the old
+    /// whole-proposal upsert dropped one of two), and the outcome must converge.
+    #[test]
+    fn concurrent_proposal_votes_all_survive_and_converge() {
+        use crate::proposals::{ActionProposal, ProposalApproval, ProposalKind, ProposalStatus};
+
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let mut proposal = ActionProposal::new("Ship it", ProposalKind::Decision);
+        proposal.required_approvals = 2;
+        let pid = proposal.id;
+        let vote = |actor: &str, approved: bool| ProposalApproval {
+            actor_id: actor.into(),
+            role: WorkspaceRole::Contributor,
+            approved,
+            created_at: Timestamp::epoch(),
+        };
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            env(sid, wid, 2, SessionEvent::ProposalUpserted { proposal }),
+            env(sid, wid, 3, SessionEvent::ProposalVoteCast { proposal_id: pid, approval: vote("u1", true) }),
+            env(sid, wid, 4, SessionEvent::ProposalVoteCast { proposal_id: pid, approval: vote("u2", true) }),
+            env(sid, wid, 5, SessionEvent::ProposalVoteCast { proposal_id: pid, approval: vote("u1", false) }),
+        ];
+
+        let expected = project(&events).expect("session");
+        let p = &expected.proposals[0];
+        assert_eq!(p.approvals.len(), 2, "both actors' votes preserved (no clobber)");
+        assert_eq!(p.status, ProposalStatus::Rejected, "u1's later reject wins per-actor");
+
+        for seed in 0..300u64 {
+            let permuted = shuffled(events.clone(), seed | 1);
+            assert_eq!(project(&permuted).expect("session"), expected, "vote divergence at seed {seed}");
         }
     }
 

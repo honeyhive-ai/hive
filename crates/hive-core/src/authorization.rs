@@ -72,6 +72,7 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         | SessionEvent::SessionTitleChanged { .. }
         | SessionEvent::SkillsUpdated { .. }
         | SessionEvent::ProposalUpserted { .. }
+        | SessionEvent::ProposalVoteCast { .. }
         | SessionEvent::VaultSourcesUpdated { .. }
         | SessionEvent::WorkflowDefinitionsUpdated { .. }
         | SessionEvent::WorkflowRunUpserted { .. } => WorkspaceRole::Contributor,
