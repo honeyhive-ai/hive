@@ -532,6 +532,94 @@ mod tests {
         assert!(s2.messages[0].reactions.is_empty());
     }
 
+    fn env(sid: Uuid, wid: Uuid, lamport: i64, payload: SessionEvent) -> SessionEventEnvelope {
+        // `new` sets lamport = the sequence argument, so passing distinct values
+        // gives each event a distinct canonical key.
+        SessionEventEnvelope::new(sid, wid, lamport, payload)
+    }
+
+    fn member(id: &str, actor: &str, role: WorkspaceRole) -> WorkspaceMember {
+        WorkspaceMember {
+            id: id.into(),
+            actor: ActorIdentity::new(actor, actor, ActorKind::Human),
+            role,
+            title: String::new(),
+            index: 0,
+            joined_at: Timestamp::epoch(),
+        }
+    }
+
+    fn reaction(actor: &str, emoji: &str) -> MessageReaction {
+        MessageReaction {
+            emoji: emoji.into(),
+            actor_id: actor.into(),
+            actor_display_name: actor.into(),
+            actor_kind: ActorKind::Human,
+            created_at: Timestamp::epoch(),
+        }
+    }
+
+    /// Deterministic in-place Fisher–Yates shuffle (seeded xorshift64) — lets us
+    /// exercise many permutations without a proptest dependency.
+    fn shuffled(mut v: Vec<SessionEventEnvelope>, seed: u64) -> Vec<SessionEventEnvelope> {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for i in (1..v.len()).rev() {
+            let j = (next() % (i as u64 + 1)) as usize;
+            v.swap(i, j);
+        }
+        v
+    }
+
+    /// The north-star invariant: given the same valid event set, projection is
+    /// identical under EVERY delivery order — and resolves conflicts correctly.
+    /// The set deliberately contains each formerly-divergent case: two title
+    /// writes (register LWW), a role change, an add/remove pair (member set),
+    /// and a reaction add→remove→add (the resurrection bug).
+    #[test]
+    fn projection_converges_across_all_permutations() {
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let msg = ChatMessage::new(MessageRole::Assistant, "Hive", "draft");
+        let mid = msg.id;
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            env(sid, wid, 2, SessionEvent::MessageAppended { message: msg }),
+            env(sid, wid, 3, SessionEvent::MemberAdded { member: member("m1", "u1", WorkspaceRole::Contributor) }),
+            env(sid, wid, 4, SessionEvent::MemberAdded { member: member("m2", "u2", WorkspaceRole::Contributor) }),
+            env(sid, wid, 5, SessionEvent::SessionTitleChanged { title: "Foo".into() }),
+            env(sid, wid, 6, SessionEvent::MessageReactionAdded { message_id: mid, reaction: reaction("u1", "👍") }),
+            env(sid, wid, 7, SessionEvent::MemberRoleChanged { change: MemberRoleChange { member_id: "m1".into(), old_role: WorkspaceRole::Contributor, new_role: WorkspaceRole::Admin } }),
+            env(sid, wid, 8, SessionEvent::MemberRemoved { member_id: "m2".into() }),
+            env(sid, wid, 9, SessionEvent::SessionTitleChanged { title: "Bar".into() }),
+            env(sid, wid, 10, SessionEvent::MessageReactionRemoved { message_id: mid, actor_id: "u1".into(), emoji: "👍".into() }),
+            env(sid, wid, 11, SessionEvent::MessageReactionAdded { message_id: mid, reaction: reaction("u2", "🎉") }),
+            env(sid, wid, 12, SessionEvent::MessageCompleted { message_id: mid, body: "final".into() }),
+        ];
+
+        let expected = project(&events).expect("session");
+        // Correct deterministic resolution (not just self-consistency):
+        assert_eq!(expected.title, "Bar", "latest title wins by canonical order");
+        assert_eq!(expected.members.len(), 1, "m2 removed");
+        assert_eq!(expected.members[0].id, "m1");
+        assert_eq!(expected.members[0].role, WorkspaceRole::Admin, "role change applied");
+        assert_eq!(expected.messages[0].body, "final");
+        assert_eq!(expected.messages[0].reactions.len(), 1, "no resurrection: 👍 stays removed");
+        assert_eq!(expected.messages[0].reactions[0].actor_id, "u2");
+
+        // Property: every permutation projects to identical state.
+        for seed in 0..500u64 {
+            let permuted = shuffled(events.clone(), seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            assert_eq!(project(&permuted).expect("session"), expected, "divergence at seed {seed}");
+        }
+    }
+
     #[test]
     fn unknown_event_kind_is_inert_not_fatal() {
         // A newer client emits an event kind this build doesn't recognize. It
