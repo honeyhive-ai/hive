@@ -18,7 +18,7 @@ use uuid::Uuid;
 use crate::agent::WorkspaceAgent;
 use crate::chat::{ChatMessage, MessageReaction};
 use crate::identity::{ActorStamp, WorkspaceMember, WorkspaceRole};
-use crate::proposals::ActionProposal;
+use crate::proposals::{ActionProposal, ProposalApproval};
 use crate::session::ChatSession;
 use crate::skills::SkillProfile;
 use crate::time_util::Timestamp;
@@ -68,7 +68,19 @@ pub enum SessionEvent {
     /// Replace the session's loaded skill set.
     SkillsUpdated { skills: Vec<SkillProfile> },
     /// Create or update a proposal (upsert by id) — carries the full snapshot.
+    /// Used for creation/metadata only; votes ride `ProposalVoteCast` so they
+    /// don't clobber each other.
     ProposalUpserted { proposal: ActionProposal },
+    /// A single vote on a proposal (a delta, not a whole-object snapshot). It
+    /// merges into the proposal's approvals set — per-actor last-writer-wins by
+    /// canonical order, with quorum recomputed deterministically — so concurrent
+    /// votes from different actors are all preserved. Replaces the former
+    /// read-modify-write-full-snapshot vote, which silently dropped one of two
+    /// concurrent votes.
+    ProposalVoteCast {
+        proposal_id: Uuid,
+        approval: ProposalApproval,
+    },
     /// Replace the session's vault source set.
     VaultSourcesUpdated { sources: Vec<VaultSource> },
     /// Replace the session's workflow definition set.
@@ -84,6 +96,14 @@ pub enum SessionEvent {
         actor_id: String,
         emoji: String,
     },
+    /// Forward-compat catch-all: an event `kind` this build does not recognize
+    /// (produced by a newer client). Serde deserializes an unknown tag here
+    /// instead of failing the whole stream; it projects as a no-op. The raw
+    /// envelope JSON is preserved verbatim in the event store, so a newer peer
+    /// still receives the original event intact — only *this* build treats it
+    /// as inert. Adding new variants above is therefore backward-compatible.
+    #[serde(other)]
+    Unknown,
 }
 
 impl SessionEvent {
@@ -104,11 +124,13 @@ impl SessionEvent {
             SessionEvent::SessionArchivedChanged { .. } => "sessionArchivedChanged",
             SessionEvent::SkillsUpdated { .. } => "skillsUpdated",
             SessionEvent::ProposalUpserted { .. } => "proposalUpserted",
+            SessionEvent::ProposalVoteCast { .. } => "proposalVoteCast",
             SessionEvent::VaultSourcesUpdated { .. } => "vaultSourcesUpdated",
             SessionEvent::WorkflowDefinitionsUpdated { .. } => "workflowDefinitionsUpdated",
             SessionEvent::WorkflowRunUpserted { .. } => "workflowRunUpserted",
             SessionEvent::MessageReactionAdded { .. } => "messageReactionAdded",
             SessionEvent::MessageReactionRemoved { .. } => "messageReactionRemoved",
+            SessionEvent::Unknown => "unknown",
         }
     }
 
@@ -135,6 +157,14 @@ pub struct SessionEventEnvelope {
     pub session_id: Uuid,
     pub workspace_id: Uuid,
     pub sequence: i64,
+    /// Lamport timestamp assigned at authoring; it travels with the event and is
+    /// never reassigned on ingest. The canonical fold order is
+    /// `(lamport, event_id)` — a deterministic total order every device shares,
+    /// so projection converges regardless of arrival/insertion order. Absent on
+    /// legacy events (`#[serde(default)]` → 0, so they sort first, tie-broken by
+    /// `event_id`).
+    #[serde(default)]
+    pub lamport: u64,
     #[serde(default)]
     pub timestamp: Timestamp,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -167,6 +197,10 @@ impl SessionEventEnvelope {
             session_id,
             workspace_id,
             sequence,
+            // Default Lamport = the authoring sequence (monotonic on the author
+            // device). Cross-device correctness comes from the runtime stamping a
+            // true Lamport clock (bumped on receive) before signing.
+            lamport: sequence.max(0) as u64,
             timestamp: Timestamp::now(),
             actor_stamp: None,
             payload,
@@ -174,6 +208,14 @@ impl SessionEventEnvelope {
             signer_device_id: None,
             signature: None,
         }
+    }
+
+    /// The canonical, device-independent ordering key. Every device folds events
+    /// by this key, so projection is a pure function of the event *set*, not of
+    /// arrival order. The `event_id` is the deterministic tie-break for events
+    /// that share a Lamport value (concurrent or legacy-zero).
+    pub fn canonical_key(&self) -> (u64, Uuid) {
+        (self.lamport, self.event_id)
     }
 }
 
@@ -242,6 +284,13 @@ impl ChatSession {
                     self.proposals.push(proposal.clone());
                 }
             }
+            SessionEvent::ProposalVoteCast { proposal_id, approval } => {
+                if let Some(p) = self.proposals.iter_mut().find(|p| p.id == *proposal_id) {
+                    // Per-actor LWW + quorum recompute; folded in canonical order
+                    // so the latest vote per actor wins on every device.
+                    p.cast_vote(approval.clone());
+                }
+            }
             SessionEvent::VaultSourcesUpdated { sources } => {
                 self.vault_sources = sources.clone();
             }
@@ -277,32 +326,38 @@ impl ChatSession {
                         .retain(|r| !(&r.actor_id == actor_id && &r.emoji == emoji));
                 }
             }
+            // Unrecognized (newer-client) event — inert in this build.
+            SessionEvent::Unknown => {}
         }
     }
 }
 
-/// Fold an ordered envelope stream into the current session state. The state
-/// is seeded by the first `SessionSnapshot`; deltas before any snapshot are
-/// ignored (nothing to apply them to). `updated_at` tracks the last applied
-/// envelope's timestamp so projection is deterministic.
+/// Fold an envelope set into the current session state.
+///
+/// Convergence contract: projection is a pure function of the event **set**, not
+/// of arrival or insertion order. Events are folded in the canonical total order
+/// `(lamport, event_id)` (see [`SessionEventEnvelope::canonical_key`]), so two
+/// devices that hold the same events — in any order — project identical state.
+/// The state is seeded by the *latest* `SessionSnapshot` in canonical order;
+/// deltas ordered before that snapshot are considered folded into it and are
+/// dropped. Returns `None` if the set contains no snapshot to seed from.
 pub fn project(envelopes: &[SessionEventEnvelope]) -> Option<ChatSession> {
-    let mut session: Option<ChatSession> = None;
-    for env in envelopes {
-        match &env.payload {
-            SessionEvent::SessionSnapshot { session: snap } => {
-                let mut s = (**snap).clone();
-                s.updated_at = env.timestamp;
-                session = Some(s);
-            }
-            other => {
-                if let Some(s) = session.as_mut() {
-                    s.apply(other);
-                    s.updated_at = env.timestamp;
-                }
-            }
-        }
+    let mut ordered: Vec<&SessionEventEnvelope> = envelopes.iter().collect();
+    ordered.sort_by_key(|e| e.canonical_key());
+
+    let base = ordered
+        .iter()
+        .rposition(|e| matches!(e.payload, SessionEvent::SessionSnapshot { .. }))?;
+    let mut session = match &ordered[base].payload {
+        SessionEvent::SessionSnapshot { session } => (**session).clone(),
+        _ => unreachable!("rposition matched a snapshot"),
+    };
+    session.updated_at = ordered[base].timestamp;
+    for env in &ordered[base + 1..] {
+        session.apply(&env.payload);
+        session.updated_at = env.timestamp;
     }
-    session
+    Some(session)
 }
 
 #[cfg(test)]
@@ -495,6 +550,154 @@ mod tests {
             emoji: "👍".into(),
         });
         assert!(s2.messages[0].reactions.is_empty());
+    }
+
+    fn env(sid: Uuid, wid: Uuid, lamport: i64, payload: SessionEvent) -> SessionEventEnvelope {
+        // `new` sets lamport = the sequence argument, so passing distinct values
+        // gives each event a distinct canonical key.
+        SessionEventEnvelope::new(sid, wid, lamport, payload)
+    }
+
+    fn member(id: &str, actor: &str, role: WorkspaceRole) -> WorkspaceMember {
+        WorkspaceMember {
+            id: id.into(),
+            actor: ActorIdentity::new(actor, actor, ActorKind::Human),
+            role,
+            title: String::new(),
+            index: 0,
+            joined_at: Timestamp::epoch(),
+        }
+    }
+
+    fn reaction(actor: &str, emoji: &str) -> MessageReaction {
+        MessageReaction {
+            emoji: emoji.into(),
+            actor_id: actor.into(),
+            actor_display_name: actor.into(),
+            actor_kind: ActorKind::Human,
+            created_at: Timestamp::epoch(),
+        }
+    }
+
+    /// Deterministic in-place Fisher–Yates shuffle (seeded xorshift64) — lets us
+    /// exercise many permutations without a proptest dependency.
+    fn shuffled(mut v: Vec<SessionEventEnvelope>, seed: u64) -> Vec<SessionEventEnvelope> {
+        let mut s = seed | 1;
+        let mut next = || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        for i in (1..v.len()).rev() {
+            let j = (next() % (i as u64 + 1)) as usize;
+            v.swap(i, j);
+        }
+        v
+    }
+
+    /// The north-star invariant: given the same valid event set, projection is
+    /// identical under EVERY delivery order — and resolves conflicts correctly.
+    /// The set deliberately contains each formerly-divergent case: two title
+    /// writes (register LWW), a role change, an add/remove pair (member set),
+    /// and a reaction add→remove→add (the resurrection bug).
+    #[test]
+    fn projection_converges_across_all_permutations() {
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let msg = ChatMessage::new(MessageRole::Assistant, "Hive", "draft");
+        let mid = msg.id;
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            env(sid, wid, 2, SessionEvent::MessageAppended { message: msg }),
+            env(sid, wid, 3, SessionEvent::MemberAdded { member: member("m1", "u1", WorkspaceRole::Contributor) }),
+            env(sid, wid, 4, SessionEvent::MemberAdded { member: member("m2", "u2", WorkspaceRole::Contributor) }),
+            env(sid, wid, 5, SessionEvent::SessionTitleChanged { title: "Foo".into() }),
+            env(sid, wid, 6, SessionEvent::MessageReactionAdded { message_id: mid, reaction: reaction("u1", "👍") }),
+            env(sid, wid, 7, SessionEvent::MemberRoleChanged { change: MemberRoleChange { member_id: "m1".into(), old_role: WorkspaceRole::Contributor, new_role: WorkspaceRole::Admin } }),
+            env(sid, wid, 8, SessionEvent::MemberRemoved { member_id: "m2".into() }),
+            env(sid, wid, 9, SessionEvent::SessionTitleChanged { title: "Bar".into() }),
+            env(sid, wid, 10, SessionEvent::MessageReactionRemoved { message_id: mid, actor_id: "u1".into(), emoji: "👍".into() }),
+            env(sid, wid, 11, SessionEvent::MessageReactionAdded { message_id: mid, reaction: reaction("u2", "🎉") }),
+            env(sid, wid, 12, SessionEvent::MessageCompleted { message_id: mid, body: "final".into() }),
+        ];
+
+        let expected = project(&events).expect("session");
+        // Correct deterministic resolution (not just self-consistency):
+        assert_eq!(expected.title, "Bar", "latest title wins by canonical order");
+        assert_eq!(expected.members.len(), 1, "m2 removed");
+        assert_eq!(expected.members[0].id, "m1");
+        assert_eq!(expected.members[0].role, WorkspaceRole::Admin, "role change applied");
+        assert_eq!(expected.messages[0].body, "final");
+        assert_eq!(expected.messages[0].reactions.len(), 1, "no resurrection: 👍 stays removed");
+        assert_eq!(expected.messages[0].reactions[0].actor_id, "u2");
+
+        // Property: every permutation projects to identical state.
+        for seed in 0..500u64 {
+            let permuted = shuffled(events.clone(), seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            assert_eq!(project(&permuted).expect("session"), expected, "divergence at seed {seed}");
+        }
+    }
+
+    /// Concurrent votes from different actors must all survive (the old
+    /// whole-proposal upsert dropped one of two), and the outcome must converge.
+    #[test]
+    fn concurrent_proposal_votes_all_survive_and_converge() {
+        use crate::proposals::{ActionProposal, ProposalApproval, ProposalKind, ProposalStatus};
+
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let mut proposal = ActionProposal::new("Ship it", ProposalKind::Decision);
+        proposal.required_approvals = 2;
+        let pid = proposal.id;
+        let vote = |actor: &str, approved: bool| ProposalApproval {
+            actor_id: actor.into(),
+            role: WorkspaceRole::Contributor,
+            approved,
+            created_at: Timestamp::epoch(),
+        };
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            env(sid, wid, 2, SessionEvent::ProposalUpserted { proposal }),
+            env(sid, wid, 3, SessionEvent::ProposalVoteCast { proposal_id: pid, approval: vote("u1", true) }),
+            env(sid, wid, 4, SessionEvent::ProposalVoteCast { proposal_id: pid, approval: vote("u2", true) }),
+            env(sid, wid, 5, SessionEvent::ProposalVoteCast { proposal_id: pid, approval: vote("u1", false) }),
+        ];
+
+        let expected = project(&events).expect("session");
+        let p = &expected.proposals[0];
+        assert_eq!(p.approvals.len(), 2, "both actors' votes preserved (no clobber)");
+        assert_eq!(p.status, ProposalStatus::Rejected, "u1's later reject wins per-actor");
+
+        for seed in 0..300u64 {
+            let permuted = shuffled(events.clone(), seed | 1);
+            assert_eq!(project(&permuted).expect("session"), expected, "vote divergence at seed {seed}");
+        }
+    }
+
+    #[test]
+    fn unknown_event_kind_is_inert_not_fatal() {
+        // A newer client emits an event kind this build doesn't recognize. It
+        // must deserialize to `Unknown` (not error) and project as a no-op,
+        // leaving surrounding known events intact.
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let msg = ChatMessage::new(MessageRole::User, "Mara", "hi");
+        let known =
+            SessionEventEnvelope::new(sid, wid, 3, SessionEvent::MessageAppended { message: msg });
+
+        // Hand-craft an envelope carrying a future "kind".
+        let mut future = serde_json::to_value(&known).unwrap();
+        future["sequence"] = serde_json::json!(2);
+        future["event_id"] = serde_json::json!(Uuid::new_v4());
+        future["payload"] = serde_json::json!({ "kind": "somethingFromTheFuture", "extra": 42 });
+        let future: SessionEventEnvelope = serde_json::from_value(future).unwrap();
+        assert!(matches!(future.payload, SessionEvent::Unknown));
+
+        let s = project(&[snapshot_env(base, 1), future, known]).unwrap();
+        assert_eq!(s.messages.len(), 1, "known append survived; unknown was inert");
     }
 
     #[test]

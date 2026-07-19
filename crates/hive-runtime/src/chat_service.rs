@@ -668,19 +668,26 @@ impl ChatService {
         let Some(mut proposal) = session.proposals.into_iter().find(|p| p.id == proposal_id) else {
             return Ok(None);
         };
-        proposal.cast_vote(ProposalApproval {
+        let approval = ProposalApproval {
             actor_id: actor_id.into(),
             role,
             approved,
             created_at: Timestamp::now(),
-        });
-        let updated = proposal.clone();
+        };
+        // Emit the vote as a delta, not a full-proposal snapshot: concurrent
+        // votes from other devices then merge (per-actor LWW + quorum recompute)
+        // instead of the last write clobbering the others.
         self.append_signed(
             session_id,
             workspace_id,
-            SessionEvent::ProposalUpserted { proposal },
+            SessionEvent::ProposalVoteCast {
+                proposal_id,
+                approval: approval.clone(),
+            },
         )?;
-        Ok(Some(updated))
+        // Locally-projected result for immediate UI feedback.
+        proposal.cast_vote(approval);
+        Ok(Some(proposal))
     }
 
     /// Toggle an emoji reaction on a message for an actor: removes it if the
