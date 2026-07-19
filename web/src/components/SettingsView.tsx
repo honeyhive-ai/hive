@@ -1415,34 +1415,59 @@ const CLAUDE_MODELS = [
 // Compact model selector shown inline on the Claude Code runtime row. Claude
 // Code isn't a config runtime (it's the local `claude` CLI), so its "model" is
 // the `--model` alias in settings, not something the generic Edit form touches —
-// this edits it in place where the runtime is listed.
+// this edits it in place where the runtime is listed. Options come from
+// listClaudeCodeModels (the CLI's own `/model` list: Fable, etc.), with a
+// free-text escape hatch for anything unlisted.
 function ClaudeCodeRowModel() {
   const qc = useQueryClient();
   const model = useQuery({ queryKey: ["claude-model"], queryFn: getClaudeCodeModel });
+  const models = useQuery({ queryKey: ["claude-model-options"], queryFn: listClaudeCodeModels });
+  const [custom, setCustom] = useState(false);
   const save = useMutation({
     mutationFn: setClaudeCodeModel,
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["claude-model"] });
+      qc.invalidateQueries({ queryKey: ["claude-model-options"] });
       qc.invalidateQueries({ queryKey: ["runtimes"] });
       toast.success("Claude Code model updated.");
     },
     onError: (e) => toast.error(`Couldn't set model: ${errMsg(e)}`),
   });
+  const options = models.data?.length ? models.data : CLAUDE_MODELS;
   const current = model.data ?? "";
-  const known = CLAUDE_MODELS.some((m) => m.value === current);
+  const known = options.some((m) => m.value === current);
+  const showCustom = custom || (!known && current !== "");
   return (
-    <select
-      value={current}
-      onChange={(e) => save.mutate(e.target.value)}
-      className="mt-2 rounded-lg border px-2 py-1 text-xs"
-      style={inputStyle}
-      aria-label="Claude Code model"
-    >
-      {!known && current !== "" && <option value={current}>{`Model: ${current}`}</option>}
-      {CLAUDE_MODELS.map((m) => (
-        <option key={m.value || "default"} value={m.value}>{`Model: ${m.label}`}</option>
-      ))}
-    </select>
+    <div className="mt-2 flex items-center gap-2">
+      <select
+        value={showCustom ? "__custom__" : current}
+        onChange={(e) => {
+          if (e.target.value === "__custom__") setCustom(true);
+          else {
+            setCustom(false);
+            save.mutate(e.target.value);
+          }
+        }}
+        className="rounded-lg border px-2 py-1 text-xs"
+        style={inputStyle}
+        aria-label="Claude Code model"
+      >
+        {options.map((m) => (
+          <option key={m.value || "default"} value={m.value}>{`Model: ${m.label}`}</option>
+        ))}
+        <option value="__custom__">Model: Custom…</option>
+      </select>
+      {showCustom && (
+        <input
+          defaultValue={known ? "" : current}
+          onBlur={(e) => save.mutate(e.target.value.trim())}
+          placeholder="alias or id (e.g. fable)"
+          className="rounded-lg border px-2 py-1 text-xs"
+          style={inputStyle}
+          aria-label="Custom Claude Code model"
+        />
+      )}
+    </div>
   );
 }
 
