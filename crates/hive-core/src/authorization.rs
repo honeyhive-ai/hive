@@ -75,6 +75,9 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         | SessionEvent::VaultSourcesUpdated { .. }
         | SessionEvent::WorkflowDefinitionsUpdated { .. }
         | SessionEvent::WorkflowRunUpserted { .. } => WorkspaceRole::Contributor,
+        // A newer-client event this build can't author or interpret — require
+        // the highest role so it can never be produced locally by accident.
+        SessionEvent::Unknown => WorkspaceRole::Owner,
     }
 }
 

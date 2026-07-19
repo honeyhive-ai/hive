@@ -252,8 +252,18 @@ impl EventStore {
         let rows = stmt.query_map(params, |row| row.get::<_, String>(0))?;
         let mut out = Vec::new();
         for json in rows {
-            let env: SessionEventEnvelope = serde_json::from_str(&json?)?;
-            out.push(env);
+            let json = json?;
+            // Resilient decode: a single malformed row must not poison the whole
+            // session load. Unknown event *kinds* already deserialize to
+            // `SessionEvent::Unknown` (forward-compat); this guards genuinely
+            // corrupt/truncated JSON — skip and continue rather than erroring the
+            // entire projection.
+            match serde_json::from_str::<SessionEventEnvelope>(&json) {
+                Ok(env) => out.push(env),
+                Err(e) => {
+                    tracing::warn!(error = %e, "skipping unparseable event row during load");
+                }
+            }
         }
         Ok(out)
     }

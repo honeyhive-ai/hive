@@ -84,6 +84,14 @@ pub enum SessionEvent {
         actor_id: String,
         emoji: String,
     },
+    /// Forward-compat catch-all: an event `kind` this build does not recognize
+    /// (produced by a newer client). Serde deserializes an unknown tag here
+    /// instead of failing the whole stream; it projects as a no-op. The raw
+    /// envelope JSON is preserved verbatim in the event store, so a newer peer
+    /// still receives the original event intact — only *this* build treats it
+    /// as inert. Adding new variants above is therefore backward-compatible.
+    #[serde(other)]
+    Unknown,
 }
 
 impl SessionEvent {
@@ -109,6 +117,7 @@ impl SessionEvent {
             SessionEvent::WorkflowRunUpserted { .. } => "workflowRunUpserted",
             SessionEvent::MessageReactionAdded { .. } => "messageReactionAdded",
             SessionEvent::MessageReactionRemoved { .. } => "messageReactionRemoved",
+            SessionEvent::Unknown => "unknown",
         }
     }
 
@@ -277,6 +286,8 @@ impl ChatSession {
                         .retain(|r| !(&r.actor_id == actor_id && &r.emoji == emoji));
                 }
             }
+            // Unrecognized (newer-client) event — inert in this build.
+            SessionEvent::Unknown => {}
         }
     }
 }
@@ -495,6 +506,29 @@ mod tests {
             emoji: "👍".into(),
         });
         assert!(s2.messages[0].reactions.is_empty());
+    }
+
+    #[test]
+    fn unknown_event_kind_is_inert_not_fatal() {
+        // A newer client emits an event kind this build doesn't recognize. It
+        // must deserialize to `Unknown` (not error) and project as a no-op,
+        // leaving surrounding known events intact.
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let msg = ChatMessage::new(MessageRole::User, "Mara", "hi");
+        let known =
+            SessionEventEnvelope::new(sid, wid, 3, SessionEvent::MessageAppended { message: msg });
+
+        // Hand-craft an envelope carrying a future "kind".
+        let mut future = serde_json::to_value(&known).unwrap();
+        future["sequence"] = serde_json::json!(2);
+        future["event_id"] = serde_json::json!(Uuid::new_v4());
+        future["payload"] = serde_json::json!({ "kind": "somethingFromTheFuture", "extra": 42 });
+        let future: SessionEventEnvelope = serde_json::from_value(future).unwrap();
+        assert!(matches!(future.payload, SessionEvent::Unknown));
+
+        let s = project(&[snapshot_env(base, 1), future, known]).unwrap();
+        assert_eq!(s.messages.len(), 1, "known append survived; unknown was inert");
     }
 
     #[test]
