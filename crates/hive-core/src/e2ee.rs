@@ -151,12 +151,24 @@ pub fn derive_workspace_key(passphrase: &str) -> [u8; 32] {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SealedEnvelope {
+    /// Key epoch this ciphertext was sealed under — the [`WorkspaceKeyRotation`]
+    /// version, or `0` for the base/passphrase key. A client keyed with multiple
+    /// epochs uses this to pick the right key, so a rotation no longer strands
+    /// history: events sealed under an older epoch stay readable. Absent on
+    /// pre-epoch bodies (`#[serde(default)]` → 0).
+    #[serde(default)]
+    pub version: u32,
     pub nonce: Vec<u8>,
     pub ciphertext: Vec<u8>,
 }
 
-/// Seal arbitrary bytes (a serialized envelope) with the workspace key.
-pub fn seal_symmetric(key: &[u8; 32], plaintext: &[u8]) -> Result<SealedEnvelope, CryptoError> {
+/// Seal arbitrary bytes (a serialized envelope) with the workspace key for epoch
+/// `version` (stamped onto the output so a keyed reader can pick the right key).
+pub fn seal_symmetric(
+    key: &[u8; 32],
+    version: u32,
+    plaintext: &[u8],
+) -> Result<SealedEnvelope, CryptoError> {
     let mut nonce = [0u8; 12];
     getrandom::getrandom(&mut nonce).map_err(|_| CryptoError::Random)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
@@ -164,6 +176,7 @@ pub fn seal_symmetric(key: &[u8; 32], plaintext: &[u8]) -> Result<SealedEnvelope
         .encrypt(Nonce::from_slice(&nonce), plaintext)
         .map_err(|_| CryptoError::VerifyFailed)?;
     Ok(SealedEnvelope {
+        version,
         nonce: nonce.to_vec(),
         ciphertext,
     })
@@ -221,7 +234,7 @@ mod tests {
     fn symmetric_seal_open_roundtrip_and_tamper() {
         let key = derive_workspace_key("team-alpha secret");
         let plaintext = br#"{"kind":"messageAppended"}"#;
-        let sealed = seal_symmetric(&key, plaintext).unwrap();
+        let sealed = seal_symmetric(&key, 0, plaintext).unwrap();
         assert_ne!(sealed.ciphertext, plaintext);
         assert_eq!(open_symmetric(&key, &sealed).unwrap(), plaintext);
 
@@ -233,6 +246,18 @@ mod tests {
         let mut bad = sealed.clone();
         bad.ciphertext[0] ^= 0xff;
         assert!(open_symmetric(&key, &bad).is_err());
+    }
+
+    #[test]
+    fn sealed_envelope_stamps_and_defaults_epoch() {
+        let key = derive_workspace_key("epoch test");
+        let sealed = seal_symmetric(&key, 3, b"payload").unwrap();
+        assert_eq!(sealed.version, 3, "epoch is stamped on the sealed body");
+
+        // A legacy pre-epoch body (no `version`) deserializes to epoch 0.
+        let legacy = serde_json::json!({ "nonce": sealed.nonce, "ciphertext": sealed.ciphertext });
+        let parsed: SealedEnvelope = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.version, 0, "missing version defaults to base epoch");
     }
 
     #[test]

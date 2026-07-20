@@ -4879,6 +4879,39 @@ fn latest_openable_key(
     best.map(|(_, k)| k)
 }
 
+/// The set of workspace keys this device can currently open, indexed by epoch:
+/// the passphrase-derived base key at epoch 0 (if any) plus every rotation this
+/// device can unseal, at its version. The sync engine seals new events under the
+/// highest epoch and opens each fetched event under its own epoch, so a rotation
+/// no longer strands history (older epochs stay in the ring). A removed member,
+/// unable to open rotations issued after their removal, simply never gains those
+/// epochs — they keep only the epochs they held while a member.
+fn build_keyring(
+    ka: Option<&hive_core::e2ee::KeyAgreementKeypair>,
+    passphrase_key: Option<[u8; 32]>,
+    rotations: &[hive_core::e2ee::WorkspaceKeyRotation],
+) -> std::collections::BTreeMap<u32, [u8; 32]> {
+    let mut ring = std::collections::BTreeMap::new();
+    if let Some(k) = passphrase_key {
+        ring.insert(0, k);
+    }
+    if let Some(kp) = ka {
+        for r in rotations {
+            for blob in r.sealed.values() {
+                if let Ok(bytes) = hive_core::e2ee::open(kp, blob) {
+                    if bytes.len() == 32 {
+                        let mut k = [0u8; 32];
+                        k.copy_from_slice(&bytes);
+                        ring.insert(r.version, k);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    ring
+}
+
 // ---------------------------------------------------------------------------
 // Scheduled / triggered agents
 // ---------------------------------------------------------------------------
@@ -5026,7 +5059,7 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
     };
     // The engine is rebuilt whenever the relay url / room / key changes, so the
     // Settings UI can connect, reconnect, or go local-only without a restart.
-    type ConnSig = (String, String, Option<[u8; 32]>);
+    type ConnSig = (String, String, std::collections::BTreeMap<u32, [u8; 32]>);
     let mut engine: Option<(hive_runtime::SyncEngine, ConnSig)> = None;
     // Suppress repeated identical sync errors so a persistent condition (e.g. an
     // unauthorized relay) logs once, not on every tick.
@@ -5044,21 +5077,25 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
         };
         match relay_url {
             Some(url) if !url.is_empty() => {
-                // Adopt the newest rotation we can open; fall back to the
-                // passphrase-derived key. A revoked member can't open rotations
-                // issued after their removal, so they can't read new traffic.
-                let key = match ka.as_ref() {
-                    Some(kp) => hive_runtime::RelayClient::new(&url)
-                        .with_auth(access_token.clone())
-                        .with_github_token(github_token.clone())
-                        .fetch_key_rotations(&room)
-                        .await
-                        .ok()
-                        .and_then(|rots| latest_openable_key(kp, &rots))
-                        .or(passphrase_key),
-                    None => passphrase_key,
+                // Build the epoch keyring: the passphrase-derived base key plus
+                // every rotation we can open. Sealing uses the highest epoch;
+                // opening picks each event's own epoch, so a rotation never
+                // strands history. A revoked member can't open rotations issued
+                // after their removal, so they never gain those epochs and can't
+                // read new traffic.
+                let keyring = match ka.as_ref() {
+                    Some(kp) => {
+                        let rots = hive_runtime::RelayClient::new(&url)
+                            .with_auth(access_token.clone())
+                            .with_github_token(github_token.clone())
+                            .fetch_key_rotations(&room)
+                            .await
+                            .unwrap_or_default();
+                        build_keyring(Some(kp), passphrase_key, &rots)
+                    }
+                    None => build_keyring(None, passphrase_key, &[]),
                 };
-                let sig: ConnSig = (url.clone(), room.clone(), key);
+                let sig: ConnSig = (url.clone(), room.clone(), keyring.clone());
                 let changed = engine.as_ref().map(|(_, s)| s != &sig).unwrap_or(true);
                 if changed {
                     let mut e = hive_runtime::SyncEngine::new(
@@ -5067,12 +5104,14 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                             .with_github_token(github_token.clone()),
                         room.clone(),
                     );
-                    if let Some(k) = key {
-                        e = e.with_key(k);
+                    let encrypted = !keyring.is_empty();
+                    if encrypted {
+                        e = e.with_keyring(keyring.clone());
                     }
                     eprintln!(
-                        "sync: relay {url} room {room} ({})",
-                        if key.is_some() { "encrypted" } else { "plaintext" }
+                        "sync: relay {url} room {room} ({}, {} epoch key(s))",
+                        if encrypted { "encrypted" } else { "plaintext" },
+                        keyring.len()
                     );
                     engine = Some((e, sig));
                 }
