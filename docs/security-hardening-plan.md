@@ -61,7 +61,12 @@ ordering below reflects hard dependencies.
 
 ---
 
-## S3 — Key epochs (rotation must not strand history)
+## S3 — Key epochs (rotation must not strand history) — ✅ **implemented**
+
+> Done: `SealedEnvelope` now carries a `version`; `SyncEngine` holds an epoch→key
+> keyring (seals under the highest epoch, opens each body under its own); the app
+> builds the ring from the passphrase key + every openable rotation. Migration is
+> additive (unversioned bodies = epoch 0). Tested by `rotated_epochs_do_not_strand_history`.
 
 **Finding.** `WorkspaceKeyRotation` has a `version` (`crates/hive-core/src/e2ee.rs`) but **events carry no epoch tag** (`SealedEnvelope` is just `{nonce, ciphertext}`), and the client holds a **single** key (`SyncEngine.key`). After a real rotation (`remove_and_revoke`), events sealed under the **old** key become undecryptable and are silently skipped (mitigated for *loss* by phase 7's cursor fix, but they still can't be read).
 
