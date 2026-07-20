@@ -338,19 +338,31 @@ impl ChatSession {
 /// of arrival or insertion order. Events are folded in the canonical total order
 /// `(lamport, event_id)` (see [`SessionEventEnvelope::canonical_key`]), so two
 /// devices that hold the same events — in any order — project identical state.
-/// The state is seeded by the *latest* `SessionSnapshot` in canonical order;
-/// deltas ordered before that snapshot are considered folded into it and are
-/// dropped. Returns `None` if the set contains no snapshot to seed from.
+///
+/// The state is seeded by the **earliest** `SessionSnapshot` in canonical order,
+/// then every later event is folded on top (later snapshots are inert — see
+/// [`ChatSession::apply`]). Seeding from the *latest* snapshot instead would drop
+/// any concurrent delta that a peer authored before that snapshot but which the
+/// snapshot's creator hadn't yet seen — a real divergence/loss under multi-device
+/// compaction. Seeding from the earliest snapshot replays every delta, so nothing
+/// is dropped and all devices converge on the identical set. (A device that
+/// joined mid-stream seeds from the recent snapshot it was handed — that snapshot
+/// is simply its earliest.) Returns `None` if the set contains no snapshot.
+///
+/// Cost note: this replays from the base snapshot rather than the newest, trading
+/// a bounded-load optimization for correctness. Causal-frontier snapshots (a
+/// per-source watermark that lets a newer snapshot safely subsume deltas) are the
+/// future optimization; correctness comes first.
 pub fn project(envelopes: &[SessionEventEnvelope]) -> Option<ChatSession> {
     let mut ordered: Vec<&SessionEventEnvelope> = envelopes.iter().collect();
     ordered.sort_by_key(|e| e.canonical_key());
 
     let base = ordered
         .iter()
-        .rposition(|e| matches!(e.payload, SessionEvent::SessionSnapshot { .. }))?;
+        .position(|e| matches!(e.payload, SessionEvent::SessionSnapshot { .. }))?;
     let mut session = match &ordered[base].payload {
         SessionEvent::SessionSnapshot { session } => (**session).clone(),
-        _ => unreachable!("rposition matched a snapshot"),
+        _ => unreachable!("position matched a snapshot"),
     };
     session.updated_at = ordered[base].timestamp;
     for env in &ordered[base + 1..] {
@@ -637,6 +649,38 @@ mod tests {
         for seed in 0..500u64 {
             let permuted = shuffled(events.clone(), seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             assert_eq!(project(&permuted).expect("session"), expected, "divergence at seed {seed}");
+        }
+    }
+
+    /// Compaction safety: a later snapshot that didn't incorporate a peer's
+    /// concurrent delta must not cause that delta to be dropped. Seeding from the
+    /// earliest snapshot replays every delta, so nothing is lost.
+    #[test]
+    fn compaction_never_drops_a_concurrent_delta() {
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+
+        // A device compacted after seeing m1 but BEFORE a concurrent m2 from a peer.
+        let mut compacted = base_session();
+        compacted.members.push(member("m1", "u1", WorkspaceRole::Contributor));
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            env(sid, wid, 2, SessionEvent::MemberAdded { member: member("m1", "u1", WorkspaceRole::Contributor) }),
+            // Concurrent — authored by a peer, canonically before the snapshot below.
+            env(sid, wid, 3, SessionEvent::MemberAdded { member: member("m2", "u2", WorkspaceRole::Contributor) }),
+            // A later snapshot whose captured state is missing m2.
+            env(sid, wid, 5, SessionEvent::SessionSnapshot { session: Box::new(compacted) }),
+        ];
+
+        let s = project(&events).expect("session");
+        let ids: Vec<_> = s.members.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"m1"), "m1 present");
+        assert!(ids.contains(&"m2"), "concurrent m2 must NOT be dropped by the later snapshot");
+
+        // And it still converges under every delivery order.
+        for seed in 0..200u64 {
+            assert_eq!(project(&shuffled(events.clone(), seed | 1)).expect("session"), s, "divergence at seed {seed}");
         }
     }
 
