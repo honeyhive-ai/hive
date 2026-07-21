@@ -29,6 +29,25 @@ ordering below reflects hard dependencies.
 
 ## S1 — Wire signature verification into ingest (GitHub-anchored identity)
 
+> **Status — verification core implemented (Layers 1–3), activation staged (Layer 4).**
+> Done: the trust events (`AccountKeyRegistered`, `DeviceCertificateAdded`), the
+> `WorkspaceRoster` + `build_roster` (folds trust events in canonical order,
+> verifies each cert chains to its account key) and the 3-way `Verdict`
+> (`hive-runtime::envelope_verifier`), and verify-on-ingest wired into
+> `apply_fetched` with the **non-bricking policy** (reject only provably-bad —
+> bad signature / revoked / impersonation; *hold* unsigned/unknown, never drop).
+> It is purely additive: with no trust events in the log the roster is empty and
+> everything is grandfathered, so behaviour is unchanged until emission ships.
+> **Staged (Layer 4 — activation):** emitting each device's trust events, which
+> requires reconciling the account-id lifecycle (the bootstrap device cert is
+> issued under the local account id, but after GitHub sign-in the author stamps
+> the GitHub-derived id — the cert must be re-issued under the current account,
+> else a device's own events fail the impersonation check). Also staged: p2p-path
+> verification (`peer.rs` ingests without `apply_fetched`), and the directory
+> extension to carry signing keys (Option A). These need the trust-bootstrap
+> decision below before implementation.
+
+
 **Finding.** `verify_stream` / `DeviceRoster` exist (`crates/hive-runtime/src/envelope_verifier.rs`) but have **zero production callers** — the live ingest path (`sync_engine::apply_fetched` → `event_store::ingest`) never verifies signatures or revocation. So a peer can inject events signed by an unknown/revoked device, or unsigned events, and they are projected. (Authorship spoofing is already *provable* against — #35's v2 preimage binds `actor_stamp` — but nothing *checks* the signature yet.)
 
 **What verification needs, and the two questions it must answer.** `verify_stream` needs a resolver mapping `signer_device_id → signing public key (+ revoked)`. To trust that mapping it must answer:

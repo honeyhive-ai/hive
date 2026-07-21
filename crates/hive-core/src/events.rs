@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use crate::agent::WorkspaceAgent;
 use crate::chat::{ChatMessage, MessageReaction};
+use crate::crypto::DeviceCertificate;
 use crate::identity::{ActorStamp, WorkspaceMember, WorkspaceRole};
 use crate::proposals::{ActionProposal, ProposalApproval};
 use crate::session::ChatSession;
@@ -96,6 +97,21 @@ pub enum SessionEvent {
         actor_id: String,
         emoji: String,
     },
+    /// Publishes an account's signing public key (GitHub-anchored: `account_id`
+    /// is derived from the GitHub user id). This is the root a `DeviceCertificate`
+    /// chains to. Trust metadata — inert in the session projection; consumed by
+    /// the device-roster builder for signature verification. See
+    /// docs/security-hardening-plan.md S1.
+    AccountKeyRegistered {
+        account_id: Uuid,
+        signing_public_key: Vec<u8>,
+    },
+    /// Publishes a device certificate (`device_id → device signing key`, signed
+    /// by the account key), extending trust from an account to one of its
+    /// devices. Trust metadata — inert in projection; consumed by the roster.
+    DeviceCertificateAdded {
+        certificate: DeviceCertificate,
+    },
     /// Forward-compat catch-all: an event `kind` this build does not recognize
     /// (produced by a newer client). Serde deserializes an unknown tag here
     /// instead of failing the whole stream; it projects as a no-op. The raw
@@ -130,6 +146,8 @@ impl SessionEvent {
             SessionEvent::WorkflowRunUpserted { .. } => "workflowRunUpserted",
             SessionEvent::MessageReactionAdded { .. } => "messageReactionAdded",
             SessionEvent::MessageReactionRemoved { .. } => "messageReactionRemoved",
+            SessionEvent::AccountKeyRegistered { .. } => "accountKeyRegistered",
+            SessionEvent::DeviceCertificateAdded { .. } => "deviceCertificateAdded",
             SessionEvent::Unknown => "unknown",
         }
     }
@@ -140,7 +158,9 @@ impl SessionEvent {
             SessionEvent::MemberAdded { .. }
             | SessionEvent::MemberRemoved { .. }
             | SessionEvent::MemberRoleChanged { .. }
-            | SessionEvent::AgentRosterUpdated { .. } => EventScope::Workspace,
+            | SessionEvent::AgentRosterUpdated { .. }
+            | SessionEvent::AccountKeyRegistered { .. }
+            | SessionEvent::DeviceCertificateAdded { .. } => EventScope::Workspace,
             SessionEvent::WorkflowRunUpserted { .. } => EventScope::Run,
             _ => EventScope::Session,
         }
@@ -327,6 +347,10 @@ impl ChatSession {
                 }
             }
             // Unrecognized (newer-client) event — inert in this build.
+            // Trust metadata — inert in the session projection; consumed only by
+            // the device-roster builder (see hive-runtime::envelope_verifier).
+            SessionEvent::AccountKeyRegistered { .. }
+            | SessionEvent::DeviceCertificateAdded { .. } => {}
             SessionEvent::Unknown => {}
         }
     }
