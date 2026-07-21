@@ -27,24 +27,57 @@ ordering below reflects hard dependencies.
 
 ---
 
-## S1 — Wire signature verification into ingest (highest value, has a prerequisite)
+## S1 — Wire signature verification into ingest (GitHub-anchored identity)
 
 **Finding.** `verify_stream` / `DeviceRoster` exist (`crates/hive-runtime/src/envelope_verifier.rs`) but have **zero production callers** — the live ingest path (`sync_engine::apply_fetched` → `event_store::ingest`) never verifies signatures or revocation. So a peer can inject events signed by an unknown/revoked device, or unsigned events, and they are projected. (Authorship spoofing is already *provable* against — #35's v2 preimage binds `actor_stamp` — but nothing *checks* the signature yet.)
 
-**Prerequisite (the real work): device-key distribution.** `verify_stream` needs a `DeviceKeyResolver` mapping `signer_device_id → signing public key (+ revoked)`. Today that roster is built only in tests (`DeviceRoster::with_device`). Production has no way to learn *other* devices' signing keys. Until it does, turning on verification would quarantine **everything** as `UnknownDevice` and break sync.
+**What verification needs, and the two questions it must answer.** `verify_stream` needs a resolver mapping `signer_device_id → signing public key (+ revoked)`. To trust that mapping it must answer:
+1. *What is device D's public signing key?* — from D's `DeviceCertificate` (`crates/hive-core/src/crypto.rs`), which binds `device_id → device_public_key → account_id`, **signed by the account key**.
+2. *Does D legitimately belong to the account it stamps as author?* — which requires trusting **that account's public key**. This is the hard part: *how do we know an account key is really this person's?*
 
-**Design.**
-1. **Publish device certificates into the event log.** Add a `DeviceCertificateAdded { certificate: DeviceCertificate }` event (already forward-compat-safe thanks to phase 1). The cert (`crates/hive-core/src/crypto.rs::DeviceCertificate`) binds `device_id → signing key` and is signed by the **account** key, chaining trust to an account already in the roster. Emit it when a device joins / on first sync.
-2. **Build the roster during projection.** As the workspace stream projects, accumulate a `DeviceRoster` from `DeviceCertificateAdded` (and revocations, S-rev below). This is the membership→verification coupling the review flagged: the roster must be built from the *authenticated* subset. Bootstrap trust from the workspace creator's account key (known from the genesis snapshot / invite).
-3. **Gate ingest/projection on verification.** In `apply_fetched`, run `verify_stream(fetched, &roster, allow_unsigned=false)`; ingest only `valid`, and persist `quarantined` to a separate table for observability + retry (a cert may arrive after the event it signs — do **not** discard; re-verify when the roster grows, mirroring the phase-7 "don't skip undecodable" rule).
+### Identity is already anchored on GitHub — leverage it
 
-**New invariants.** Only events whose signature verifies against a device whose cert chains to an account in the roster are projected. Unsigned/unknown/revoked → quarantined, never silently dropped.
+Two things already ship that make (2) tractable without a from-scratch web-of-trust PKI:
 
-**Migration.** Legacy events were signed with the **v1** preimage (pre-#35) and lack `lamport` in the signed bytes. Verification must accept a v1 fallback for events authored before the v2 cutover (detect by a version tag or attempt-both), else all historical events quarantine. Add an explicit `preimage_version` to the envelope, or grandfather by timestamp.
+- **The account id is derived from the GitHub user id.** `account_id_for(github_id)` (`hive-runtime::github`) — a workspace member's stable identity *is* their immutable GitHub identity, not a random UUID. Invites add members keyed by it (`invite_by_handle`, `app/src/lib.rs:6065`).
+- **A GitHub-authenticated key directory already exists.** Clients `directory_register` their device's **X25519 key-agreement** public key under their signed-in GitHub login (the call is authenticated by the GitHub token, so the relay only lets you list devices under *your* login). `directory_lookup(handle)` returns `DirectoryEntry { github_id, login, devices: [{device_id, ka_public}] }`. Invite-by-handle already resolves `@alice` this way and seals the workspace key to her registered devices (`relay_client.rs`, `invite_by_handle`).
 
-**Tests.** Extend the existing `envelope_verifier` tests to the ingest path: a store that ingests an unknown-device event drops it; a cert arriving *after* its event promotes the quarantined event on re-verify; a revoked device's event is rejected.
+> ⚠️ Scope of the existing mechanism: this directory lives **on the relay**, so invite-by-handle / directory resolution is **relay-dependent** — it needs a relay both parties are registered on, and it does **not** work in pure-P2P / no-relay mode (that path uses the passphrase + short-code join). It is a *per-relay* directory, not a global one.
 
-**Risk / ordering.** Do this **first** among security items but **only after** the cert-distribution design is reviewed — turning verification on prematurely bricks sync. Depends on #35 (v2 preimage) being merged ✅.
+So S1's "device-key distribution" is largely **extend what already ships**: add the device **signing** key + its `DeviceCertificate` to the same directory entry (today it only carries the KA/sealing key), and resolve `signer_device_id → signing key → GitHub identity` through it.
+
+### The real fork: is the relay a trusted identity anchor?
+
+The directory binding **trusts the relay** to assert "this key belongs to @alice." That is exactly the tension with the review's *"authorization must not depend on trusting the relay."* Three binding options span the trade-off:
+
+- **Option A — relay-attested (lowest friction, relay semi-trusted).** Reuse the directory: the relay verified the GitHub token at registration, so it vouches `github_id → keys`. Almost no new user friction; **but a malicious relay could substitute a key.** Fine for a **relay you run / enterprise** (the enterprise relay already gates on GitHub via `HIVE_RELAY_ADMIN_LOGINS`); not fine for a hostile relay.
+- **Option B — GitHub-hosted proof (relay untrusted, more friction).** The user posts a signed `@alice ↔ key K` statement to a GitHub-controlled location (gist/repo/signed commit); verifiers fetch it straight from `github.com` and check it's hosted under `@alice` **and** signed by K. GitHub becomes the CA; the relay is bypassed for identity. Keybase-style.
+- **Option C — GitHub's native signing-key directory (relay untrusted, moderate friction).** Register the account public key as one of the user's GitHub **SSH signing keys**; verifiers fetch `api.github.com/users/<login>/ssh_signing_keys`. Reuses a first-class GitHub feature (also makes signed commits show "Verified"); one-time key-add friction.
+
+**Recommended split:** Option **A** for trusted/enterprise relays (reuse the shipped directory), Options **B/C** as the relay-untrusted path for self-hosters who need identity to survive a hostile relay. In all cases **authorization** (who is a member, in what role) stays in Hive events (S2), and **device→account** stays the existing `DeviceCertificate` — GitHub only answers *identity*.
+
+### Design
+
+1. **Extend the directory + a `DeviceCertificateAdded { certificate }` event** so peers learn each device's signing key: the directory (Option A) and/or the event log (forward-compat-safe via phase 1). The cert chains device → GitHub-anchored account.
+2. **Build the roster during projection** from members (GitHub-anchored account keys, bound per the chosen option) + device certs + revocations. This is the membership→verification coupling the review flagged: build from the *authenticated* subset, rooted in the workspace creator's GitHub identity (known from the genesis snapshot / invite).
+3. **Wire `verify_stream` into `apply_fetched` with a safe enforcement policy:** ingest `valid`; **quarantine** provably-bad (bad signature, revoked device, or `actor_stamp` account ≠ the signing device's account); **hold** `UnknownDevice` for retry (a cert may arrive after the event — do not drop, re-verify when the roster grows, mirroring the phase-7 "don't skip undecodable" rule). Strict mode (reject unknown) is a later flag-flip once distribution is universal, so wiring it never bricks sync.
+
+### New invariants (stated honestly per relay-trust assumption)
+
+Only events whose signature verifies against a device whose cert chains to a **GitHub-anchored account in the roster** are projected; unsigned/unknown/revoked/impersonating → quarantined, never silently dropped. Under **Option A** the identity binding is *"as strong as trusting the relay's GitHub-gated directory"*; under **B/C** it is *"as strong as the member's GitHub account,"* independent of the relay.
+
+### Migration
+
+- Legacy events signed with the **v1** preimage (pre-#35, no `lamport` in the signed bytes) must be grandfathered — add an explicit `preimage_version` (or attempt-both), else all history quarantines.
+- Directory entry gains a signing-key field additively (serde default); old clients ignore it.
+
+### Tests
+
+Extend `envelope_verifier` tests to the ingest path: an unknown-device event is held (not dropped) and **promoted** once its cert arrives; a revoked-device event is rejected; an event whose `actor_stamp` account ≠ the signer's account is rejected (impersonation); a v1-preimage legacy event is grandfathered.
+
+### Risk / ordering + the open decision
+
+Do this **first** among the security items, but the one decision to make before implementing is the relay-trust fork above: **is a self-hosted/trusted relay an acceptable identity anchor for the default deployment (Option A), or must identity survive a hostile relay (Options B/C)?** That is a product-security call. Depends on #35 (v2 preimage) ✅.
 
 ---
 
