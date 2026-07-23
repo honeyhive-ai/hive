@@ -29,7 +29,18 @@ ordering below reflects hard dependencies.
 
 ## S1 — Wire signature verification into ingest (GitHub-anchored identity)
 
-> **Status — verification core implemented (Layers 1–3), activation staged (Layer 4).**
+> **Status — implemented and activated (default: relay-vouched via GitHub).**
+> Layers 1–3 (below) plus **Layer 4 activation**: `ChatService::publish_identity`
+> emits this device's trust events (`AccountKeyRegistered` + a `DeviceCertificateAdded`
+> re-issued under the account's *current* id) on chat create / join, idempotently,
+> so peers verify its signatures. The account-id switch (GitHub sign-in) is handled
+> — the cert re-issues under the new id and `ensure_self_member` re-adds the member
+> under it. **Residual (narrow):** account keys are pinned first-registration in the
+> log, so a malicious member could pre-register an *invited-but-not-yet-online*
+> member's identity. Closed by **pin-at-invite** (the inviter already fetches the
+> invitee from the GitHub-authenticated directory — record their signing key there),
+> the immediate follow-up. Also still staged: p2p-path verification (`peer.rs`).
+> Historical status:
 > Done: the trust events (`AccountKeyRegistered`, `DeviceCertificateAdded`), the
 > `WorkspaceRoster` + `build_roster` (folds trust events in canonical order,
 > verifies each cert chains to its account key) and the 3-way `Verdict`
