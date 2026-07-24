@@ -452,6 +452,10 @@ export function ChatView({
   }
 
   const messages: ChatMessageDto[] = chat.data?.messages ?? [];
+  // The only real provenance we have today is the chat's runtime (there's no
+  // per-message model/provider on ChatMessageDto). Derive a single "via
+  // provider/model" attribution line for agent turns from it.
+  const runtimeVia = currentRuntime ? runtimePickerLabel(currentRuntime) : undefined;
   const lastAssistantId = [...messages]
     .reverse()
     .find((m) => m.role === "assistant" || m.role === "agent")?.id;
@@ -463,7 +467,7 @@ export function ChatView({
         style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
       >
         <div className="relative flex min-h-0 flex-1 flex-col">
-        <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-4 py-4">
+        <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-1 py-2">
           {chat.isLoading && messages.length === 0 && <SkeletonBubbles count={3} />}
           {!chat.isLoading && messages.length === 0 && !optimisticUser && (
             <div
@@ -533,6 +537,7 @@ export function ChatView({
               body={m.body}
               createdAt={m.createdAt}
               streaming={m.isStreaming}
+              via={runtimeVia}
               reactions={m.reactions}
               toolCalls={m.toolCalls}
               toolResults={m.toolResults}
@@ -542,7 +547,7 @@ export function ChatView({
           ))}
           {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} />}
           {[...streams.entries()].map(([id, text]) => (
-            <Bubble key={id} role="assistant" author="Hive" body={text} streaming />
+            <Bubble key={id} role="assistant" author="Hive" body={text} via={runtimeVia} streaming />
           ))}
           {sending && streams.size === 0 && <TypingDots label="Hive is thinking" />}
           {typingNames.length > 0 && <TypingDots label={typingLabel(typingNames)} />}
@@ -960,6 +965,14 @@ function avColor(seed: string): string {
   for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
   return AV_COLORS[h % AV_COLORS.length];
 }
+// Avatar glyph: up to two letters, `@` stripped, hyphen/underscore = word break
+// (so "@alice-claude" → "AC", "Hive" → "HI"). Ported from the redesign.
+function initials(name: string): string {
+  const cleaned = name.replace(/^@/, "").replace(/[-_]/g, " ");
+  const parts = cleaned.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
+  return cleaned.slice(0, 2).toUpperCase();
+}
 
 const Bubble = memo(function Bubble({
   messageId,
@@ -968,6 +981,7 @@ const Bubble = memo(function Bubble({
   body,
   createdAt,
   streaming = false,
+  via,
   reactions,
   toolCalls,
   toolResults,
@@ -980,6 +994,7 @@ const Bubble = memo(function Bubble({
   body: string;
   createdAt?: string;
   streaming?: boolean;
+  via?: string;
   reactions?: { emoji: string; actorId: string; actorDisplayName: string }[];
   toolCalls?: { id: string; name: string; inputJson: string; serverId: string | null }[];
   toolResults?: { callId: string; content: string; isError: boolean }[];
@@ -1021,29 +1036,30 @@ const Bubble = memo(function Bubble({
   }
 
   return (
-    // Full-width tinted turn row (redesign): human = warm, agent = cool.
-    // `content-visibility: auto` lets the engine skip layout/paint for rows
-    // scrolled out of view — cheap "virtualization" for long transcripts.
+    // Flat message row (Slack/Buzz-style): no card/tint, avatar + name + time +
+    // body, full-row hover. `content-visibility: auto` lets the engine skip
+    // layout/paint for off-screen rows — cheap virtualization for long logs.
     <div
       className={`group tt ${isUser ? "human" : "agent"}`}
-      style={streaming ? undefined : { contentVisibility: "auto", containIntrinsicSize: "0 120px" }}
+      style={streaming ? undefined : { contentVisibility: "auto", containIntrinsicSize: "0 80px" }}
     >
       <div className="tt-av">
         <div
           className={`av ${isUser ? "human" : "agent"}`}
-          style={{ width: 28, height: 28, background: avColor(author), fontSize: 11 }}
+          style={{ width: 30, height: 30, background: avColor(author), fontSize: 12 }}
           aria-hidden
         >
-          {author.slice(0, 1).toUpperCase()}
+          {initials(author)}
         </div>
       </div>
 
       <div className="tt-body">
         <div className="tt-head">
           <span className={isUser ? "tt-name" : "tt-handle"}>{author}</span>
-          <span className="tt-spacer" />
           {timeLabel && <span className="tt-time">{timeLabel}</span>}
+          <span className="tt-spacer" />
         </div>
+        {via && !isUser && <div className="tt-attr">via {via}</div>}
 
         <div className="tt-text">
           {content}
