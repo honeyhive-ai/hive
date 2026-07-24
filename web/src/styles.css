@@ -30,8 +30,14 @@
      when applyTheme() overrides the base vars — no per-theme wiring needed. */
   --hive-ink-soft: color-mix(in srgb, var(--hive-ink) 55%, transparent);
   --hive-hover: color-mix(in srgb, var(--hive-ink) 7%, transparent);
-  --turn-human: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-warm));
-  --turn-agent: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-cool));
+  /* Semantic warm/cool hues for the turn split. Hive's brand accents are both
+     warm (amber/gold), so the redesign's "human warm / agent cool" needs a
+     dedicated cool (blue) here — otherwise both turns tint the same. Mixed with
+     the theme's --hive-panel, so the tint adapts light/dark automatically. */
+  --hive-turn-warm: #c17b45;
+  --hive-turn-cool: #5a86c0;
+  --turn-human: color-mix(in srgb, var(--hive-panel) 86%, var(--hive-turn-warm));
+  --turn-agent: color-mix(in srgb, var(--hive-panel) 86%, var(--hive-turn-cool));
   --turn-shared: var(--hive-mist);
   --tint-cool: color-mix(in srgb, var(--hive-accent-cool) 14%, transparent);
   --tint-cool-line: color-mix(in srgb, var(--hive-accent-cool) 38%, transparent);
@@ -54,7 +60,7 @@
 .tt-body { flex: 1; min-width: 0; }
 .tt-head { display: flex; align-items: baseline; gap: 8px; }
 .tt-name { font-weight: 600; font-size: 14px; }
-.tt-handle { font-weight: 600; font-size: 14px; color: var(--hive-accent-cool); }
+.tt-handle { font-weight: 600; font-size: 14px; color: var(--hive-turn-cool); }
 .tt.shared .tt-handle { color: var(--hive-ink); }
 .tt-model { font-size: 11px; color: var(--hive-ink-soft); font-family: ui-monospace, Menlo, monospace; }
 .tt-spacer { flex: 1; }
