@@ -41,6 +41,7 @@ import {
 } from "@/lib/icons";
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonBubbles } from "@/components/Skeleton";
+import { EmojiPicker } from "@/components/EmojiPicker";
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
 import { applyStreamDelta, retireStream } from "@/lib/streams";
@@ -49,7 +50,6 @@ import { confirmThen } from "@/lib/confirm";
 import { promptDialog } from "@/components/Dialog";
 import { loadTemplates } from "@/lib/templates";
 
-const QUICK_EMOJI = ["👍", "👎", "🎉", "👀", "❤️"];
 const CLAUDE_NOTE_KEY = "hive.claudeCodeNoteDismissed";
 
 // Clickable starter prompts shown in an empty chat — concrete examples of what
@@ -1011,6 +1011,24 @@ const Bubble = memo(function Bubble({
   const counts = new Map<string, number>();
   for (const r of reactions ?? []) counts.set(r.emoji, (counts.get(r.emoji) ?? 0) + 1);
   const [reactOpen, setReactOpen] = useState(false);
+  const reactRef = useRef<HTMLDivElement>(null);
+  // Close the emoji picker on outside click or Escape (the trigger button lives
+  // inside reactRef, so clicking it still toggles rather than double-firing).
+  useEffect(() => {
+    if (!reactOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (reactRef.current && !reactRef.current.contains(e.target as Node)) setReactOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setReactOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [reactOpen]);
 
   const content = streaming ? (
     <div className="whitespace-pre-wrap text-[0.95rem] leading-7">
@@ -1089,34 +1107,18 @@ const Bubble = memo(function Bubble({
               </IconAction>
             )}
             {onReact && messageId && (
-              <div className="relative">
+              <div className="relative" ref={reactRef}>
                 <IconAction title="Add reaction" onClick={() => setReactOpen((o) => !o)}>
                   <IconSmile />
                 </IconAction>
                 {reactOpen && (
-                  <div
-                    className="absolute bottom-full z-20 mb-1 flex gap-0.5 rounded-lg border p-1 shadow-lg"
-                    style={{
-                      borderColor: "var(--hive-line)",
-                      background: "var(--hive-panel)",
-                      ...(isUser ? { right: 0 } : { left: 0 }),
+                  <EmojiPicker
+                    align={isUser ? "right" : "left"}
+                    onPick={(emoji) => {
+                      onReact(messageId, emoji);
+                      setReactOpen(false);
                     }}
-                    onMouseLeave={() => setReactOpen(false)}
-                  >
-                    {QUICK_EMOJI.map((emoji) => (
-                      <button
-                        key={emoji}
-                        onClick={() => {
-                          onReact(messageId, emoji);
-                          setReactOpen(false);
-                        }}
-                        className="rounded px-1.5 py-0.5 text-sm transition-transform hover:scale-125"
-                        aria-label={`React ${emoji}`}
-                      >
-                        {emoji}
-                      </button>
-                    ))}
-                  </div>
+                  />
                 )}
               </div>
             )}
