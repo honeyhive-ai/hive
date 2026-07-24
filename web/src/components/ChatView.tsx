@@ -463,7 +463,7 @@ export function ChatView({
         style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
       >
         <div className="relative flex min-h-0 flex-1 flex-col">
-        <div ref={scrollRef} onScroll={onScroll} className="flex-1 space-y-4 overflow-y-auto px-4 py-5">
+        <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-4 py-4">
           {chat.isLoading && messages.length === 0 && <SkeletonBubbles count={3} />}
           {!chat.isLoading && messages.length === 0 && !optimisticUser && (
             <div
@@ -953,6 +953,14 @@ export function ToolCallCards({
   );
 }
 
+// Deterministic avatar color from a name/handle (ported from the redesign).
+const AV_COLORS = ["#3f72a8", "#b5673a", "#5a8f6b", "#8a5a9e", "#c08438", "#4c8aa6", "#a85a6a"];
+function avColor(seed: string): string {
+  let h = 0;
+  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
+  return AV_COLORS[h % AV_COLORS.length];
+}
+
 const Bubble = memo(function Bubble({
   messageId,
   role,
@@ -989,13 +997,6 @@ const Bubble = memo(function Bubble({
   for (const r of reactions ?? []) counts.set(r.emoji, (counts.get(r.emoji) ?? 0) + 1);
   const [reactOpen, setReactOpen] = useState(false);
 
-  // Modern chat: user messages hug the right in a warm bubble, assistant/agent
-  // hug the left in a cool bubble. A hairline border of the same hue keeps each
-  // bubble defined against the panel in every palette.
-  const surface = isUser
-    ? { bg: "rgba(214,158,87,0.16)", border: "rgba(214,158,87,0.30)", avatar: "rgba(214,158,87,0.32)" }
-    : { bg: "rgba(87,161,168,0.12)", border: "rgba(87,161,168,0.22)", avatar: "rgba(87,161,168,0.30)" };
-
   const content = streaming ? (
     <div className="whitespace-pre-wrap text-[0.95rem] leading-7">
       {body}
@@ -1010,52 +1011,50 @@ const Bubble = memo(function Bubble({
   // System messages (summaries, notices) read as centered meta, not a reply.
   if (isSystem) {
     return (
-      <div
-        className="mx-auto max-w-[85%] rounded-xl border px-3.5 py-2 text-center text-xs"
-        style={{ background: "var(--hive-mist)", borderColor: "var(--hive-line)", color: "var(--hive-ink)" }}
-      >
-        <span className="mr-2 uppercase tracking-[0.16em] opacity-45">System</span>
-        <span className="opacity-80">{body}</span>
+      <div className="tt-system">
+        <span className="ln" />
+        <span>{body}</span>
+        {timeLabel && <span className="opacity-70">{timeLabel}</span>}
+        <span className="ln" />
       </div>
     );
   }
 
   return (
+    // Full-width tinted turn row (redesign): human = warm, agent = cool.
     // `content-visibility: auto` lets the engine skip layout/paint for rows
-    // scrolled out of view — cheap "virtualization" for long transcripts, most
-    // relevant on WebView2/Windows. Skipped for the live streaming bubble.
+    // scrolled out of view — cheap "virtualization" for long transcripts.
     <div
-      className={`group flex gap-2.5 ${isUser ? "flex-row-reverse" : "flex-row"}`}
+      className={`group tt ${isUser ? "human" : "agent"}`}
       style={streaming ? undefined : { contentVisibility: "auto", containIntrinsicSize: "0 120px" }}
     >
-      <div
-        className="mt-6 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold"
-        style={{ background: surface.avatar, color: "var(--hive-ink)" }}
-        aria-hidden
-      >
-        {author.slice(0, 1).toUpperCase()}
+      <div className="tt-av">
+        <div
+          className={`av ${isUser ? "human" : "agent"}`}
+          style={{ width: 28, height: 28, background: avColor(author), fontSize: 11 }}
+          aria-hidden
+        >
+          {author.slice(0, 1).toUpperCase()}
+        </div>
       </div>
 
-      <div className={`flex min-w-0 max-w-[82%] flex-col ${isUser ? "items-end" : "items-start"}`}>
-        <div className="mb-1 flex items-center gap-2 px-1 text-xs">
-          <span className="font-semibold">{author}</span>
-          {timeLabel && <span className="opacity-40">{timeLabel}</span>}
+      <div className="tt-body">
+        <div className="tt-head">
+          <span className={isUser ? "tt-name" : "tt-handle"}>{author}</span>
+          <span className="tt-spacer" />
+          {timeLabel && <span className="tt-time">{timeLabel}</span>}
         </div>
 
-        <div
-          className={`min-w-0 border px-4 py-2.5 ${isUser ? "rounded-2xl rounded-tr-sm" : "rounded-2xl rounded-tl-sm"}`}
-          style={{ background: surface.bg, borderColor: surface.border, color: "var(--hive-ink)" }}
-        >
+        <div className="tt-text">
           {content}
           {toolCalls && toolCalls.length > 0 && (
             <ToolCallCards calls={toolCalls} results={toolResults ?? []} />
           )}
         </div>
 
-        {/* Persisted reactions stay visible; the action row (copy / regenerate /
-            react-picker) only appears on hover, so no emoji strip floats under
-            every message. */}
-        <div className={`mt-1 flex min-h-[1.5rem] items-center gap-1 ${isUser ? "flex-row-reverse" : ""}`}>
+        {/* Persisted reactions stay visible; the copy / regenerate / react-picker
+            row only appears on hover. */}
+        <div className="tt-actions">
           {[...counts.entries()].map(([emoji, n]) => (
             <button
               key={emoji}
