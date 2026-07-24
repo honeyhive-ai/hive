@@ -1200,7 +1200,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.117",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -2415,7 +2415,7 @@ dependencies = [
  "hkdf",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.18",
  "time",
  "toml 0.8.2",
@@ -2465,7 +2465,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
  "time",
@@ -5724,6 +5724,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
 dependencies = [
  "proc-macro2",
+ "quote",
  "unicode-ident",
 ]
 
