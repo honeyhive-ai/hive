@@ -8,7 +8,7 @@
 //! sequence on fetch + local ingestion order, which the commutative projector
 //! (upsert-by-id, idempotent reactions) tolerates.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use hive_core::{open_symmetric, seal_symmetric, SealedEnvelope, SessionEventEnvelope};
 use serde_json::Value;
@@ -38,9 +38,11 @@ pub struct SyncEngine {
     seen: HashSet<Uuid>,
     /// highest relay server sequence fetched so far.
     last_fetched_seq: u64,
-    /// When set, envelopes are sealed (ChaCha20-Poly1305) before the relay and
-    /// opened on fetch — the relay only ever sees ciphertext.
-    key: Option<[u8; 32]>,
+    /// Key epoch → workspace key. New events are sealed under the **highest**
+    /// epoch; a fetched body is opened with the key for **its** epoch (stamped on
+    /// the `SealedEnvelope`). Retaining older epochs is what keeps history
+    /// readable across rotations. Empty ⇒ plaintext (no E2EE on the wire).
+    keyring: BTreeMap<u32, [u8; 32]>,
 }
 
 impl SyncEngine {
@@ -50,34 +52,43 @@ impl SyncEngine {
             workspace: workspace.into(),
             seen: HashSet::new(),
             last_fetched_seq: 0,
-            key: None,
+            keyring: BTreeMap::new(),
         }
     }
 
-    /// Enable E2EE on the wire with a shared workspace key.
+    /// Enable E2EE with a single base-epoch (0) key — the passphrase-derived path.
     pub fn with_key(mut self, key: [u8; 32]) -> Self {
-        self.key = Some(key);
+        self.keyring.insert(0, key);
+        self
+    }
+
+    /// Enable E2EE with a full epoch→key ring (base key + opened rotations).
+    pub fn with_keyring(mut self, keyring: BTreeMap<u32, [u8; 32]>) -> Self {
+        self.keyring = keyring;
         self
     }
 
     /// Encode an envelope for the relay: sealed ciphertext if a key is set,
     /// else plaintext JSON.
     fn encode(&self, env: &SessionEventEnvelope) -> Result<Value, SyncError> {
-        match &self.key {
-            Some(k) => {
+        // Seal under the highest epoch we hold — the current key.
+        match self.keyring.iter().next_back() {
+            Some((&version, k)) => {
                 let plain = serde_json::to_vec(env)?;
-                Ok(serde_json::to_value(seal_symmetric(k, &plain)?)?)
+                Ok(serde_json::to_value(seal_symmetric(k, version, &plain)?)?)
             }
             None => Ok(serde_json::to_value(env)?),
         }
     }
 
-    /// Decode a relay body back into an envelope. Returns `None` for a sealed
-    /// body we can't open (no/incorrect key) so a foreign room doesn't poison us.
+    /// Decode a relay body back into an envelope. A sealed body is opened with
+    /// the key for **its** epoch; `None` if we don't hold that epoch's key yet
+    /// (a foreign room, or a rotation that hasn't reached us) — phase-7 fetch
+    /// durability then retries it rather than skipping it for good.
     fn decode(&self, body: &Value) -> Result<Option<SessionEventEnvelope>, SyncError> {
         if body.get("ciphertext").is_some() {
-            let Some(k) = &self.key else { return Ok(None) };
             let sealed: SealedEnvelope = serde_json::from_value(body.clone())?;
+            let Some(k) = self.keyring.get(&sealed.version) else { return Ok(None) };
             match open_symmetric(k, &sealed) {
                 Ok(plain) => Ok(Some(serde_json::from_slice(&plain)?)),
                 Err(_) => Ok(None),
@@ -186,10 +197,17 @@ impl SyncEngine {
         self.last_fetched_seq
     }
 
-    /// Swap the workspace key (e.g. a rotation reached us). Lets previously
-    /// undecodable events decode on the next pull.
+    /// Replace the base-epoch (0) key. Lets previously undecodable base-epoch
+    /// events decode on the next pull.
     pub fn set_key(&mut self, key: [u8; 32]) {
-        self.key = Some(key);
+        self.keyring.insert(0, key);
+    }
+
+    /// Add (or replace) the key for a specific epoch — e.g. a rotation reached
+    /// us. New events then seal under the new highest epoch, while older-epoch
+    /// events already fetched remain openable.
+    pub fn add_key(&mut self, version: u32, key: [u8; 32]) {
+        self.keyring.insert(version, key);
     }
 }
 
@@ -358,6 +376,51 @@ mod tests {
         sync_b.set_key(key);
         assert_eq!(sync_b.pull(&mut store_b).await.unwrap(), 2);
         assert_eq!(store_b.load_session(sid).unwrap().unwrap().messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rotated_epochs_do_not_strand_history() {
+        let base = spawn_relay().await;
+        let workspace = Uuid::new_v4().to_string();
+        let k0 = hive_core::derive_workspace_key("epoch 0 base");
+        let k1 = hive_core::e2ee::generate_workspace_key().unwrap();
+
+        // A seals a snapshot under epoch 0, rotates to epoch 1, seals a message.
+        let mut store_a = EventStore::open_in_memory().unwrap();
+        let (sid, wid) = seed_chat(&mut store_a);
+        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(k0);
+        assert_eq!(sync_a.push_new(&store_a).await.unwrap(), 1); // snapshot @ epoch 0
+
+        store_a
+            .ingest(&SessionEventEnvelope::new(
+                sid,
+                wid,
+                2,
+                SessionEvent::MessageAppended {
+                    message: ChatMessage::new(MessageRole::User, "A", "after rotation"),
+                },
+            ))
+            .unwrap();
+        sync_a.add_key(1, k1); // epoch 1 is now the highest → new events seal under it
+        assert_eq!(sync_a.push_new(&store_a).await.unwrap(), 1); // message @ epoch 1
+
+        // B holds only epoch 0: reads the epoch-0 snapshot; the epoch-1 message is
+        // undecodable and retained (not permanently skipped — phase 7).
+        let mut store_b = EventStore::open_in_memory().unwrap();
+        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(k0);
+        sync_b.pull(&mut store_b).await.unwrap();
+        let sb = store_b.load_session(sid).unwrap().expect("snapshot synced");
+        assert_eq!(sb.title, "Shared", "epoch-0 content is readable");
+        assert_eq!(sb.messages.len(), 0, "epoch-1 message not yet readable");
+
+        // Epoch 1 reaches B. It reads the message AND still reads epoch-0 history —
+        // both keys are retained, so the rotation stranded nothing.
+        sync_b.add_key(1, k1);
+        sync_b.pull(&mut store_b).await.unwrap();
+        let sb = store_b.load_session(sid).unwrap().unwrap();
+        assert_eq!(sb.title, "Shared", "epoch-0 history still readable after rotation");
+        assert_eq!(sb.messages.len(), 1, "epoch-1 message now readable");
+        assert_eq!(sb.messages[0].body, "after rotation");
     }
 
     #[tokio::test]
