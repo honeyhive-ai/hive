@@ -98,7 +98,7 @@ impl OpenAiClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api { status, body });
+            return Err(ProviderError::Api { provider: "openai", status, body });
         }
 
         let mut assembled = String::new();

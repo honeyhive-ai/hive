@@ -16,8 +16,15 @@ const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 pub enum ProviderError {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("anthropic API error ({status}): {body}")]
-    Api { status: u16, body: String },
+    // `ProviderError` is shared by every provider client (anthropic, openai,
+    // claude_code…), so the label must name the *actual* provider — otherwise an
+    // OpenAI quota error reads as "anthropic API error".
+    #[error("{provider} API error ({status}): {body}")]
+    Api {
+        provider: &'static str,
+        status: u16,
+        body: String,
+    },
     #[error("stream decode error: {0}")]
     Decode(String),
     #[error("subprocess error: {0}")]
@@ -184,7 +191,7 @@ impl AnthropicClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api { status, body });
+            return Err(ProviderError::Api { provider: "anthropic", status, body });
         }
 
         let mut assembled = String::new();
@@ -276,7 +283,7 @@ impl AnthropicClient {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            return Err(ProviderError::Api { status, body });
+            return Err(ProviderError::Api { provider: "anthropic", status, body });
         }
         let value: Value = resp.json().await.map_err(ProviderError::Http)?;
         Ok(parse_messages_response(&value))
