@@ -1113,7 +1113,6 @@ const Bubble = memo(function Bubble({
                 </IconAction>
                 {reactOpen && (
                   <EmojiPicker
-                    align={isUser ? "right" : "left"}
                     onPick={(emoji) => {
                       onReact(messageId, emoji);
                       setReactOpen(false);

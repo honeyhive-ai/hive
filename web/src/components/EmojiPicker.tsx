@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 // Full offline emoji picker for message reactions. The ~1900-emoji dataset
 // (unicode-emoji-json) is loaded via dynamic import so it lands in its own
@@ -43,7 +43,17 @@ export function EmojiPicker({
   const [groups, setGroups] = useState<EmojiGroup[] | null>(null);
   const [query, setQuery] = useState("");
   const [recent, setRecent] = useState<string[]>(loadRecent);
+  const [dir, setDir] = useState<"up" | "down">("up");
   const inputRef = useRef<HTMLInputElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // Default to opening upward (reactions usually happen near the bottom of the
+  // log); flip downward when the panel would clip the top of the viewport
+  // (message near the top). Re-measured when the dataset loads and grows it.
+  useLayoutEffect(() => {
+    const r = rootRef.current?.getBoundingClientRect();
+    if (r && r.top < 8) setDir("down");
+  }, [groups]);
 
   useEffect(() => {
     let alive = true;
@@ -90,7 +100,10 @@ export function EmojiPicker({
 
   return (
     <div
-      className="absolute bottom-full z-30 mb-1 flex w-[288px] flex-col rounded-xl border shadow-xl"
+      ref={rootRef}
+      className={`absolute z-30 flex w-[288px] flex-col rounded-xl border shadow-xl ${
+        dir === "up" ? "bottom-full mb-1" : "top-full mt-1"
+      }`}
       style={{
         borderColor: "var(--hive-line)",
         background: "var(--hive-panel)",
