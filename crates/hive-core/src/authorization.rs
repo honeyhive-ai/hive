@@ -75,7 +75,12 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         | SessionEvent::ProposalVoteCast { .. }
         | SessionEvent::VaultSourcesUpdated { .. }
         | SessionEvent::WorkflowDefinitionsUpdated { .. }
-        | SessionEvent::WorkflowRunUpserted { .. } => WorkspaceRole::Contributor,
+        | SessionEvent::WorkflowRunUpserted { .. }
+        // Any member may publish their own account key / device certificate; the
+        // roster only trusts a self-consistent chain (cert signed by the account
+        // key), so a lower floor here can't forge trust.
+        | SessionEvent::AccountKeyRegistered { .. }
+        | SessionEvent::DeviceCertificateAdded { .. } => WorkspaceRole::Contributor,
         // A newer-client event this build can't author or interpret — require
         // the highest role so it can never be produced locally by accident.
         SessionEvent::Unknown => WorkspaceRole::Owner,

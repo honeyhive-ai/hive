@@ -187,6 +187,38 @@ impl EventStore {
         Ok(env)
     }
 
+    /// The envelopes that feed the trust roster (membership + account-key /
+    /// device-cert events + snapshots), across all sessions. Cheap — filtered by
+    /// `kind`. Consumed by `envelope_verifier::build_roster` to verify signatures
+    /// on ingest without any network.
+    pub fn roster_envelopes(&self) -> Result<Vec<SessionEventEnvelope>> {
+        self.query_envelopes(
+            "SELECT envelope_json FROM events \
+             WHERE kind IN ('accountKeyRegistered','deviceCertificateAdded','memberAdded','memberRemoved','sessionSnapshot') \
+             ORDER BY row_id ASC",
+            [],
+        )
+    }
+
+    /// Whether this workspace already carries a device certificate binding
+    /// `device_id` to `account_id` — so identity publication stays idempotent
+    /// (and re-publishes once when the account id changes, e.g. GitHub sign-in).
+    pub fn has_device_certificate(
+        &self,
+        workspace_id: Uuid,
+        device_id: Uuid,
+        account_id: Uuid,
+    ) -> Result<bool> {
+        let envs = self.query_envelopes(
+            "SELECT envelope_json FROM events WHERE workspace_id = ?1 AND kind = 'deviceCertificateAdded'",
+            [workspace_id.to_string()],
+        )?;
+        Ok(envs.iter().any(|e| {
+            matches!(&e.payload, SessionEvent::DeviceCertificateAdded { certificate }
+                if certificate.device_id == device_id && certificate.account_id == account_id)
+        }))
+    }
+
     /// Whether an envelope with this `event_id` is already stored (dedup).
     pub fn has_event(&self, event_id: Uuid) -> Result<bool> {
         let n: i64 = self.conn.query_row(

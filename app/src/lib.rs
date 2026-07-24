@@ -4666,13 +4666,14 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
     let identity = IdentityStore::new(&data_dir, FileKeyVault::new(&data_dir));
     let stored = identity.bootstrap("You", "you", "This device").map_err(map_err)?;
     let device_kp = identity.device_keypair(stored.device.id).map_err(map_err)?;
+    let account_kp = identity.account_keypair(stored.account.id).map_err(map_err)?;
 
     let db_path = data_dir.join("hive.db");
     let store = EventStore::open(&db_path).map_err(map_err)?;
     // NB: chunk-row pruning (one-time DB shrink) is deferred to a background
     // thread after the window is live — see `run()`. Running it here scanned
     // the events table on every launch and blocked first paint.
-    let service = ChatService::new(store, stored.device.id, device_kp, stored.account.actor());
+    let service = ChatService::new(store, stored.device.id, device_kp, account_kp, stored.account.actor());
 
     let workspace_root = std::env::current_dir()
         .map(|p| p.to_string_lossy().to_string())

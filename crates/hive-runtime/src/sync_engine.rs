@@ -15,6 +15,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::event_store::EventStore;
+use crate::envelope_verifier::{build_roster, verdict_for, Verdict};
 use crate::relay_client::{RelayClient, RelayError};
 
 #[derive(Debug, thiserror::Error)]
@@ -175,19 +176,39 @@ impl SyncEngine {
         store: &mut EventStore,
         fetched: &[(u64, Value)],
     ) -> Result<usize, SyncError> {
-        let mut applied = 0;
+        // Decode the contiguous openable prefix (phase 7: stop at the first body
+        // we can't open, so a missing-key event is retried, not skipped).
+        let mut decoded: Vec<(u64, SessionEventEnvelope)> = Vec::new();
         for (seq, body) in fetched {
             match self.decode(body)? {
-                Some(env) => {
-                    self.seen.insert(env.event_id);
-                    if store.ingest(&env)? {
-                        applied += 1;
-                    }
-                    // Durably ingested (or a known duplicate) — safe to advance.
-                    self.last_fetched_seq = self.last_fetched_seq.max(*seq);
-                }
+                Some(env) => decoded.push((*seq, env)),
                 None => break,
             }
+        }
+
+        // Verify-on-ingest (S1): build the trust roster from what we already hold
+        // plus the trust events in this batch, then classify each envelope. The
+        // policy is non-bricking: reject only the *provably bad* (bad signature,
+        // revoked device, impersonation); merely-unverifiable events (unsigned,
+        // or from a device whose cert we haven't seen yet) are accepted and
+        // re-checked as the roster grows — never dropped.
+        let mut roster_src = store.roster_envelopes()?;
+        roster_src.extend(decoded.iter().map(|(_, e)| e.clone()));
+        let roster = build_roster(&roster_src);
+
+        let mut applied = 0;
+        for (seq, env) in &decoded {
+            if let Verdict::Quarantine(reason) = verdict_for(&roster, env) {
+                tracing::warn!(?reason, event_id = %env.event_id, "quarantined a fetched event");
+                // Provably bad and stable — advance past it (re-fetching won't help).
+                self.last_fetched_seq = self.last_fetched_seq.max(*seq);
+                continue;
+            }
+            self.seen.insert(env.event_id);
+            if store.ingest(env)? {
+                applied += 1;
+            }
+            self.last_fetched_seq = self.last_fetched_seq.max(*seq);
         }
         Ok(applied)
     }
@@ -376,6 +397,98 @@ mod tests {
         sync_b.set_key(key);
         assert_eq!(sync_b.pull(&mut store_b).await.unwrap(), 2);
         assert_eq!(store_b.load_session(sid).unwrap().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn apply_fetched_rejects_provably_bad_keeps_good() {
+        use hive_core::crypto::{DeviceCertificate, SigningKeypair};
+        use hive_core::identity::{ActorIdentity, ActorKind, ActorStamp, WorkspaceMember, WorkspaceRole};
+        use hive_core::Timestamp;
+
+        let account = SigningKeypair::generate().unwrap();
+        let account_id = Uuid::new_v4();
+        let device = SigningKeypair::generate().unwrap();
+        let device_id = Uuid::new_v4();
+        let cert = DeviceCertificate::issue(
+            &account,
+            account_id,
+            device_id,
+            &device.public_key_bytes(),
+            Timestamp::epoch(),
+        );
+        let member = WorkspaceMember {
+            id: account_id.to_string(),
+            actor: ActorIdentity {
+                id: account_id.to_string(),
+                display_name: "A".into(),
+                kind: ActorKind::Human,
+                account_id: Some(account_id),
+                device_id: Some(device_id),
+                git_email: None,
+                key_agreement_public: None,
+            },
+            role: WorkspaceRole::Owner,
+            title: String::new(),
+            index: 1,
+            joined_at: Timestamp::epoch(),
+        };
+
+        // A content event signed by `device`, stamping `claim` as the author.
+        let content = |lamport: i64, claim: Uuid| -> SessionEventEnvelope {
+            let mut e = SessionEventEnvelope::new(
+                Uuid::nil(),
+                Uuid::nil(),
+                lamport,
+                SessionEvent::SessionTitleChanged { title: format!("t{lamport}") },
+            );
+            e.actor_stamp = Some(ActorStamp {
+                actor: ActorIdentity {
+                    id: claim.to_string(),
+                    display_name: "A".into(),
+                    kind: ActorKind::Human,
+                    account_id: Some(claim),
+                    device_id: Some(device_id),
+                    git_email: None,
+                    key_agreement_public: None,
+                },
+                recorded_at: Timestamp::epoch(),
+            });
+            hive_core::sign_envelope(&mut e, device_id, &device);
+            e
+        };
+
+        let good = content(100, account_id);
+        let mut tampered = content(101, account_id);
+        tampered.sequence = 9999; // breaks the signature
+        let spoof = content(102, Uuid::new_v4()); // stamps a different account
+
+        let plain = |lamport: i64, payload: SessionEvent| {
+            SessionEventEnvelope::new(Uuid::nil(), Uuid::nil(), lamport, payload)
+        };
+        let all: Vec<SessionEventEnvelope> = vec![
+            plain(1, SessionEvent::MemberAdded { member }),
+            plain(2, SessionEvent::AccountKeyRegistered {
+                account_id,
+                signing_public_key: account.public_key_bytes().to_vec(),
+            }),
+            plain(3, SessionEvent::DeviceCertificateAdded { certificate: cert }),
+            good.clone(),
+            tampered.clone(),
+            spoof.clone(),
+        ];
+        let batch: Vec<(u64, Value)> = all
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i as u64 + 1, serde_json::to_value(e).unwrap()))
+            .collect();
+
+        let mut store = EventStore::open_in_memory().unwrap();
+        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string());
+        eng.apply_fetched(&mut store, &batch).unwrap();
+
+        assert!(store.has_event(good.event_id).unwrap(), "valid signed event ingested");
+        assert!(!store.has_event(tampered.event_id).unwrap(), "tampered event rejected");
+        assert!(!store.has_event(spoof.event_id).unwrap(), "impersonating event rejected");
     }
 
     #[tokio::test]

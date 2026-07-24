@@ -9,7 +9,7 @@
 //! `complete_assistant_message` from whatever produces the deltas (the
 //! Anthropic client in production, synthetic chunks in tests).
 
-use hive_core::crypto::sign_envelope;
+use hive_core::crypto::{sign_envelope, DeviceCertificate};
 use hive_core::events::MemberRoleChange;
 use hive_core::{
     ActionProposal, ActorIdentity, ActorStamp, ChatMessage, ChatSession, MessageReaction,
@@ -40,6 +40,9 @@ pub struct ChatService {
     store: EventStore,
     device_id: Uuid,
     keypair: SigningKeypair,
+    /// The account signing keypair — signs this device's certificate and is
+    /// published (as a public key) so peers can verify events from this device.
+    account_keypair: SigningKeypair,
     author: ActorIdentity,
 }
 
@@ -48,12 +51,14 @@ impl ChatService {
         store: EventStore,
         device_id: Uuid,
         keypair: SigningKeypair,
+        account_keypair: SigningKeypair,
         author: ActorIdentity,
     ) -> Self {
         Self {
             store,
             device_id,
             keypair,
+            account_keypair,
             author,
         }
     }
@@ -185,7 +190,51 @@ impl ChatService {
                 session: Box::new(session),
             },
         )?;
+        // Publish this device's identity so peers can verify events it authors.
+        self.publish_identity(id, workspace_id)?;
         Ok(self.load(id)?.expect("session exists after snapshot"))
+    }
+
+    /// Publish this device's trust events into a workspace — an
+    /// `AccountKeyRegistered` (the account's signing public key) and a
+    /// `DeviceCertificateAdded` (this device's certificate, freshly issued under
+    /// the account's *current* id so it stays consistent across a GitHub sign-in
+    /// that changes the id). Peers fold these into their device roster
+    /// (`envelope_verifier::build_roster`) to verify signatures. Idempotent per
+    /// (workspace, device, account); a no-op when the actor has no account id
+    /// (a local-only session with no verifiable identity). Returns whether it
+    /// published.
+    pub fn publish_identity(&mut self, session_id: Uuid, workspace_id: Uuid) -> Result<bool> {
+        let Some(account_id) = self.author.account_id else {
+            return Ok(false);
+        };
+        if self
+            .store
+            .has_device_certificate(workspace_id, self.device_id, account_id)?
+        {
+            return Ok(false);
+        }
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::AccountKeyRegistered {
+                account_id,
+                signing_public_key: self.account_keypair.public_key_bytes().to_vec(),
+            },
+        )?;
+        let certificate = DeviceCertificate::issue(
+            &self.account_keypair,
+            account_id,
+            self.device_id,
+            &self.keypair.public_key_bytes(),
+            Timestamp::now(),
+        );
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::DeviceCertificateAdded { certificate },
+        )?;
+        Ok(true)
     }
 
     /// Record a user message. Returns the stored message.
@@ -398,20 +447,26 @@ impl ChatService {
             m.actor.id == self.author.id
                 || (self.author.account_id.is_some() && m.actor.account_id == self.author.account_id)
         });
-        if already {
-            return Ok(false);
-        }
-        let next_index = session.members.iter().map(|m| m.index).max().unwrap_or(0) + 1;
-        let member = WorkspaceMember {
-            id: self.author.id.clone(),
-            actor: self.author.clone(),
-            role: WorkspaceRole::Contributor,
-            title: String::new(),
-            index: next_index,
-            joined_at: Timestamp::now(),
+        let added = if already {
+            false
+        } else {
+            let next_index = session.members.iter().map(|m| m.index).max().unwrap_or(0) + 1;
+            let member = WorkspaceMember {
+                id: self.author.id.clone(),
+                actor: self.author.clone(),
+                role: WorkspaceRole::Contributor,
+                title: String::new(),
+                index: next_index,
+                joined_at: Timestamp::now(),
+            };
+            self.add_member(session_id, workspace_id, member)?;
+            true
         };
-        self.add_member(session_id, workspace_id, member)?;
-        Ok(true)
+        // Publish this device's identity so peers can verify our events. Runs
+        // even when already a member (idempotent) — and re-publishes once after a
+        // GitHub sign-in changes the account id.
+        self.publish_identity(session_id, workspace_id)?;
+        Ok(added)
     }
 
     /// Rename the session (manual, or auto-generated from the first exchange).
@@ -802,8 +857,10 @@ mod tests {
         let kp = SigningKeypair::generate().unwrap();
         let public = kp.public_key_bytes().to_vec();
         let device_id = Uuid::new_v4();
+        let account_kp = SigningKeypair::generate().unwrap();
+        // No account id → publish_identity is a no-op (local-only, unverifiable).
         let author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
-        (ChatService::new(store, device_id, kp, author), public)
+        (ChatService::new(store, device_id, kp, account_kp, author), public)
     }
 
     #[test]
@@ -829,6 +886,49 @@ mod tests {
             .unwrap();
         assert!(env.lamport > 500, "authored lamport {} not causal", env.lamport);
         assert!(verify_envelope(&env, &pk).is_ok());
+    }
+
+    #[test]
+    fn create_chat_publishes_verifiable_identity() {
+        use crate::envelope_verifier::{build_roster, verdict_for, Verdict};
+
+        let store = EventStore::open_in_memory().unwrap();
+        let device_kp = SigningKeypair::generate().unwrap();
+        let device_id = Uuid::new_v4();
+        let account_kp = SigningKeypair::generate().unwrap();
+        let account_id = Uuid::new_v4();
+        let author = ActorIdentity {
+            id: account_id.to_string(),
+            display_name: "Alice".into(),
+            kind: hive_core::ActorKind::Human,
+            account_id: Some(account_id),
+            device_id: Some(device_id),
+            git_email: None,
+            key_agreement_public: None,
+        };
+        let mut svc = ChatService::new(store, device_id, device_kp, account_kp, author);
+
+        let chat = svc.create_chat("Demo", Uuid::new_v4(), "anthropic").unwrap();
+        svc.post_user_message(chat.id, chat.workspace_id, "hello").unwrap();
+
+        // A peer folds the synced trust events into a roster and verifies our
+        // events: our device is trusted and our signed message is Valid.
+        let roster = build_roster(&svc.store().roster_envelopes().unwrap());
+        let envs = svc.store().list(chat.id).unwrap();
+        let msg = envs
+            .iter()
+            .find(|e| matches!(e.payload, SessionEvent::MessageAppended { .. }))
+            .expect("message event");
+        assert_eq!(
+            verdict_for(&roster, msg),
+            Verdict::Valid,
+            "our own signed message verifies against the published identity"
+        );
+
+        // Idempotent: publishing again adds nothing.
+        let before = svc.store().roster_envelopes().unwrap().len();
+        assert!(!svc.publish_identity(chat.id, chat.workspace_id).unwrap());
+        assert_eq!(svc.store().roster_envelopes().unwrap().len(), before);
     }
 
     #[test]
