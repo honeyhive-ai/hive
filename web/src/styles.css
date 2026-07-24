@@ -24,7 +24,50 @@
   --hive-danger: rgb(198, 55, 55);
   --hive-warn: rgb(170, 116, 24);
   --hive-overlay: rgba(0, 0, 0, 0.05);
+
+  /* Derived chat-layer tokens (redesign / iteration 2). Built from the base
+     --hive-* tokens with color-mix, so they follow every palette automatically
+     when applyTheme() overrides the base vars — no per-theme wiring needed. */
+  --hive-ink-soft: color-mix(in srgb, var(--hive-ink) 55%, transparent);
+  --hive-hover: color-mix(in srgb, var(--hive-ink) 7%, transparent);
+  --turn-human: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-warm));
+  --turn-agent: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-cool));
+  --turn-shared: var(--hive-mist);
+  --tint-cool: color-mix(in srgb, var(--hive-accent-cool) 14%, transparent);
+  --tint-cool-line: color-mix(in srgb, var(--hive-accent-cool) 38%, transparent);
+  --tint-warm: color-mix(in srgb, var(--hive-accent-warm) 13%, transparent);
+  --tint-warm-line: color-mix(in srgb, var(--hive-accent-warm) 40%, transparent);
 }
+
+/* ================= CHAT LAYER — tinted turn rows (redesign) =================
+   The transcript reads as a column of full-width turns, tinted by author role:
+   human = warm, agent = cool, shared = neutral, system = centered meta. Ported
+   from the redesign spec (transcript.jsx); every color is a palette token. */
+.tt { display: flex; gap: 12px; padding: 14px; border-radius: 12px; border: 1px solid transparent; position: relative; transition: background 0.12s, border-color 0.12s; }
+.tt + .tt { margin-top: 6px; }
+.tt.human { background: var(--turn-human); }
+.tt.agent { background: var(--turn-agent); }
+.tt.shared { background: var(--turn-shared); }
+.tt:hover { border-color: var(--hive-line); }
+.tt.is-stale { opacity: 0.7; }
+.tt-av { padding-top: 1px; flex: none; }
+.tt-body { flex: 1; min-width: 0; }
+.tt-head { display: flex; align-items: baseline; gap: 8px; }
+.tt-name { font-weight: 600; font-size: 14px; }
+.tt-handle { font-weight: 600; font-size: 14px; color: var(--hive-accent-cool); }
+.tt.shared .tt-handle { color: var(--hive-ink); }
+.tt-model { font-size: 11px; color: var(--hive-ink-soft); font-family: ui-monospace, Menlo, monospace; }
+.tt-spacer { flex: 1; }
+.tt-time { font-size: 12px; color: var(--hive-ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tt-attr { font-size: 12px; color: var(--hive-ink-soft); margin-top: 1px; }
+.tt-text { font-size: 14px; margin-top: 8px; line-height: 1.55; }
+.tt-actions { margin-top: 6px; display: flex; align-items: center; gap: 4px; min-height: 24px; }
+.tt-system { text-align: center; font-size: 12px; color: var(--hive-ink-soft); padding: 10px 0; display: flex; align-items: center; gap: 8px; justify-content: center; }
+.tt-system .ln { height: 1px; background: var(--hive-line); flex: 1; max-width: 120px; }
+/* avatars: human = circle, agent = rounded square */
+.av { flex: none; display: grid; place-items: center; color: #fff; font-weight: 600; position: relative; }
+.av.human { border-radius: 50%; }
+.av.agent { border-radius: 30%; }
 
 html,
 body,
