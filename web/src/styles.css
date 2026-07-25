@@ -36,13 +36,20 @@
   --tint-warm-line: color-mix(in srgb, var(--hive-accent-warm) 40%, transparent);
 }
 
-/* ================= CHAT LAYER — flat message rows =================
-   Slack/Buzz-style transcript: no card, no tint, no border. Each turn is a flat
-   row — avatar · bold name · muted time · body — with a full-row hover
-   highlight. Human vs agent is carried by avatar shape (circle vs rounded
-   square) + a cool-accent handle, not by a tinted background. */
-.tt { display: flex; gap: 10px; padding: 5px 14px; position: relative; }
-.tt:hover { background: var(--hive-hover); }
+/* ================= CHAT LAYER — flat rows + whisper tint =================
+   Flat geometry (tight padding, small radius, no border) so turns never read as
+   bubbles — but a WHISPER of tint carries identity per spec §5.3/D10: 8% warm on
+   human, 8% cool on agent, over the panel. Hover deepens the same tint rather
+   than replacing it, so the identity cue survives. Avatar shape (circle/rounded
+   square) + handle color reinforce it. */
+.tt { display: flex; gap: 10px; padding: 6px 12px; border-radius: 8px; position: relative; }
+.tt + .tt { margin-top: 2px; }
+.tt.human { background: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-warm)); }
+.tt.agent { background: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-cool)); }
+.tt.shared { background: var(--hive-mist); }
+.tt.human:hover { background: color-mix(in srgb, var(--hive-panel) 87%, var(--hive-accent-warm)); }
+.tt.agent:hover { background: color-mix(in srgb, var(--hive-panel) 87%, var(--hive-accent-cool)); }
+.tt.shared:hover { background: color-mix(in srgb, var(--hive-mist) 90%, var(--hive-ink)); }
 .tt.is-stale { opacity: 0.6; }
 .tt-av { padding-top: 2px; flex: none; }
 .tt-body { flex: 1; min-width: 0; }

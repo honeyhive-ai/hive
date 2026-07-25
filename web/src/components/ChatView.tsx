@@ -475,6 +475,9 @@ export function ChatView({
       ? "broadcast"
       : routeHit.kind
     : runtimeVia;
+  // Streaming/pending turns are authored by the resolved recipient, never the
+  // literal "Hive" (spec §7.4) — the @mentioned agent, else the runtime's model.
+  const streamAuthor = routeHandle !== "primary" ? routeHandle : currentRuntime?.model?.trim() || "Assistant";
 
   async function selectRuntime(id: string) {
     setRouteOpen(false);
@@ -518,7 +521,7 @@ export function ChatView({
             >
               <div
                 className="flex h-11 w-11 items-center justify-center rounded-2xl"
-                style={{ background: "rgba(87,161,168,0.18)", color: "var(--hive-accent-cool)" }}
+                style={{ background: "color-mix(in srgb, var(--hive-accent-cool) 18%, transparent)", color: "var(--hive-accent-cool)" }}
                 aria-hidden
               >
                 <IconMessage size={22} />
@@ -595,9 +598,9 @@ export function ChatView({
           ))}
           {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} avatarUrl={selfAvatarUrl} />}
           {[...streams.entries()].map(([id, text]) => (
-            <Bubble key={id} role="assistant" author="Hive" body={text} via={runtimeVia} model={currentRuntime?.model || undefined} streaming />
+            <Bubble key={id} role="assistant" author={streamAuthor} body={text} via={runtimeVia} model={currentRuntime?.model || undefined} streaming />
           ))}
-          {sending && streams.size === 0 && <TypingDots label="Hive is thinking" />}
+          {sending && streams.size === 0 && <TypingDots label={`${streamAuthor} is thinking`} />}
           {typingNames.length > 0 && <TypingDots label={typingLabel(typingNames)} />}
         </div>
           {hasNew && !atBottom && (
@@ -617,7 +620,7 @@ export function ChatView({
             className="mx-4 mt-3 flex items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-xs leading-5"
             style={{
               borderColor: "var(--hive-line)",
-              background: "rgba(87,161,168,0.10)",
+              background: "color-mix(in srgb, var(--hive-accent-cool) 10%, transparent)",
             }}
           >
             <span aria-hidden className="mt-px shrink-0 opacity-70" style={{ color: "var(--hive-accent-cool)" }}>
@@ -929,7 +932,7 @@ function TypingDots({ label }: { label: string }) {
   return (
     <div
       className="inline-flex items-center gap-2 rounded-2xl border px-3.5 py-2.5 text-sm"
-      style={{ borderColor: "rgba(87,161,168,0.26)", background: "rgba(87,161,168,0.10)" }}
+      style={{ borderColor: "color-mix(in srgb, var(--hive-accent-cool) 26%, transparent)", background: "color-mix(in srgb, var(--hive-accent-cool) 10%, transparent)" }}
     >
       <span className="opacity-70">{label}</span>
       <span className="inline-flex gap-0.5">
@@ -1004,8 +1007,8 @@ export function ToolCallCards({
                   className="ml-auto shrink-0 rounded-full px-2 py-0.5 text-[0.7rem] font-medium"
                   style={
                     result.isError
-                      ? { background: "rgba(214,90,70,0.16)", color: "var(--hive-danger)" }
-                      : { background: "rgba(34,160,90,0.14)", color: "var(--hive-success)" }
+                      ? { background: "color-mix(in srgb, var(--hive-danger) 16%, transparent)", color: "var(--hive-danger)" }
+                      : { background: "color-mix(in srgb, var(--hive-success) 14%, transparent)", color: "var(--hive-success)" }
                   }
                 >
                   {result.isError ? "error" : "done"}
@@ -1025,7 +1028,7 @@ export function ToolCallCards({
                 <pre
                   className="overflow-x-auto rounded-lg p-2 text-xs"
                   style={{
-                    background: result.isError ? "rgba(214,90,70,0.14)" : "var(--hive-overlay)",
+                    background: result.isError ? "color-mix(in srgb, var(--hive-danger) 14%, transparent)" : "var(--hive-overlay)",
                     border: "1px solid var(--hive-line)",
                   }}
                 >
