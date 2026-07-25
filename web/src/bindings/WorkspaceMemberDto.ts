@@ -21,4 +21,9 @@ index: number,
  * True when this member is the local user. The People list hides "you"
  * (you're shown in the identity card), so it shows only collaborators.
  */
-isSelf: boolean, };
+isSelf: boolean, 
+/**
+ * Optional avatar image (`data:` URL) the member chose; rides the synced
+ * roster. Absent = initials-on-color.
+ */
+avatarUrl: string | null, };

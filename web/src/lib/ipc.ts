@@ -188,6 +188,19 @@ export const removeWorkspaceFromList = (path: string) =>
 export const setDisplayName = (name: string) =>
   invoke<void>("set_display_name", { name });
 
+/// Set (or clear, with null) the local user's avatar — a small `data:image` URL.
+/// Rides the synced roster so every member sees it.
+export const setAvatar = (avatar: string | null) =>
+  invoke<void>("set_avatar", { avatar });
+
+/// Set (or clear) an owned agent's avatar image and/or accent color.
+export const setAgentAvatar = (
+  sessionId: string,
+  agentId: string,
+  avatar: string | null,
+  colorHex: string | null,
+) => invoke<void>("set_agent_avatar", { sessionId, agentId, avatar, colorHex });
+
 /// Git email used to attribute commits agents make on this user's behalf.
 export const setGitEmail = (email: string) =>
   invoke<void>("set_git_email", { email });

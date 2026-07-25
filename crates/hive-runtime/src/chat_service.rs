@@ -30,6 +30,8 @@ pub enum ChatError {
     Store(#[from] EventStoreError),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, ChatError>;
@@ -84,6 +86,12 @@ impl ChatService {
     /// keep their original author (the log is immutable).
     pub fn set_author_display_name(&mut self, name: impl Into<String>) {
         self.author.display_name = name.into();
+    }
+
+    /// Set (or clear) the avatar carried on this user's identity, so new
+    /// messages stamp it and it rides the synced roster to every member.
+    pub fn set_author_avatar(&mut self, avatar_url: Option<String>) {
+        self.author.avatar_url = avatar_url.filter(|u| !u.is_empty());
     }
 
     /// Set the git email carried on this user's identity (for commit
@@ -387,6 +395,41 @@ impl ChatService {
         } else {
             agents.push(agent);
         }
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::AgentRosterUpdated { agents },
+        )?;
+        Ok(())
+    }
+
+    /// Set an agent's avatar (image `data:` URL and/or accent color), emitting
+    /// the full new roster. Only the agent's owner may edit it; a mismatch is a
+    /// no-op error. Passing `None` for a field clears it.
+    pub fn set_agent_avatar(
+        &mut self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        agent_id: Uuid,
+        avatar_url: Option<String>,
+        avatar_color_hex: Option<String>,
+    ) -> Result<()> {
+        let mut agents = self
+            .load(session_id)?
+            .map(|s| s.workspace_agents)
+            .unwrap_or_default();
+        let Some(slot) = agents.iter_mut().find(|a| a.id == agent_id) else {
+            return Err(ChatError::NotFound("unknown agent".into()));
+        };
+        // Owner-only: an unowned agent (empty owner) is editable by anyone who
+        // can reach it; an owned one only by its owner.
+        if !slot.owner_actor_id.is_empty() && slot.owner_actor_id != self.author.id {
+            return Err(ChatError::Unauthorized(
+                "only the agent's owner can change its avatar".into(),
+            ));
+        }
+        slot.avatar_url = avatar_url.filter(|u| !u.is_empty());
+        slot.avatar_color_hex = avatar_color_hex.filter(|c| !c.is_empty());
         self.append_signed(
             session_id,
             workspace_id,
@@ -905,6 +948,7 @@ mod tests {
             device_id: Some(device_id),
             git_email: None,
             key_agreement_public: None,
+            avatar_url: None,
         };
         let mut svc = ChatService::new(store, device_id, device_kp, account_kp, author);
 

@@ -42,6 +42,7 @@ import {
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonBubbles } from "@/components/Skeleton";
 import { EmojiPicker } from "@/components/EmojiPicker";
+import { Avatar } from "@/components/Avatar";
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
 import { applyStreamDelta, retireStream } from "@/lib/streams";
@@ -124,6 +125,7 @@ export function ChatView({
   // from "You" to the display name once the message lands.
   const appSettings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
   const selfName = appSettings.data?.displayName?.trim() || "You";
+  const selfAvatarUrl = appSettings.data?.avatarUrl ?? undefined;
 
   // Live presence (other users' typing + online), polled while the chat is open
   // — but only when a relay is configured. Solo/relay-less workspaces skip the
@@ -579,6 +581,11 @@ export function ChatView({
               streaming={m.isStreaming}
               via={runtimeVia}
               model={currentRuntime?.model || undefined}
+              // Prefer the avatar stamped/resolved on the message; for the local
+              // user's own turns, fall back to their freshly-set local avatar so
+              // older turns aren't left blank before a re-stamp.
+              avatarUrl={m.authorAvatarUrl ?? (m.author === selfName ? selfAvatarUrl : undefined)}
+              colorHex={m.authorColorHex}
               reactions={m.reactions}
               toolCalls={m.toolCalls}
               toolResults={m.toolResults}
@@ -586,7 +593,7 @@ export function ChatView({
               onRegenerate={m.id === lastAssistantId && !sending && streams.size === 0 ? handleRegenerate : undefined}
             />
           ))}
-          {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} />}
+          {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} avatarUrl={selfAvatarUrl} />}
           {[...streams.entries()].map(([id, text]) => (
             <Bubble key={id} role="assistant" author="Hive" body={text} via={runtimeVia} model={currentRuntime?.model || undefined} streaming />
           ))}
@@ -1033,21 +1040,6 @@ export function ToolCallCards({
   );
 }
 
-// Deterministic avatar color from a name/handle (ported from the redesign).
-const AV_COLORS = ["#3f72a8", "#b5673a", "#5a8f6b", "#8a5a9e", "#c08438", "#4c8aa6", "#a85a6a"];
-function avColor(seed: string): string {
-  let h = 0;
-  for (let i = 0; i < seed.length; i++) h = (h * 31 + seed.charCodeAt(i)) >>> 0;
-  return AV_COLORS[h % AV_COLORS.length];
-}
-// Avatar glyph: up to two letters, `@` stripped, hyphen/underscore = word break
-// (so "@alice-claude" → "AC", "Hive" → "HI"). Ported from the redesign.
-function initials(name: string): string {
-  const cleaned = name.replace(/^@/, "").replace(/[-_]/g, " ");
-  const parts = cleaned.split(/\s+/).filter(Boolean);
-  if (parts.length >= 2) return (parts[0][0] + parts[1][0]).toUpperCase();
-  return cleaned.slice(0, 2).toUpperCase();
-}
 
 const Bubble = memo(function Bubble({
   messageId,
@@ -1058,6 +1050,8 @@ const Bubble = memo(function Bubble({
   streaming = false,
   via,
   model,
+  avatarUrl,
+  colorHex,
   reactions,
   toolCalls,
   toolResults,
@@ -1072,6 +1066,8 @@ const Bubble = memo(function Bubble({
   streaming?: boolean;
   via?: string;
   model?: string;
+  avatarUrl?: string | null;
+  colorHex?: string | null;
   reactions?: { emoji: string; actorId: string; actorDisplayName: string }[];
   toolCalls?: { id: string; name: string; inputJson: string; serverId: string | null }[];
   toolResults?: { callId: string; content: string; isError: boolean }[];
@@ -1139,13 +1135,13 @@ const Bubble = memo(function Bubble({
       style={streaming ? undefined : { contentVisibility: "auto", containIntrinsicSize: "0 80px" }}
     >
       <div className="tt-av">
-        <div
-          className={`av ${isUser ? "human" : "agent"}`}
-          style={{ width: 30, height: 30, background: avColor(author), fontSize: 12 }}
-          aria-hidden
-        >
-          {initials(author)}
-        </div>
+        <Avatar
+          name={author}
+          url={avatarUrl}
+          colorHex={colorHex}
+          kind={isUser ? "human" : "agent"}
+          size={30}
+        />
       </div>
 
       <div className="tt-body">

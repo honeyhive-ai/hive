@@ -15,6 +15,7 @@ import {
 import type { UtilityPane } from "@/components/RightRail";
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonRows } from "@/components/Skeleton";
+import { Avatar } from "@/components/Avatar";
 import { confirmDialog } from "@/components/Dialog";
 import {
   IconPlus,
@@ -389,9 +390,7 @@ export function Sidebar({
                   onClick={() => onOpenUtilityPane("people")}
                   className="flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left hover:bg-white/5"
                 >
-                  <div className="flex h-9 w-9 items-center justify-center rounded-full bg-white/18 text-sm font-semibold">
-                    {member.displayName.slice(0, 1).toUpperCase()}
-                  </div>
+                  <Avatar name={member.displayName} url={member.avatarUrl} kind="human" size={36} />
                   <div className="min-w-0">
                     <div className="truncate text-base font-medium">{member.displayName}</div>
                     <div className="truncate text-sm opacity-60">{member.title || member.role}</div>

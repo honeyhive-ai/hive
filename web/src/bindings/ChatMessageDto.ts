@@ -22,4 +22,13 @@ toolCalls: Array<ToolCallDto>,
 /**
  * Tool results carried by this (user-role) turn, keyed back to a call id.
  */
-toolResults: Array<ToolResultDto>, };
+toolResults: Array<ToolResultDto>, 
+/**
+ * The author's avatar image (`data:` URL) for this turn — from the stamped
+ * actor identity (humans) or the agent roster (agents). None = initials.
+ */
+authorAvatarUrl: string | null, 
+/**
+ * The author's avatar accent color (`#rrggbb`), when set. None = derived.
+ */
+authorColorHex: string | null, };

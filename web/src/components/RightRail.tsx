@@ -28,6 +28,7 @@ import {
   listVaults,
   previewVault,
   removeAgent,
+  setAgentAvatar,
   removeMcpServer,
   removeSkill,
   removeVault,
@@ -39,6 +40,8 @@ import {
   type RuntimeSummaryDto,
 } from "@/lib/ipc";
 import { LogsView } from "@/components/LogsView";
+import { Avatar } from "@/components/Avatar";
+import { fileToAvatarDataUrl } from "@/lib/avatar";
 import { toast, errMsg } from "@/components/Toast";
 import { confirmThen } from "@/lib/confirm";
 import { Button, IconButton } from "@/components/ui";
@@ -238,10 +241,63 @@ function ToolsPane({
           {(agents.data ?? []).map((agent) => (
             <div key={agent.id} className="rounded-2xl border px-3 py-3" style={panelStyle}>
               <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="font-medium">@{agent.name}</div>
-                  <div className="mt-1 text-xs opacity-60">
-                    {agent.runtimeId} · {agent.role || "agent"}
+                <div className="flex min-w-0 items-start gap-2.5">
+                  <label
+                    className="group/av relative cursor-pointer"
+                    title="Upload an avatar for this agent"
+                  >
+                    <Avatar
+                      name={agent.name}
+                      url={agent.avatarUrl}
+                      colorHex={agent.avatarColorHex}
+                      kind="agent"
+                      size={32}
+                    />
+                    <span
+                      className="absolute inset-0 flex items-center justify-center rounded-[30%] text-[9px] font-semibold text-white opacity-0 transition-opacity group-hover/av:opacity-100"
+                      style={{ background: "rgba(0,0,0,0.45)" }}
+                    >
+                      Edit
+                    </span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        e.target.value = "";
+                        if (!file) return;
+                        try {
+                          const url = await fileToAvatarDataUrl(file);
+                          await setAgentAvatar(sessionId, agent.id, url, null);
+                          qc.invalidateQueries({ queryKey: ["agents", sessionId] });
+                          toast.success("Agent avatar updated.");
+                        } catch (err) {
+                          toast.error(`Couldn't set avatar: ${errMsg(err)}`);
+                        }
+                      }}
+                    />
+                  </label>
+                  <div className="min-w-0">
+                    <div className="font-medium">@{agent.name}</div>
+                    <div className="mt-1 text-xs opacity-60">
+                      {agent.runtimeId} · {agent.role || "agent"}
+                    </div>
+                    {agent.avatarUrl && (
+                      <button
+                        onClick={async () => {
+                          try {
+                            await setAgentAvatar(sessionId, agent.id, null, null);
+                            qc.invalidateQueries({ queryKey: ["agents", sessionId] });
+                          } catch (err) {
+                            toast.error(`Couldn't clear avatar: ${errMsg(err)}`);
+                          }
+                        }}
+                        className="mt-1 text-xs opacity-60 hover:opacity-100"
+                      >
+                        Remove avatar
+                      </button>
+                    )}
                   </div>
                 </div>
                 <button
@@ -626,11 +682,17 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
             return (
               <div key={member.id} className="rounded-2xl border px-3 py-3" style={panelStyle}>
                 <div className="flex items-center gap-2 font-medium">
-                  <span
-                    className="inline-block h-2 w-2 shrink-0 rounded-full"
-                    style={{ background: online ? "var(--hive-success)" : "var(--hive-line)" }}
-                    title={sync.data?.relayConfigured ? (online ? "Online" : "Offline") : "Presence needs a relay"}
-                  />
+                  <span className="relative shrink-0">
+                    <Avatar name={member.displayName} url={member.avatarUrl} kind="human" size={26} />
+                    <span
+                      className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full"
+                      style={{
+                        background: online ? "var(--hive-success)" : "var(--hive-line)",
+                        boxShadow: "0 0 0 2px var(--hive-panel)",
+                      }}
+                      title={sync.data?.relayConfigured ? (online ? "Online" : "Offline") : "Presence needs a relay"}
+                    />
+                  </span>
                   {member.displayName}
                   {dup && (
                     <span className="text-xs opacity-50" title={`Mention precisely with @${member.displayName}#${member.index}`}>

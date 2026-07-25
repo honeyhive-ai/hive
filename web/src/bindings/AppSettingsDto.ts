@@ -7,4 +7,8 @@ export type AppSettingsDto = { displayName: string,
 /**
  * Git email used to attribute commits agents make on this user's behalf.
  */
-gitEmail: string, deviceName: string, workspaceRoot: string, knownWorkspaces: Array<string>, model: string, gitBranch: string | null, gitDirtyCount: number, };
+gitEmail: string, deviceName: string, workspaceRoot: string, knownWorkspaces: Array<string>, model: string, gitBranch: string | null, gitDirtyCount: number, 
+/**
+ * The local user's chosen avatar (`data:` URL), or None for initials.
+ */
+avatarUrl: string | null, };

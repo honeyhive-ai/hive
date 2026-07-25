@@ -171,6 +171,11 @@ pub struct HumanAccount {
     pub display_name: String,
     pub handle: String,
     pub signing_public_key: Vec<u8>,
+    /// Optional avatar (bounded `data:image/…` URL). Persisted locally with the
+    /// account; flows into `actor()` so it rides the synced roster and shows to
+    /// every member. `None` = deterministic initials-on-color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
     #[serde(default)]
     pub created_at: Timestamp,
 }
@@ -186,6 +191,7 @@ impl HumanAccount {
             device_id: None,
             git_email: None,
             key_agreement_public: None,
+            avatar_url: self.avatar_url.clone(),
         }
     }
 }

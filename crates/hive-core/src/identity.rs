@@ -51,6 +51,13 @@ pub struct ActorIdentity {
     /// member's device when revoking access. See `crate::e2ee`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_agreement_public: Option<Vec<u8>>,
+    /// Optional avatar as a bounded `data:image/…` URL. Rides in the synced
+    /// roster (like `key_agreement_public`) so every member renders the actor's
+    /// chosen picture, not just a deterministic color. Kept small at the edit
+    /// boundary (client resizes; the command size-caps) so it doesn't bloat the
+    /// event log. `None` = fall back to initials-on-color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
 }
 
 impl ActorIdentity {
@@ -63,6 +70,7 @@ impl ActorIdentity {
             device_id: None,
             git_email: None,
             key_agreement_public: None,
+            avatar_url: None,
         }
     }
 }

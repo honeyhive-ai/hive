@@ -816,7 +816,18 @@ fn role_name(role: WorkspaceRole) -> &'static str {
     }
 }
 
-fn message_dto(m: &ChatMessage) -> ChatMessageDto {
+fn message_dto(m: &ChatMessage, agents: &[WorkspaceAgent]) -> ChatMessageDto {
+    // Resolve the author's avatar. Humans carry it on their stamped, synced
+    // actor identity, so a teammate's picture rides in with their message. Agent
+    // turns have no personal identity stamp, so resolve from the roster by name.
+    let (author_avatar_url, author_color_hex) = match m.actor_identity.as_ref().and_then(|a| a.avatar_url.clone()) {
+        Some(url) => (Some(url), None),
+        None => agents
+            .iter()
+            .find(|ag| ag.name == m.author)
+            .map(|ag| (ag.avatar_url.clone(), ag.avatar_color_hex.clone()))
+            .unwrap_or((None, None)),
+    };
     ChatMessageDto {
         id: m.id.to_string(),
         role: role_str(m.role).to_string(),
@@ -852,6 +863,8 @@ fn message_dto(m: &ChatMessage) -> ChatMessageDto {
                 is_error: r.is_error,
             })
             .collect(),
+        author_avatar_url,
+        author_color_hex,
     }
 }
 
@@ -893,7 +906,7 @@ fn session_dto(s: &ChatSession) -> ChatSessionDto {
         id: s.id.to_string(),
         title: s.title.clone(),
         runtime_id: s.runtime_id.clone(),
-        messages: s.messages.iter().map(message_dto).collect(),
+        messages: s.messages.iter().map(|m| message_dto(m, &s.workspace_agents)).collect(),
     }
 }
 
@@ -903,6 +916,9 @@ fn agent_dto(a: &WorkspaceAgent) -> WorkspaceAgentDto {
         name: a.name.clone(),
         runtime_id: a.runtime_id.clone(),
         role: a.role.clone(),
+        owner_actor_id: a.owner_actor_id.clone(),
+        avatar_url: a.avatar_url.clone(),
+        avatar_color_hex: a.avatar_color_hex.clone(),
     }
 }
 
@@ -1322,6 +1338,7 @@ fn member_dto(m: &WorkspaceMember, self_actor_id: &str) -> WorkspaceMemberDto {
         title: m.title.clone(),
         index: m.index,
         is_self: m.actor.id == self_actor_id,
+        avatar_url: m.actor.avatar_url.clone(),
     }
 }
 
@@ -1779,6 +1796,8 @@ fn add_agent(
     );
     agent.role = role;
     let mut svc = state.service.lock().unwrap();
+    // Stamp ownership so only the creator can later edit the agent's avatar.
+    agent.owner_actor_id = svc.author().id.clone();
     svc.add_agent(id, state.active_workspace_id(), agent).map_err(map_err)
 }
 
@@ -4115,12 +4134,12 @@ fn open_path_in_editor(
 fn get_app_settings(state: State<AppState>) -> Result<AppSettingsDto, String> {
     let root = state.workspace_root.lock().unwrap().clone();
     let known_workspaces = load_workspace_index(&state.data_dir);
-    let display_name = state
-        .identity
-        .load()
-        .map_err(map_err)?
-        .map(|s| s.account.display_name)
+    let loaded = state.identity.load().map_err(map_err)?;
+    let display_name = loaded
+        .as_ref()
+        .map(|s| s.account.display_name.clone())
         .unwrap_or_else(|| "You".to_string());
+    let avatar_url = loaded.as_ref().and_then(|s| s.account.avatar_url.clone());
     let git_email = state.settings.lock().unwrap().git_email.clone().unwrap_or_default();
     // NB: git status is intentionally NOT computed here — it shells out to `git`
     // (expensive, especially on Windows where process spawn is slow) and was
@@ -4136,6 +4155,7 @@ fn get_app_settings(state: State<AppState>) -> Result<AppSettingsDto, String> {
         model: state.fallback_model.lock().unwrap().clone(),
         git_branch: None,
         git_dirty_count: 0,
+        avatar_url,
     })
 }
 
@@ -4437,6 +4457,58 @@ fn set_display_name(state: State<AppState>, name: String) -> Result<(), String> 
         .lock()
         .unwrap()
         .set_author_display_name(name.trim());
+    Ok(())
+}
+
+/// A bounded `data:image/…` URL fit to ride the synced event log. Avatars fan
+/// out to every member, so the cap is tighter than the workspace icon's 512 KB;
+/// the frontend already resizes to a small square before calling this. `None`
+/// passes through (clears the avatar).
+fn validate_avatar_data_url(url: &Option<String>) -> Result<(), String> {
+    if let Some(u) = url {
+        if !u.starts_with("data:image/") {
+            return Err("avatar must be a data:image/… URL".to_string());
+        }
+        // ~96 KB of base64 ≈ 72 KB raw — ample for a 128px square, and small
+        // enough that it doesn't bloat the E2EE log it syncs through.
+        if u.len() > 96 * 1024 {
+            return Err("avatar is too large (max ~96 KB); use a smaller image".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Set (or clear, with `None`) the local user's avatar. Persists it on the
+/// account and updates the live author so new messages stamp it — the avatar
+/// then rides the synced roster to every member.
+#[tauri::command]
+fn set_avatar(state: State<AppState>, avatar: Option<String>) -> Result<(), String> {
+    validate_avatar_data_url(&avatar)?;
+    state.identity.update_avatar(avatar.clone()).map_err(map_err)?;
+    state.service.lock().unwrap().set_author_avatar(avatar);
+    Ok(())
+}
+
+/// Set (or clear) an agent's avatar — owner-only, propagated to every member via
+/// the roster event.
+#[tauri::command]
+fn set_agent_avatar(
+    state: State<AppState>,
+    session_id: String,
+    agent_id: String,
+    avatar: Option<String>,
+    color_hex: Option<String>,
+) -> Result<(), String> {
+    validate_avatar_data_url(&avatar)?;
+    let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let aid = Uuid::parse_str(&agent_id).map_err(map_err)?;
+    let wid = state.active_workspace_id();
+    state
+        .service
+        .lock()
+        .unwrap()
+        .set_agent_avatar(sid, wid, aid, avatar, color_hex)
+        .map_err(map_err)?;
     Ok(())
 }
 
@@ -6109,6 +6181,7 @@ async fn invite_by_handle(
                 device_id: None,
                 git_email: None,
                 key_agreement_public: recipients.first().map(|(_, b)| b.clone()),
+                avatar_url: None,
             },
             role: WorkspaceRole::Contributor,
             title: String::new(),
@@ -7027,6 +7100,8 @@ pub fn run() {
             read_workspace_file,
             remove_workspace_from_list,
             set_display_name,
+            set_avatar,
+            set_agent_avatar,
             open_in_editor,
             get_file_diff_sides,
             detect_editors,

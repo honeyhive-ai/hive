@@ -21,6 +21,7 @@ import {
   removeRuntime,
   setDefaultRuntime,
   setDisplayName,
+  setAvatar,
   setGitEmail,
   p2pMyCode,
   p2pListContacts,
@@ -80,6 +81,8 @@ import {
 } from "@/lib/icons";
 import { Button } from "@/components/ui";
 import { toast, errMsg } from "@/components/Toast";
+import { Avatar } from "@/components/Avatar";
+import { fileToAvatarDataUrl } from "@/lib/avatar";
 import { confirmThen } from "@/lib/confirm";
 import { promptDialog } from "@/components/Dialog";
 import { loadTemplates, addTemplate, removeTemplate, type PromptTemplate } from "@/lib/templates";
@@ -212,8 +215,57 @@ function IdentitySection() {
     }
   }
 
+  async function pickAvatar(file: File | undefined) {
+    if (!file) return;
+    try {
+      const url = await fileToAvatarDataUrl(file);
+      await setAvatar(url);
+      qc.invalidateQueries({ queryKey: ["settings"] });
+      toast.success("Avatar updated.");
+    } catch (e) {
+      toast.error(`Couldn't set avatar: ${errMsg(e)}`);
+    }
+  }
+  async function clearAvatar() {
+    try {
+      await setAvatar(null);
+      qc.invalidateQueries({ queryKey: ["settings"] });
+    } catch (e) {
+      toast.error(`Couldn't clear avatar: ${errMsg(e)}`);
+    }
+  }
+
   return (
     <Section title="Identity">
+      <div className="mb-4 flex items-center gap-3">
+        <label className="group/av relative cursor-pointer" title="Upload an avatar">
+          <Avatar name={settings.data?.displayName || name || "You"} url={settings.data?.avatarUrl} kind="human" size={52} />
+          <span
+            className="absolute inset-0 flex items-center justify-center rounded-full text-[10px] font-semibold text-white opacity-0 transition-opacity group-hover/av:opacity-100"
+            style={{ background: "rgba(0,0,0,0.45)" }}
+          >
+            Edit
+          </span>
+          <input
+            type="file"
+            accept="image/*"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              void pickAvatar(f);
+            }}
+          />
+        </label>
+        <div className="text-xs opacity-60">
+          <div>Your avatar is shown to everyone in the workspace.</div>
+          {settings.data?.avatarUrl && (
+            <button onClick={() => void clearAvatar()} className="mt-1 opacity-80 hover:opacity-100 underline">
+              Remove
+            </button>
+          )}
+        </div>
+      </div>
       <label className="block text-sm opacity-70">Display name</label>
       <input
         value={name}
