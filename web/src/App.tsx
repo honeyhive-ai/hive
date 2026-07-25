@@ -32,7 +32,7 @@ const DiffView = lazy(() => import("@/components/DiffView").then((m) => ({ defau
 const WorkflowBuilder = lazy(() =>
   import("@/components/WorkflowBuilder").then((m) => ({ default: m.WorkflowBuilder })),
 );
-import { SettingsView, type SettingsTab } from "@/components/SettingsView";
+import { SettingsView, parseSettingsTab, type SettingsTab } from "@/components/SettingsView";
 import { RightRail } from "@/components/RightRail";
 import { Onboarding } from "@/components/Onboarding";
 import { ToastHost, toast, errMsg } from "@/components/Toast";
@@ -55,7 +55,7 @@ import {
   type ThemeName,
 } from "@/lib/theme";
 
-type View = "workspace" | "settings" | "friends";
+type View = "workspace" | "friends";
 type CanvasMode = "chat" | "diff";
 type UtilityPane =
   | "tools"
@@ -106,18 +106,19 @@ export function App() {
   const [palette, setPaletteState] = useState<ThemeName>(loadTheme());
   const [appearanceMode, setAppearanceModeState] = useState<AppearanceMode>(loadMode());
   const [view, setView] = useState<View>("workspace");
-  // Which Settings tab to open on, plus a nonce so each open (including repeat
-  // tray clicks) remounts SettingsView on the requested tab.
-  const [settingsTab, setSettingsTab] = useState<SettingsTab>("Account");
+  // Settings is a presented sheet over the workspace, not a view — opening it
+  // never unmounts the chat behind it. A nonce remounts the sheet so a repeat
+  // open (including repeat tray clicks) re-applies the requested tab.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("account");
   const [settingsNonce, setSettingsNonce] = useState(0);
 
-  // Open Settings on a given tab. Bumping the nonce remounts SettingsView so a
-  // repeat request (e.g. a second tray click) re-applies the requested tab even
-  // when Settings is already on screen.
-  function openSettings(tab: SettingsTab = "Account") {
-    setSettingsTab(tab);
+  // Open the Settings sheet on a given tab. Accepts new ids, legacy names, or a
+  // deep-link fragment (parseSettingsTab normalizes them).
+  function openSettings(tab: string = "account") {
+    setSettingsTab(parseSettingsTab(tab));
     setSettingsNonce((n) => n + 1);
-    setView("settings");
+    setSettingsOpen(true);
   }
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -264,6 +265,13 @@ export function App() {
         return;
       }
 
+      // ⌘, opens Settings (the platform-standard preferences shortcut).
+      if (event.key === ",") {
+        event.preventDefault();
+        openSettings();
+        return;
+      }
+
       if (event.key === "0") {
         event.preventDefault();
         setUiScale(DEFAULT_UI_SCALE);
@@ -317,7 +325,7 @@ export function App() {
       } else if (route === "workspace") {
         setView("workspace");
       } else if (route.startsWith("settings")) {
-        const tab = route.includes(":") ? (route.split(":")[1] as SettingsTab) : "Account";
+        const tab = route.includes(":") ? route.split(":")[1] : "account";
         openSettings(tab);
       }
     });
@@ -500,7 +508,7 @@ export function App() {
         sidebarVisible={sidebarVisible}
         onToggleSidebar={() => setSidebarVisible((v) => !v)}
         onOpenSettings={() => openSettings()}
-        settingsActive={view === "settings"}
+        settingsActive={settingsOpen}
       />
       <AddWorkspaceModal open={addWsOpen} onClose={() => setAddWsOpen(false)} />
       {sidebarVisible && (
@@ -550,16 +558,7 @@ export function App() {
       )}
 
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        {view === "settings" ? (
-          <SettingsView
-            key={`settings-${settingsNonce}`}
-            initialTab={settingsTab}
-            palette={palette}
-            onPaletteChange={setPalette}
-            appearanceMode={appearanceMode}
-            onAppearanceModeChange={setAppearanceMode}
-          />
-        ) : view === "friends" ? (
+        {view === "friends" ? (
           <FriendsView
             onOpenSettings={(tab) => openSettings(tab)}
             onOpenDm={() => {
@@ -689,6 +688,20 @@ export function App() {
           </>
         )}
       </main>
+
+      {/* Settings presents OVER the workspace — the chat behind it stays mounted.
+          The nonce remounts the sheet so a repeat open re-applies the tab. */}
+      {settingsOpen && (
+        <SettingsView
+          key={`settings-${settingsNonce}`}
+          initialTab={settingsTab}
+          palette={palette}
+          onPaletteChange={setPalette}
+          appearanceMode={appearanceMode}
+          onAppearanceModeChange={setAppearanceMode}
+          onClose={() => setSettingsOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -705,11 +718,11 @@ function PaneResizeHandle({
       role="separator"
       aria-orientation="vertical"
       aria-label={ariaLabel}
-      className="relative w-1.5 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-white/10 active:bg-white/15"
+      className="relative w-1.5 shrink-0 cursor-col-resize bg-transparent transition-colors hover:bg-[color:var(--hive-overlay)] active:bg-[color:var(--hive-overlay)]"
       style={{ touchAction: "none" }}
       onPointerDown={onPointerDown}
     >
-      <span className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-white/15" />
+      <span className="pointer-events-none absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-[color:var(--hive-line)]" />
     </div>
   );
 }
@@ -797,7 +810,7 @@ function ChatHeaderBar({
               background: mode === t.id ? "var(--hive-panel)" : "transparent",
               color: "var(--hive-ink)",
               opacity: mode === t.id ? 1 : 0.55,
-              boxShadow: mode === t.id ? "0 1px 2px rgba(0,0,0,0.08)" : undefined,
+              boxShadow: mode === t.id ? "0 1px 2px color-mix(in srgb, var(--hive-ink) 12%, transparent)" : undefined,
             }}
           >
             {t.label}
@@ -810,8 +823,12 @@ function ChatHeaderBar({
         aria-pressed={utilityPaneVisible}
         className="shrink-0 rounded-xl border px-3 py-1 text-sm font-medium transition-colors"
         style={{
-          borderColor: utilityPaneVisible ? "rgba(87,161,168,0.4)" : "var(--hive-line)",
-          background: utilityPaneVisible ? "rgba(87,161,168,0.18)" : "var(--hive-mist)",
+          borderColor: utilityPaneVisible
+            ? "color-mix(in srgb, var(--hive-accent-cool) 40%, transparent)"
+            : "var(--hive-line)",
+          background: utilityPaneVisible
+            ? "color-mix(in srgb, var(--hive-accent-cool) 18%, transparent)"
+            : "var(--hive-mist)",
           color: "var(--hive-ink)",
         }}
       >
