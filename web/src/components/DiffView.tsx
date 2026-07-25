@@ -247,7 +247,7 @@ export function DiffView() {
                     style={{
                       background: sideBySide === t.id ? "var(--hive-panel)" : "transparent",
                       opacity: sideBySide === t.id ? 1 : 0.55,
-                      boxShadow: sideBySide === t.id ? "0 1px 2px rgba(0,0,0,0.08)" : undefined,
+                      boxShadow: sideBySide === t.id ? "0 1px 2px color-mix(in srgb, var(--hive-ink) 8%, transparent)" : undefined,
                     }}
                   >
                     {t.label}

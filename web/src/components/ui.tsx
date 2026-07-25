@@ -367,7 +367,7 @@ export function ChatRow({
   unread?: number;
   active?: boolean;
   onClick?: () => void;
-  onOptions?: () => void;
+  onOptions?: (anchor: HTMLElement) => void;
   menu?: ReactNode;
   avatars?: ReactNode;
   sub?: ReactNode;
@@ -408,7 +408,10 @@ export function ChatRow({
       </button>
       {onOptions && (
         <button
-          onClick={onOptions}
+          onClick={(e) => {
+            e.stopPropagation();
+            onOptions(e.currentTarget);
+          }}
           aria-label="Chat options"
           title="Chat options"
           className="absolute right-1.5 top-1.5 grid h-[22px] w-[22px] place-items-center rounded-md opacity-0 transition-opacity hover:bg-[color:var(--hive-overlay)] group-hover/crow:opacity-100"

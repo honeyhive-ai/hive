@@ -25,17 +25,17 @@ import { RailFrame, Stack, EmptyHint, panelStyle, fieldStyle } from "@/component
 export function statusTone(status: string): { color: string; background: string } {
   switch (status) {
     case "running":
-      return { color: "var(--hive-accent-cool)", background: "rgba(90,120,255,0.12)" };
+      return { color: "var(--hive-accent-cool)", background: "color-mix(in srgb, var(--hive-accent-cool) 12%, transparent)" };
     case "awaitingApproval":
     case "awaitingGate":
-      return { color: "var(--hive-warn)", background: "rgba(220,160,40,0.14)" };
+      return { color: "var(--hive-warn)", background: "color-mix(in srgb, var(--hive-accent-warm) 14%, transparent)" };
     case "succeeded":
     case "completed":
-      return { color: "var(--hive-success)", background: "rgba(34,160,90,0.14)" };
+      return { color: "var(--hive-success)", background: "color-mix(in srgb, var(--hive-success) 14%, transparent)" };
     case "failed":
     case "rejected":
     case "halted":
-      return { color: "var(--hive-danger)", background: "rgba(200,70,70,0.14)" };
+      return { color: "var(--hive-danger)", background: "color-mix(in srgb, var(--hive-danger) 14%, transparent)" };
     default: // pending, skipped, canceled
       return { color: "var(--hive-ink)", background: "var(--hive-overlay)" };
   }
@@ -265,14 +265,14 @@ function RunCard({ sessionId, run }: { sessionId: string; run: WorkflowRunDto })
             <span className="opacity-70">“{n.name}” needs your decision:</span>
             <button
               className="rounded-lg px-2.5 py-1 font-medium"
-              style={{ background: "rgba(34,160,90,0.2)", color: "var(--hive-success)" }}
+              style={{ background: "color-mix(in srgb, var(--hive-success) 20%, transparent)", color: "var(--hive-success)" }}
               onClick={() => act(async () => void (await voteProposal(sessionId, n.proposalId!, true)))}
             >
               Approve
             </button>
             <button
               className="rounded-lg px-2.5 py-1 font-medium"
-              style={{ background: "rgba(200,70,70,0.18)", color: "var(--hive-danger)" }}
+              style={{ background: "color-mix(in srgb, var(--hive-danger) 18%, transparent)", color: "var(--hive-danger)" }}
               onClick={() => act(async () => void (await voteProposal(sessionId, n.proposalId!, false)))}
             >
               Reject

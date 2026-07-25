@@ -131,7 +131,7 @@ export function AddWorkspaceModal({ open, onClose }: { open: boolean; onClose: (
     <Modal
       onClose={onClose}
       overlayClassName="z-[900] flex items-center justify-center p-4"
-      overlayStyle={{ background: "rgba(0,0,0,0.5)" }}
+      overlayStyle={{ background: "color-mix(in srgb, var(--hive-ink) 45%, transparent)" }}
       panelClassName="w-full max-w-md rounded-2xl border p-5 shadow-2xl"
       panelStyle={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)", color: "var(--hive-ink)" }}
     >
@@ -142,7 +142,7 @@ export function AddWorkspaceModal({ open, onClose }: { open: boolean; onClose: (
         </button>
       </div>
 
-      <div className="mb-4 flex gap-1 rounded-lg p-1" style={{ background: "rgba(127,127,127,0.12)" }}>
+      <div className="mb-4 flex gap-1 rounded-lg p-1" style={{ background: "color-mix(in srgb, var(--hive-ink) 12%, transparent)" }}>
         {(["create", "join"] as Tab[]).map((t) => (
           <button
             key={t}
@@ -266,7 +266,7 @@ export function AddWorkspaceModal({ open, onClose }: { open: boolean; onClose: (
                   </button>
                   <button
                     className="underline opacity-70 hover:opacity-100"
-                    style={{ color: "#ff5a5f" }}
+                    style={{ color: "var(--hive-danger)" }}
                     onClick={() => leave(w)}
                   >
                     Leave

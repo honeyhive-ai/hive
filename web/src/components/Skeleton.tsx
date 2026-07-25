@@ -41,7 +41,9 @@ export function SkeletonBubbles({ count = 3 }: { count?: number }) {
               <div
                 className={`w-full border px-4 py-3 ${isUser ? "rounded-2xl rounded-tr-sm" : "rounded-2xl rounded-tl-sm"}`}
                 style={{
-                  background: isUser ? "rgba(214,158,87,0.10)" : "rgba(87,161,168,0.08)",
+                  background: isUser
+                    ? "color-mix(in srgb, var(--hive-accent-warm) 10%, transparent)"
+                    : "color-mix(in srgb, var(--hive-accent-cool) 8%, transparent)",
                   borderColor: "var(--hive-line)",
                 }}
               >

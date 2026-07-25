@@ -140,7 +140,7 @@ export function FriendsView({
         >
           <div
             className="flex h-11 w-11 items-center justify-center rounded-2xl"
-            style={{ background: "rgba(87,161,168,0.18)", color: "var(--hive-accent-cool)" }}
+            style={{ background: "color-mix(in srgb, var(--hive-accent-cool) 18%, transparent)", color: "var(--hive-accent-cool)" }}
             aria-hidden
           >
             <IconUsers size={20} />
@@ -266,7 +266,7 @@ export function FriendsView({
               <button
                 onClick={() => remove(f.accountId, f.login)}
                 className="text-xs opacity-0 transition-opacity group-hover:opacity-100"
-                style={{ color: "#ff5a5f" }}
+                style={{ color: "var(--hive-danger)" }}
               >
                 Remove
               </button>

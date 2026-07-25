@@ -1,10 +1,11 @@
-import type { ReactNode } from "react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
+import type { CSSProperties } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   archiveChat,
   createChat,
   deleteChat,
+  getAppSettings,
   listAgents,
   listChats,
   listMembers,
@@ -18,17 +19,54 @@ import { SkeletonRows } from "@/components/Skeleton";
 import { Avatar } from "@/components/Avatar";
 import { confirmDialog } from "@/components/Dialog";
 import {
+  NavRow,
+  ChatRow,
+  SectionCap,
+  EmptyHint,
+  Popover,
+  PopoverHeader,
+  PopoverItem,
+} from "@/components/ui";
+import {
   IconPlus,
   IconCheck,
-  IconEllipsis,
-  IconChevronRight,
-  IconChevronDown,
+  IconMessage,
+  IconUsers,
+  IconWrench,
+  IconInbox,
+  IconActivity,
+  IconSparkle,
+  IconBook,
+  IconFlow,
+  IconGrid,
+  IconGear,
 } from "@/lib/icons";
 
 /// Last path segment of a folder path (cross-platform separators).
 function folderBasename(path: string): string {
   return path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
 }
+
+/// Compact relative time for chat rows ("now", "5m", "3h", "2d", "4w").
+function relTime(iso: string): string {
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "";
+  const s = Math.floor((Date.now() - t) / 1000);
+  if (s < 60) return "now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d`;
+  const w = Math.floor(d / 7);
+  if (w < 5) return `${w}w`;
+  const mo = Math.floor(d / 30);
+  if (mo < 12) return `${mo}mo`;
+  return `${Math.floor(d / 365)}y`;
+}
+
+type ChatFilter = "all" | "recent";
 
 export function Sidebar({
   width,
@@ -65,7 +103,7 @@ export function Sidebar({
 }) {
   const qc = useQueryClient();
   const chats = useQuery({ queryKey: ["chats"], queryFn: listChats });
-  // Workspace scope (Personal / rooms) now lives in the WorkspaceRail.
+  const settings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
   const members = useQuery({
     queryKey: ["members", sessionId],
     queryFn: () => listMembers(sessionId ?? ""),
@@ -86,18 +124,33 @@ export function Sidebar({
     queryFn: () => listSkills(sessionId ?? ""),
     enabled: Boolean(sessionId),
   });
+
   const [showArchived, setShowArchived] = useState(false);
+  const [filter, setFilter] = useState<ChatFilter>("all");
+  const [search, setSearch] = useState("");
   const [menuFor, setMenuFor] = useState<string | null>(null);
+  const menuAnchor = useRef<HTMLElement | null>(null);
   const [showWorkspaceMenu, setShowWorkspaceMenu] = useState(false);
+  const wsAnchor = useRef<HTMLButtonElement | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
   const [workspaceBusy, setWorkspaceBusy] = useState(false);
 
   const all: ChatSummaryDto[] = chats.data ?? [];
-  const visible = useMemo(
-    () => all.filter((c) => c.archived === showArchived),
-    [all, showArchived],
-  );
+  const visible = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    let out = all.filter((c) => c.archived === showArchived);
+    if (q) out = out.filter((c) => (c.title || "Untitled").toLowerCase().includes(q));
+    if (filter === "recent") {
+      out = [...out].sort(
+        (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
+      );
+    }
+    return out;
+  }, [all, showArchived, search, filter]);
+  const menuChat = menuFor ? visible.find((c) => c.id === menuFor) ?? null : null;
   const canRemoveCurrentWorkspace = workspacePath.trim().length > 0;
+  const memberCount = (members.data ?? []).filter((m) => !m.isSelf).length;
+  const deviceName = settings.data?.deviceName ?? "";
 
   async function handleWorkspaceAdd() {
     if (workspaceBusy) return;
@@ -105,6 +158,7 @@ export function Sidebar({
     setWorkspaceError(null);
     try {
       await onAddWorkspace();
+      setShowWorkspaceMenu(false);
     } catch (error) {
       setWorkspaceError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -118,6 +172,7 @@ export function Sidebar({
     setWorkspaceError(null);
     try {
       await onRemoveWorkspace(workspacePath);
+      setShowWorkspaceMenu(false);
     } catch (error) {
       setWorkspaceError(error instanceof Error ? error.message : String(error));
     } finally {
@@ -146,396 +201,242 @@ export function Sidebar({
   }
 
   async function handleDelete(c: ChatSummaryDto) {
-    const ok = await confirmDialog(`Permanently delete "${c.title}"? This cannot be undone.`, {
+    setMenuFor(null);
+    const ok = await confirmDialog(`Permanently delete "${c.title || "Untitled"}"? This cannot be undone.`, {
       danger: true,
       confirmLabel: "Delete",
     });
     if (!ok) return;
     try {
       await deleteChat(c.id);
-      setMenuFor(null);
       qc.invalidateQueries({ queryKey: ["chats"] });
     } catch (e) {
       toast.error(`Couldn't delete chat: ${errMsg(e)}`);
     }
   }
 
+  // Inside the sidebar, text rides the dedicated sidebar-ink tokens (spec §2)
+  // and hover is a light overlay — so the shared primitives (which reference
+  // --hive-ink/--hive-overlay) render correctly on the dark gradient without
+  // being parameterized.
+  const asideStyle: Record<string, string | number> = {
+    width,
+    background: "linear-gradient(180deg, var(--hive-sidebar-top), var(--hive-sidebar-bottom))",
+    color: "var(--hive-sidebar-ink)",
+    borderColor: "var(--hive-line)",
+    "--hive-ink": "var(--hive-sidebar-ink)",
+    "--hive-ink-soft": "var(--hive-sidebar-ink-muted)",
+    "--hive-overlay": "color-mix(in srgb, var(--hive-sidebar-ink) 10%, transparent)",
+  };
+
   return (
-    <aside
-      className="flex shrink-0 flex-col border-r"
-      style={{
-        width,
-        background: "linear-gradient(180deg, var(--hive-sidebar-top), var(--hive-sidebar-bottom))",
-        color: "var(--hive-sidebar-ink)",
-        borderColor: "rgba(255,255,255,0.06)",
-      }}
-    >
-      <div className="relative border-b px-3.5 py-4" style={{ borderColor: "rgba(255,255,255,0.08)" }}>
-        {/* The rail (left) now owns workspace switching; the working folder is a
-            demoted header property here — a static identity row with a small
-            "Change" link to the folder menu, plus an execution-location chip. */}
-        <div className="flex w-full items-center gap-3">
-          {/* A folder glyph (not the Hive logo) — the rail already shows the
-              workspace's brand icon, so repeating it here read as the logo next
-              to itself. This header is about the working folder. */}
-          <div
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl border opacity-80"
+    <aside className="flex shrink-0 flex-col border-r" style={asideStyle as CSSProperties}>
+      {/* 1 — Workspace header: one identity row (spec §6.2). */}
+      <div className="px-2.5 pt-3 pb-1.5">
+        <button
+          ref={wsAnchor}
+          onClick={() => setShowWorkspaceMenu((v) => !v)}
+          title="Switch workspace folder"
+          className="flex w-full items-center gap-2.5 rounded-xl px-1.5 py-1.5 text-left transition-colors hover:bg-[color:var(--hive-overlay)]"
+        >
+          <span
+            className="grid h-[26px] w-[26px] shrink-0 place-items-center rounded-lg border"
             style={{
-              background: "linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03))",
-              borderColor: "rgba(255,255,255,0.08)",
+              borderColor: "var(--hive-line)",
+              background: "color-mix(in srgb, var(--hive-sidebar-ink) 8%, transparent)",
             }}
+            aria-hidden
           >
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
               <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
             </svg>
-          </div>
-          <div className="min-w-0">
-            <div className="truncate text-xl font-semibold">{workspaceLabel}</div>
-            <div className="truncate text-sm opacity-65">{workspacePath || "No project folder"}</div>
-          </div>
-          <button
-            className="ml-auto shrink-0 rounded-md px-2 py-1 text-xs opacity-65 hover:opacity-95"
-            onClick={() => setShowWorkspaceMenu((value) => !value)}
-            title="Change the working folder"
-          >
-            Change
-          </button>
-        </div>
-
-        {/* Execution-location chip: makes it clear where agent work runs. Local
-            workspaces execute on this device; the dot is the host status. */}
-        <div className="mt-2.5 flex items-center gap-1.5 text-xs opacity-70">
-          {/* Neutral bullet — a green dot implied a live health check we don't do. */}
-          <span className="h-1.5 w-1.5 rounded-full bg-current opacity-60" />
-          <span className="truncate">
-            Runs on this device{workspacePath ? ` · ${folderBasename(workspacePath)}` : ""}
           </span>
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-[13px] font-semibold" style={{ letterSpacing: "-0.01em" }}>
+              {workspaceLabel}
+            </span>
+            <span
+              className="block truncate font-mono text-[11px]"
+              style={{ color: "var(--hive-sidebar-ink-muted)" }}
+            >
+              {workspacePath ? folderBasename(workspacePath) : "No project folder"}
+            </span>
+          </span>
+          <span style={{ color: "var(--hive-sidebar-ink-muted)" }} aria-hidden>
+            <IconChevronDownGlyph />
+          </span>
+        </button>
+        <div
+          className="mt-0.5 flex items-center gap-1.5 px-1.5 text-[11px]"
+          style={{ color: "var(--hive-sidebar-ink-muted)" }}
+        >
+          <span className="h-1.5 w-1.5 rounded-full bg-current opacity-60" aria-hidden />
+          <span className="truncate">Runs on this device</span>
         </div>
         {showWorkspaceMenu && (
-          <div
-            className="absolute left-3 right-3 top-[calc(100%-0.25rem)] z-20 rounded-2xl border p-2 shadow-2xl"
-            style={{ background: "var(--hive-panel)", color: "var(--hive-ink)", borderColor: "var(--hive-line)" }}
-          >
-            <div className="px-2 pb-2 text-[11px] font-semibold uppercase tracking-[0.18em] opacity-55">
-              Project folders
-            </div>
-            <div className="space-y-1">
-              {knownWorkspaces.map((path) => {
-                const label = path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
-                const isCurrent = path === workspacePath;
-                return (
-                  <button
-                    key={path}
-                    onClick={async () => {
-                      await onSwitchWorkspace(path);
-                      setShowWorkspaceMenu(false);
-                    }}
-                    className="flex w-full items-start gap-2 rounded-xl px-2.5 py-2 text-left hover:opacity-85"
-                    style={{ background: isCurrent ? "rgba(87,161,168,0.14)" : "transparent" }}
-                  >
-                    <span className="flex w-4 shrink-0 justify-center pt-0.5 opacity-65">
-                      {isCurrent ? (
-                        <IconCheck size={12} />
-                      ) : (
-                        <span className="mt-1.5 h-1 w-1 rounded-full bg-current opacity-50" />
-                      )}
-                    </span>
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-medium">{label}</span>
-                      <span className="block truncate text-xs opacity-55">{path}</span>
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-            <div className="my-2 border-t" style={{ borderColor: "var(--hive-line)" }} />
-            <div className="space-y-1">
-              <button
-                onClick={handleWorkspaceAdd}
-                disabled={workspaceBusy}
-                className="w-full rounded-xl px-2.5 py-2 text-left text-sm font-medium hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {workspaceBusy ? "Adding…" : "Add project folder…"}
-              </button>
-              <button
-                onClick={handleWorkspaceRemove}
-                disabled={!canRemoveCurrentWorkspace || workspaceBusy}
-                className="w-full rounded-xl px-2.5 py-2 text-left text-sm font-medium hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Remove current folder from list
-              </button>
-              <button
-                onClick={() => {
+          <Popover anchorRef={wsAnchor} minWidth={width - 24} onDismiss={() => setShowWorkspaceMenu(false)}>
+            <PopoverHeader>Project folders</PopoverHeader>
+            {knownWorkspaces.map((path) => (
+              <PopoverItem
+                key={path}
+                glyph={path === workspacePath ? <IconCheck size={13} /> : <span className="h-1 w-1 rounded-full bg-current opacity-50" />}
+                label={folderBasename(path)}
+                active={path === workspacePath}
+                onSelect={async () => {
+                  await onSwitchWorkspace(path);
                   setShowWorkspaceMenu(false);
-                  onOpenSettings();
                 }}
-                className="w-full rounded-xl px-2.5 py-2 text-left text-sm opacity-65 hover:opacity-85"
-              >
-                Workspace Settings…
-              </button>
-              {workspaceError && (
-                <div className="px-2.5 pt-1 text-xs text-red-400">
-                  {workspaceError}
-                </div>
-              )}
-            </div>
-          </div>
+              />
+            ))}
+            <div className="my-1 h-px" style={{ background: "var(--hive-line)" }} />
+            <PopoverItem label={workspaceBusy ? "Adding…" : "Add project folder…"} onSelect={handleWorkspaceAdd} />
+            {canRemoveCurrentWorkspace && (
+              <PopoverItem label="Remove current folder" onSelect={handleWorkspaceRemove} />
+            )}
+            <PopoverItem label="Workspace settings…" onSelect={() => { setShowWorkspaceMenu(false); onOpenSettings(); }} />
+            {workspaceError && (
+              <div className="px-2 pt-1 text-[11px]" style={{ color: "var(--hive-danger)" }}>{workspaceError}</div>
+            )}
+          </Popover>
         )}
       </div>
 
-      <div className="border-b px-3.5 py-3.5" style={{ borderColor: "rgba(255,255,255,0.08)" }}>
-        <div className="flex items-center gap-3">
-          <div
-            className="flex h-10 w-10 items-center justify-center rounded-full text-base font-semibold"
-            style={{ background: "rgba(87,182,122,0.92)", color: "#13201a" }}
-          >
-            {displayName.slice(0, 1).toUpperCase()}
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-base font-semibold">{displayName}</div>
-            <div className="truncate text-sm opacity-65">{displayName.toLowerCase()}</div>
-          </div>
-          {/* No presence dot here: there's no self-presence signal to reflect,
-              and a permanently-green dot reads as a fake status. */}
-        </div>
+      {/* 2 — Search across chats. */}
+      <div className="px-2.5 pb-1">
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search chats"
+          className="w-full rounded-lg border px-2.5 py-1.5 text-[12.5px] outline-none placeholder:opacity-60 focus:border-[color:var(--hive-accent-cool)]"
+          style={{
+            borderColor: "var(--hive-line)",
+            background: "color-mix(in srgb, var(--hive-sidebar-ink) 8%, transparent)",
+            color: "var(--hive-sidebar-ink)",
+          }}
+        />
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2.5">
-        <SidebarSection
-          title="Chats"
-          action={
-            <button
-              onClick={handleNew}
-              className="flex h-6 w-6 items-center justify-center rounded-md opacity-80 transition-opacity hover:opacity-100"
-              title="New chat"
-              aria-label="New chat"
-            >
-              <IconPlus size={15} />
-            </button>
-          }
-          trailing={
-            <button className="text-xs underline opacity-60" onClick={() => setShowArchived((v) => !v)}>
-              {showArchived ? "active" : "archived"}
-            </button>
-          }
-        >
-          <div className="space-y-1">
-            {visible.map((c) => (
-              <div key={c.id} className="group relative">
+      <div className="min-h-0 flex-1 overflow-y-auto px-1.5 py-1">
+        {/* 3 — Views (cross-channel filters). "Needs review" awaits a per-chat
+            review signal on the summary DTO; shipping the two backed filters. */}
+        <NavRow icon={<IconMessage size={15} />} label="All chats" active={filter === "all"} onClick={() => setFilter("all")} count={all.filter((c) => !c.archived).length} />
+        <NavRow icon={<IconActivity size={15} />} label="Recent" active={filter === "recent"} onClick={() => setFilter("recent")} />
+
+        {/* 4 — Chats. (Channel grouping is deferred to the config-hoist schema.) */}
+        <div className="mt-2">
+          <SectionCap
+            action={
+              <div className="flex items-center gap-1.5">
                 <button
-                  onClick={() => onSelect(c.id)}
-                    className="w-full rounded-2xl px-3 py-2.5 text-left"
-                  style={{
-                    background: c.id === selectedId && view === "workspace" ? "rgba(87,161,168,0.18)" : "transparent",
-                  }}
+                  className="text-[11px] opacity-70 hover:opacity-100"
+                  onClick={() => setShowArchived((v) => !v)}
+                  title={showArchived ? "Show active chats" : "Show archived chats"}
                 >
-                  <div className="truncate text-base font-semibold">{c.title}</div>
-                  <div className="mt-1 text-sm opacity-60">{c.messageCount} messages</div>
+                  {showArchived ? "Archived" : "Active"}
                 </button>
-                <button
-                  className="absolute right-2 top-2 rounded-md px-2 py-1 opacity-0 transition-opacity group-hover:opacity-70"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setMenuFor((m) => (m === c.id ? null : c.id));
-                  }}
-                  title="Chat options"
-                  aria-label="Chat options"
-                >
-                  <IconEllipsis size={15} />
-                </button>
-                {menuFor === c.id && (
-                  <div
-                    className="absolute right-2 top-10 z-10 w-32 rounded-xl border py-1 text-xs shadow-lg"
-                    style={{ background: "var(--hive-panel)", color: "var(--hive-ink)", borderColor: "var(--hive-line)" }}
-                  >
-                    <button className="block w-full px-3 py-1.5 text-left hover:opacity-70" onClick={() => handleArchive(c)}>
-                      {c.archived ? "Restore" : "Archive"}
-                    </button>
-                    <button className="block w-full px-3 py-1.5 text-left text-red-500 hover:opacity-70" onClick={() => handleDelete(c)}>
-                      Delete…
-                    </button>
-                  </div>
-                )}
-              </div>
-            ))}
-            {chats.isLoading && <SkeletonRows rows={5} />}
-            {!chats.isLoading && visible.length === 0 && !showArchived && (
-              <div className="rounded-2xl border px-3 py-4 text-sm" style={{ borderColor: "var(--hive-line)" }}>
-                <div className="opacity-60">No chats yet.</div>
                 <button
                   onClick={handleNew}
-                  className="mt-2 rounded-lg px-3 py-1.5 text-xs font-medium text-white"
+                  className="grid h-5 w-5 place-items-center rounded-md opacity-80 hover:bg-[color:var(--hive-overlay)] hover:opacity-100"
+                  title="New chat"
+                  aria-label="New chat"
+                >
+                  <IconPlus size={14} />
+                </button>
+              </div>
+            }
+          >
+            {showArchived ? "Archived" : "Chats"}
+          </SectionCap>
+
+          {chats.isLoading && <SkeletonRows rows={5} />}
+          {!chats.isLoading &&
+            visible.map((c) => (
+              <ChatRow
+                key={c.id}
+                title={c.title || "Untitled"}
+                when={relTime(c.lastActivityAt)}
+                active={c.id === selectedId && view === "workspace"}
+                onClick={() => onSelect(c.id)}
+                onOptions={(el) => {
+                  menuAnchor.current = el;
+                  setMenuFor(c.id);
+                }}
+              />
+            ))}
+          {!chats.isLoading && visible.length === 0 && search.trim() && (
+            <EmptyHint text={`No chats match “${search.trim()}”.`} />
+          )}
+          {!chats.isLoading && visible.length === 0 && !search.trim() && !showArchived && (
+            <EmptyHint
+              text="No chats yet."
+              action={
+                <button
+                  onClick={handleNew}
+                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-white"
                   style={{ background: "var(--hive-accent-cool)" }}
                 >
                   Start a chat
                 </button>
-              </div>
-            )}
-            {!chats.isLoading && visible.length === 0 && showArchived && (
-              <div className="px-3 py-2 text-sm opacity-55">Nothing archived.</div>
-            )}
-          </div>
-        </SidebarSection>
+              }
+            />
+          )}
+          {!chats.isLoading && visible.length === 0 && !search.trim() && showArchived && (
+            <div className="px-2.5 py-2 text-[12px]" style={{ color: "var(--hive-sidebar-ink-muted)" }}>
+              Nothing archived.
+            </div>
+          )}
+        </div>
 
-        <SidebarSection title="People" collapsible>
-          <div className="space-y-2 px-1">
-            {/* Hide "you" — you're shown in the identity card above; People lists
-                collaborators. */}
-            {(members.data ?? [])
-              .filter((m) => !m.isSelf)
-              .slice(0, 4)
-              .map((member) => (
-                <button
-                  key={member.id}
-                  onClick={() => onOpenUtilityPane("people")}
-                  className="flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left hover:bg-white/5"
-                >
-                  <Avatar name={member.displayName} url={member.avatarUrl} kind="human" size={36} />
-                  <div className="min-w-0">
-                    <div className="truncate text-base font-medium">{member.displayName}</div>
-                    <div className="truncate text-sm opacity-60">{member.title || member.role}</div>
-                  </div>
-                </button>
-              ))}
-            {(members.data ?? []).filter((m) => !m.isSelf).length === 0 && (
-              <button
-                onClick={() => onOpenUtilityPane("people")}
-                className="flex w-full items-center justify-between rounded-xl px-2 py-1.5 text-left text-sm opacity-55 transition-opacity hover:bg-white/5 hover:opacity-90"
-              >
-                Invite collaborators
-                <IconChevronRight size={13} />
-              </button>
-            )}
-          </div>
-        </SidebarSection>
-
-        <SidebarSection title="Agents" collapsible>
-          <div className="space-y-2 px-1">
-            {(agents.data ?? []).slice(0, 4).map((agent) => (
-              <button
-                key={agent.id}
-                onClick={() => onOpenUtilityPane("tools")}
-                className="flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left hover:bg-white/5"
-              >
-                <div
-                  className="flex h-9 w-9 items-center justify-center rounded-2xl text-sm font-semibold"
-                  style={{ background: "rgba(214,158,87,0.18)" }}
-                >
-                  {agent.name.slice(0, 1).toUpperCase()}
-                </div>
-                <div className="min-w-0">
-                  <div className="truncate text-base font-medium">@{agent.name}</div>
-                  <div className="truncate text-sm opacity-60">{agent.runtimeId}</div>
-                </div>
-              </button>
-            ))}
-            {(agents.data ?? []).length === 0 && (
-              <button
-                onClick={() => onOpenUtilityPane("tools")}
-                className="flex w-full items-center justify-between rounded-xl px-2 py-1.5 text-left text-sm opacity-55 transition-opacity hover:bg-white/5 hover:opacity-90"
-              >
-                Add an agent
-                <IconChevronRight size={13} />
-              </button>
-            )}
-          </div>
-        </SidebarSection>
-
-        <SidebarNavRow
-          label="Vaults"
-          count={(vaults.data ?? []).length}
-          active={utilityPane === "vaults"}
-          onClick={() => onOpenUtilityPane("vaults")}
-        />
-        <SidebarNavRow
-          label="Skills"
-          count={(skills.data ?? []).length}
-          active={utilityPane === "skills"}
-          onClick={() => onOpenUtilityPane("skills")}
-        />
-        <SidebarNavRow
-          label="Activity"
-          active={utilityPane === "activity"}
-          onClick={() => onOpenUtilityPane("activity")}
-        />
+        {/* 5 — Workspace panes, one NavRow each with live counts. */}
+        <div className="mt-2">
+          <SectionCap>Workspace</SectionCap>
+          <NavRow icon={<IconUsers size={15} />} label="People" count={memberCount} active={utilityPane === "people"} onClick={() => onOpenUtilityPane("people")} />
+          <NavRow icon={<IconWrench size={15} />} label="Agents & tools" count={(agents.data ?? []).length} active={utilityPane === "tools"} onClick={() => onOpenUtilityPane("tools")} />
+          <NavRow icon={<IconInbox size={15} />} label="Review" active={utilityPane === "review"} onClick={() => onOpenUtilityPane("review")} />
+          <NavRow icon={<IconActivity size={15} />} label="Context" active={utilityPane === "context"} onClick={() => onOpenUtilityPane("context")} />
+          <NavRow icon={<IconSparkle size={15} />} label="Skills" count={(skills.data ?? []).length} active={utilityPane === "skills"} onClick={() => onOpenUtilityPane("skills")} />
+          <NavRow icon={<IconBook size={15} />} label="Vaults" count={(vaults.data ?? []).length} active={utilityPane === "vaults"} onClick={() => onOpenUtilityPane("vaults")} />
+          <NavRow icon={<IconFlow size={15} />} label="Workflows" active={utilityPane === "workflows"} onClick={() => onOpenUtilityPane("workflows")} />
+          <NavRow icon={<IconGrid size={15} />} label="Activity" active={utilityPane === "activity"} onClick={() => onOpenUtilityPane("activity")} />
+        </div>
       </div>
 
-      {/* Settings moved to the workspace rail's bottom (gear) so it survives
-          sidebar dismissal; onOpenSettings is still used by the workspace
-          menu's "Workspace Settings…" entry above. */}
+      {/* Chat options menu — one shared Popover for whichever row is open. */}
+      {menuChat && (
+        <Popover anchorRef={menuAnchor} align="right" minWidth={150} onDismiss={() => setMenuFor(null)}>
+          <PopoverItem label={menuChat.archived ? "Restore" : "Archive"} onSelect={() => handleArchive(menuChat)} />
+          <PopoverItem label="Delete…" danger onSelect={() => handleDelete(menuChat)} />
+        </Popover>
+      )}
+
+      {/* 6 — Account row. */}
+      <button
+        onClick={onOpenSettings}
+        className="flex items-center gap-2.5 border-t px-3 py-2.5 text-left transition-colors hover:bg-[color:var(--hive-overlay)]"
+        style={{ borderColor: "var(--hive-line)" }}
+        title="Open settings"
+      >
+        <Avatar name={displayName} url={settings.data?.avatarUrl} kind="human" size={26} />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[12.5px] font-semibold">{displayName}</span>
+          <span className="block truncate text-[11px]" style={{ color: "var(--hive-sidebar-ink-muted)" }}>
+            {deviceName || "This device"}
+          </span>
+        </span>
+        <span style={{ color: "var(--hive-sidebar-ink-muted)" }} aria-hidden>
+          <IconGear size={15} />
+        </span>
+      </button>
     </aside>
   );
 }
 
-function SidebarSection({
-  title,
-  action,
-  trailing,
-  children,
-  collapsible = false,
-}: {
-  title: string;
-  action?: ReactNode;
-  trailing?: ReactNode;
-  children: ReactNode;
-  collapsible?: boolean;
-}) {
-  // Collapse state persists per section so it survives remounts/restarts.
-  const storageKey = `hive.sidebar.collapsed.${title}`;
-  const [collapsed, setCollapsed] = useState(
-    () => typeof window !== "undefined" && window.localStorage.getItem(storageKey) === "1",
-  );
-  const toggle = () =>
-    setCollapsed((c) => {
-      const next = !c;
-      window.localStorage.setItem(storageKey, next ? "1" : "0");
-      return next;
-    });
+/// Small downward chevron used in the workspace header (the icon set's
+/// IconChevronDown expects the same size prop).
+function IconChevronDownGlyph() {
   return (
-    <section className="mb-4">
-      <div className="mb-2 flex items-center px-2">
-        {collapsible ? (
-          <button
-            onClick={toggle}
-            aria-expanded={!collapsed}
-            className="flex items-center gap-1 text-xs font-semibold uppercase tracking-[0.18em] opacity-65 hover:opacity-100"
-          >
-            <span className="opacity-70">
-              {collapsed ? <IconChevronRight size={11} /> : <IconChevronDown size={11} />}
-            </span>
-            {title}
-          </button>
-        ) : (
-          <div className="text-xs font-semibold uppercase tracking-[0.18em] opacity-65">{title}</div>
-        )}
-        <div className="ml-auto flex items-center gap-2">{trailing}{action}</div>
-      </div>
-      {!collapsed && children}
-    </section>
-  );
-}
-
-function SidebarNavRow({
-  label,
-  count,
-  active,
-  onClick,
-}: {
-  label: string;
-  count?: number;
-  active?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className="mb-2 flex w-full items-center justify-between rounded-2xl px-4 py-2.5 text-left hover:bg-white/6"
-      style={{ background: active ? "rgba(255,255,255,0.08)" : "transparent" }}
-    >
-      <span className="text-base font-medium">{label}</span>
-      <span className="flex items-center text-sm opacity-60">
-        {typeof count === "number" ? count : <IconChevronRight size={13} />}
-      </span>
-    </button>
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M6 9l6 6 6-6" />
+    </svg>
   );
 }
