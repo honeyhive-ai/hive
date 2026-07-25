@@ -104,6 +104,9 @@ export function ChatView({
   const [slashActive, setSlashActive] = useState(0);
   // Pending composer attachments (saved to disk; referenced by path on send).
   const [attachments, setAttachments] = useState<{ name: string; path: string; image: boolean }[]>([]);
+  // Composer route pill: the "default recipient when no @mention" popover.
+  const [routeOpen, setRouteOpen] = useState(false);
+  const routeRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef(sessionId);
   sessionRef.current = sessionId;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -456,6 +459,43 @@ export function ChatView({
   // per-message model/provider on ChatMessageDto). Derive a single "via
   // provider/model" attribution line for agent turns from it.
   const runtimeVia = currentRuntime ? runtimePickerLabel(currentRuntime) : undefined;
+
+  // The composer's resolved route (mockup §7.5): the first @mention in the draft
+  // routes the turn; with none, it falls back to @primary (the chat's runtime).
+  const routeMention = input.match(/@([\w-]+)/)?.[1]?.toLowerCase();
+  const routeHit =
+    routeMention && routeMention !== "primary"
+      ? mentionCands.find((c) => c.handle.toLowerCase() === routeMention)
+      : undefined;
+  const routeHandle = routeHit?.handle ?? "primary";
+  const routeVia = routeHit
+    ? routeHit.handle === "all"
+      ? "broadcast"
+      : routeHit.kind
+    : runtimeVia;
+
+  async function selectRuntime(id: string) {
+    setRouteOpen(false);
+    await setChatRuntime(sessionId, id);
+    qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+    qc.invalidateQueries({ queryKey: ["chats"] });
+  }
+
+  useEffect(() => {
+    if (!routeOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (routeRef.current && !routeRef.current.contains(e.target as Node)) setRouteOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setRouteOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [routeOpen]);
   const lastAssistantId = [...messages]
     .reverse()
     .find((m) => m.role === "assistant" || m.role === "agent")?.id;
@@ -538,6 +578,7 @@ export function ChatView({
               createdAt={m.createdAt}
               streaming={m.isStreaming}
               via={runtimeVia}
+              model={currentRuntime?.model || undefined}
               reactions={m.reactions}
               toolCalls={m.toolCalls}
               toolResults={m.toolResults}
@@ -547,7 +588,7 @@ export function ChatView({
           ))}
           {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} />}
           {[...streams.entries()].map(([id, text]) => (
-            <Bubble key={id} role="assistant" author="Hive" body={text} via={runtimeVia} streaming />
+            <Bubble key={id} role="assistant" author="Hive" body={text} via={runtimeVia} model={currentRuntime?.model || undefined} streaming />
           ))}
           {sending && streams.size === 0 && <TypingDots label="Hive is thinking" />}
           {typingNames.length > 0 && <TypingDots label={typingLabel(typingNames)} />}
@@ -594,37 +635,6 @@ export function ChatView({
         )}
 
         <div className="border-t px-4 py-3.5" style={{ borderColor: "var(--hive-line)" }}>
-          <div className="mb-2.5 flex flex-wrap items-center gap-2">
-            <label className="inline-flex min-w-[16rem] items-center gap-2.5 rounded-xl border px-2.5 py-1.5 transition-colors focus-within:border-[color:var(--hive-accent-cool)]" style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}>
-              <span className="shrink-0 text-[10px] font-medium uppercase tracking-[0.12em] opacity-45">
-                Primary runtime
-              </span>
-              <select
-                value={currentRuntimeId}
-                onChange={async (e) => {
-                  await setChatRuntime(sessionId, e.target.value);
-                  qc.invalidateQueries({ queryKey: ["chat", sessionId] });
-                  qc.invalidateQueries({ queryKey: ["chats"] });
-                }}
-                className="min-w-0 flex-1 appearance-none bg-transparent pr-1 text-sm font-medium outline-none"
-                style={{
-                  color: "var(--hive-ink)",
-                  fontFamily: "inherit",
-                }}
-              >
-                {runtimes.map((rt) => (
-                  <option
-                    key={rt.id}
-                    value={rt.id}
-                    title={`${rt.label} (${rt.provider || "provider unknown"}${rt.model ? ` · ${rt.model}` : ""})`}
-                  >
-                    {runtimePickerLabel(rt)}
-                  </option>
-                ))}
-              </select>
-              <span className="opacity-40"><IconChevronDown size={12} /></span>
-            </label>
-          </div>
 
           {attachments.length > 0 && (
             <div className="mb-2 flex flex-wrap gap-2">
@@ -783,7 +793,7 @@ export function ChatView({
                 }
               }}
               rows={1}
-              placeholder="Message Hive or describe the next supervised task…"
+              placeholder="Message the room — @ to route, / for commands…"
               className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm leading-6 outline-none"
               style={{
                 color: "var(--hive-ink)",
@@ -792,6 +802,64 @@ export function ChatView({
               }}
             />
             <div className="flex items-center gap-1 px-2 pb-2">
+              {/* Route pill — the resolved recipient (mockup §7.5). Shows the
+                  draft's first @mention, else @primary + the chat runtime. The
+                  popover switches which runtime is primary. */}
+              <div className="relative" ref={routeRef}>
+                <button
+                  type="button"
+                  onClick={() => setRouteOpen((o) => !o)}
+                  className="inline-flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-xs transition-colors"
+                  style={{
+                    borderColor: routeOpen ? "var(--tint-cool-line)" : "transparent",
+                    background: routeOpen ? "var(--tint-cool)" : "transparent",
+                    color: "var(--hive-ink-soft)",
+                  }}
+                  title="Default recipient"
+                >
+                  <span aria-hidden style={{ color: "var(--hive-accent-cool)" }}>→</span>
+                  <span className="font-semibold" style={{ color: "var(--hive-accent-cool)" }}>@{routeHandle}</span>
+                  {routeVia && <span>· {routeVia}</span>}
+                  <span className="opacity-50"><IconChevronDown size={11} /></span>
+                </button>
+                {routeOpen && (
+                  <div
+                    className="absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border p-1.5 shadow-xl"
+                    style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
+                  >
+                    <div className="px-2 pb-1.5 pt-1 text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--hive-ink-soft)" }}>
+                      Default recipient · when no @mention
+                    </div>
+                    {runtimes.map((rt) => (
+                      <button
+                        key={rt.id}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          void selectRuntime(rt.id);
+                        }}
+                        className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors"
+                        style={{ background: rt.id === currentRuntimeId ? "var(--tint-cool)" : "transparent" }}
+                      >
+                        <span className="route-glyph"><IconWrench size={11} /></span>
+                        <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+                          {rt.id === currentRuntimeId ? "@primary" : rt.label || rt.name}
+                        </span>
+                        <span className="shrink-0 text-xs" style={{ color: "var(--hive-ink-soft)" }}>
+                          {runtimePickerLabel(rt)}
+                        </span>
+                      </button>
+                    ))}
+                    {currentRuntime?.provider === "claude-code" && (
+                      <>
+                        <div className="my-1 h-px" style={{ background: "var(--hive-line)" }} />
+                        <div className="px-2 py-1 text-xs" style={{ color: "var(--hive-ink-soft)" }}>
+                          Claude Code answers with its own tools &amp; permissions, via your Claude subscription.
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
               <label
                 className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg opacity-60 transition-all hover:bg-[color:var(--hive-panel)] hover:opacity-100"
                 title="Attach files"
@@ -820,7 +888,7 @@ export function ChatView({
               <button
                 onClick={handleSend}
                 disabled={sending || (!input.trim() && attachments.length === 0)}
-                className="flex h-8 w-8 items-center justify-center rounded-full text-white shadow-sm transition-all hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-30 disabled:shadow-none disabled:hover:brightness-100"
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-white shadow-sm transition-all hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-30 disabled:shadow-none disabled:hover:brightness-100"
                 style={{ background: "var(--hive-accent-cool)" }}
                 aria-label="Send message"
                 title="Send (Enter)"
@@ -828,6 +896,13 @@ export function ChatView({
                 <IconSend />
               </button>
             </div>
+          </div>
+
+          {/* Footer hint (mockup §7.5) — the affordance legend under the composer. */}
+          <div className="hint">
+            Live — type <span className="kbd">@</span> or <span className="kbd">/</span>, attach with{" "}
+            <span className="kbd">@file</span>, send with <span className="kbd">↵</span>, newline with{" "}
+            <span className="kbd">⇧↵</span>.
           </div>
         </div>
       </div>
@@ -982,6 +1057,7 @@ const Bubble = memo(function Bubble({
   createdAt,
   streaming = false,
   via,
+  model,
   reactions,
   toolCalls,
   toolResults,
@@ -995,6 +1071,7 @@ const Bubble = memo(function Bubble({
   createdAt?: string;
   streaming?: boolean;
   via?: string;
+  model?: string;
   reactions?: { emoji: string; actorId: string; actorDisplayName: string }[];
   toolCalls?: { id: string; name: string; inputJson: string; serverId: string | null }[];
   toolResults?: { callId: string; content: string; isError: boolean }[];
@@ -1074,8 +1151,9 @@ const Bubble = memo(function Bubble({
       <div className="tt-body">
         <div className="tt-head">
           <span className={isUser ? "tt-name" : "tt-handle"}>{author}</span>
-          {timeLabel && <span className="tt-time">{timeLabel}</span>}
+          {!isUser && model && <span className="tt-model">{model}</span>}
           <span className="tt-spacer" />
+          {timeLabel && <span className="tt-time">{timeLabel}</span>}
         </div>
         {via && !isUser && <div className="tt-attr">via {via}</div>}
 
