@@ -128,30 +128,42 @@ export function WorkspaceRail({
       {(workspaces.data ?? []).map((w) => {
         const local = w.kind === "local";
         return (
-          <button
-            key={w.id}
-            onClick={() => select(w.id)}
-            onContextMenu={(e) => {
-              e.preventDefault();
-              setMenu({ ws: w, x: e.clientX, y: e.clientY });
-            }}
-            title={local ? "Personal — right-click to set an icon" : `${w.name} — right-click for options`}
-            className="flex h-10 w-10 items-center justify-center overflow-hidden rounded-2xl text-sm font-semibold transition-all hover:brightness-110"
-            style={{
-              background: w.active ? "var(--hive-accent-cool)" : "var(--hive-panel)",
-              color: w.active ? "#fff" : "var(--hive-ink)",
-              border: w.active ? "none" : "1px solid var(--hive-line)",
-              boxShadow: w.active ? "0 0 0 2px var(--hive-accent-cool)" : "none",
-            }}
-          >
-            {w.iconUrl ? (
-              <img src={w.iconUrl} alt="" className="h-full w-full object-cover" />
-            ) : local ? (
-              <HiveBrandMark size={22} />
-            ) : (
-              <span>{roomInitials(w.name)}</span>
-            )}
-          </button>
+          <div key={w.id} className="relative flex w-full items-center justify-center">
+            {/* Leading-edge pip so the active workspace reads even at a glance,
+                not only by fill (§7.2). */}
+            <span
+              className="absolute left-0 rounded-r-full transition-all"
+              style={{
+                width: 3,
+                height: w.active ? 22 : 0,
+                background: "var(--hive-accent-cool)",
+              }}
+              aria-hidden
+            />
+            <button
+              onClick={() => select(w.id)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ ws: w, x: e.clientX, y: e.clientY });
+              }}
+              title={local ? "Personal — right-click to set an icon" : `${w.name} — right-click for options`}
+              className="flex h-10 w-10 items-center justify-center overflow-hidden text-sm font-semibold transition-all hover:brightness-110"
+              style={{
+                background: w.active ? "var(--hive-accent-cool)" : "var(--hive-panel)",
+                color: w.active ? "#fff" : "var(--hive-ink)",
+                border: w.active ? "none" : "1px solid var(--hive-line)",
+                borderRadius: w.active ? 12 : 18,
+              }}
+            >
+              {w.iconUrl ? (
+                <img src={w.iconUrl} alt="" className="h-full w-full object-cover" />
+              ) : local ? (
+                <HiveBrandMark size={22} />
+              ) : (
+                <span>{roomInitials(w.name)}</span>
+              )}
+            </button>
+          </div>
         );
       })}
       <button
@@ -252,8 +264,8 @@ export function WorkspaceRail({
 function MenuItem({ label, onClick, danger }: { label: string; onClick: () => void; danger?: boolean }) {
   return (
     <button
-      className="block w-full px-3 py-1.5 text-left hover:bg-[rgba(127,127,127,0.15)]"
-      style={danger ? { color: "#ff5a5f" } : undefined}
+      className="block w-full px-3 py-1.5 text-left hover:bg-[color:var(--hive-overlay)]"
+      style={danger ? { color: "var(--hive-danger)" } : undefined}
       onClick={onClick}
     >
       {label}
