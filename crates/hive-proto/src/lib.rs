@@ -487,6 +487,38 @@ pub struct IssuedRelayTokenDto {
     pub raw: String,
 }
 
+/// One unit of queued work: an unanswered agent mention, tagged with the host
+/// its agent is bound to and that host's live status. Surfaces the CLI's `hive
+/// queue` in the desktop Review pane so offline/detached work is visible and
+/// reassignable (spec §12.5).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct QueuedWorkDto {
+    pub session_id: String,
+    pub chat_title: String,
+    pub agent_id: String,
+    pub agent_name: String,
+    /// The host the agent is bound to (empty = the owner's device).
+    pub host_id: String,
+    pub host_label: String,
+    /// "online" (host heartbeating) | "offline" (bound to a stale host) |
+    /// "device" (owner-device, no worker host) | "unknown" (host not found).
+    pub host_status: String,
+}
+
+/// A registered workspace host, for the "run on worker" reassignment menu.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct WorkspaceHostDto {
+    pub id: String,
+    /// "device" | "worker"
+    pub kind: String,
+    pub label: String,
+    pub online: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,5 +560,7 @@ mod tests {
         RelayTokenDto::export_all(&cfg).unwrap();
         RelayUserDto::export_all(&cfg).unwrap();
         IssuedRelayTokenDto::export_all(&cfg).unwrap();
+        QueuedWorkDto::export_all(&cfg).unwrap();
+        WorkspaceHostDto::export_all(&cfg).unwrap();
     }
 }
