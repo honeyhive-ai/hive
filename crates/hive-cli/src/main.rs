@@ -32,10 +32,13 @@ use hive_core::{
     Timestamp, WorkspaceAgent, WorkspaceCredential, WorkspaceHost, WorkspaceRuntime,
 };
 use hive_runtime::{
-    dispatch, parse_mentions, pending_mentions, resolve_workspace_credential, turns_for,
-    ChatService, EventStore, FileKeyVault, IdentityStore, RelayClient, ResolvedRuntime, SyncEngine,
+    parse_mentions, pending_mentions, resolve_workspace_credential, turns_for, ChatService,
+    EventStore, FileKeyVault, IdentityStore, RelayClient, ResolvedRuntime, SyncEngine,
 };
 use uuid::Uuid;
+
+mod mcp_config;
+mod reply;
 
 struct Config {
     data_dir: PathBuf,
@@ -389,9 +392,8 @@ async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Re
             // current-thread runtime (see run()), so this is allowed.
             let turns = turns_for(&s);
             print!("↳ @{name} replying in {} … ", s.id);
-            let reply = dispatch::stream(&rt, Some(&system), &turns, None, &[], 1024, |_| {})
-                .await
-                .map_err(|e| anyhow!("provider: {e}"))?;
+            // MCP tools when HIVE_MCP_CONFIG provisions them, else a plain stream.
+            let reply = reply::generate_reply(&rt, &system, &turns).await?;
             let mid = svc.begin_assistant_message(s.id, s.workspace_id, name.clone(), rt_label.clone())?;
             svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
             seen.insert(mid);
@@ -566,7 +568,8 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
                     agent.name
                 );
                 print!("↳ @{} replying in {} … ", agent.name, s.id);
-                match dispatch::stream(&rt, Some(&system), &turns, None, &[], 1024, |_| {}).await {
+                // MCP tools when HIVE_MCP_CONFIG provisions them, else a plain stream.
+                match reply::generate_reply(&rt, &system, &turns).await {
                     Ok(reply) => {
                         let mid = svc.begin_assistant_message(s.id, s.workspace_id, agent.name.clone(), rt_label.clone())?;
                         svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;

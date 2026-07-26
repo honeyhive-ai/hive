@@ -31,6 +31,7 @@ Everything is env-driven so it drops into a container or a secret mount. A
 | `HIVE_PROVIDER` | For `agent`: `anthropic` (default) \| `openai` \| `openrouter` \| `ollama`. |
 | `HIVE_MODEL` | For `agent`: model id (e.g. `claude-sonnet-4-5`, `gpt-5`). |
 | `HIVE_PROVIDER_API_KEY` | For `agent`: the model key (or provider-specific `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY`). |
+| `HIVE_MCP_CONFIG` | Optional path to an MCP-servers TOML that gives `agent`/`worker` tools (Linear/GitHub boards). Unset → no tools. See [MCP tools](#mcp-tools-for-headless-agents). |
 
 ## Commands
 
@@ -101,6 +102,51 @@ Each `send` is a signed event; the next push syncs it to every member.
 > addressed to you (`@primary` or an un-directed question). Keep replies concise.
 > Re-run `hive sync` before reading so you see the latest. Never invent chat ids —
 > get them from `hive chats`.
+
+## MCP tools for headless agents
+
+`hive agent` and `hive worker` can call **MCP tools** — so a hosted agent reaches
+external boards like **Linear** or **GitHub** — when you point `HIVE_MCP_CONFIG`
+at a TOML file listing MCP servers. Unset (or a missing file) ⇒ no tools ⇒ the
+agent behaves exactly as before (a single streamed completion). When the config
+yields ≥1 tool and the runtime is **Anthropic** with a key, replies run through
+the agentic tool loop (model ↔ tool_use ↔ tool_result, mirroring the app).
+
+```sh
+export HIVE_MCP_CONFIG=/etc/hive/mcp.toml
+# provide each server's token out-of-band (never in the TOML):
+export HIVE_MCP_LINEAR_TOKEN=lin_…   GITHUB_PERSONAL_ACCESS_TOKEN=ghp_…
+hive worker --label prod-box
+```
+
+The file reuses the app's `mcp_servers` table shape:
+
+```toml
+# Remote HTTP/SSE server — bearer token resolved from `token_env` (env, not file).
+[[mcp_servers]]
+id = "linear"
+transport = "http"                     # "http" | "sse" | "stdio"
+url = "https://mcp.linear.app/mcp"
+token_env = "HIVE_MCP_LINEAR_TOKEN"    # NAME of the env var holding the bearer
+
+# Local stdio server — the spawned child inherits the worker's environment,
+# so its provider token is provisioned there (e.g. GITHUB_PERSONAL_ACCESS_TOKEN).
+[[mcp_servers]]
+id = "github"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+# enabled = false                      # servers default to enabled here; opt out per-server
+```
+
+- **The file is the opt-in.** Unlike the app (which gates each server behind a UI
+  toggle), a headless server defaults to `enabled = true` — you wrote and
+  provisioned the file. Set `enabled = false` to keep one inert.
+- **Secrets never live in the TOML.** An http/sse server's bearer is named by
+  `token_env` and read from the worker's environment (same out-of-band convention
+  as `HIVE_WS_SECRET_*`); a stdio server's child inherits the worker env.
+- **Anthropic only** (as in the app) and only when a key resolves; other
+  providers / no key fall back to the plain streamed reply.
 
 ## Workspace-owned runtimes (spec §12.5)
 

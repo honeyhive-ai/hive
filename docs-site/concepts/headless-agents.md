@@ -75,6 +75,12 @@ See the
 [CLI README](https://github.com/honeyhive-ai/hive/blob/main/crates/hive-cli/README.md#the-worker-daemon-spec-124)
 for the full daemon behaviour.
 
+**Give the worker tools.** A worker (or `hive agent`) can reach external boards
+like **Linear** or **GitHub** through MCP tools: point `HIVE_MCP_CONFIG` at a TOML
+listing MCP servers and provision each server's token via the environment (never
+in the file). With no config it runs tool-free, exactly as before. See the
+[CLI README — MCP tools for headless agents](https://github.com/honeyhive-ai/hive/blob/main/crates/hive-cli/README.md#mcp-tools-for-headless-agents).
+
 Do **not** try to substitute a network filesystem (SSHFS/NFS) for the relay —
 SQLite over a network mount is corruption-prone. Use the relay.
 
