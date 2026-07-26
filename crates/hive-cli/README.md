@@ -32,6 +32,7 @@ Everything is env-driven so it drops into a container or a secret mount. A
 | `HIVE_MODEL` | For `agent`: model id (e.g. `claude-sonnet-4-5`, `gpt-5`). |
 | `HIVE_PROVIDER_API_KEY` | For `agent`: the model key (or provider-specific `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `OPENROUTER_API_KEY`). |
 | `HIVE_MCP_CONFIG` | Optional path to an MCP-servers TOML that gives `agent`/`worker` tools (Linear/GitHub boards). Unset → no tools. See [MCP tools](#mcp-tools-for-headless-agents). |
+| `HIVE_MCP_MIN_ROLE` | Minimum **triggering author** role before MCP tools run: `viewer`\|`contributor`\|`admin`\|`owner`. Default `contributor`. See [Requester-role gate](#requester-role-gate-hive_mcp_min_role). |
 
 ## Commands
 
@@ -147,6 +148,28 @@ args = ["-y", "@modelcontextprotocol/server-github"]
   as `HIVE_WS_SECRET_*`); a stdio server's child inherits the worker env.
 - **Anthropic only** (as in the app) and only when a key resolves; other
   providers / no key fall back to the plain streamed reply.
+
+### Requester-role gate (`HIVE_MCP_MIN_ROLE`)
+
+MCP tools run on the **worker's** provider key and MCP servers, so a message that
+triggers a tool call spends the worker owner's credentials and reaches their
+boards. To stop a low-privilege member from driving those tools, the tool loop is
+**gated on the triggering message author's workspace role**. Before offering tools
+for a reply, the worker resolves the author of the user message it is answering
+(via the message's `actor_identity`) and looks up their role in the chat's synced
+member roster. Tools are executed **only** when that role is **≥ `HIVE_MCP_MIN_ROLE`**
+(`viewer` | `contributor` | `admin` | `owner`, case-insensitive; default
+**`contributor`**). Otherwise the agent still replies, but through the **tool-free**
+streamed path — the under-privileged requester simply isn't offered tools — and a
+line is logged to stderr noting the withheld message id and roles.
+
+- **Default:** a workspace **Viewer** can never make the worker execute MCP tools;
+  a **Contributor** or above can. Raise the bar with `HIVE_MCP_MIN_ROLE=admin`
+  (or `owner`) to require more privilege; unknown/absent ⇒ `contributor`.
+- **Fail closed:** if the author can't be resolved (no `actor_identity`), tools are
+  withheld.
+- This gate is independent of the §12.5 workspace-credential enforcement and does
+  not change the non-MCP reply path or reply posting.
 
 ## Workspace-owned runtimes (spec §12.5)
 
