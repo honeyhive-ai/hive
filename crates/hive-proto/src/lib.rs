@@ -54,6 +54,13 @@ pub struct ChatMessageDto {
     /// Tool results carried by this (user-role) turn, keyed back to a call id.
     #[serde(default)]
     pub tool_results: Vec<ToolResultDto>,
+    /// The author's avatar image (`data:` URL) for this turn — from the stamped
+    /// actor identity (humans) or the agent roster (agents). None = initials.
+    #[serde(default)]
+    pub author_avatar_url: Option<String>,
+    /// The author's avatar accent color (`#rrggbb`), when set. None = derived.
+    #[serde(default)]
+    pub author_color_hex: Option<String>,
 }
 
 /// A tool invocation an assistant turn made (MCP or built-in).
@@ -143,6 +150,14 @@ pub struct WorkspaceAgentDto {
     pub name: String,
     pub runtime_id: String,
     pub role: String,
+    /// Actor id of the member who owns this agent (empty if unowned). Only the
+    /// owner may edit the agent's avatar.
+    pub owner_actor_id: String,
+    /// Optional avatar image (`data:` URL); falls back to the color, then to
+    /// initials-on-color when absent.
+    pub avatar_url: Option<String>,
+    /// Optional avatar accent color (`#rrggbb`).
+    pub avatar_color_hex: Option<String>,
 }
 
 /// A configured runtime surfaced to the desktop shell.
@@ -214,6 +229,9 @@ pub struct WorkspaceMemberDto {
     /// True when this member is the local user. The People list hides "you"
     /// (you're shown in the identity card), so it shows only collaborators.
     pub is_self: bool,
+    /// Optional avatar image (`data:` URL) the member chose; rides the synced
+    /// roster. Absent = initials-on-color.
+    pub avatar_url: Option<String>,
 }
 
 /// One selectable workspace in the switcher: the local "My workspace", or a
@@ -282,6 +300,8 @@ pub struct AppSettingsDto {
     pub model: String,
     pub git_branch: Option<String>,
     pub git_dirty_count: u32,
+    /// The local user's chosen avatar (`data:` URL), or None for initials.
+    pub avatar_url: Option<String>,
 }
 
 /// A chat opened in the transcript pane.

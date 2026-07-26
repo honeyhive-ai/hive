@@ -11,7 +11,7 @@
 import { useSyncExternalStore } from "react";
 import { setTitlebarColor } from "@/lib/ipc";
 
-export type ThemeName = "pollen" | "studio" | "harbor" | "meadow";
+export type ThemeName = "pollen" | "studio" | "harbor" | "meadow" | "midnight";
 export type AppearanceMode = "auto" | "light" | "dark";
 
 export interface Palette {
@@ -131,6 +131,40 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
     },
   },
 
+  // Midnight — neutral blue-grey dark (the chat-redesign base). A genuinely
+  // cool, low-chroma dark with a blue agent accent; light variant is a clean
+  // cool-white for daytime.
+  midnight: {
+    light: {
+      canvas: "rgb(243,246,249)",
+      ink: "rgb(29,39,49)",
+      panel: "rgb(255,255,255)",
+      mist: "rgb(233,239,245)",
+      line: "rgba(20,32,48,0.11)",
+      accentWarm: "rgb(181,103,58)",
+      accentCool: "rgb(47,111,196)",
+      sidebarTop: "rgb(24,28,35)",
+      sidebarBottom: "rgb(16,18,22)",
+      sidebarInk: "rgb(233,238,244)",
+      sidebarInkMuted: "rgb(150,160,172)",
+      scheme: "light",
+    },
+    dark: {
+      canvas: "rgb(21,23,28)",
+      ink: "rgb(231,234,239)",
+      panel: "rgb(35,40,48)",
+      mist: "rgb(25,28,34)",
+      line: "rgba(255,255,255,0.10)",
+      accentWarm: "rgb(210,133,79)",
+      accentCool: "rgb(90,155,234)",
+      sidebarTop: "rgb(27,31,38)",
+      sidebarBottom: "rgb(19,21,25)",
+      sidebarInk: "rgb(231,234,239)",
+      sidebarInkMuted: "rgb(139,148,162)",
+      scheme: "dark",
+    },
+  },
+
   // Botanical green.
   meadow: {
     light: {
@@ -172,8 +206,6 @@ const DEFAULT_THEME: ThemeName = "pollen";
 export function loadTheme(): ThemeName {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored && stored in THEMES) return stored as ThemeName;
-  // Migrate the old dark-only "midnight" palette to the neutral graphite family.
-  if (stored === "midnight") return "studio";
   return DEFAULT_THEME;
 }
 

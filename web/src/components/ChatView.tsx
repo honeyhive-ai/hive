@@ -41,6 +41,9 @@ import {
 } from "@/lib/icons";
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonBubbles } from "@/components/Skeleton";
+import { EmojiPicker } from "@/components/EmojiPicker";
+import { Avatar } from "@/components/Avatar";
+import { Popover, PopoverItem, candidateKey } from "@/components/ui";
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
 import { applyStreamDelta, retireStream } from "@/lib/streams";
@@ -49,7 +52,6 @@ import { confirmThen } from "@/lib/confirm";
 import { promptDialog } from "@/components/Dialog";
 import { loadTemplates } from "@/lib/templates";
 
-const QUICK_EMOJI = ["👍", "👎", "🎉", "👀", "❤️"];
 const CLAUDE_NOTE_KEY = "hive.claudeCodeNoteDismissed";
 
 // Clickable starter prompts shown in an empty chat — concrete examples of what
@@ -104,6 +106,9 @@ export function ChatView({
   const [slashActive, setSlashActive] = useState(0);
   // Pending composer attachments (saved to disk; referenced by path on send).
   const [attachments, setAttachments] = useState<{ name: string; path: string; image: boolean }[]>([]);
+  // Composer route pill: the "default recipient when no @mention" popover.
+  const [routeOpen, setRouteOpen] = useState(false);
+  const routeRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef(sessionId);
   sessionRef.current = sessionId;
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -121,6 +126,7 @@ export function ChatView({
   // from "You" to the display name once the message lands.
   const appSettings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
   const selfName = appSettings.data?.displayName?.trim() || "You";
+  const selfAvatarUrl = appSettings.data?.avatarUrl ?? undefined;
 
   // Live presence (other users' typing + online), polled while the chat is open
   // — but only when a relay is configured. Solo/relay-less workspaces skip the
@@ -452,6 +458,50 @@ export function ChatView({
   }
 
   const messages: ChatMessageDto[] = chat.data?.messages ?? [];
+  // The only real provenance we have today is the chat's runtime (there's no
+  // per-message model/provider on ChatMessageDto). Derive a single "via
+  // provider/model" attribution line for agent turns from it.
+  const runtimeVia = currentRuntime ? runtimePickerLabel(currentRuntime) : undefined;
+
+  // The composer's resolved route (mockup §7.5): the first @mention in the draft
+  // routes the turn; with none, it falls back to @primary (the chat's runtime).
+  const routeMention = input.match(/@([\w-]+)/)?.[1]?.toLowerCase();
+  const routeHit =
+    routeMention && routeMention !== "primary"
+      ? mentionCands.find((c) => c.handle.toLowerCase() === routeMention)
+      : undefined;
+  const routeHandle = routeHit?.handle ?? "primary";
+  const routeVia = routeHit
+    ? routeHit.handle === "all"
+      ? "broadcast"
+      : routeHit.kind
+    : runtimeVia;
+  // Streaming/pending turns are authored by the resolved recipient, never the
+  // literal "Hive" (spec §7.4) — the @mentioned agent, else the runtime's model.
+  const streamAuthor = routeHandle !== "primary" ? routeHandle : currentRuntime?.model?.trim() || "Assistant";
+
+  async function selectRuntime(id: string) {
+    setRouteOpen(false);
+    await setChatRuntime(sessionId, id);
+    qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+    qc.invalidateQueries({ queryKey: ["chats"] });
+  }
+
+  useEffect(() => {
+    if (!routeOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (routeRef.current && !routeRef.current.contains(e.target as Node)) setRouteOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setRouteOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [routeOpen]);
   const lastAssistantId = [...messages]
     .reverse()
     .find((m) => m.role === "assistant" || m.role === "agent")?.id;
@@ -463,7 +513,7 @@ export function ChatView({
         style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
       >
         <div className="relative flex min-h-0 flex-1 flex-col">
-        <div ref={scrollRef} onScroll={onScroll} className="flex-1 space-y-4 overflow-y-auto px-4 py-5">
+        <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-1 py-2">
           {chat.isLoading && messages.length === 0 && <SkeletonBubbles count={3} />}
           {!chat.isLoading && messages.length === 0 && !optimisticUser && (
             <div
@@ -472,7 +522,7 @@ export function ChatView({
             >
               <div
                 className="flex h-11 w-11 items-center justify-center rounded-2xl"
-                style={{ background: "rgba(87,161,168,0.18)", color: "var(--hive-accent-cool)" }}
+                style={{ background: "color-mix(in srgb, var(--hive-accent-cool) 18%, transparent)", color: "var(--hive-accent-cool)" }}
                 aria-hidden
               >
                 <IconMessage size={22} />
@@ -533,6 +583,13 @@ export function ChatView({
               body={m.body}
               createdAt={m.createdAt}
               streaming={m.isStreaming}
+              via={runtimeVia}
+              model={currentRuntime?.model || undefined}
+              // Prefer the avatar stamped/resolved on the message; for the local
+              // user's own turns, fall back to their freshly-set local avatar so
+              // older turns aren't left blank before a re-stamp.
+              avatarUrl={m.authorAvatarUrl ?? (m.author === selfName ? selfAvatarUrl : undefined)}
+              colorHex={m.authorColorHex}
               reactions={m.reactions}
               toolCalls={m.toolCalls}
               toolResults={m.toolResults}
@@ -540,11 +597,11 @@ export function ChatView({
               onRegenerate={m.id === lastAssistantId && !sending && streams.size === 0 ? handleRegenerate : undefined}
             />
           ))}
-          {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} />}
+          {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} avatarUrl={selfAvatarUrl} />}
           {[...streams.entries()].map(([id, text]) => (
-            <Bubble key={id} role="assistant" author="Hive" body={text} streaming />
+            <Bubble key={id} role="assistant" author={streamAuthor} body={text} via={runtimeVia} model={currentRuntime?.model || undefined} streaming />
           ))}
-          {sending && streams.size === 0 && <TypingDots label="Hive is thinking" />}
+          {sending && streams.size === 0 && <TypingDots label={`${streamAuthor} is thinking`} />}
           {typingNames.length > 0 && <TypingDots label={typingLabel(typingNames)} />}
         </div>
           {hasNew && !atBottom && (
@@ -564,7 +621,7 @@ export function ChatView({
             className="mx-4 mt-3 flex items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-xs leading-5"
             style={{
               borderColor: "var(--hive-line)",
-              background: "rgba(87,161,168,0.10)",
+              background: "color-mix(in srgb, var(--hive-accent-cool) 10%, transparent)",
             }}
           >
             <span aria-hidden className="mt-px shrink-0 opacity-70" style={{ color: "var(--hive-accent-cool)" }}>
@@ -589,37 +646,6 @@ export function ChatView({
         )}
 
         <div className="border-t px-4 py-3.5" style={{ borderColor: "var(--hive-line)" }}>
-          <div className="mb-2.5 flex flex-wrap items-center gap-2">
-            <label className="inline-flex min-w-[16rem] items-center gap-2.5 rounded-xl border px-2.5 py-1.5 transition-colors focus-within:border-[color:var(--hive-accent-cool)]" style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}>
-              <span className="shrink-0 text-[10px] font-medium uppercase tracking-[0.12em] opacity-45">
-                Primary runtime
-              </span>
-              <select
-                value={currentRuntimeId}
-                onChange={async (e) => {
-                  await setChatRuntime(sessionId, e.target.value);
-                  qc.invalidateQueries({ queryKey: ["chat", sessionId] });
-                  qc.invalidateQueries({ queryKey: ["chats"] });
-                }}
-                className="min-w-0 flex-1 appearance-none bg-transparent pr-1 text-sm font-medium outline-none"
-                style={{
-                  color: "var(--hive-ink)",
-                  fontFamily: "inherit",
-                }}
-              >
-                {runtimes.map((rt) => (
-                  <option
-                    key={rt.id}
-                    value={rt.id}
-                    title={`${rt.label} (${rt.provider || "provider unknown"}${rt.model ? ` · ${rt.model}` : ""})`}
-                  >
-                    {runtimePickerLabel(rt)}
-                  </option>
-                ))}
-              </select>
-              <span className="opacity-40"><IconChevronDown size={12} /></span>
-            </label>
-          </div>
 
           {attachments.length > 0 && (
             <div className="mb-2 flex flex-wrap gap-2">
@@ -659,49 +685,35 @@ export function ChatView({
               if (e.dataTransfer.types.includes("Files")) e.preventDefault();
             }}
           >
+            {/* Composer autocomplete rides the shared Popover (R5) — backdrop
+                off so the textarea stays clickable; Escape / input-state dismiss. */}
             {slash && slashItems.length > 0 && (
-              <div
-                className="absolute bottom-full left-0 z-20 mb-2 w-80 overflow-hidden rounded-xl border p-1 shadow-xl"
-                style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
-              >
+              <Popover anchorRef={taRef} backdrop={false} minWidth={300} onDismiss={() => setSlash(null)}>
                 {slashItems.map((c, i) => (
-                  <button
+                  <PopoverItem
                     key={c.id}
-                    onMouseEnter={() => setSlashActive(i)}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      c.run();
-                    }}
-                    className="flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-left text-sm transition-colors"
-                    style={{ background: i === slashActive ? "var(--hive-mist)" : "transparent" }}
-                  >
-                    <span className="truncate">{c.label}</span>
-                    <span className="shrink-0 text-xs opacity-45">{c.hint}</span>
-                  </button>
+                    label={c.label}
+                    kind={c.hint}
+                    active={i === slashActive}
+                    onHover={() => setSlashActive(i)}
+                    onSelect={() => c.run()}
+                  />
                 ))}
-              </div>
+              </Popover>
             )}
             {mention && mentionMatches.length > 0 && (
-              <div
-                className="absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border p-1 shadow-xl"
-                style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
-              >
+              <Popover anchorRef={taRef} backdrop={false} minWidth={280} onDismiss={() => setMention(null)}>
                 {mentionMatches.map((c, i) => (
-                  <button
+                  <PopoverItem
                     key={c.handle}
-                    onMouseEnter={() => setMentionActive(i)}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      acceptMention(c.handle);
-                    }}
-                    className="flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-left text-sm transition-colors"
-                    style={{ background: i === mentionActive ? "var(--hive-mist)" : "transparent" }}
-                  >
-                    <span className="truncate font-medium">@{c.handle}</span>
-                    <span className="shrink-0 text-xs capitalize opacity-45">{c.kind}</span>
-                  </button>
+                    label={<span className="font-medium">@{c.handle}</span>}
+                    kind={c.kind}
+                    active={i === mentionActive}
+                    onHover={() => setMentionActive(i)}
+                    onSelect={() => acceptMention(c.handle)}
+                  />
                 ))}
-              </div>
+              </Popover>
             )}
             <textarea
               ref={taRef}
@@ -726,59 +738,47 @@ export function ChatView({
                 if (v.trim()) pingTyping();
                 else clearTyping();
               }}
-              onBlur={clearTyping}
+              onBlur={() => {
+                clearTyping();
+                // Close autocomplete when focus leaves the composer. Picking an
+                // item preventDefaults its mousedown, so it never blurs here.
+                setSlash(null);
+                setMention(null);
+              }}
               onKeyDown={(e) => {
-                if (slash && slashItems.length > 0) {
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setSlashActive((a) => Math.min(a + 1, slashItems.length - 1));
-                    return;
-                  }
-                  if (e.key === "ArrowUp") {
-                    e.preventDefault();
-                    setSlashActive((a) => Math.max(a - 1, 0));
-                    return;
-                  }
-                  if (e.key === "Enter" || e.key === "Tab") {
-                    e.preventDefault();
-                    slashItems[slashActive].run();
-                    return;
-                  }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    setSlash(null);
-                    return;
-                  }
-                }
-                if (mention && mentionMatches.length > 0) {
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setMentionActive((a) => Math.min(a + 1, mentionMatches.length - 1));
-                    return;
-                  }
-                  if (e.key === "ArrowUp") {
-                    e.preventDefault();
-                    setMentionActive((a) => Math.max(a - 1, 0));
-                    return;
-                  }
-                  if (e.key === "Enter" || e.key === "Tab") {
-                    e.preventDefault();
-                    acceptMention(mentionMatches[mentionActive].handle);
-                    return;
-                  }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    setMention(null);
-                    return;
-                  }
-                }
+                // One shared reducer (↑↓ move · ↩/⇥ accept · esc dismiss) for both
+                // composer menus (R5).
+                if (
+                  slash &&
+                  slashItems.length > 0 &&
+                  candidateKey(e, {
+                    count: slashItems.length,
+                    active: slashActive,
+                    setActive: setSlashActive,
+                    onAccept: (i) => slashItems[i].run(),
+                    onDismiss: () => setSlash(null),
+                  })
+                )
+                  return;
+                if (
+                  mention &&
+                  mentionMatches.length > 0 &&
+                  candidateKey(e, {
+                    count: mentionMatches.length,
+                    active: mentionActive,
+                    setActive: setMentionActive,
+                    onAccept: (i) => acceptMention(mentionMatches[i].handle),
+                    onDismiss: () => setMention(null),
+                  })
+                )
+                  return;
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   handleSend();
                 }
               }}
               rows={1}
-              placeholder="Message Hive or describe the next supervised task…"
+              placeholder="Message the room — @ to route, / for commands…"
               className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm leading-6 outline-none"
               style={{
                 color: "var(--hive-ink)",
@@ -787,6 +787,64 @@ export function ChatView({
               }}
             />
             <div className="flex items-center gap-1 px-2 pb-2">
+              {/* Route pill — the resolved recipient (mockup §7.5). Shows the
+                  draft's first @mention, else @primary + the chat runtime. The
+                  popover switches which runtime is primary. */}
+              <div className="relative" ref={routeRef}>
+                <button
+                  type="button"
+                  onClick={() => setRouteOpen((o) => !o)}
+                  className="inline-flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-xs transition-colors"
+                  style={{
+                    borderColor: routeOpen ? "var(--tint-cool-line)" : "transparent",
+                    background: routeOpen ? "var(--tint-cool)" : "transparent",
+                    color: "var(--hive-ink-soft)",
+                  }}
+                  title="Default recipient"
+                >
+                  <span aria-hidden style={{ color: "var(--hive-accent-cool)" }}>→</span>
+                  <span className="font-semibold" style={{ color: "var(--hive-accent-cool)" }}>@{routeHandle}</span>
+                  {routeVia && <span>· {routeVia}</span>}
+                  <span className="opacity-50"><IconChevronDown size={11} /></span>
+                </button>
+                {routeOpen && (
+                  <div
+                    className="absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border p-1.5 shadow-xl"
+                    style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
+                  >
+                    <div className="px-2 pb-1.5 pt-1 text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--hive-ink-soft)" }}>
+                      Default recipient · when no @mention
+                    </div>
+                    {runtimes.map((rt) => (
+                      <button
+                        key={rt.id}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          void selectRuntime(rt.id);
+                        }}
+                        className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors"
+                        style={{ background: rt.id === currentRuntimeId ? "var(--tint-cool)" : "transparent" }}
+                      >
+                        <span className="route-glyph"><IconWrench size={11} /></span>
+                        <span className="min-w-0 flex-1 truncate text-sm font-semibold">
+                          {rt.id === currentRuntimeId ? "@primary" : rt.label || rt.name}
+                        </span>
+                        <span className="shrink-0 text-xs" style={{ color: "var(--hive-ink-soft)" }}>
+                          {runtimePickerLabel(rt)}
+                        </span>
+                      </button>
+                    ))}
+                    {currentRuntime?.provider === "claude-code" && (
+                      <>
+                        <div className="my-1 h-px" style={{ background: "var(--hive-line)" }} />
+                        <div className="px-2 py-1 text-xs" style={{ color: "var(--hive-ink-soft)" }}>
+                          Claude Code answers with its own tools &amp; permissions, via your Claude subscription.
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+              </div>
               <label
                 className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg opacity-60 transition-all hover:bg-[color:var(--hive-panel)] hover:opacity-100"
                 title="Attach files"
@@ -815,7 +873,7 @@ export function ChatView({
               <button
                 onClick={handleSend}
                 disabled={sending || (!input.trim() && attachments.length === 0)}
-                className="flex h-8 w-8 items-center justify-center rounded-full text-white shadow-sm transition-all hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-30 disabled:shadow-none disabled:hover:brightness-100"
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-white shadow-sm transition-all hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-30 disabled:shadow-none disabled:hover:brightness-100"
                 style={{ background: "var(--hive-accent-cool)" }}
                 aria-label="Send message"
                 title="Send (Enter)"
@@ -823,6 +881,13 @@ export function ChatView({
                 <IconSend />
               </button>
             </div>
+          </div>
+
+          {/* Footer hint (mockup §7.5) — the affordance legend under the composer. */}
+          <div className="hint">
+            Live — type <span className="kbd">@</span> or <span className="kbd">/</span>, attach with{" "}
+            <span className="kbd">@file</span>, send with <span className="kbd">↵</span>, newline with{" "}
+            <span className="kbd">⇧↵</span>.
           </div>
         </div>
       </div>
@@ -842,7 +907,7 @@ function TypingDots({ label }: { label: string }) {
   return (
     <div
       className="inline-flex items-center gap-2 rounded-2xl border px-3.5 py-2.5 text-sm"
-      style={{ borderColor: "rgba(87,161,168,0.26)", background: "rgba(87,161,168,0.10)" }}
+      style={{ borderColor: "color-mix(in srgb, var(--hive-accent-cool) 26%, transparent)", background: "color-mix(in srgb, var(--hive-accent-cool) 10%, transparent)" }}
     >
       <span className="opacity-70">{label}</span>
       <span className="inline-flex gap-0.5">
@@ -917,8 +982,8 @@ export function ToolCallCards({
                   className="ml-auto shrink-0 rounded-full px-2 py-0.5 text-[0.7rem] font-medium"
                   style={
                     result.isError
-                      ? { background: "rgba(214,90,70,0.16)", color: "var(--hive-danger)" }
-                      : { background: "rgba(34,160,90,0.14)", color: "var(--hive-success)" }
+                      ? { background: "color-mix(in srgb, var(--hive-danger) 16%, transparent)", color: "var(--hive-danger)" }
+                      : { background: "color-mix(in srgb, var(--hive-success) 14%, transparent)", color: "var(--hive-success)" }
                   }
                 >
                   {result.isError ? "error" : "done"}
@@ -938,7 +1003,7 @@ export function ToolCallCards({
                 <pre
                   className="overflow-x-auto rounded-lg p-2 text-xs"
                   style={{
-                    background: result.isError ? "rgba(214,90,70,0.14)" : "var(--hive-overlay)",
+                    background: result.isError ? "color-mix(in srgb, var(--hive-danger) 14%, transparent)" : "var(--hive-overlay)",
                     border: "1px solid var(--hive-line)",
                   }}
                 >
@@ -953,6 +1018,7 @@ export function ToolCallCards({
   );
 }
 
+
 const Bubble = memo(function Bubble({
   messageId,
   role,
@@ -960,6 +1026,10 @@ const Bubble = memo(function Bubble({
   body,
   createdAt,
   streaming = false,
+  via,
+  model,
+  avatarUrl,
+  colorHex,
   reactions,
   toolCalls,
   toolResults,
@@ -972,6 +1042,10 @@ const Bubble = memo(function Bubble({
   body: string;
   createdAt?: string;
   streaming?: boolean;
+  via?: string;
+  model?: string;
+  avatarUrl?: string | null;
+  colorHex?: string | null;
   reactions?: { emoji: string; actorId: string; actorDisplayName: string }[];
   toolCalls?: { id: string; name: string; inputJson: string; serverId: string | null }[];
   toolResults?: { callId: string; content: string; isError: boolean }[];
@@ -988,13 +1062,24 @@ const Bubble = memo(function Bubble({
   const counts = new Map<string, number>();
   for (const r of reactions ?? []) counts.set(r.emoji, (counts.get(r.emoji) ?? 0) + 1);
   const [reactOpen, setReactOpen] = useState(false);
-
-  // Modern chat: user messages hug the right in a warm bubble, assistant/agent
-  // hug the left in a cool bubble. A hairline border of the same hue keeps each
-  // bubble defined against the panel in every palette.
-  const surface = isUser
-    ? { bg: "rgba(214,158,87,0.16)", border: "rgba(214,158,87,0.30)", avatar: "rgba(214,158,87,0.32)" }
-    : { bg: "rgba(87,161,168,0.12)", border: "rgba(87,161,168,0.22)", avatar: "rgba(87,161,168,0.30)" };
+  const reactRef = useRef<HTMLDivElement>(null);
+  // Close the emoji picker on outside click or Escape (the trigger button lives
+  // inside reactRef, so clicking it still toggles rather than double-firing).
+  useEffect(() => {
+    if (!reactOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (reactRef.current && !reactRef.current.contains(e.target as Node)) setReactOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setReactOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [reactOpen]);
 
   const content = streaming ? (
     <div className="whitespace-pre-wrap text-[0.95rem] leading-7">
@@ -1010,52 +1095,52 @@ const Bubble = memo(function Bubble({
   // System messages (summaries, notices) read as centered meta, not a reply.
   if (isSystem) {
     return (
-      <div
-        className="mx-auto max-w-[85%] rounded-xl border px-3.5 py-2 text-center text-xs"
-        style={{ background: "var(--hive-mist)", borderColor: "var(--hive-line)", color: "var(--hive-ink)" }}
-      >
-        <span className="mr-2 uppercase tracking-[0.16em] opacity-45">System</span>
-        <span className="opacity-80">{body}</span>
+      <div className="tt-system">
+        <span className="ln" />
+        <span>{body}</span>
+        {timeLabel && <span className="opacity-70">{timeLabel}</span>}
+        <span className="ln" />
       </div>
     );
   }
 
   return (
-    // `content-visibility: auto` lets the engine skip layout/paint for rows
-    // scrolled out of view — cheap "virtualization" for long transcripts, most
-    // relevant on WebView2/Windows. Skipped for the live streaming bubble.
+    // Flat message row (Slack/Buzz-style): no card/tint, avatar + name + time +
+    // body, full-row hover. `content-visibility: auto` lets the engine skip
+    // layout/paint for off-screen rows — cheap virtualization for long logs.
     <div
-      className={`group flex gap-2.5 ${isUser ? "flex-row-reverse" : "flex-row"}`}
-      style={streaming ? undefined : { contentVisibility: "auto", containIntrinsicSize: "0 120px" }}
+      className={`group tt ${isUser ? "human" : "agent"}`}
+      style={streaming ? undefined : { contentVisibility: "auto", containIntrinsicSize: "0 80px" }}
     >
-      <div
-        className="mt-6 flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-xs font-semibold"
-        style={{ background: surface.avatar, color: "var(--hive-ink)" }}
-        aria-hidden
-      >
-        {author.slice(0, 1).toUpperCase()}
+      <div className="tt-av">
+        <Avatar
+          name={author}
+          url={avatarUrl}
+          colorHex={colorHex}
+          kind={isUser ? "human" : "agent"}
+          size={30}
+        />
       </div>
 
-      <div className={`flex min-w-0 max-w-[82%] flex-col ${isUser ? "items-end" : "items-start"}`}>
-        <div className="mb-1 flex items-center gap-2 px-1 text-xs">
-          <span className="font-semibold">{author}</span>
-          {timeLabel && <span className="opacity-40">{timeLabel}</span>}
+      <div className="tt-body">
+        <div className="tt-head">
+          <span className={isUser ? "tt-name" : "tt-handle"}>{author}</span>
+          {!isUser && model && <span className="tt-model">{model}</span>}
+          <span className="tt-spacer" />
+          {timeLabel && <span className="tt-time">{timeLabel}</span>}
         </div>
+        {via && !isUser && <div className="tt-attr">via {via}</div>}
 
-        <div
-          className={`min-w-0 border px-4 py-2.5 ${isUser ? "rounded-2xl rounded-tr-sm" : "rounded-2xl rounded-tl-sm"}`}
-          style={{ background: surface.bg, borderColor: surface.border, color: "var(--hive-ink)" }}
-        >
+        <div className="tt-text">
           {content}
           {toolCalls && toolCalls.length > 0 && (
             <ToolCallCards calls={toolCalls} results={toolResults ?? []} />
           )}
         </div>
 
-        {/* Persisted reactions stay visible; the action row (copy / regenerate /
-            react-picker) only appears on hover, so no emoji strip floats under
-            every message. */}
-        <div className={`mt-1 flex min-h-[1.5rem] items-center gap-1 ${isUser ? "flex-row-reverse" : ""}`}>
+        {/* Persisted reactions stay visible; the copy / regenerate / react-picker
+            row only appears on hover. */}
+        <div className="tt-actions">
           {[...counts.entries()].map(([emoji, n]) => (
             <button
               key={emoji}
@@ -1074,34 +1159,17 @@ const Bubble = memo(function Bubble({
               </IconAction>
             )}
             {onReact && messageId && (
-              <div className="relative">
+              <div className="relative" ref={reactRef}>
                 <IconAction title="Add reaction" onClick={() => setReactOpen((o) => !o)}>
                   <IconSmile />
                 </IconAction>
                 {reactOpen && (
-                  <div
-                    className="absolute bottom-full z-20 mb-1 flex gap-0.5 rounded-lg border p-1 shadow-lg"
-                    style={{
-                      borderColor: "var(--hive-line)",
-                      background: "var(--hive-panel)",
-                      ...(isUser ? { right: 0 } : { left: 0 }),
+                  <EmojiPicker
+                    onPick={(emoji) => {
+                      onReact(messageId, emoji);
+                      setReactOpen(false);
                     }}
-                    onMouseLeave={() => setReactOpen(false)}
-                  >
-                    {QUICK_EMOJI.map((emoji) => (
-                      <button
-                        key={emoji}
-                        onClick={() => {
-                          onReact(messageId, emoji);
-                          setReactOpen(false);
-                        }}
-                        className="rounded px-1.5 py-0.5 text-sm transition-transform hover:scale-125"
-                        aria-label={`React ${emoji}`}
-                      >
-                        {emoji}
-                      </button>
-                    ))}
-                  </div>
+                  />
                 )}
               </div>
             )}

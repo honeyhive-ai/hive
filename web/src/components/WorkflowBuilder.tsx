@@ -564,7 +564,7 @@ export function WorkflowBuilder({
           {errors.length > 0 && (
             <ul
               className="mt-3 space-y-1 rounded-xl border px-3 py-2 text-xs"
-              style={{ borderColor: "rgba(200,70,70,0.35)", color: "var(--hive-danger)" }}
+              style={{ borderColor: "color-mix(in srgb, var(--hive-danger) 35%, transparent)", color: "var(--hive-danger)" }}
             >
               {errors.map((e, i) => (
                 <li key={i}>{e}</li>

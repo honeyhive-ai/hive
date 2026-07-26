@@ -22,6 +22,12 @@ pub struct WorkspaceAgent {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_color_hex: Option<String>,
+    /// Optional avatar as a bounded `data:image/…` URL. Rides in the synced
+    /// roster (`AgentRosterUpdated`), so every member renders the agent's
+    /// picture. Size-capped at the edit boundary. `None` = fall back to
+    /// `avatar_color_hex`, then to initials-on-color.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
     #[serde(default)]
     pub created_at: Timestamp,
 }
@@ -35,6 +41,7 @@ impl WorkspaceAgent {
             owner_actor_id: String::new(),
             role: String::new(),
             avatar_color_hex: None,
+            avatar_url: None,
             created_at: Timestamp::now(),
         }
     }

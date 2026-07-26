@@ -108,7 +108,7 @@ export function CommandPalette({
     <Modal
       onClose={onClose}
       overlayClassName="z-[900] flex items-start justify-center pt-[12vh]"
-      overlayStyle={{ background: "rgba(0,0,0,0.45)" }}
+      overlayStyle={{ background: "color-mix(in srgb, var(--hive-ink) 45%, transparent)" }}
       panelClassName="w-full max-w-lg overflow-hidden rounded-2xl border shadow-2xl"
       panelStyle={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)", color: "var(--hive-ink)" }}
     >

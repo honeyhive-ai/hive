@@ -426,6 +426,7 @@ mod tests {
                 device_id: Some(device_id),
                 git_email: None,
                 key_agreement_public: None,
+                avatar_url: None,
             },
             role: WorkspaceRole::Owner,
             title: String::new(),
@@ -450,6 +451,7 @@ mod tests {
                     device_id: Some(device_id),
                     git_email: None,
                     key_agreement_public: None,
+                    avatar_url: None,
                 },
                 recorded_at: Timestamp::epoch(),
             });

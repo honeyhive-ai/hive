@@ -24,7 +24,56 @@
   --hive-danger: rgb(198, 55, 55);
   --hive-warn: rgb(170, 116, 24);
   --hive-overlay: rgba(0, 0, 0, 0.05);
+
+  /* Derived chat-layer tokens (redesign / iteration 2). Built from the base
+     --hive-* tokens with color-mix, so they follow every palette automatically
+     when applyTheme() overrides the base vars — no per-theme wiring needed. */
+  --hive-ink-soft: color-mix(in srgb, var(--hive-ink) 55%, transparent);
+  --hive-hover: color-mix(in srgb, var(--hive-ink) 6%, transparent);
+  --tint-cool: color-mix(in srgb, var(--hive-accent-cool) 14%, transparent);
+  --tint-cool-line: color-mix(in srgb, var(--hive-accent-cool) 38%, transparent);
+  --tint-warm: color-mix(in srgb, var(--hive-accent-warm) 13%, transparent);
+  --tint-warm-line: color-mix(in srgb, var(--hive-accent-warm) 40%, transparent);
 }
+
+/* ================= CHAT LAYER — flat rows + whisper tint =================
+   Flat geometry (tight padding, small radius, no border) so turns never read as
+   bubbles — but a WHISPER of tint carries identity per spec §5.3/D10: 8% warm on
+   human, 8% cool on agent, over the panel. Hover deepens the same tint rather
+   than replacing it, so the identity cue survives. Avatar shape (circle/rounded
+   square) + handle color reinforce it. */
+.tt { display: flex; gap: 10px; padding: 6px 12px; border-radius: 8px; position: relative; }
+.tt + .tt { margin-top: 2px; }
+.tt.human { background: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-warm)); }
+.tt.agent { background: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-cool)); }
+.tt.shared { background: var(--hive-mist); }
+.tt.human:hover { background: color-mix(in srgb, var(--hive-panel) 87%, var(--hive-accent-warm)); }
+.tt.agent:hover { background: color-mix(in srgb, var(--hive-panel) 87%, var(--hive-accent-cool)); }
+.tt.shared:hover { background: color-mix(in srgb, var(--hive-mist) 90%, var(--hive-ink)); }
+.tt.is-stale { opacity: 0.6; }
+.tt-av { padding-top: 2px; flex: none; }
+.tt-body { flex: 1; min-width: 0; }
+.tt-head { display: flex; align-items: baseline; gap: 8px; }
+.tt-name { font-weight: 600; font-size: 14px; color: var(--hive-ink); }
+.tt-handle { font-weight: 600; font-size: 14px; color: var(--hive-accent-cool); }
+.tt-model { font-size: 11px; color: var(--hive-ink-soft); font-family: ui-monospace, Menlo, monospace; }
+.tt-spacer { flex: 1; }
+.tt-time { font-size: 12px; color: var(--hive-ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.tt-attr { font-size: 12px; color: var(--hive-ink-soft); margin-top: 0; }
+.tt-text { font-size: 14px; margin-top: 2px; line-height: 1.5; }
+.tt-actions { margin-top: 2px; display: flex; align-items: center; gap: 4px; min-height: 20px; }
+.tt-system { text-align: center; font-size: 12px; color: var(--hive-ink-soft); padding: 8px 0; display: flex; align-items: center; gap: 8px; justify-content: center; }
+.tt-system .ln { height: 1px; background: var(--hive-line); flex: 1; max-width: 120px; }
+/* avatars: human = circle, agent = rounded square */
+.av { flex: none; display: grid; place-items: center; color: #fff; font-weight: 600; position: relative; }
+.av.human { border-radius: 50%; }
+.av.agent { border-radius: 30%; }
+
+/* Composer footer hint line ("Live — type @ or / …") with keycaps. */
+.hint { font-size: 12px; color: var(--hive-ink-soft); padding: 7px 6px 0; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.kbd { font-family: ui-monospace, Menlo, monospace; font-size: 11px; background: var(--hive-mist); border: 1px solid var(--hive-line); border-bottom-width: 2px; border-radius: 5px; padding: 0 5px; line-height: 1.5; }
+/* Route pill (composer): the default recipient / resolved @route. */
+.route-glyph { width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center; background: var(--tint-cool); color: var(--hive-accent-cool); flex: none; }
 
 html,
 body,

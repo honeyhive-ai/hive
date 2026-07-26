@@ -144,6 +144,7 @@ impl<V: KeyVault> IdentityStore<V> {
             display_name: display_name.to_string(),
             handle: handle.to_string(),
             signing_public_key: account_kp.public_key_bytes().to_vec(),
+            avatar_url: None,
             created_at: now,
         };
 
@@ -181,6 +182,17 @@ impl<V: KeyVault> IdentityStore<V> {
             .load()?
             .ok_or_else(|| IdentityError::Vault("no identity to update".into()))?;
         stored.account.display_name = display_name.to_string();
+        self.save(&stored)?;
+        Ok(stored)
+    }
+
+    /// Set (or clear, with `None`) the account avatar and persist. Keys
+    /// unchanged. The avatar rides the actor identity into the synced roster.
+    pub fn update_avatar(&self, avatar_url: Option<String>) -> Result<StoredIdentity, IdentityError> {
+        let mut stored = self
+            .load()?
+            .ok_or_else(|| IdentityError::Vault("no identity to update".into()))?;
+        stored.account.avatar_url = avatar_url;
         self.save(&stored)?;
         Ok(stored)
     }

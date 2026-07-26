@@ -3,4 +3,18 @@
 /**
  * A workspace agent in the roster (a named participant on a runtime).
  */
-export type WorkspaceAgentDto = { id: string, name: string, runtimeId: string, role: string, };
+export type WorkspaceAgentDto = { id: string, name: string, runtimeId: string, role: string, 
+/**
+ * Actor id of the member who owns this agent (empty if unowned). Only the
+ * owner may edit the agent's avatar.
+ */
+ownerActorId: string, 
+/**
+ * Optional avatar image (`data:` URL); falls back to the color, then to
+ * initials-on-color when absent.
+ */
+avatarUrl: string | null, 
+/**
+ * Optional avatar accent color (`#rrggbb`).
+ */
+avatarColorHex: string | null, };

@@ -168,7 +168,7 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
     let mut member_account: HashMap<String, Uuid> = HashMap::new();
     let mut certs: Vec<hive_core::crypto::DeviceCertificate> = Vec::new();
 
-    let mut note_member = |members: &mut HashSet<Uuid>,
+    let note_member = |members: &mut HashSet<Uuid>,
                            member_account: &mut HashMap<String, Uuid>,
                            m: &hive_core::WorkspaceMember| {
         if let Some(aid) = m.actor.account_id {
@@ -391,6 +391,7 @@ mod tests {
                 device_id: Some(p.device_id),
                 git_email: None,
                 key_agreement_public: None,
+                avatar_url: None,
             },
             role: WorkspaceRole::Contributor,
             title: String::new(),
@@ -435,6 +436,7 @@ mod tests {
                 device_id: Some(signer_device),
                 git_email: None,
                 key_agreement_public: None,
+                avatar_url: None,
             },
             recorded_at: Timestamp::epoch(),
         });

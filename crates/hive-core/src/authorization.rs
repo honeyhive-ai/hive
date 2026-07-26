@@ -80,7 +80,14 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         // roster only trusts a self-consistent chain (cert signed by the account
         // key), so a lower floor here can't forge trust.
         | SessionEvent::AccountKeyRegistered { .. }
-        | SessionEvent::DeviceCertificateAdded { .. } => WorkspaceRole::Contributor,
+        | SessionEvent::DeviceCertificateAdded { .. }
+        // Channels are cheap organization (spec §11) — any contributor may
+        // create, rename, reorder, archive, or file a chat into one.
+        | SessionEvent::ChannelCreated { .. }
+        | SessionEvent::ChannelRenamed { .. }
+        | SessionEvent::ChannelReordered { .. }
+        | SessionEvent::ChannelArchived { .. }
+        | SessionEvent::ChatChannelChanged { .. } => WorkspaceRole::Contributor,
         // A newer-client event this build can't author or interpret — require
         // the highest role so it can never be produced locally by accident.
         SessionEvent::Unknown => WorkspaceRole::Owner,

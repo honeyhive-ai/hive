@@ -100,7 +100,7 @@ export function DialogHost() {
     <Modal
       onClose={onCancel}
       overlayClassName="z-[990] flex items-center justify-center p-6"
-      overlayStyle={{ background: "rgba(0,0,0,0.4)" }}
+      overlayStyle={{ background: "color-mix(in srgb, var(--hive-ink) 45%, transparent)" }}
       panelClassName="w-full max-w-sm rounded-2xl border p-5 shadow-2xl"
       panelStyle={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)", color: "var(--hive-ink)" }}
     >
@@ -135,7 +135,7 @@ export function DialogHost() {
           className="rounded-lg px-4 py-1.5 text-sm font-medium text-white hover:brightness-110"
           style={{
             background:
-              req.kind === "confirm" && req.danger ? "rgb(200,70,70)" : "var(--hive-accent-cool)",
+              req.kind === "confirm" && req.danger ? "var(--hive-danger)" : "var(--hive-accent-cool)",
           }}
         >
           {req.kind === "prompt" ? "OK" : req.confirmLabel ?? "Confirm"}

@@ -31,7 +31,7 @@ export const Markdown = memo(function Markdown({ content }: { content: string })
             <code
               className={className}
               style={{
-                background: "rgba(127,127,127,0.18)",
+                background: "color-mix(in srgb, var(--hive-ink) 18%, transparent)",
                 borderRadius: "4px",
                 padding: "0.1em 0.35em",
                 fontSize: "0.9em",

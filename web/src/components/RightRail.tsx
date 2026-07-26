@@ -28,6 +28,7 @@ import {
   listVaults,
   previewVault,
   removeAgent,
+  setAgentAvatar,
   removeMcpServer,
   removeSkill,
   removeVault,
@@ -37,11 +38,25 @@ import {
   onChatStream,
   voteProposal,
   type RuntimeSummaryDto,
+  type McpServerDto,
 } from "@/lib/ipc";
 import { LogsView } from "@/components/LogsView";
+import { Avatar } from "@/components/Avatar";
+import { fileToAvatarDataUrl } from "@/lib/avatar";
 import { toast, errMsg } from "@/components/Toast";
 import { confirmThen } from "@/lib/confirm";
-import { Button, IconButton } from "@/components/ui";
+import {
+  Button,
+  IconButton,
+  Card,
+  Section,
+  Switch,
+  Field,
+  SelectField,
+  FormDisclosure,
+  EmptyHint,
+  SELECT_TINT,
+} from "@/components/ui";
 import {
   IconWrench,
   IconHexagon,
@@ -156,6 +171,15 @@ export function RailFrame({
   );
 }
 
+// ─── Tools pane (design spec §6.3 / §6.4 / §7.5) ─────────────────────────────
+// Scope is the top-level split: "In this chat" is READ-ONLY (what the agents
+// here can reach, inherited from the workspace); "Workspace" is where those
+// same records are actually edited. §11.1 made the workspace own configuration,
+// so the chat side never renders an editable control — except the answering
+// runtime, which is genuinely per-chat.
+
+type ToolsScope = "chat" | "workspace";
+
 function ToolsPane({
   sessionId,
   activeRuntimeId,
@@ -167,11 +191,14 @@ function ToolsPane({
   const runtimes = useQuery({ queryKey: ["runtimes"], queryFn: listRuntimes });
   const agents = useQuery({ queryKey: ["agents", sessionId], queryFn: () => listAgents(sessionId) });
   const mcp = useQuery({ queryKey: ["mcp"], queryFn: listMcpServers });
+  const [scope, setScope] = useState<ToolsScope>("chat");
   const [agentName, setAgentName] = useState("");
   const [agentRole, setAgentRole] = useState("");
   const [agentRuntimeId, setAgentRuntimeId] = useState(activeRuntimeId);
+  const [showAddAgent, setShowAddAgent] = useState(false);
   const [mcpSource, setMcpSource] = useState("");
   const [mcpError, setMcpError] = useState<string | null>(null);
+  const [showInstallMcp, setShowInstallMcp] = useState(false);
 
   useEffect(() => {
     if (!agentRuntimeId) {
@@ -184,6 +211,7 @@ function ToolsPane({
     onSuccess: () => {
       setAgentName("");
       setAgentRole("");
+      setShowAddAgent(false);
       qc.invalidateQueries({ queryKey: ["agents", sessionId] });
       toast.success("Agent added.");
     },
@@ -199,6 +227,7 @@ function ToolsPane({
     onSuccess: () => {
       setMcpSource("");
       setMcpError(null);
+      setShowInstallMcp(false);
       qc.invalidateQueries({ queryKey: ["mcp"] });
       toast.success("MCP server installed (disabled until you enable it).");
     },
@@ -213,148 +242,428 @@ function ToolsPane({
     onError: (e) => toast.error(`Couldn't remove MCP server: ${errMsg(e)}`),
   });
 
+  const selectRuntime = async (id: string) => {
+    await setChatRuntime(sessionId, id);
+    qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+    qc.invalidateQueries({ queryKey: ["chats"] });
+  };
+  const toggleMcp = async (server: McpServerDto, enabled: boolean) => {
+    await setMcpEnabled(server.id, enabled);
+    qc.invalidateQueries({ queryKey: ["mcp"] });
+  };
+
+  const runtimeList = runtimes.data ?? [];
+  const agentList = agents.data ?? [];
+  const mcpList = mcp.data ?? [];
+  const enabledMcp = mcpList.filter((s) => s.enabled);
+
   return (
-    <RailFrame title="Tools" subtitle="Workspace agents, runtimes, and MCP servers for this chat.">
-      <Section title="Configured Runtimes">
-        <div className="space-y-2">
-          {(runtimes.data ?? []).map((rt) => (
-            <RuntimeCard
-              key={rt.id}
-              runtime={rt}
-              active={rt.id === activeRuntimeId}
-              onSelect={async () => {
-                await setChatRuntime(sessionId, rt.id);
-                qc.invalidateQueries({ queryKey: ["chat", sessionId] });
-                qc.invalidateQueries({ queryKey: ["chats"] });
+    <RailFrame title="Tools" subtitle="What the agents here can reach, and where it's configured.">
+      <ScopeToggle scope={scope} onScope={setScope} />
+
+      {scope === "chat" ? (
+        <>
+          <div
+            className="mb-4 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border px-3 py-2.5 text-[12px] leading-5"
+            style={{
+              borderColor: "color-mix(in srgb, var(--hive-accent-cool) 38%, transparent)",
+              background: SELECT_TINT,
+              color: "var(--hive-ink)",
+            }}
+          >
+            <span>These are inherited from the workspace.</span>
+            <button
+              onClick={() => setScope("workspace")}
+              className="font-medium underline underline-offset-2"
+              style={{ color: "var(--hive-accent-cool)" }}
+            >
+              Edit in Workspace
+            </button>
+          </div>
+
+          <Section title="Answering runtime">
+            {runtimeList.length === 0 ? (
+              <EmptyHint text="No runtimes configured yet." />
+            ) : (
+              runtimeList.map((rt) => (
+                <RuntimeCard
+                  key={rt.id}
+                  runtime={rt}
+                  active={rt.id === activeRuntimeId}
+                  onSelect={() => selectRuntime(rt.id)}
+                />
+              ))
+            )}
+          </Section>
+
+          <Section title="Agents available to @mention">
+            {agentList.length === 0 ? (
+              <EmptyHint text="No agents in this workspace yet." />
+            ) : (
+              agentList.map((agent) => (
+                <Card key={agent.id} className="flex items-center gap-2.5 px-3 py-2.5">
+                  <Avatar
+                    name={agent.name}
+                    url={agent.avatarUrl}
+                    colorHex={agent.avatarColorHex}
+                    kind="agent"
+                    size={28}
+                  />
+                  <div className="min-w-0">
+                    <div className="truncate text-[13px] font-medium">@{agent.name}</div>
+                    <div className="truncate text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+                      {agent.runtimeId} · {agent.role || "agent"}
+                    </div>
+                  </div>
+                </Card>
+              ))
+            )}
+          </Section>
+
+          <Section title="Tools reachable">
+            {enabledMcp.length === 0 ? (
+              <EmptyHint text="No MCP servers are enabled, so no external tools are reachable here." />
+            ) : (
+              enabledMcp.map((server) => (
+                <McpServerCard key={server.id} server={server} editable={false} />
+              ))
+            )}
+          </Section>
+        </>
+      ) : (
+        <>
+          <Section title="Agent roster">
+            {agentList.length === 0 ? (
+              <EmptyHint text="No workspace agents yet. Add one below." />
+            ) : (
+              agentList.map((agent) => (
+                <AgentRosterRow
+                  key={agent.id}
+                  sessionId={sessionId}
+                  agent={agent}
+                  onRemove={() =>
+                    confirmThen("Remove this agent?", () => removeAgentMutation.mutate(agent.id))
+                  }
+                  onChanged={() => qc.invalidateQueries({ queryKey: ["agents", sessionId] })}
+                />
+              ))
+            )}
+            <FormDisclosure
+              label="Add an agent"
+              open={showAddAgent}
+              onToggle={() => setShowAddAgent((v) => !v)}
+            >
+              <Card className="space-y-2 p-3">
+                <input
+                  value={agentName}
+                  onChange={(event) => setAgentName(event.target.value)}
+                  placeholder="Agent name"
+                  className="w-full rounded-xl border px-3 py-2 text-sm"
+                  style={fieldStyle}
+                />
+                <input
+                  value={agentRole}
+                  onChange={(event) => setAgentRole(event.target.value)}
+                  placeholder="Role (optional)"
+                  className="w-full rounded-xl border px-3 py-2 text-sm"
+                  style={fieldStyle}
+                />
+                <Field label="Agent runtime">
+                  <SelectField value={agentRuntimeId} onChange={setAgentRuntimeId} ariaLabel="Agent runtime">
+                    {runtimeList.map((runtime) => (
+                      <option key={runtime.id} value={runtime.id}>
+                        {runtimePickerLabel(runtime)}
+                      </option>
+                    ))}
+                  </SelectField>
+                </Field>
+                <Button
+                  variant="primary"
+                  disabled={!agentName.trim() || !agentRuntimeId || addAgentMutation.isPending}
+                  onClick={() => addAgentMutation.mutate()}
+                >
+                  Add agent
+                </Button>
+              </Card>
+            </FormDisclosure>
+          </Section>
+
+          <Section title="Runtimes">
+            {runtimeList.length === 0 ? (
+              <EmptyHint text="No runtimes configured yet." />
+            ) : (
+              runtimeList.map((rt) => (
+                <RuntimeCard key={rt.id} runtime={rt} active={rt.id === activeRuntimeId} />
+              ))
+            )}
+            <p className="px-1 pt-1 text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+              Manage in Settings → Models.
+            </p>
+          </Section>
+
+          <Section title="MCP servers">
+            {mcpList.length === 0 ? (
+              <EmptyHint text="No MCP servers configured." />
+            ) : (
+              mcpList.map((server) => (
+                <McpServerCard
+                  key={server.id}
+                  server={server}
+                  editable
+                  onToggle={(v) => toggleMcp(server, v)}
+                  onRemove={
+                    server.isManaged
+                      ? () =>
+                          confirmThen("Remove this MCP server?", () =>
+                            removeMcpMutation.mutate(server.id),
+                          )
+                      : undefined
+                  }
+                />
+              ))
+            )}
+            <FormDisclosure
+              label="Install a server"
+              open={showInstallMcp}
+              onToggle={() => setShowInstallMcp((v) => !v)}
+            >
+              <Card className="space-y-2 p-3">
+                <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+                  Paste a manifest URL, GitHub blob URL, or owner/repo/path reference.
+                </p>
+                <input
+                  value={mcpSource}
+                  onChange={(event) => setMcpSource(event.target.value)}
+                  placeholder="owner/repo/mcp.json or https://…"
+                  className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
+                  style={fieldStyle}
+                />
+                {mcpError && (
+                  <div className="text-xs" style={{ color: "var(--hive-danger)" }}>
+                    {mcpError}
+                  </div>
+                )}
+                <Button
+                  variant="primary"
+                  disabled={!mcpSource.trim() || installMcpMutation.isPending}
+                  onClick={() => installMcpMutation.mutate()}
+                >
+                  Install
+                </Button>
+              </Card>
+            </FormDisclosure>
+          </Section>
+        </>
+      )}
+    </RailFrame>
+  );
+}
+
+/// The top-level scope split for the Tools pane (§6.3).
+function ScopeToggle({ scope, onScope }: { scope: ToolsScope; onScope: (s: ToolsScope) => void }) {
+  const opts: { id: ToolsScope; label: string }[] = [
+    { id: "chat", label: "In this chat" },
+    { id: "workspace", label: "Workspace" },
+  ];
+  return (
+    <div
+      className="mb-4 flex rounded-xl border p-0.5"
+      style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+    >
+      {opts.map((o) => {
+        const active = scope === o.id;
+        return (
+          <button
+            key={o.id}
+            onClick={() => onScope(o.id)}
+            aria-pressed={active}
+            className="flex-1 rounded-lg px-3 py-1.5 text-[13px] font-medium transition-colors"
+            style={
+              active
+                ? {
+                    background: "var(--hive-panel)",
+                    color: "var(--hive-ink)",
+                    boxShadow: "0 1px 2px color-mix(in srgb, var(--hive-ink) 14%, transparent)",
+                  }
+                : { color: "var(--hive-ink-soft)" }
+            }
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/// One MCP server card (§6.4). Header carries the disclosure chevron, id,
+/// transport detail, an enabled/inert label and a Switch (editable) or a plain
+/// state pill (read-only). The backend exposes no per-tool policy or tool list
+/// (McpServerDto = {id,transport,detail,enabled,isManaged}), so there are no
+/// per-tool rows — only an honest note in the expanded body.
+function McpServerCard({
+  server,
+  editable,
+  onToggle,
+  onRemove,
+}: {
+  server: McpServerDto;
+  editable: boolean;
+  onToggle?: (enabled: boolean) => void;
+  onRemove?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const disabled = !server.enabled;
+  return (
+    <Card className="px-3 py-2.5">
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => setOpen((o) => !o)}
+          aria-label={open ? `Collapse ${server.id}` : `Expand ${server.id}`}
+          title={open ? "Collapse" : "Expand"}
+          className="grid h-6 w-6 shrink-0 place-items-center rounded-md hover:bg-[color:var(--hive-overlay)]"
+          style={{ color: "var(--hive-ink-soft)" }}
+        >
+          <span
+            className="transition-transform"
+            style={{ transform: open ? "rotate(0deg)" : "rotate(-90deg)" }}
+          >
+            <IconChevronDown size={14} />
+          </span>
+        </button>
+        <div className="min-w-0 flex-1" style={{ opacity: disabled ? 0.6 : 1 }}>
+          <div className="flex items-center gap-2">
+            <span className="truncate text-[13px] font-medium">{server.id}</span>
+            <span
+              className="shrink-0 text-[11px] uppercase tracking-[0.08em]"
+              style={{ color: disabled ? "var(--hive-ink-soft)" : "var(--hive-success)" }}
+            >
+              {disabled ? "inert" : "enabled"}
+            </span>
+          </div>
+          <div className="truncate text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+            [{server.transport}] {server.detail}
+          </div>
+        </div>
+        {editable ? (
+          <Switch
+            on={server.enabled}
+            onChange={(v) => onToggle?.(v)}
+            label={`Enable ${server.id}`}
+          />
+        ) : (
+          <span
+            className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase"
+            style={{ background: "var(--hive-mist)", color: "var(--hive-ink-soft)" }}
+          >
+            {disabled ? "off" : "on"}
+          </span>
+        )}
+      </div>
+      {open && (
+        <div
+          className="mt-2.5 border-t pt-2.5 text-[11.5px] leading-5"
+          style={{ borderColor: "var(--hive-line)", color: "var(--hive-ink-soft)" }}
+        >
+          {disabled
+            ? "Disabled — inert gate: this server is never launched or connected."
+            : "Per-tool permissions arrive with backend support."}
+          {editable && onRemove && (
+            <div className="mt-2.5">
+              <Button variant="danger" onClick={onRemove}>
+                Remove server
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+    </Card>
+  );
+}
+
+/// Editable agent row (Workspace scope): avatar upload + remove.
+function AgentRosterRow({
+  sessionId,
+  agent,
+  onRemove,
+  onChanged,
+}: {
+  sessionId: string;
+  agent: import("@/lib/ipc").WorkspaceAgentDto;
+  onRemove: () => void;
+  onChanged: () => void;
+}) {
+  return (
+    <Card className="px-3 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-start gap-2.5">
+          <label className="group/av relative cursor-pointer" title="Upload an avatar for this agent">
+            <Avatar
+              name={agent.name}
+              url={agent.avatarUrl}
+              colorHex={agent.avatarColorHex}
+              kind="agent"
+              size={32}
+            />
+            <span
+              className="absolute inset-0 flex items-center justify-center rounded-[30%] text-[9px] font-semibold opacity-0 transition-opacity group-hover/av:opacity-100"
+              style={{
+                background: "color-mix(in srgb, var(--hive-ink) 55%, transparent)",
+                color: "var(--hive-canvas)",
+              }}
+            >
+              Edit
+            </span>
+            <input
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                e.target.value = "";
+                if (!file) return;
+                try {
+                  const url = await fileToAvatarDataUrl(file);
+                  await setAgentAvatar(sessionId, agent.id, url, null);
+                  onChanged();
+                  toast.success("Agent avatar updated.");
+                } catch (err) {
+                  toast.error(`Couldn't set avatar: ${errMsg(err)}`);
+                }
               }}
             />
-          ))}
-          {(runtimes.data ?? []).length === 0 && <EmptyHint text="No runtimes configured yet." />}
+          </label>
+          <div className="min-w-0">
+            <div className="font-medium">@{agent.name}</div>
+            <div className="mt-1 text-xs opacity-60">
+              {agent.runtimeId} · {agent.role || "agent"}
+            </div>
+            {agent.avatarUrl && (
+              <button
+                onClick={async () => {
+                  try {
+                    await setAgentAvatar(sessionId, agent.id, null, null);
+                    onChanged();
+                  } catch (err) {
+                    toast.error(`Couldn't clear avatar: ${errMsg(err)}`);
+                  }
+                }}
+                className="mt-1 text-xs opacity-60 hover:opacity-100"
+              >
+                Remove avatar
+              </button>
+            )}
+          </div>
         </div>
-      </Section>
-
-      <Section title="Workspace Agents">
-        <Stack>
-          {(agents.data ?? []).map((agent) => (
-            <div key={agent.id} className="rounded-2xl border px-3 py-3" style={panelStyle}>
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="font-medium">@{agent.name}</div>
-                  <div className="mt-1 text-xs opacity-60">
-                    {agent.runtimeId} · {agent.role || "agent"}
-                  </div>
-                </div>
-                <button
-                  onClick={() => confirmThen("Remove this agent?", () => removeAgentMutation.mutate(agent.id))}
-                  className="text-xs hover:opacity-80"
-                  style={{ color: "var(--hive-danger)" }}
-                >
-                  Remove
-                </button>
-              </div>
-            </div>
-          ))}
-          {(agents.data ?? []).length === 0 && (
-            <EmptyHint text="No workspace agents are attached to this chat yet." />
-          )}
-        </Stack>
-        <FormCard
-          title="Add agent"
-          actions={
-            <PrimaryButton
-              disabled={!agentName.trim() || !agentRuntimeId || addAgentMutation.isPending}
-              onClick={() => addAgentMutation.mutate()}
-            >
-              Add
-            </PrimaryButton>
-          }
+        <button
+          onClick={onRemove}
+          className="text-xs hover:opacity-80"
+          style={{ color: "var(--hive-danger)" }}
         >
-          <input
-            value={agentName}
-            onChange={(event) => setAgentName(event.target.value)}
-            placeholder="Agent name"
-            className="w-full rounded-xl border px-3 py-2"
-            style={fieldStyle}
-          />
-          <input
-            value={agentRole}
-            onChange={(event) => setAgentRole(event.target.value)}
-            placeholder="Role (optional)"
-            className="w-full rounded-xl border px-3 py-2"
-            style={fieldStyle}
-          />
-          <SubtleSelectField
-            label="Agent runtime"
-            value={agentRuntimeId}
-            onChange={setAgentRuntimeId}
-          >
-            {(runtimes.data ?? []).map((runtime) => (
-              <option key={runtime.id} value={runtime.id}>
-                {runtimePickerLabel(runtime)}
-              </option>
-            ))}
-          </SubtleSelectField>
-        </FormCard>
-      </Section>
-
-      <Section title="MCP Servers">
-        <Stack>
-          {(mcp.data ?? []).map((server) => (
-            <div key={server.id} className="rounded-2xl border px-3 py-3" style={panelStyle}>
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="font-medium">{server.id}</div>
-                  <div className="mt-1 text-xs opacity-60">
-                    [{server.transport}] {server.detail}
-                  </div>
-                </div>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="checkbox"
-                    checked={server.enabled}
-                    onChange={async (event) => {
-                      await setMcpEnabled(server.id, event.target.checked);
-                      qc.invalidateQueries({ queryKey: ["mcp"] });
-                    }}
-                  />
-                  {server.isManaged && (
-                    <button
-                      onClick={() => confirmThen("Remove this MCP server?", () => removeMcpMutation.mutate(server.id))}
-                      className="text-xs hover:opacity-80"
-                      style={{ color: "var(--hive-danger)" }}
-                    >
-                      Remove
-                    </button>
-                  )}
-                </div>
-              </div>
-            </div>
-          ))}
-          {(mcp.data ?? []).length === 0 && <EmptyHint text="No MCP servers configured." />}
-        </Stack>
-        <FormCard
-          title="Install from the internet"
-          hint="Paste a manifest URL, GitHub blob URL, or owner/repo/path reference."
-          actions={
-            <PrimaryButton
-              disabled={!mcpSource.trim() || installMcpMutation.isPending}
-              onClick={() => installMcpMutation.mutate()}
-            >
-              Install
-            </PrimaryButton>
-          }
-        >
-          <input
-            value={mcpSource}
-            onChange={(event) => setMcpSource(event.target.value)}
-            placeholder="owner/repo/mcp.json or https://…"
-            className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
-            style={fieldStyle}
-          />
-          {mcpError && <div className="text-xs" style={{ color: "var(--hive-danger)" }}>{mcpError}</div>}
-        </FormCard>
-      </Section>
-    </RailFrame>
+          Remove
+        </button>
+      </div>
+    </Card>
   );
 }
 
@@ -365,39 +674,58 @@ function RuntimeCard({
 }: {
   runtime: RuntimeSummaryDto;
   active: boolean;
-  onSelect: () => void;
+  onSelect?: () => void;
 }) {
+  const style = {
+    borderColor: active ? "var(--hive-accent-cool)" : "var(--hive-line)",
+    background: active ? SELECT_TINT : "var(--hive-mist)",
+  } as const;
+  const inner = (
+    <div className="flex items-center justify-between gap-3">
+      <div className="min-w-0">
+        <div className="truncate text-base font-semibold">{runtime.label}</div>
+        <div className="mt-1 truncate text-xs opacity-55">
+          {runtime.location} · {runtime.provider}
+          {runtime.endpoint ? ` · ${runtime.endpoint}` : ""}
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        {runtime.isManaged && (
+          <span
+            className="rounded-full px-2 py-1 text-[10px] font-semibold uppercase opacity-70"
+            style={{ background: "var(--hive-mist)" }}
+          >
+            Added
+          </span>
+        )}
+        {active && (
+          <span
+            className="rounded-full px-2 py-1 text-xs font-semibold"
+            style={{
+              background: "color-mix(in srgb, var(--hive-success) 18%, transparent)",
+              color: "var(--hive-success)",
+            }}
+          >
+            Active
+          </span>
+        )}
+      </div>
+    </div>
+  );
+  if (!onSelect) {
+    return (
+      <div className="w-full rounded-2xl border px-3.5 py-3.5 text-left" style={style}>
+        {inner}
+      </div>
+    );
+  }
   return (
     <button
       onClick={onSelect}
-      className="w-full rounded-2xl border px-3.5 py-3.5 text-left"
-      style={{
-        ...panelStyle,
-        borderColor: active ? "var(--hive-accent-cool)" : panelStyle.borderColor,
-        background: active ? "rgba(87,161,168,0.12)" : panelStyle.background,
-      }}
+      className="w-full rounded-2xl border px-3.5 py-3.5 text-left transition-colors hover:bg-[color:var(--hive-overlay)]"
+      style={style}
     >
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="truncate text-base font-semibold">{runtime.label}</div>
-          <div className="mt-1 truncate text-xs opacity-55">
-            {runtime.location} · {runtime.provider}
-            {runtime.endpoint ? ` · ${runtime.endpoint}` : ""}
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {runtime.isManaged && (
-            <span className="rounded-full px-2 py-1 text-[10px] font-semibold uppercase opacity-70" style={{ background: "var(--hive-mist)" }}>
-              Added
-            </span>
-          )}
-          {active && (
-            <span className="rounded-full px-2 py-1 text-xs font-semibold" style={{ background: "rgba(34,160,90,0.18)", color: "var(--hive-success)" }}>
-              Active
-            </span>
-          )}
-        </div>
-      </div>
+      {inner}
     </button>
   );
 }
@@ -412,67 +740,73 @@ function ReviewPane({ sessionId }: { sessionId: string }) {
   return (
     <RailFrame title="Review" subtitle="Pending decisions and proposal quorum for this chat.">
       <Section title="Pending Proposals">
-        <Stack>
-          {(proposals.data ?? []).map((proposal) => (
-            <div key={proposal.id} className="rounded-2xl border px-4 py-4" style={panelStyle}>
-              <div className="flex items-center justify-between gap-3">
-                <div className="font-semibold">{proposal.title}</div>
-                <div className="text-xs uppercase tracking-[0.16em] opacity-55">{proposal.status}</div>
-              </div>
-              {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
-              <div className="mt-3 text-xs opacity-60">
-                {proposal.qualifyingApprovals}/{proposal.requiredApprovals} approvals
-              </div>
-              <div className="mt-3 flex gap-2">
-                <button
-                  className="rounded-xl px-3 py-2 text-sm font-medium"
-                  style={{ background: "rgba(34,160,90,0.2)", color: "var(--hive-success)" }}
-                  onClick={async () => {
-                    await voteProposal(sessionId, proposal.id, true);
-                    qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
-                  }}
-                >
-                  Approve
-                </button>
-                <button
-                  className="rounded-xl px-3 py-2 text-sm font-medium"
-                  style={{ background: "rgba(200,70,70,0.18)", color: "var(--hive-danger)" }}
-                  onClick={async () => {
-                    await voteProposal(sessionId, proposal.id, false);
-                    qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
-                  }}
-                >
-                  Reject
-                </button>
-                {/* Agreement gate: an approved proposal only runs when a human
-                    explicitly implements it; the agent then carries it out.
-                    (Ported from the retired standalone ReviewView.) */}
-                {proposal.quorumMet && proposal.status !== "applied" && (
-                  <Button
-                    variant="primary"
-                    className="ml-auto"
-                    onClick={async () => {
-                      try {
-                        await implementProposal(sessionId, proposal.id);
-                        qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
-                        qc.invalidateQueries({ queryKey: ["chat", sessionId] });
-                        toast.success("Sent to the agent to implement.");
-                      } catch (e) {
-                        toast.error(`Couldn't implement: ${errMsg(e)}`);
-                      }
-                    }}
-                  >
-                    Implement
-                  </Button>
-                )}
-                {proposal.status === "applied" && (
-                  <span className="ml-auto self-center text-xs opacity-60">Implemented</span>
-                )}
-              </div>
+        {(proposals.data ?? []).map((proposal) => (
+          <Card key={proposal.id} className="px-4 py-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="font-semibold">{proposal.title}</div>
+              <div className="text-xs uppercase tracking-[0.16em] opacity-55">{proposal.status}</div>
             </div>
-          ))}
-          {(proposals.data ?? []).length === 0 && <EmptyHint text="No proposals are waiting for review." />}
-        </Stack>
+            {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
+            <div className="mt-3 text-xs opacity-60">
+              {proposal.qualifyingApprovals}/{proposal.requiredApprovals} approvals
+            </div>
+            <div className="mt-3 flex gap-2">
+              <button
+                className="rounded-xl px-3 py-2 text-sm font-medium"
+                style={{
+                  background: "color-mix(in srgb, var(--hive-success) 20%, transparent)",
+                  color: "var(--hive-success)",
+                }}
+                onClick={async () => {
+                  await voteProposal(sessionId, proposal.id, true);
+                  qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+                }}
+              >
+                Approve
+              </button>
+              <button
+                className="rounded-xl px-3 py-2 text-sm font-medium"
+                style={{
+                  background: "color-mix(in srgb, var(--hive-danger) 18%, transparent)",
+                  color: "var(--hive-danger)",
+                }}
+                onClick={async () => {
+                  await voteProposal(sessionId, proposal.id, false);
+                  qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+                }}
+              >
+                Reject
+              </button>
+              {/* Agreement gate: an approved proposal only runs when a human
+                  explicitly implements it; the agent then carries it out.
+                  (Ported from the retired standalone ReviewView.) */}
+              {proposal.quorumMet && proposal.status !== "applied" && (
+                <Button
+                  variant="primary"
+                  className="ml-auto"
+                  onClick={async () => {
+                    try {
+                      await implementProposal(sessionId, proposal.id);
+                      qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+                      qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+                      toast.success("Sent to the agent to implement.");
+                    } catch (e) {
+                      toast.error(`Couldn't implement: ${errMsg(e)}`);
+                    }
+                  }}
+                >
+                  Implement
+                </Button>
+              )}
+              {proposal.status === "applied" && (
+                <span className="ml-auto self-center text-xs opacity-60">Implemented</span>
+              )}
+            </div>
+          </Card>
+        ))}
+        {(proposals.data ?? []).length === 0 && (
+          <EmptyHint text="No proposals are waiting for review." />
+        )}
       </Section>
     </RailFrame>
   );
@@ -505,6 +839,10 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
   const [title, setTitle] = useState("");
   const [handle, setHandle] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [showInvite, setShowInvite] = useState(false);
+  const [showAdd, setShowAdd] = useState(false);
+  const [showImport, setShowImport] = useState(false);
+  const [showSrvAdd, setShowSrvAdd] = useState(false);
   const refresh = () => qc.invalidateQueries({ queryKey: ["members", sessionId] });
 
   const setRoleMutation = useMutation({
@@ -543,6 +881,7 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
     onSuccess: (r) => {
       setHandle("");
       setError(null);
+      setShowInvite(false);
       refresh();
       toast.success(
         r.sealed
@@ -558,6 +897,7 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
       setName("");
       setTitle("");
       setError(null);
+      setShowAdd(false);
       refresh();
     },
     onError: (e) => setError(String(e)),
@@ -566,10 +906,11 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
   const importTeams = useMutation({
     mutationFn: () => importGithubTeams(sessionId, org.trim()),
     onSuccess: (n) => {
-      const handle = org.trim();
+      const imported = org.trim();
       setOrg("");
+      setShowImport(false);
       refresh();
-      toast.success(`Imported ${n} member${n === 1 ? "" : "s"} from @${handle}.`);
+      toast.success(`Imported ${n} member${n === 1 ? "" : "s"} from @${imported}.`);
     },
     onError: (e) => toast.error(`Import failed: ${errMsg(e)}`),
   });
@@ -601,6 +942,7 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
     mutationFn: () => workspaceAddMember(srvHandle.trim(), srvRole),
     onSuccess: () => {
       setSrvHandle("");
+      setShowSrvAdd(false);
       refreshSrv();
       toast.success("Member updated on the relay.");
     },
@@ -618,198 +960,224 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
   return (
     <RailFrame title="People" subtitle="Workspace members and governance roles for this chat.">
       <Section title="Members">
-        <Stack>
-          {error && <div className="text-xs" style={{ color: "var(--hive-danger)" }}>{error}</div>}
-          {(members.data ?? []).map((member) => {
-            const online = onlineActors.has(member.actorId);
-            const dup = (nameCounts.get(member.displayName) ?? 0) > 1 && member.index > 0;
-            return (
-              <div key={member.id} className="rounded-2xl border px-3 py-3" style={panelStyle}>
-                <div className="flex items-center gap-2 font-medium">
+        {error && (
+          <div className="text-xs" style={{ color: "var(--hive-danger)" }}>
+            {error}
+          </div>
+        )}
+        {(members.data ?? []).map((member) => {
+          const online = onlineActors.has(member.actorId);
+          const dup = (nameCounts.get(member.displayName) ?? 0) > 1 && member.index > 0;
+          return (
+            <Card key={member.id} className="px-3 py-3">
+              <div className="flex items-center gap-2 font-medium">
+                <span className="relative shrink-0">
+                  <Avatar name={member.displayName} url={member.avatarUrl} kind="human" size={26} />
                   <span
-                    className="inline-block h-2 w-2 shrink-0 rounded-full"
-                    style={{ background: online ? "var(--hive-success)" : "var(--hive-line)" }}
+                    className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full"
+                    style={{
+                      background: online ? "var(--hive-success)" : "var(--hive-line)",
+                      boxShadow: "0 0 0 2px var(--hive-panel)",
+                    }}
                     title={sync.data?.relayConfigured ? (online ? "Online" : "Offline") : "Presence needs a relay"}
                   />
-                  {member.displayName}
-                  {dup && (
-                    <span className="text-xs opacity-50" title={`Mention precisely with @${member.displayName}#${member.index}`}>
-                      #{member.index}
-                    </span>
-                  )}
-                  {member.title && <span className="text-xs opacity-50">· {member.title}</span>}
-                </div>
-                <div className="mt-2 flex items-center gap-2">
-                  <SubtleSelectField
-                    label="Role"
-                    value={member.role}
-                    onChange={(r) => setRoleMutation.mutate({ id: member.id, role: r })}
+                </span>
+                {member.displayName}
+                {dup && (
+                  <span
+                    className="text-xs opacity-50"
+                    title={`Mention precisely with @${member.displayName}#${member.index}`}
                   >
-                    {MEMBER_ROLES.map((r) => (
-                      <option key={r} value={r}>
-                        {r}
-                      </option>
-                    ))}
-                  </SubtleSelectField>
-                  <button
-                    className="shrink-0 text-xs opacity-70 hover:opacity-100"
-                    onClick={() => confirmThen("Remove this member from the roster?", () => removeMutation.mutate(member.id))}
-                    title="Remove from the member list only"
-                  >
-                    Remove
-                  </button>
-                  <button
-                    className="shrink-0 text-xs font-medium hover:opacity-80"
-                    style={{ color: "var(--hive-danger)" }}
-                    onClick={() =>
-                      confirmThen(
-                        `Remove ${member.displayName} and revoke their access? The workspace key will be rotated so they can't read new messages.`,
-                        () => revokeMutation.mutate(member.id),
-                      )
-                    }
-                    title="Remove and rotate the key so they lose access (for a bad actor)"
-                  >
-                    Remove &amp; revoke
-                  </button>
-                </div>
+                    #{member.index}
+                  </span>
+                )}
+                {member.title && <span className="text-xs opacity-50">· {member.title}</span>}
               </div>
-            );
-          })}
-          {(members.data ?? []).length === 0 && <EmptyHint text="No extra members have been added yet." />}
-        </Stack>
-        <FormCard
-          title="Invite by GitHub handle"
-          hint="Adds the person and seals the workspace key to all their devices. They must have signed in to Hive with GitHub once. Needs a relay + your GitHub sign-in."
-          actions={
-            <PrimaryButton disabled={!handle.trim() || inviteMutation.isPending} onClick={() => inviteMutation.mutate()}>
+              <div className="mt-2 flex items-center gap-2">
+                <SubtleSelectField
+                  label="Role"
+                  value={member.role}
+                  onChange={(r) => setRoleMutation.mutate({ id: member.id, role: r })}
+                >
+                  {MEMBER_ROLES.map((r) => (
+                    <option key={r} value={r}>
+                      {r}
+                    </option>
+                  ))}
+                </SubtleSelectField>
+                <button
+                  className="shrink-0 text-xs opacity-70 hover:opacity-100"
+                  onClick={() =>
+                    confirmThen("Remove this member from the roster?", () =>
+                      removeMutation.mutate(member.id),
+                    )
+                  }
+                  title="Remove from the member list only"
+                >
+                  Remove
+                </button>
+                <button
+                  className="shrink-0 text-xs font-medium hover:opacity-80"
+                  style={{ color: "var(--hive-danger)" }}
+                  onClick={() =>
+                    confirmThen(
+                      `Remove ${member.displayName} and revoke their access? The workspace key will be rotated so they can't read new messages.`,
+                      () => revokeMutation.mutate(member.id),
+                    )
+                  }
+                  title="Remove and rotate the key so they lose access (for a bad actor)"
+                >
+                  Remove &amp; revoke
+                </button>
+              </div>
+            </Card>
+          );
+        })}
+        {(members.data ?? []).length === 0 && (
+          <EmptyHint text="No extra members have been added yet." />
+        )}
+
+        <FormDisclosure label="Invite by GitHub handle" open={showInvite} onToggle={() => setShowInvite((v) => !v)}>
+          <Card className="space-y-2 p-3">
+            <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+              Adds the person and seals the workspace key to all their devices. They must have signed
+              in to Hive with GitHub once. Needs a relay + your GitHub sign-in.
+            </p>
+            <input
+              value={handle}
+              onChange={(e) => setHandle(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && handle.trim() && inviteMutation.mutate()}
+              placeholder="@github-handle"
+              className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
+              style={fieldStyle}
+            />
+            <Button variant="primary" disabled={!handle.trim() || inviteMutation.isPending} onClick={() => inviteMutation.mutate()}>
               {inviteMutation.isPending ? "…" : "Invite"}
-            </PrimaryButton>
-          }
-        >
-          <input
-            value={handle}
-            onChange={(e) => setHandle(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && handle.trim() && inviteMutation.mutate()}
-            placeholder="@github-handle"
-            className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
-            style={fieldStyle}
-          />
-        </FormCard>
-        <FormCard
-          title="Add member"
-          hint="Roles gate actions: owner > admin > contributor > viewer. The last owner is protected."
-          actions={
-            <PrimaryButton disabled={!name.trim() || addMutation.isPending} onClick={() => addMutation.mutate()}>
+            </Button>
+          </Card>
+        </FormDisclosure>
+
+        <FormDisclosure label="Add member" open={showAdd} onToggle={() => setShowAdd((v) => !v)}>
+          <Card className="space-y-2 p-3">
+            <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+              Roles gate actions: owner &gt; admin &gt; contributor &gt; viewer. The last owner is protected.
+            </p>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Display name"
+              className="w-full rounded-xl border px-3 py-2 text-sm"
+              style={fieldStyle}
+            />
+            <input
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="Title (optional)"
+              className="w-full rounded-xl border px-3 py-2 text-sm"
+              style={fieldStyle}
+            />
+            <SubtleSelectField label="Role" value={role} onChange={setRole}>
+              {MEMBER_ROLES.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </SubtleSelectField>
+            <Button variant="primary" disabled={!name.trim() || addMutation.isPending} onClick={() => addMutation.mutate()}>
               Add
-            </PrimaryButton>
-          }
-        >
-          <input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="Display name"
-            className="w-full rounded-xl border px-3 py-2 text-sm"
-            style={fieldStyle}
-          />
-          <input
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="Title (optional)"
-            className="w-full rounded-xl border px-3 py-2 text-sm"
-            style={fieldStyle}
-          />
-          <SubtleSelectField label="Role" value={role} onChange={setRole}>
-            {MEMBER_ROLES.map((r) => (
-              <option key={r} value={r}>
-                {r}
-              </option>
-            ))}
-          </SubtleSelectField>
-        </FormCard>
-        <FormCard
-          title="Import GitHub org"
-          hint="Pull an org's Teams into the roster, mapping team membership to roles (highest wins). Needs GitHub sign-in with read:org."
-          actions={
-            <PrimaryButton disabled={!org.trim() || importTeams.isPending} onClick={() => importTeams.mutate()}>
+            </Button>
+          </Card>
+        </FormDisclosure>
+
+        <FormDisclosure label="Import GitHub org" open={showImport} onToggle={() => setShowImport((v) => !v)}>
+          <Card className="space-y-2 p-3">
+            <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+              Pull an org's Teams into the roster, mapping team membership to roles (highest wins).
+              Needs GitHub sign-in with read:org.
+            </p>
+            <input
+              value={org}
+              onChange={(e) => setOrg(e.target.value)}
+              placeholder="github-org-slug"
+              className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
+              style={fieldStyle}
+            />
+            <Button variant="primary" disabled={!org.trim() || importTeams.isPending} onClick={() => importTeams.mutate()}>
               {importTeams.isPending ? "Importing…" : "Import"}
-            </PrimaryButton>
-          }
-        >
-          <input
-            value={org}
-            onChange={(e) => setOrg(e.target.value)}
-            placeholder="github-org-slug"
-            className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
-            style={fieldStyle}
-          />
-        </FormCard>
+            </Button>
+          </Card>
+        </FormDisclosure>
       </Section>
 
       <Section title="Team members (server-enforced)">
         {!relayOn ? (
           <EmptyHint text="Connect a relay (Settings → Team sync) to use server-enforced membership." />
         ) : (
-          <Stack>
+          <>
             <p className="text-xs opacity-60">
-              Who the relay accepts writes from. Requires a membership-enforcing
-              (paid/enterprise) relay; on an open relay this stays empty and
-              everyone can write.
+              Who the relay accepts writes from. Requires a membership-enforcing (paid/enterprise)
+              relay; on an open relay this stays empty and everyone can write.
             </p>
             {(srvMembers.data ?? []).map((m) => (
-              <div key={m.account} className="flex items-center justify-between rounded-2xl border px-3 py-2" style={panelStyle}>
+              <Card key={m.account} className="flex items-center justify-between px-3 py-2">
                 <div className="min-w-0">
                   <div className="truncate font-medium">@{m.login}</div>
-                  <div className="text-xs opacity-50">{m.role} · {m.account}</div>
+                  <div className="text-xs opacity-50">
+                    {m.role} · {m.account}
+                  </div>
                 </div>
                 <button
                   className="shrink-0 text-xs font-medium hover:opacity-80"
                   style={{ color: "var(--hive-danger)" }}
-                  onClick={() => confirmThen(`Remove @${m.login} from this workspace on the relay?`, () => srvRemoveMutation.mutate(m.account))}
+                  onClick={() =>
+                    confirmThen(`Remove @${m.login} from this workspace on the relay?`, () =>
+                      srvRemoveMutation.mutate(m.account),
+                    )
+                  }
                   title="Stop the relay from accepting their writes (pair with Remove & revoke to cut reads)"
                 >
                   Remove
                 </button>
-              </div>
+              </Card>
             ))}
             {(srvMembers.data ?? []).length === 0 && (
-              <FormCard
-                title="Enable member controls"
-                hint="Claim this workspace on the relay so it enforces who can write — you become the owner. No-op on an open relay."
-                actions={
-                  <PrimaryButton disabled={claimMutation.isPending} onClick={() => claimMutation.mutate()}>
-                    {claimMutation.isPending ? "…" : "Claim ownership"}
-                  </PrimaryButton>
-                }
-              >
-                <span className="text-xs opacity-50">No server-enforced members yet.</span>
-              </FormCard>
+              <Card className="space-y-2 p-3">
+                <div className="text-sm font-semibold">Enable member controls</div>
+                <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+                  Claim this workspace on the relay so it enforces who can write — you become the
+                  owner. No-op on an open relay.
+                </p>
+                <Button variant="primary" disabled={claimMutation.isPending} onClick={() => claimMutation.mutate()}>
+                  {claimMutation.isPending ? "…" : "Claim ownership"}
+                </Button>
+              </Card>
             )}
-            <FormCard
-              title="Add / set member by handle"
-              hint="Admin+ only. Looks the handle up in the directory and sets their role on the relay."
-              actions={
-                <PrimaryButton disabled={!srvHandle.trim() || srvAddMutation.isPending} onClick={() => srvAddMutation.mutate()}>
+            <FormDisclosure label="Add or set member by handle" open={showSrvAdd} onToggle={() => setShowSrvAdd((v) => !v)}>
+              <Card className="space-y-2 p-3">
+                <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+                  Admin+ only. Looks the handle up in the directory and sets their role on the relay.
+                </p>
+                <input
+                  value={srvHandle}
+                  onChange={(e) => setSrvHandle(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && srvHandle.trim() && srvAddMutation.mutate()}
+                  placeholder="@github-handle"
+                  className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
+                  style={fieldStyle}
+                />
+                <SubtleSelectField label="Role" value={srvRole} onChange={setSrvRole}>
+                  {MEMBER_ROLES.map((r) => (
+                    <option key={r} value={r}>
+                      {r}
+                    </option>
+                  ))}
+                </SubtleSelectField>
+                <Button variant="primary" disabled={!srvHandle.trim() || srvAddMutation.isPending} onClick={() => srvAddMutation.mutate()}>
                   {srvAddMutation.isPending ? "…" : "Set"}
-                </PrimaryButton>
-              }
-            >
-              <input
-                value={srvHandle}
-                onChange={(e) => setSrvHandle(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && srvHandle.trim() && srvAddMutation.mutate()}
-                placeholder="@github-handle"
-                className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
-                style={fieldStyle}
-              />
-              <SubtleSelectField label="Role" value={srvRole} onChange={setSrvRole}>
-                {MEMBER_ROLES.map((r) => (
-                  <option key={r} value={r}>
-                    {r}
-                  </option>
-                ))}
-              </SubtleSelectField>
-            </FormCard>
-          </Stack>
+                </Button>
+              </Card>
+            </FormDisclosure>
+          </>
         )}
       </Section>
     </RailFrame>
@@ -823,11 +1191,13 @@ function VaultsPane({ sessionId }: { sessionId: string }) {
   const [reference, setReference] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ url: string; text: string } | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
   const addVaultMutation = useMutation({
     mutationFn: () => addVault(sessionId, kind, reference.trim()),
     onSuccess: () => {
       setReference("");
       setError(null);
+      setShowAdd(false);
       qc.invalidateQueries({ queryKey: ["vaults", sessionId] });
     },
     onError: (mutationError) => setError(String(mutationError)),
@@ -846,59 +1216,65 @@ function VaultsPane({ sessionId }: { sessionId: string }) {
   return (
     <RailFrame title="Vaults" subtitle="Reference material mounted into this workspace.">
       <Section title="Sources">
-        <Stack>
-          {(vaults.data ?? []).map((vault) => (
-            <div key={vault.url} className="rounded-2xl border px-3 py-3" style={panelStyle}>
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="font-medium">{vault.label}</div>
-                  <div className="mt-1 truncate text-xs opacity-60">
-                    {vault.kind} · {vault.url}
-                  </div>
-                </div>
-                <div className="flex gap-2 text-xs">
-                  <button className="opacity-70 hover:opacity-100" onClick={() => previewVaultMutation.mutate(vault.url)}>
-                    Preview
-                  </button>
-                  <button className="hover:opacity-80" style={{ color: "var(--hive-danger)" }} onClick={() => confirmThen("Remove this vault source?", () => removeVaultMutation.mutate(vault.url))}>
-                    Remove
-                  </button>
+        {(vaults.data ?? []).map((vault) => (
+          <Card key={vault.url} className="px-3 py-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-medium">{vault.label}</div>
+                <div className="mt-1 truncate text-xs opacity-60">
+                  {vault.kind} · {vault.url}
                 </div>
               </div>
-              {preview?.url === vault.url && (
-                <pre className="mt-3 max-h-56 overflow-auto rounded-2xl p-3 text-xs leading-5" style={{ background: "var(--hive-mist)" }}>
-                  {preview.text}
-                </pre>
-              )}
+              <div className="flex gap-2 text-xs">
+                <button className="opacity-70 hover:opacity-100" onClick={() => previewVaultMutation.mutate(vault.url)}>
+                  Preview
+                </button>
+                <button
+                  className="hover:opacity-80"
+                  style={{ color: "var(--hive-danger)" }}
+                  onClick={() => confirmThen("Remove this vault source?", () => removeVaultMutation.mutate(vault.url))}
+                >
+                  Remove
+                </button>
+              </div>
             </div>
-          ))}
-          {(vaults.data ?? []).length === 0 && <EmptyHint text="No vault sources are mounted in this chat." />}
-        </Stack>
-        <FormCard
-          title="Add vault"
-          actions={
-            <PrimaryButton
-              disabled={!reference.trim() || addVaultMutation.isPending}
-              onClick={() => addVaultMutation.mutate()}
-            >
+            {preview?.url === vault.url && (
+              <pre
+                className="mt-3 max-h-56 overflow-auto rounded-2xl p-3 text-xs leading-5"
+                style={{ background: "var(--hive-mist)" }}
+              >
+                {preview.text}
+              </pre>
+            )}
+          </Card>
+        ))}
+        {(vaults.data ?? []).length === 0 && (
+          <EmptyHint text="No vault sources are mounted in this chat." />
+        )}
+        <FormDisclosure label="Add vault" open={showAdd} onToggle={() => setShowAdd((v) => !v)}>
+          <Card className="space-y-2 p-3">
+            <SubtleSelectField label="Vault source" value={kind} onChange={setKind}>
+              <option value="github">GitHub</option>
+              <option value="gitlab">GitLab</option>
+              <option value="https">HTTPS</option>
+            </SubtleSelectField>
+            <input
+              value={reference}
+              onChange={(event) => setReference(event.target.value)}
+              placeholder={placeholder}
+              className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
+              style={fieldStyle}
+            />
+            {error && (
+              <div className="text-xs" style={{ color: "var(--hive-danger)" }}>
+                {error}
+              </div>
+            )}
+            <Button variant="primary" disabled={!reference.trim() || addVaultMutation.isPending} onClick={() => addVaultMutation.mutate()}>
               Add
-            </PrimaryButton>
-          }
-        >
-          <SubtleSelectField label="Vault source" value={kind} onChange={setKind}>
-            <option value="github">GitHub</option>
-            <option value="gitlab">GitLab</option>
-            <option value="https">HTTPS</option>
-          </SubtleSelectField>
-          <input
-            value={reference}
-            onChange={(event) => setReference(event.target.value)}
-            placeholder={placeholder}
-            className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
-            style={fieldStyle}
-          />
-          {error && <div className="text-xs" style={{ color: "var(--hive-danger)" }}>{error}</div>}
-        </FormCard>
+            </Button>
+          </Card>
+        </FormDisclosure>
       </Section>
     </RailFrame>
   );
@@ -910,12 +1286,14 @@ function SkillsPane({ sessionId }: { sessionId: string }) {
   const [name, setName] = useState("");
   const [source, setSource] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
   const installSkillMutation = useMutation({
     mutationFn: () => installSkill(sessionId, name.trim(), source.trim()),
     onSuccess: () => {
       setName("");
       setSource("");
       setError(null);
+      setShowAdd(false);
       qc.invalidateQueries({ queryKey: ["skills", sessionId] });
     },
     onError: (mutationError) => setError(String(mutationError)),
@@ -928,55 +1306,54 @@ function SkillsPane({ sessionId }: { sessionId: string }) {
   return (
     <RailFrame title="Skills" subtitle="Instruction bundles injected into the active participants.">
       <Section title="Loaded Skills">
-        <Stack>
-          {(skills.data ?? []).map((skill) => (
-            <div key={skill.id} className="rounded-2xl border px-3 py-3" style={panelStyle}>
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="font-medium">{skill.name}</div>
-                  {skill.sourceUrl && <div className="mt-1 truncate text-xs opacity-55">{skill.sourceUrl}</div>}
-                  <div className="mt-2 line-clamp-3 text-xs leading-5 opacity-60">{skill.instructions}</div>
-                </div>
-                <button
-                  onClick={() => confirmThen("Remove this skill?", () => removeSkillMutation.mutate(skill.id))}
-                  className="text-xs hover:opacity-80"
-                  style={{ color: "var(--hive-danger)" }}
-                >
-                  Remove
-                </button>
+        {(skills.data ?? []).map((skill) => (
+          <Card key={skill.id} className="px-3 py-3">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-medium">{skill.name}</div>
+                {skill.sourceUrl && <div className="mt-1 truncate text-xs opacity-55">{skill.sourceUrl}</div>}
+                <div className="mt-2 line-clamp-3 text-xs leading-5 opacity-60">{skill.instructions}</div>
               </div>
+              <button
+                onClick={() => confirmThen("Remove this skill?", () => removeSkillMutation.mutate(skill.id))}
+                className="text-xs hover:opacity-80"
+                style={{ color: "var(--hive-danger)" }}
+              >
+                Remove
+              </button>
             </div>
-          ))}
-          {(skills.data ?? []).length === 0 && <EmptyHint text="No skills loaded for this chat." />}
-        </Stack>
-        <FormCard
-          title="Install from the internet"
-          hint="Supports direct URLs, GitHub blob URLs, and owner/repo/path references."
-          actions={
-            <PrimaryButton
-              disabled={!source.trim() || installSkillMutation.isPending}
-              onClick={() => installSkillMutation.mutate()}
-            >
+          </Card>
+        ))}
+        {(skills.data ?? []).length === 0 && <EmptyHint text="No skills loaded for this chat." />}
+        <FormDisclosure label="Install skill" open={showAdd} onToggle={() => setShowAdd((v) => !v)}>
+          <Card className="space-y-2 p-3">
+            <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+              Supports direct URLs, GitHub blob URLs, and owner/repo/path references.
+            </p>
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="Display name (optional)"
+              className="w-full rounded-xl border px-3 py-2 text-sm"
+              style={fieldStyle}
+            />
+            <input
+              value={source}
+              onChange={(event) => setSource(event.target.value)}
+              placeholder="skills.sh/... or owner/repo/SKILL.md"
+              className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
+              style={fieldStyle}
+            />
+            {error && (
+              <div className="text-xs" style={{ color: "var(--hive-danger)" }}>
+                {error}
+              </div>
+            )}
+            <Button variant="primary" disabled={!source.trim() || installSkillMutation.isPending} onClick={() => installSkillMutation.mutate()}>
               Install
-            </PrimaryButton>
-          }
-        >
-          <input
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            placeholder="Display name (optional)"
-            className="w-full rounded-xl border px-3 py-2"
-            style={fieldStyle}
-          />
-          <input
-            value={source}
-            onChange={(event) => setSource(event.target.value)}
-            placeholder="skills.sh/... or owner/repo/SKILL.md"
-            className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
-            style={fieldStyle}
-          />
-          {error && <div className="text-xs" style={{ color: "var(--hive-danger)" }}>{error}</div>}
-        </FormCard>
+            </Button>
+          </Card>
+        </FormDisclosure>
       </Section>
     </RailFrame>
   );
@@ -1080,10 +1457,7 @@ function ContextPane({
   }
 
   return (
-    <RailFrame
-      title="Context"
-      subtitle="Real backend context budget and compaction state."
-    >
+    <RailFrame title="Context" subtitle="Real backend context budget and compaction state.">
       <Section title="Budget">
         <div className="rounded-2xl border p-3" style={panelStyle}>
           <div className="mb-2 flex items-center justify-between text-xs">
@@ -1114,18 +1488,22 @@ function ContextPane({
           {hasCompaction && data && (
             <div
               className="mt-2.5 rounded-xl px-3 py-2 text-xs leading-5"
-              style={{ background: "rgba(214,158,87,0.10)", color: "var(--hive-accent-warm)" }}
+              style={{
+                background: "color-mix(in srgb, var(--hive-accent-warm) 10%, transparent)",
+                color: "var(--hive-accent-warm)",
+              }}
             >
               {data.overflowMessageCount} earlier messages are currently condensed to fit the context window.
             </div>
           )}
-          {data && (
-            <div className="mt-2 text-[11px] opacity-50">{summaryLabel}</div>
-          )}
+          {data && <div className="mt-2 text-[11px] opacity-50">{summaryLabel}</div>}
           {budgetPct >= 70 && (
             <div
               className="mt-2.5 rounded-xl px-3 py-2 text-xs leading-5"
-              style={{ background: "rgba(200,70,70,0.10)", color: "var(--hive-danger)" }}
+              style={{
+                background: "color-mix(in srgb, var(--hive-danger) 10%, transparent)",
+                color: "var(--hive-danger)",
+              }}
             >
               Context is getting full — consider removing unused skills or vaults below.
             </div>
@@ -1142,30 +1520,28 @@ function ContextPane({
         {(skills.data ?? []).length === 0 ? (
           <EmptyHint text="No skills loaded. Skills inject instructions into every turn." />
         ) : (
-          <Stack>
-            {(skills.data ?? []).map((skill) => {
-              const est = Math.ceil(skill.instructions.length / 4);
-              return (
-                <div
-                  key={skill.id}
-                  className="flex items-start gap-2 rounded-xl border px-2.5 py-2"
-                  style={panelStyle}
-                >
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate text-sm font-medium">{skill.name}</div>
-                    <div className="mt-0.5 text-xs opacity-50">~{fmtTokens(est)} tokens in prompt</div>
-                  </div>
-                  <IconButton
-                    label="Remove skill"
-                    size={24}
-                    onClick={() => confirmThen("Remove this skill?", () => removeSkillMutation.mutate(skill.id))}
-                  >
-                    <IconX size={14} />
-                  </IconButton>
+          (skills.data ?? []).map((skill) => {
+            const est = Math.ceil(skill.instructions.length / 4);
+            return (
+              <div
+                key={skill.id}
+                className="flex items-start gap-2 rounded-xl border px-2.5 py-2"
+                style={panelStyle}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-sm font-medium">{skill.name}</div>
+                  <div className="mt-0.5 text-xs opacity-50">~{fmtTokens(est)} tokens in prompt</div>
                 </div>
-              );
-            })}
-          </Stack>
+                <IconButton
+                  label="Remove skill"
+                  size={24}
+                  onClick={() => confirmThen("Remove this skill?", () => removeSkillMutation.mutate(skill.id))}
+                >
+                  <IconX size={14} />
+                </IconButton>
+              </div>
+            );
+          })
         )}
       </Section>
 
@@ -1173,32 +1549,42 @@ function ContextPane({
         {(vaults.data ?? []).length === 0 ? (
           <EmptyHint text="No vaults mounted. Vaults inject reference material into context." />
         ) : (
-          <Stack>
-            {(vaults.data ?? []).map((vault) => (
-              <div
-                key={vault.url}
-                className="flex items-start gap-2 rounded-xl border px-2.5 py-2"
-                style={panelStyle}
-              >
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium">{vault.label}</div>
-                  <div className="mt-0.5 text-xs opacity-50">{vault.kind} reference source</div>
-                </div>
-                <IconButton
-                  label="Unmount vault"
-                  size={24}
-                  onClick={() => confirmThen("Remove this vault source?", () => removeVaultMutation.mutate(vault.url))}
-                >
-                  <IconX size={14} />
-                </IconButton>
+          (vaults.data ?? []).map((vault) => (
+            <div
+              key={vault.url}
+              className="flex items-start gap-2 rounded-xl border px-2.5 py-2"
+              style={panelStyle}
+            >
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-medium">{vault.label}</div>
+                <div className="mt-0.5 text-xs opacity-50">{vault.kind} reference source</div>
               </div>
-            ))}
-          </Stack>
+              <IconButton
+                label="Unmount vault"
+                size={24}
+                onClick={() => confirmThen("Remove this vault source?", () => removeVaultMutation.mutate(vault.url))}
+              >
+                <IconX size={14} />
+              </IconButton>
+            </div>
+          ))
         )}
       </Section>
     </RailFrame>
   );
 }
+
+// ─── Back-compat shims (retained deliberately) ───────────────────────────────
+// `SubtleSelectField`, `Stack`, `panelStyle` and `fieldStyle` are still imported
+// by WorkflowsPane.tsx and WorkflowBuilder.tsx, which are out of scope for this
+// task. ui.tsx has no `Stack` and its `SubtleSelectField` shape differs, and its
+// same-named `panelStyle`/`fieldStyle` tokens carry *swapped* panel/mist
+// semantics — re-exporting them would invert contrast in those files and in this
+// pane. So these keep RightRail's original values. RightRail's own new code
+// composes the ui.tsx primitives (Button, Card, Section, SelectField, Switch,
+// FormDisclosure, EmptyHint) instead. `EmptyHint` is re-exported from ui.tsx.
+
+export { EmptyHint };
 
 export function SubtleSelectField({
   label,
@@ -1227,7 +1613,9 @@ export function SubtleSelectField({
       >
         {children}
       </select>
-      <span className="shrink-0 opacity-40"><IconChevronDown size={13} /></span>
+      <span className="shrink-0 opacity-40">
+        <IconChevronDown size={13} />
+      </span>
     </label>
   );
 }
@@ -1241,65 +1629,8 @@ function ContextStat({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Section({ title, action, children }: { title: string; action?: ReactNode; children: ReactNode }) {
-  return (
-    <section className="mb-5">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-[0.16em] opacity-60">{title}</h2>
-        {action}
-      </div>
-      {children}
-    </section>
-  );
-}
-
 export function Stack({ children }: { children: ReactNode }) {
   return <div className="space-y-2">{children}</div>;
-}
-
-function FormCard({
-  title,
-  hint,
-  actions,
-  children,
-}: {
-  title: string;
-  hint?: string;
-  actions?: ReactNode;
-  children: ReactNode;
-}) {
-  return (
-    <div className="mt-3 rounded-2xl border p-3" style={panelStyle}>
-      <div className="mb-3 flex items-start justify-between gap-3">
-        <div>
-          <div className="text-sm font-semibold">{title}</div>
-          {hint && <div className="mt-1 text-xs opacity-55">{hint}</div>}
-        </div>
-        {actions}
-      </div>
-      <div className="space-y-2">{children}</div>
-    </div>
-  );
-}
-
-function PrimaryButton({
-  children,
-  disabled,
-  onClick,
-}: {
-  children: ReactNode;
-  disabled?: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <Button variant="primary" disabled={disabled} onClick={onClick}>
-      {children}
-    </Button>
-  );
-}
-
-export function EmptyHint({ text }: { text: string }) {
-  return <div className="rounded-2xl border px-3 py-4 text-sm opacity-55" style={panelStyle}>{text}</div>;
 }
 
 export const panelStyle = {
