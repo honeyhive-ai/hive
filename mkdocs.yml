@@ -91,6 +91,7 @@ nav:
       - Settings: features/settings.md
       - Right Rail: features/right-rail.md
       - Multi-agent collaboration: features/multi-agent.md
+      - Mentions & notifications: features/mentions-and-notifications.md
       - Agentic workflows: features/workflows.md
       - Scheduled agents: features/scheduling.md
       - Managing context: features/voice-and-slash.md

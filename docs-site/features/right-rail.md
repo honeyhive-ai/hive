@@ -7,7 +7,7 @@ vertical icon strip you click to switch contents. Eight sections:
 |-----------|-----------------------------------------------------------------|
 | Tools     | Runtimes, workspace agent CRUD, MCP servers                     |
 | Context   | Context-budget telemetry + summarize/compact controls           |
-| Review    | Pending proposals: quorum votes + agreement-gated implement      |
+| Review    | Pending proposals (quorum votes + agreement-gated implement) **and** queued work: unanswered agent mentions + host status |
 | People    | Members, presence, roles, invites                               |
 | Vaults    | Reference-material sources mounted into the session             |
 | Skills    | Instruction bundles injected into participants' prompts         |
@@ -35,7 +35,12 @@ pane header to close the rail entirely.
   workspace bar shows the rollup count; the pane shows what's
   changed.
 - **Review**: when an agent has proposed a write. Lists pending
-  proposals, lets you claim / approve / disposition.
+  proposals, lets you claim / approve / disposition. It also shows
+  **Queued work** — every unanswered `@agent` mention with its host's
+  live status (online / offline / owner-device). If an agent's host is
+  offline, a **Run on worker** button reassigns it to an online worker
+  so the backlog drains without waiting for that laptop to wake. See
+  [Headless agents](../concepts/headless-agents.md).
 - **People**: members, online status, invites, cross-network
   rendezvous status, nearby-on-LAN peers.
 

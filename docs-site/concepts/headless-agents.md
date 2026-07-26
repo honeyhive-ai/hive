@@ -75,6 +75,12 @@ See the
 [CLI README](https://github.com/honeyhive-ai/hive/blob/main/crates/hive-cli/README.md#the-worker-daemon-spec-124)
 for the full daemon behaviour.
 
+The **desktop app** surfaces the same queue without the CLI: the **Review**
+pane lists every unanswered agent mention with its host's live status, and an
+offline or device-bound agent gets a **Run on worker** button that reassigns it
+to an online worker — the GUI equivalent of `hive set-agent-host`. See
+[Right Rail — Review](../features/right-rail.md).
+
 **Give the worker tools.** A worker (or `hive agent`) can reach external boards
 like **Linear** or **GitHub** through MCP tools: point `HIVE_MCP_CONFIG` at a TOML
 listing MCP servers and provision each server's token via the environment (never
