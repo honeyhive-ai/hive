@@ -87,6 +87,14 @@ listing MCP servers and provision each server's token via the environment (never
 in the file). With no config it runs tool-free, exactly as before. See the
 [CLI README — MCP tools for headless agents](https://github.com/honeyhive-ai/hive/blob/main/crates/hive-cli/README.md#mcp-tools-for-headless-agents).
 
+**Tools are gated on the requester's role.** A synced message only drives the
+worker's MCP tools if its author holds at least `HIVE_MCP_MIN_ROLE`
+(`viewer`|`contributor`|`admin`|`owner`, default `contributor`). Below that bar
+the agent still replies — it just runs **tool-free**, so a Viewer can't provoke
+a write to Linear or GitHub through a headless agent. Raise the bar with
+`HIVE_MCP_MIN_ROLE=admin`. See the
+[CLI README — requester-role gate](https://github.com/honeyhive-ai/hive/blob/main/crates/hive-cli/README.md#requester-role-gate-hive_mcp_min_role).
+
 Do **not** try to substitute a network filesystem (SSHFS/NFS) for the relay —
 SQLite over a network mount is corruption-prone. Use the relay.
 

@@ -20,7 +20,7 @@ The body is a `WorkspaceConn` serialized to JSON and base64url-encoded
 |-------|-------|
 | `relay_url` | The relay peers converge on (e.g. `wss://relay.example/v1`). |
 | `room` | The room id; its hash is the stable workspace id. |
-| `key` | The E2EE passphrase that derives the workspace key. `null` = a plaintext room. |
+| `key` | The E2EE passphrase that derives the workspace key. `null` = a keyless room, which **cannot sync through a relay** — E2EE is mandatory for relay sync, so a keyless workspace is local-only. |
 | `name` | Friendly display label (defaults to the room name). |
 | `dm_account` | Set only for a 1:1 direct-message workspace; otherwise absent. |
 
@@ -36,23 +36,23 @@ local rail decoration and could be a large `data:` URL.
     [invite by GitHub handle](../features/invites.md#invite-by-github-handle),
     which seals the key to the invitee's devices instead of embedding it.
 
-## Short codes
+## The key is exchanged out-of-band
 
-A **short code** is not the same bytes hyphenated — it's a brief,
-relay-brokered token (e.g. `K7P2QX`). `workspaceShareCode` publishes
-the full `hivews1:` invite to the relay's pairing store and returns a
-short handle with a **TTL of about ten minutes**; `redeemShortCode`
-resolves the handle back to the full invite and joins. Because the
-lookup lives on the relay, short codes require a configured relay
-(unlike the full code, which is self-contained).
+Because the `key` field lives inside the `hivews1:` code, the code **is** the
+secret — it is exchanged out-of-band (paste it to the joiner over a channel you
+trust) and the **relay never sees it**. There is deliberately no relay-brokered
+handoff of the key.
 
-The same short-code mechanism also brokers peer **friend codes**; the
-resolver decides which it is by whether the resolved payload starts
-with `hivews1:`.
+The old relay-brokered "short code" — a brief token (e.g. `K7P2QX`) that
+published the full `hivews1:` invite, key and all, to the relay's pairing store —
+has been **removed**, precisely because it put the key on the relay. For a
+copy-paste-free path that keeps the key off the relay, use
+[invite by GitHub handle](../features/invites.md#invite-by-github-handle), which
+seals the key to the invitee's devices instead of brokering it.
 
 ## Redemption
 
-`joinWorkspace` (or a resolved short code):
+`joinWorkspace`:
 
 1. Strips the `hivews1:` prefix and base64url-decodes the body.
 2. Rejects a code whose `room` is empty or whose encoding is invalid.

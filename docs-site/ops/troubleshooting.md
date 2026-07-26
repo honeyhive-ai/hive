@@ -42,16 +42,29 @@ endpoint isn't reachable:
 
 ## Peers aren't syncing
 
-Multiuser goes through the relay. Check, on **every** device:
+Multiuser goes through the relay. **Start with the status pill** — it is now
+real, not cosmetic. It shows **live / error / offline** (older builds always
+said "Live" whenever a URL was set). A wrong workspace key, a dead relay, or an
+expired token surfaces as a visible **Sync error** with the reason, so read that
+first. Then check, on **every** device:
 
-1. **Relay URL + Room match exactly** (Settings → Multiuser sync). The status
-   line should read `● connected`.
-2. The relay is up: `curl https://<relay>/v1/health` → `ok`.
-3. If you set a **workspace key**, it must be identical on every device
-   (mismatched keys can't decrypt each other's envelopes). Status shows
-   `🔒 encrypted`.
+1. **Relay URL + Room match exactly** (Settings → Multiuser sync). A healthy
+   connection reads **live**; a problem reads **error** (with the reason) or
+   **offline**.
+2. The relay is up: `curl https://<relay>/v1/health` → `ok` (`200`; a `503`
+   means the relay is running but its store is unhealthy).
+3. If you set a **workspace key**, it must be identical on every device — a
+   mismatch now shows up as a **Sync error** rather than silently dropping the
+   remote messages it can't decrypt. Status shows `🔒 encrypted` when a key is
+   set. Note that **sync requires a key**: a workspace pointed at a relay with no
+   key won't push at all and shows a Sync error until you configure one.
 4. The relay holds queued events **in memory** — a relay restart (or a free-tier
    host that slept) drops anything peers hadn't pulled yet.
+
+> A single bad or undecryptable envelope no longer halts sync — the client skips
+> the corrupt/foreign body and keeps applying the rest, logging the reason. So
+> "everything stopped" is unlikely; look for a **Sync error** on the pill and the
+> specific reason it names.
 
 ## Agent says it did something but nothing happened
 

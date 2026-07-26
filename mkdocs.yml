@@ -87,6 +87,7 @@ nav:
       - Tools & permissions: concepts/tools-and-consent.md
       - Vaults & knowledge sources: concepts/vaults.md
       - Identity & devices: concepts/identity.md
+      - Security & trust: concepts/security.md
   - Features:
       - Settings: features/settings.md
       - Right Rail: features/right-rail.md

@@ -102,10 +102,12 @@ password and don't skip it.
 
 In Hive: **Settings → Multiuser sync**, fill in the Relay URL, Room, and
 Workspace key, then **Save**. The background sync picks it up within a few
-seconds — no relaunch needed. The panel should show:
+seconds — no relaunch needed. The status pill should read **live** (it reports
+real connection state — **live / error / offline** — so a bad key or dead relay
+shows as a **Sync error**, not a false "Live"):
 
 ```
-● connected · relay https://acme-hive.fly.dev · room acme-backend · 🔒 encrypted
+live · relay https://acme-hive.fly.dev · room acme-backend · 🔒 encrypted
 ```
 
 Now create a chat on one machine; it shows up on the others within ~3 seconds.
@@ -170,6 +172,6 @@ Move up when you hit one of these:
 
 - [ ] One relay deployed, `/v1/health` returns `ok`
 - [ ] Relay URL + room + workspace key shared over a trusted channel
-- [ ] Every teammate's Settings → Multiuser sync shows `● connected · 🔒 encrypted`
+- [ ] Every teammate's Settings → Multiuser sync pill reads `live · 🔒 encrypted`
 - [ ] Each developer has their own runtime credentials (claude login / API key / Ollama)
 - [ ] Room id is unguessable; everyone has the workspace key
