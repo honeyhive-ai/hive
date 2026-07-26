@@ -570,6 +570,21 @@ impl ChatService {
         Ok(config_id)
     }
 
+    /// Ensure a workspace has at least one channel — create `#general` (+ its
+    /// drop-in chat) if it has none. Idempotent; a no-op once any channel exists.
+    /// Returns whether it created the default.
+    pub fn ensure_default_channel(
+        &mut self,
+        workspace_id: Uuid,
+        runtime_id: impl Into<String>,
+    ) -> Result<bool> {
+        if !self.list_channels(workspace_id)?.is_empty() {
+            return Ok(false);
+        }
+        self.create_channel(workspace_id, "general", None, runtime_id)?;
+        Ok(true)
+    }
+
     /// The workspace's channels, ordered by position.
     pub fn list_channels(&self, workspace_id: Uuid) -> Result<Vec<Channel>> {
         let config_id = workspace_config_session_id(workspace_id);

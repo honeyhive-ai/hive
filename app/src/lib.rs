@@ -7125,6 +7125,20 @@ pub fn run() {
                                 }
                             }
                         }
+                        // Give every workspace a default #general channel so the
+                        // channel tree is never empty (idempotent — no-op once any
+                        // channel exists).
+                        let wid = state.active_workspace_id();
+                        let rt = state.current_default_runtime_id();
+                        if let Ok(mut svc) = state.service.lock() {
+                            match svc.ensure_default_channel(wid, &rt) {
+                                Ok(true) => {
+                                    let _ = handle.emit("workspace://synced", 1);
+                                }
+                                Ok(false) => {}
+                                Err(e) => eprintln!("ensure default channel: {e}"),
+                            }
+                        }
                     }
                 });
             }
