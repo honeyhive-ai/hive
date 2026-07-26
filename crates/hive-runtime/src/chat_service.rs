@@ -386,6 +386,9 @@ impl ChatService {
         workspace_id: Uuid,
         agent: WorkspaceAgent,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let mut agents = self
             .load(session_id)?
             .map(|s| s.workspace_agents)
@@ -414,6 +417,9 @@ impl ChatService {
         avatar_url: Option<String>,
         avatar_color_hex: Option<String>,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let mut agents = self
             .load(session_id)?
             .map(|s| s.workspace_agents)
@@ -445,6 +451,9 @@ impl ChatService {
         workspace_id: Uuid,
         agent_id: Uuid,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let agents: Vec<WorkspaceAgent> = self
             .load(session_id)?
             .map(|s| s.workspace_agents)
@@ -675,6 +684,9 @@ impl ChatService {
         workspace_id: Uuid,
         skill: SkillProfile,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let mut skills = self
             .load(session_id)?
             .map(|s| s.loaded_skills)
@@ -695,6 +707,9 @@ impl ChatService {
         workspace_id: Uuid,
         skill_id: Uuid,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let skills: Vec<SkillProfile> = self
             .load(session_id)?
             .map(|s| s.loaded_skills)
@@ -829,6 +844,9 @@ impl ChatService {
         workspace_id: Uuid,
         source: VaultSource,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let mut sources = self
             .load(session_id)?
             .map(|s| s.vault_sources)
@@ -847,6 +865,9 @@ impl ChatService {
         workspace_id: Uuid,
         raw_url: &str,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let sources: Vec<VaultSource> = self
             .load(session_id)?
             .map(|s| s.vault_sources)
@@ -1003,7 +1024,40 @@ impl ChatService {
         Ok(())
     }
 
+    /// Project a session. For a chat, the effective agents/skills/vaults are the
+    /// workspace's — held on the config log (§11 config hoist) — so overlay them
+    /// (union with any pre-hoist per-chat config, so nothing vanishes before the
+    /// migration). The config log itself loads raw: it IS the source.
     pub fn load(&self, session_id: Uuid) -> Result<Option<ChatSession>> {
+        let Some(mut session) = self.store.load_session(session_id)? else {
+            return Ok(None);
+        };
+        let config_id = workspace_config_session_id(session.workspace_id);
+        if session_id != config_id {
+            if let Some(cfg) = self.store.load_session(config_id)? {
+                for a in cfg.workspace_agents {
+                    if !session.workspace_agents.iter().any(|x| x.id == a.id) {
+                        session.workspace_agents.push(a);
+                    }
+                }
+                for s in cfg.loaded_skills {
+                    if !session.loaded_skills.iter().any(|x| x.name == s.name) {
+                        session.loaded_skills.push(s);
+                    }
+                }
+                for v in cfg.vault_sources {
+                    if !session.vault_sources.iter().any(|x| x.raw_url() == v.raw_url()) {
+                        session.vault_sources.push(v);
+                    }
+                }
+            }
+        }
+        Ok(Some(session))
+    }
+
+    /// Raw projection with no config overlay — for the read-modify-write config
+    /// methods, which must see only the config log's own roster.
+    fn load_raw(&self, session_id: Uuid) -> Result<Option<ChatSession>> {
         Ok(self.store.load_session(session_id)?)
     }
 }
@@ -1043,6 +1097,30 @@ mod tests {
         // No account id → publish_identity is a no-op (local-only, unverifiable).
         let author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
         (ChatService::new(store, device_id, kp, account_kp, author), public)
+    }
+
+    #[test]
+    fn config_hoists_to_the_workspace_and_is_shared_across_chats() {
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let chat_a = svc.create_chat("A", wid, "anthropic").unwrap();
+        let chat_b = svc.create_chat("B", wid, "anthropic").unwrap();
+
+        // An agent added "in" chat A is written to the workspace-config log…
+        let agent = WorkspaceAgent::new("Scout", "anthropic");
+        let agent_id = agent.id;
+        svc.add_agent(chat_a.id, wid, agent).unwrap();
+
+        // …and is therefore visible from chat B too (hoist), and from the config log.
+        let b = svc.load(chat_b.id).unwrap().unwrap();
+        assert!(b.workspace_agents.iter().any(|a| a.id == agent_id), "agent not shared to chat B");
+        let cfg = svc.load(workspace_config_session_id(wid)).unwrap().unwrap();
+        assert!(cfg.workspace_agents.iter().any(|a| a.id == agent_id));
+
+        // Removing it clears it everywhere.
+        svc.remove_agent(chat_a.id, wid, agent_id).unwrap();
+        let b = svc.load(chat_b.id).unwrap().unwrap();
+        assert!(!b.workspace_agents.iter().any(|a| a.id == agent_id));
     }
 
     #[test]

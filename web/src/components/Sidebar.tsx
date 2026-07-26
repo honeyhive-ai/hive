@@ -3,21 +3,28 @@ import type { CSSProperties } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   archiveChat,
+  archiveChannel,
   createChat,
+  createChannel,
+  createChatInChannel,
   deleteChat,
   getAppSettings,
   listAgents,
+  listChannels,
   listChats,
   listMembers,
   listSkills,
   listVaults,
+  renameChannel,
+  type ChannelDto,
   type ChatSummaryDto,
 } from "@/lib/ipc";
 import type { UtilityPane } from "@/components/RightRail";
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonRows } from "@/components/Skeleton";
 import { Avatar } from "@/components/Avatar";
-import { confirmDialog } from "@/components/Dialog";
+import { confirmDialog, promptDialog } from "@/components/Dialog";
+import { confirmThen } from "@/lib/confirm";
 import {
   NavRow,
   ChatRow,
@@ -26,6 +33,7 @@ import {
   Popover,
   PopoverHeader,
   PopoverItem,
+  SELECT_TINT,
 } from "@/components/ui";
 import {
   IconPlus,
@@ -40,6 +48,9 @@ import {
   IconFlow,
   IconGrid,
   IconGear,
+  IconEllipsis,
+  IconChevronRight,
+  IconChevronDown,
 } from "@/lib/icons";
 
 /// Last path segment of a folder path (cross-platform separators).
@@ -103,6 +114,7 @@ export function Sidebar({
 }) {
   const qc = useQueryClient();
   const chats = useQuery({ queryKey: ["chats"], queryFn: listChats });
+  const channels = useQuery({ queryKey: ["channels"], queryFn: listChannels });
   const settings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
   const members = useQuery({
     queryKey: ["members", sessionId],
@@ -126,10 +138,25 @@ export function Sidebar({
   });
 
   const [showArchived, setShowArchived] = useState(false);
-  const [filter, setFilter] = useState<ChatFilter>("all");
+  // `null` = no cross-channel View active → the channel tree is shown. A View
+  // ("all"/"recent") forces the flat, cross-channel list (spec §11 rule 8).
+  const [filter, setFilter] = useState<ChatFilter | null>(null);
   const [search, setSearch] = useState("");
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const menuAnchor = useRef<HTMLElement | null>(null);
+  const [channelMenuFor, setChannelMenuFor] = useState<string | null>(null);
+  const channelMenuAnchor = useRef<HTMLElement | null>(null);
+  // Per-channel collapse, persisted in localStorage (spec §6.2). Absent key =
+  // expanded; "1" = collapsed. State mirrors the store so toggles re-render.
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const isCollapsed = (id: string): boolean =>
+    id in collapsed
+      ? collapsed[id]
+      : window.localStorage.getItem(`hive.sidebar.channel.${id}`) === "1";
+  const setChannelCollapsed = (id: string, next: boolean) => {
+    window.localStorage.setItem(`hive.sidebar.channel.${id}`, next ? "1" : "0");
+    setCollapsed((prev) => ({ ...prev, [id]: next }));
+  };
   const [showWorkspaceMenu, setShowWorkspaceMenu] = useState(false);
   const wsAnchor = useRef<HTMLButtonElement | null>(null);
   const [workspaceError, setWorkspaceError] = useState<string | null>(null);
@@ -147,7 +174,43 @@ export function Sidebar({
     }
     return out;
   }, [all, showArchived, search, filter]);
-  const menuChat = menuFor ? visible.find((c) => c.id === menuFor) ?? null : null;
+
+  // Active channels sorted by position (archived channels are hidden — their
+  // history stays attributable but they leave the list, spec §11 rule 7).
+  const openChannels = useMemo(
+    () =>
+      (channels.data ?? [])
+        .filter((c) => !c.archived)
+        .sort((a, b) => a.position - b.position),
+    [channels.data],
+  );
+  // Chats grouped by channel (default chats excluded — the header IS that
+  // conversation, §11 rule 1) and the unfiled remainder (empty channelId).
+  const focusedByChannel = useMemo(() => {
+    const map = new Map<string, ChatSummaryDto[]>();
+    for (const c of all) {
+      if (c.archived !== showArchived) continue;
+      if (!c.channelId || c.isChannelDefault) continue;
+      const list = map.get(c.channelId);
+      if (list) list.push(c);
+      else map.set(c.channelId, [c]);
+    }
+    return map;
+  }, [all, showArchived]);
+  const unfiled = useMemo(
+    () => all.filter((c) => !c.channelId && c.archived === showArchived),
+    [all, showArchived],
+  );
+
+  // A View (or an active search) forces the flat cross-channel list; otherwise
+  // the channel tree is shown. With no channels at all the tree degrades to the
+  // flat list plus a "+ New channel" affordance (current behavior preserved).
+  const flatMode = filter !== null || search.trim().length > 0;
+  const hasChannels = openChannels.length > 0;
+  const menuChat = menuFor ? all.find((c) => c.id === menuFor) ?? null : null;
+  const menuChannel = channelMenuFor
+    ? openChannels.find((c) => c.id === channelMenuFor) ?? null
+    : null;
   const canRemoveCurrentWorkspace = workspacePath.trim().length > 0;
   const memberCount = (members.data ?? []).filter((m) => !m.isSelf).length;
   const deviceName = settings.data?.deviceName ?? "";
@@ -213,6 +276,58 @@ export function Sidebar({
     } catch (e) {
       toast.error(`Couldn't delete chat: ${errMsg(e)}`);
     }
+  }
+
+  async function handleNewChannel() {
+    const name = await promptDialog("Name this channel", { placeholder: "e.g. design" });
+    if (!name || !name.trim()) return;
+    try {
+      await createChannel(name.trim());
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["channels"] }),
+        qc.invalidateQueries({ queryKey: ["chats"] }),
+      ]);
+    } catch (e) {
+      toast.error(`Couldn't create channel: ${errMsg(e)}`);
+    }
+  }
+
+  async function handleNewChatIn(ch: ChannelDto) {
+    try {
+      const created = await createChatInChannel(ch.id, "");
+      setChannelCollapsed(ch.id, false);
+      await qc.invalidateQueries({ queryKey: ["chats"] });
+      onSelect(created.id);
+    } catch (e) {
+      toast.error(`Couldn't create chat: ${errMsg(e)}`);
+    }
+  }
+
+  async function handleRenameChannel(ch: ChannelDto) {
+    setChannelMenuFor(null);
+    const name = await promptDialog("Rename channel", { defaultValue: ch.name });
+    if (!name || !name.trim() || name.trim() === ch.name) return;
+    try {
+      await renameChannel(ch.id, name.trim(), ch.purpose ?? undefined);
+      await qc.invalidateQueries({ queryKey: ["channels"] });
+    } catch (e) {
+      toast.error(`Couldn't rename channel: ${errMsg(e)}`);
+    }
+  }
+
+  function handleArchiveChannel(ch: ChannelDto) {
+    setChannelMenuFor(null);
+    confirmThen(`Archive #${ch.name}? Its chats archive with it.`, async () => {
+      try {
+        await archiveChannel(ch.id, true);
+        await Promise.all([
+          qc.invalidateQueries({ queryKey: ["channels"] }),
+          qc.invalidateQueries({ queryKey: ["chats"] }),
+        ]);
+      } catch (e) {
+        toast.error(`Couldn't archive channel: ${errMsg(e)}`);
+      }
+    });
   }
 
   // Inside the sidebar, text rides the dedicated sidebar-ink tokens (spec §2)
@@ -317,73 +432,223 @@ export function Sidebar({
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-1.5 py-1">
-        {/* 3 — Views (cross-channel filters). "Needs review" awaits a per-chat
-            review signal on the summary DTO; shipping the two backed filters. */}
-        <NavRow icon={<IconMessage size={15} />} label="All chats" active={filter === "all"} onClick={() => setFilter("all")} count={all.filter((c) => !c.archived).length} />
-        <NavRow icon={<IconActivity size={15} />} label="Recent" active={filter === "recent"} onClick={() => setFilter("recent")} />
+        {/* 3 — Views (cross-channel filters) sit ABOVE the channel tree (spec
+            §11 rule 8). Clicking an active View toggles back to the tree.
+            "Needs review" awaits a per-chat review signal on the summary DTO. */}
+        <NavRow
+          icon={<IconMessage size={15} />}
+          label="All chats"
+          active={filter === "all"}
+          onClick={() => setFilter((f) => (f === "all" ? null : "all"))}
+          count={all.filter((c) => !c.archived).length}
+        />
+        <NavRow
+          icon={<IconActivity size={15} />}
+          label="Recent"
+          active={filter === "recent"}
+          onClick={() => setFilter((f) => (f === "recent" ? null : "recent"))}
+        />
 
-        {/* 4 — Chats. (Channel grouping is deferred to the config-hoist schema.) */}
+        {/* 4 — Chats. A View (or search) forces the flat cross-channel list;
+            otherwise the channel tree (spec §11.1). With no channels the tree
+            degrades to the flat list + a "+ New channel" affordance. */}
         <div className="mt-2">
-          <SectionCap
-            action={
-              <div className="flex items-center gap-1.5">
-                <button
-                  className="text-[11px] opacity-70 hover:opacity-100"
-                  onClick={() => setShowArchived((v) => !v)}
-                  title={showArchived ? "Show active chats" : "Show archived chats"}
-                >
-                  {showArchived ? "Archived" : "Active"}
-                </button>
-                <button
-                  onClick={handleNew}
-                  className="grid h-5 w-5 place-items-center rounded-md opacity-80 hover:bg-[color:var(--hive-overlay)] hover:opacity-100"
-                  title="New chat"
-                  aria-label="New chat"
-                >
-                  <IconPlus size={14} />
-                </button>
-              </div>
-            }
-          >
-            {showArchived ? "Archived" : "Chats"}
-          </SectionCap>
+          {(chats.isLoading || channels.isLoading) && <SkeletonRows rows={5} />}
 
-          {chats.isLoading && <SkeletonRows rows={5} />}
-          {!chats.isLoading &&
-            visible.map((c) => (
-              <ChatRow
-                key={c.id}
-                title={c.title || "Untitled"}
-                when={relTime(c.lastActivityAt)}
-                active={c.id === selectedId && view === "workspace"}
-                onClick={() => onSelect(c.id)}
-                onOptions={(el) => {
-                  menuAnchor.current = el;
-                  setMenuFor(c.id);
-                }}
-              />
-            ))}
-          {!chats.isLoading && visible.length === 0 && search.trim() && (
-            <EmptyHint text={`No chats match “${search.trim()}”.`} />
+          {/* 4a — Flat, cross-channel list (a View is active, searching, or the
+              workspace has no channels yet). Preserves the original behavior. */}
+          {!chats.isLoading && !channels.isLoading && (flatMode || !hasChannels) && (
+            <>
+              <SectionCap
+                action={
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      className="text-[11px] opacity-70 hover:opacity-100"
+                      onClick={() => setShowArchived((v) => !v)}
+                      title={showArchived ? "Show active chats" : "Show archived chats"}
+                    >
+                      {showArchived ? "Archived" : "Active"}
+                    </button>
+                    <button
+                      onClick={handleNew}
+                      className="grid h-5 w-5 place-items-center rounded-md opacity-80 hover:bg-[color:var(--hive-overlay)] hover:opacity-100"
+                      title="New chat"
+                      aria-label="New chat"
+                    >
+                      <IconPlus size={14} />
+                    </button>
+                  </div>
+                }
+              >
+                {showArchived ? "Archived" : "Chats"}
+              </SectionCap>
+
+              {visible.map((c) => (
+                <ChatRow
+                  key={c.id}
+                  title={c.title || "Untitled"}
+                  when={relTime(c.lastActivityAt)}
+                  active={c.id === selectedId && view === "workspace"}
+                  onClick={() => onSelect(c.id)}
+                  onOptions={(el) => {
+                    menuAnchor.current = el;
+                    setMenuFor(c.id);
+                  }}
+                />
+              ))}
+              {visible.length === 0 && search.trim() && (
+                <EmptyHint text={`No chats match “${search.trim()}”.`} />
+              )}
+              {visible.length === 0 && !search.trim() && !showArchived && (
+                <EmptyHint
+                  text="No chats yet."
+                  action={
+                    <button
+                      onClick={handleNew}
+                      className="rounded-lg px-3 py-1.5 text-xs font-medium text-white"
+                      style={{ background: "var(--hive-accent-cool)" }}
+                    >
+                      Start a chat
+                    </button>
+                  }
+                />
+              )}
+              {visible.length === 0 && !search.trim() && showArchived && (
+                <div className="px-2.5 py-2 text-[12px]" style={{ color: "var(--hive-sidebar-ink-muted)" }}>
+                  Nothing archived.
+                </div>
+              )}
+
+              {/* Degraded tree: no channels yet, but keep the create path. */}
+              {!flatMode && !hasChannels && <NewChannelRow onClick={handleNewChannel} />}
+            </>
           )}
-          {!chats.isLoading && visible.length === 0 && !search.trim() && !showArchived && (
-            <EmptyHint
-              text="No chats yet."
-              action={
-                <button
-                  onClick={handleNew}
-                  className="rounded-lg px-3 py-1.5 text-xs font-medium text-white"
-                  style={{ background: "var(--hive-accent-cool)" }}
-                >
-                  Start a chat
-                </button>
-              }
-            />
-          )}
-          {!chats.isLoading && visible.length === 0 && !search.trim() && showArchived && (
-            <div className="px-2.5 py-2 text-[12px]" style={{ color: "var(--hive-sidebar-ink-muted)" }}>
-              Nothing archived.
-            </div>
+
+          {/* 4b — The channel tree. */}
+          {!chats.isLoading && !channels.isLoading && !flatMode && hasChannels && (
+            <>
+              <SectionCap
+                action={
+                  <button
+                    className="text-[11px] opacity-70 hover:opacity-100"
+                    onClick={() => setShowArchived((v) => !v)}
+                    title={showArchived ? "Show active chats" : "Show archived chats"}
+                  >
+                    {showArchived ? "Archived" : "Active"}
+                  </button>
+                }
+              >
+                Channels
+              </SectionCap>
+
+              {openChannels.map((ch) => {
+                const collapsedNow = isCollapsed(ch.id);
+                const active = ch.defaultChatId === selectedId && view === "workspace";
+                const focused = focusedByChannel.get(ch.id) ?? [];
+                return (
+                  <div key={ch.id}>
+                    {/* Header: chevron collapses; the name opens the default chat
+                        (which IS this conversation — no child row, §11 rule 1). */}
+                    <div
+                      className="group/chan relative flex items-center rounded-xl pr-1 transition-colors hover:bg-[color:var(--hive-overlay)]"
+                      style={active ? { background: SELECT_TINT } : undefined}
+                    >
+                      <button
+                        onClick={() => setChannelCollapsed(ch.id, !collapsedNow)}
+                        className="grid h-[30px] w-6 shrink-0 place-items-center rounded-lg"
+                        style={{ color: "var(--hive-ink-soft)" }}
+                        title={collapsedNow ? "Expand" : "Collapse"}
+                        aria-label={collapsedNow ? `Expand #${ch.name}` : `Collapse #${ch.name}`}
+                      >
+                        {collapsedNow ? <IconChevronRight size={14} /> : <IconChevronDown size={14} />}
+                      </button>
+                      <button
+                        onClick={() => onSelect(ch.defaultChatId)}
+                        className="flex h-[30px] min-w-0 flex-1 items-center text-left"
+                        title={ch.purpose ?? `#${ch.name}`}
+                      >
+                        <span
+                          className="min-w-0 flex-1 truncate text-[13px]"
+                          style={{ fontWeight: active ? 700 : 590, letterSpacing: "-0.01em", color: "var(--hive-ink)" }}
+                        >
+                          <span style={{ color: "var(--hive-ink-soft)" }}>#</span>
+                          {ch.name}
+                        </span>
+                      </button>
+                      <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover/chan:opacity-100">
+                        <button
+                          onClick={() => handleNewChatIn(ch)}
+                          className="grid h-[22px] w-[22px] place-items-center rounded-md hover:bg-[color:var(--hive-overlay)]"
+                          style={{ color: "var(--hive-ink-soft)" }}
+                          title="New chat in channel"
+                          aria-label={`New chat in #${ch.name}`}
+                        >
+                          <IconPlus size={14} />
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            channelMenuAnchor.current = e.currentTarget;
+                            setChannelMenuFor(ch.id);
+                          }}
+                          className="grid h-[22px] w-[22px] place-items-center rounded-md hover:bg-[color:var(--hive-overlay)]"
+                          style={{ color: "var(--hive-ink-soft)" }}
+                          title="Channel options"
+                          aria-label={`#${ch.name} options`}
+                        >
+                          <IconEllipsis size={15} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {!collapsedNow && (
+                      <div className="ml-3 border-l pl-1" style={{ borderColor: "var(--hive-line)" }}>
+                        {focused.map((c) => (
+                          <ChatRow
+                            key={c.id}
+                            title={c.title || "Untitled"}
+                            when={relTime(c.lastActivityAt)}
+                            active={c.id === selectedId && view === "workspace"}
+                            onClick={() => onSelect(c.id)}
+                            onOptions={(el) => {
+                              menuAnchor.current = el;
+                              setMenuFor(c.id);
+                            }}
+                          />
+                        ))}
+                        {focused.length === 0 && (
+                          <div className="px-2.5 py-1 text-[11px]" style={{ color: "var(--hive-sidebar-ink-muted)" }}>
+                            {showArchived ? "Nothing archived" : "No focused chats"}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+
+              <NewChannelRow onClick={handleNewChannel} />
+
+              {/* Unfiled chats (empty channelId — the pre-migration norm) live
+                  under a plain "Chats" cap so nothing disappears (§11 rule 2). */}
+              {unfiled.length > 0 && (
+                <div className="mt-2">
+                  <SectionCap>Chats</SectionCap>
+                  {unfiled.map((c) => (
+                    <ChatRow
+                      key={c.id}
+                      title={c.title || "Untitled"}
+                      when={relTime(c.lastActivityAt)}
+                      active={c.id === selectedId && view === "workspace"}
+                      onClick={() => onSelect(c.id)}
+                      onOptions={(el) => {
+                        menuAnchor.current = el;
+                        setMenuFor(c.id);
+                      }}
+                    />
+                  ))}
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -409,6 +674,14 @@ export function Sidebar({
         </Popover>
       )}
 
+      {/* Channel options menu — Rename / Archive (spec §11 rules 4, 7). */}
+      {menuChannel && (
+        <Popover anchorRef={channelMenuAnchor} align="right" minWidth={160} onDismiss={() => setChannelMenuFor(null)}>
+          <PopoverItem label="Rename…" onSelect={() => handleRenameChannel(menuChannel)} />
+          <PopoverItem label="Archive…" danger onSelect={() => handleArchiveChannel(menuChannel)} />
+        </Popover>
+      )}
+
       {/* 6 — Account row. */}
       <button
         onClick={onOpenSettings}
@@ -428,6 +701,23 @@ export function Sidebar({
         </span>
       </button>
     </aside>
+  );
+}
+
+/// The "+ New channel" row that closes the channel group (spec §6.2). Styled
+/// as a muted NavRow so it reads as an affordance, not a channel.
+function NewChannelRow({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className="flex h-[30px] w-full items-center gap-2.5 rounded-xl px-2.5 text-left text-[13px] transition-colors hover:bg-[color:var(--hive-overlay)]"
+      style={{ color: "var(--hive-sidebar-ink-muted)" }}
+    >
+      <span className="grid h-4 w-4 shrink-0 place-items-center" aria-hidden>
+        <IconPlus size={15} />
+      </span>
+      <span className="min-w-0 flex-1 truncate">New channel</span>
+    </button>
   );
 }
 
