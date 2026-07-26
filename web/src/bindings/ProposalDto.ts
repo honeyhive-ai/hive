@@ -6,6 +6,11 @@ import type { ApprovalDto } from "./ApprovalDto";
  */
 export type ProposalDto = { id: string, title: string, body: string, 
 /**
+ * Actor who created the proposal; their own approval doesn't count toward
+ * quorum. Empty for authorless proposals (e.g. workflow gates).
+ */
+authorActorId: string, 
+/**
  * "fileDiff" | "command" | "decision"
  */
 kind: string, 

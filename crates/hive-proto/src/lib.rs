@@ -105,6 +105,10 @@ pub struct ProposalDto {
     pub id: String,
     pub title: String,
     pub body: String,
+    /// Actor who created the proposal; their own approval doesn't count toward
+    /// quorum. Empty for authorless proposals (e.g. workflow gates).
+    #[serde(default)]
+    pub author_actor_id: String,
     /// "fileDiff" | "command" | "decision"
     pub kind: String,
     /// "open" | "approved" | "rejected" | "applied"

@@ -1055,7 +1055,7 @@ mod tests {
 
         let base = base_session();
         let (sid, wid) = (base.id, base.workspace_id);
-        let mut proposal = ActionProposal::new("Ship it", ProposalKind::Decision);
+        let mut proposal = ActionProposal::new("Ship it", ProposalKind::Decision, "");
         proposal.required_approvals = 2;
         let pid = proposal.id;
         let vote = |actor: &str, approved: bool| ProposalApproval {
