@@ -2405,6 +2405,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hive-core",
+ "hive-runtime",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "hive-core"
 version = "0.2.0"
 dependencies = [

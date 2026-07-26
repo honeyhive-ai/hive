@@ -5,8 +5,19 @@
 //! member through the existing per-session sync machinery.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::time_util::Timestamp;
+
+/// The reserved session id for a workspace's **config log** — the event stream
+/// that holds channels + hoisted config (agents/skills/vaults/members). Derived
+/// deterministically from the workspace id so every device and peer computes the
+/// same id and the log syncs through the existing per-session machinery.
+pub fn workspace_config_session_id(workspace_id: Uuid) -> Uuid {
+    // Fixed namespace ("hiveconfiglogses") so the mapping is stable across builds.
+    const NS: Uuid = Uuid::from_u128(0x6869_7665_636f_6e66_6967_6c6f_6773_6573);
+    Uuid::new_v5(&NS, workspace_id.as_bytes())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

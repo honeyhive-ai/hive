@@ -83,6 +83,7 @@ nav:
   - Concepts:
       - Workspaces & chats: concepts/workspaces.md
       - Agents (built-in vs BYO): concepts/agents.md
+      - Headless agents & setups: concepts/headless-agents.md
       - Tools & permissions: concepts/tools-and-consent.md
       - Vaults & knowledge sources: concepts/vaults.md
       - Identity & devices: concepts/identity.md

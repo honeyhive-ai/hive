@@ -22,11 +22,13 @@ pub mod skills;
 pub mod time_util;
 pub mod vault;
 pub mod workflow;
+pub mod workspace_runtime;
 
 // Flat re-exports of the core domain types for ergonomic downstream use.
 pub use agent::WorkspaceAgent;
 pub use authorization::{evaluate as authorize, AuthzDecision, AuthzReason};
-pub use channel::Channel;
+pub use channel::{workspace_config_session_id, Channel};
+pub use workspace_runtime::{WorkspaceCredential, WorkspaceRuntime};
 pub use chat::{
     ChatMessage, ChatToolCall, ChatToolResult, MessageReaction, MessageRole, TranscriptEventKind,
 };

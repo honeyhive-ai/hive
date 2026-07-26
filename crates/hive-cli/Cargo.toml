@@ -1,0 +1,18 @@
+[package]
+name = "hive-cli"
+version = "0.1.0"
+edition.workspace = true
+
+# A headless Hive client — connect to a relay, sync a workspace's E2EE event
+# log, read/write signed events. The `hive` binary a cloud-hosted agent runs
+# instead of the desktop app. Composes hive-core + hive-runtime; no Tauri.
+[[bin]]
+name = "hive"
+path = "src/main.rs"
+
+[dependencies]
+hive-core = { path = "../hive-core" }
+hive-runtime = { path = "../hive-runtime" }
+anyhow.workspace = true
+uuid.workspace = true
+tokio.workspace = true

@@ -12,10 +12,10 @@
 use hive_core::crypto::{sign_envelope, DeviceCertificate};
 use hive_core::events::MemberRoleChange;
 use hive_core::{
-    ActionProposal, ActorIdentity, ActorStamp, ChatMessage, ChatSession, MessageReaction,
-    MessageRole, ProposalApproval, SessionEvent, SessionEventEnvelope, SigningKeypair,
-    SkillProfile, Timestamp, VaultSource, WorkflowDefinition, WorkflowRun, WorkspaceAgent,
-    WorkspaceMember, WorkspaceRole,
+    workspace_config_session_id, ActionProposal, ActorIdentity, ActorStamp, Channel, ChatMessage,
+    ChatSession, MessageReaction, MessageRole, ProposalApproval, SessionEvent, SessionEventEnvelope,
+    SigningKeypair, SkillProfile, Timestamp, VaultSource, WorkflowDefinition, WorkflowRun,
+    WorkspaceAgent, WorkspaceCredential, WorkspaceMember, WorkspaceRole, WorkspaceRuntime,
 };
 use uuid::Uuid;
 
@@ -382,10 +382,13 @@ impl ChatService {
     /// Add (or replace, by id) a workspace agent, emitting the full new roster.
     pub fn add_agent(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         agent: WorkspaceAgent,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let mut agents = self
             .load(session_id)?
             .map(|s| s.workspace_agents)
@@ -408,12 +411,15 @@ impl ChatService {
     /// no-op error. Passing `None` for a field clears it.
     pub fn set_agent_avatar(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         agent_id: Uuid,
         avatar_url: Option<String>,
         avatar_color_hex: Option<String>,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let mut agents = self
             .load(session_id)?
             .map(|s| s.workspace_agents)
@@ -441,10 +447,13 @@ impl ChatService {
     /// Remove a workspace agent by id, emitting the full new roster.
     pub fn remove_agent(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         agent_id: Uuid,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let agents: Vec<WorkspaceAgent> = self
             .load(session_id)?
             .map(|s| s.workspace_agents)
@@ -529,13 +538,224 @@ impl ChatService {
         Ok(())
     }
 
-    /// Install (or replace, by name) a loaded skill, emitting the new set.
-    pub fn add_skill(
+    // ── Channels (spec §11) ────────────────────────────────────────────────
+    // Channels live on the workspace-config log — a reserved session whose id is
+    // derived from the workspace id. It syncs like any other session. Its members
+    // roster (seeded here) is what authorizes config-log edits.
+
+    /// Ensure the workspace-config log exists, seeded with the creator as the
+    /// first Owner member so its authz has a roster. Idempotent. Returns the
+    /// config-log session id.
+    pub fn ensure_workspace_config(&mut self, workspace_id: Uuid) -> Result<Uuid> {
+        let config_id = workspace_config_session_id(workspace_id);
+        if self.load(config_id)?.is_none() {
+            let mut session = ChatSession::new("", workspace_id, "");
+            session.id = config_id;
+            session.creator_actor_id = self.author.id.clone();
+            session.members.push(WorkspaceMember {
+                id: self.author.id.clone(),
+                actor: self.author.clone(),
+                role: WorkspaceRole::Owner,
+                title: String::new(),
+                index: 1,
+                joined_at: Timestamp::now(),
+            });
+            self.append_signed(
+                config_id,
+                workspace_id,
+                SessionEvent::SessionSnapshot { session: Box::new(session) },
+            )?;
+            self.publish_identity(config_id, workspace_id)?;
+        }
+        Ok(config_id)
+    }
+
+    /// Ensure a workspace has at least one channel — create `#general` (+ its
+    /// drop-in chat) if it has none. Idempotent; a no-op once any channel exists.
+    /// Returns whether it created the default.
+    pub fn ensure_default_channel(
+        &mut self,
+        workspace_id: Uuid,
+        runtime_id: impl Into<String>,
+    ) -> Result<bool> {
+        if !self.list_channels(workspace_id)?.is_empty() {
+            return Ok(false);
+        }
+        self.create_channel(workspace_id, "general", None, runtime_id)?;
+        Ok(true)
+    }
+
+    /// The workspace's channels, ordered by position.
+    pub fn list_channels(&self, workspace_id: Uuid) -> Result<Vec<Channel>> {
+        let config_id = workspace_config_session_id(workspace_id);
+        let mut channels = self
+            .load(config_id)?
+            .map(|s| s.channels)
+            .unwrap_or_default();
+        channels.sort_by(|a, b| a.position.cmp(&b.position).then(a.id.cmp(&b.id)));
+        Ok(channels)
+    }
+
+    /// Create a channel and its drop-in default chat (titled after the channel).
+    /// Returns (channel, default_chat).
+    pub fn create_channel(
+        &mut self,
+        workspace_id: Uuid,
+        name: impl Into<String>,
+        purpose: Option<String>,
+        runtime_id: impl Into<String>,
+    ) -> Result<(Channel, ChatSession)> {
+        self.ensure_workspace_config(workspace_id)?;
+        let config_id = workspace_config_session_id(workspace_id);
+        let name = name.into();
+        let channel_id = Uuid::new_v4().to_string();
+        // The default chat lives in the channel from birth.
+        let default_chat = self.create_chat(name.clone(), workspace_id, runtime_id)?;
+        self.set_chat_channel(default_chat.id, workspace_id, &channel_id)?;
+        let next_pos = self
+            .load(config_id)?
+            .map(|s| s.channels.iter().map(|c| c.position).max().unwrap_or(-1) + 1)
+            .unwrap_or(0);
+        let mut channel = Channel::new(channel_id, name);
+        channel.purpose = purpose.filter(|p| !p.trim().is_empty());
+        channel.position = next_pos;
+        channel.default_chat_id = default_chat.id.to_string();
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::ChannelCreated { channel: channel.clone() },
+        )?;
+        self.maybe_snapshot(config_id, workspace_id)?;
+        Ok((channel, default_chat))
+    }
+
+    /// Rename a channel and/or set its purpose.
+    pub fn rename_channel(
+        &mut self,
+        workspace_id: Uuid,
+        channel_id: impl Into<String>,
+        name: impl Into<String>,
+        purpose: Option<String>,
+    ) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::ChannelRenamed {
+                channel_id: channel_id.into(),
+                name: name.into(),
+                purpose: purpose.filter(|p| !p.trim().is_empty()),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Set the channel order (ascending position).
+    pub fn reorder_channels(&mut self, workspace_id: Uuid, channel_ids: Vec<String>) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::ChannelReordered { channel_ids },
+        )?;
+        Ok(())
+    }
+
+    /// Archive (or restore) a channel.
+    pub fn archive_channel(
+        &mut self,
+        workspace_id: Uuid,
+        channel_id: impl Into<String>,
+        archived: bool,
+    ) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::ChannelArchived { channel_id: channel_id.into(), archived },
+        )?;
+        Ok(())
+    }
+
+    // ── Workspace-owned runtimes (spec §12.5) ──────────────────────────────
+    // Detached/headless agents run on these — a workspace credential, never a
+    // member's personal key. They ride the config log (synced) like other config.
+
+    /// The workspace's owned runtimes.
+    pub fn list_workspace_runtimes(&self, workspace_id: Uuid) -> Result<Vec<WorkspaceRuntime>> {
+        Ok(self
+            .load(workspace_config_session_id(workspace_id))?
+            .map(|s| s.workspace_runtimes)
+            .unwrap_or_default())
+    }
+
+    /// Add (or replace by id) a workspace-owned runtime.
+    pub fn add_workspace_runtime(
+        &mut self,
+        workspace_id: Uuid,
+        runtime: WorkspaceRuntime,
+    ) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let mut runtimes = self
+            .load(config_id)?
+            .map(|s| s.workspace_runtimes)
+            .unwrap_or_default();
+        if let Some(slot) = runtimes.iter_mut().find(|r| r.id == runtime.id) {
+            *slot = runtime;
+        } else {
+            runtimes.push(runtime);
+        }
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::WorkspaceRuntimesUpdated { runtimes },
+        )?;
+        Ok(())
+    }
+
+    /// Remove a workspace-owned runtime by id.
+    pub fn remove_workspace_runtime(&mut self, workspace_id: Uuid, id: &str) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let runtimes: Vec<WorkspaceRuntime> = self
+            .load(config_id)?
+            .map(|s| s.workspace_runtimes)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.id != id)
+            .collect();
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::WorkspaceRuntimesUpdated { runtimes },
+        )?;
+        Ok(())
+    }
+
+    /// File a chat into a channel (per-chat, session-scoped). Empty id unfiles.
+    pub fn set_chat_channel(
         &mut self,
         session_id: Uuid,
         workspace_id: Uuid,
+        channel_id: impl Into<String>,
+    ) -> Result<()> {
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::ChatChannelChanged { channel_id: channel_id.into() },
+        )?;
+        Ok(())
+    }
+
+    /// Install (or replace, by name) a loaded skill, emitting the new set.
+    pub fn add_skill(
+        &mut self,
+        _session_id: Uuid,
+        workspace_id: Uuid,
         skill: SkillProfile,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let mut skills = self
             .load(session_id)?
             .map(|s| s.loaded_skills)
@@ -552,10 +772,13 @@ impl ChatService {
     /// Remove a loaded skill by id.
     pub fn remove_skill(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         skill_id: Uuid,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let skills: Vec<SkillProfile> = self
             .load(session_id)?
             .map(|s| s.loaded_skills)
@@ -686,10 +909,13 @@ impl ChatService {
     /// Add (dedup by raw URL) a vault source.
     pub fn add_vault_source(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         source: VaultSource,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let mut sources = self
             .load(session_id)?
             .map(|s| s.vault_sources)
@@ -704,10 +930,13 @@ impl ChatService {
     /// Remove a vault source by its raw URL.
     pub fn remove_vault_source(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         raw_url: &str,
     ) -> Result<()> {
+        // Config hoist (§11): these records are workspace-level — target the
+        // workspace-config log, not the calling chat's session.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let sources: Vec<VaultSource> = self
             .load(session_id)?
             .map(|s| s.vault_sources)
@@ -864,8 +1093,57 @@ impl ChatService {
         Ok(())
     }
 
+    /// Project a session. For a chat, the effective agents/skills/vaults are the
+    /// workspace's — held on the config log (§11 config hoist) — so overlay them
+    /// (union with any pre-hoist per-chat config, so nothing vanishes before the
+    /// migration). The config log itself loads raw: it IS the source.
     pub fn load(&self, session_id: Uuid) -> Result<Option<ChatSession>> {
-        Ok(self.store.load_session(session_id)?)
+        let Some(mut session) = self.store.load_session(session_id)? else {
+            return Ok(None);
+        };
+        let config_id = workspace_config_session_id(session.workspace_id);
+        if session_id != config_id {
+            if let Some(cfg) = self.store.load_session(config_id)? {
+                for a in cfg.workspace_agents {
+                    if !session.workspace_agents.iter().any(|x| x.id == a.id) {
+                        session.workspace_agents.push(a);
+                    }
+                }
+                for s in cfg.loaded_skills {
+                    if !session.loaded_skills.iter().any(|x| x.name == s.name) {
+                        session.loaded_skills.push(s);
+                    }
+                }
+                for v in cfg.vault_sources {
+                    if !session.vault_sources.iter().any(|x| x.raw_url() == v.raw_url()) {
+                        session.vault_sources.push(v);
+                    }
+                }
+                for r in cfg.workspace_runtimes {
+                    if !session.workspace_runtimes.iter().any(|x| x.id == r.id) {
+                        session.workspace_runtimes.push(r);
+                    }
+                }
+            }
+        }
+        Ok(Some(session))
+    }
+}
+
+/// Resolve a workspace runtime's credential to a usable secret — where a
+/// headless worker turns a **workspace-owned** runtime into an actual key (spec
+/// §12.5), never a personal one. `SecretRef` reads the worker's out-of-band env
+/// (`HIVE_WS_SECRET_<ref>`); `Inline` returns the secret carried E2EE on the
+/// config log; `None` is keyless.
+pub fn resolve_workspace_credential(cred: &WorkspaceCredential) -> Option<String> {
+    match cred {
+        WorkspaceCredential::SecretRef { secret_ref } => {
+            std::env::var(WorkspaceCredential::env_var(secret_ref))
+                .ok()
+                .filter(|s| !s.is_empty())
+        }
+        WorkspaceCredential::Inline { secret } => (!secret.is_empty()).then(|| secret.clone()),
+        WorkspaceCredential::None => None,
     }
 }
 
@@ -904,6 +1182,104 @@ mod tests {
         // No account id → publish_identity is a no-op (local-only, unverifiable).
         let author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
         (ChatService::new(store, device_id, kp, account_kp, author), public)
+    }
+
+    #[test]
+    fn workspace_runtimes_sync_and_resolve_credentials() {
+        use hive_core::{ModelProviderKind, WorkspaceCredential, WorkspaceRuntime};
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+
+        // Define a workspace-owned runtime with an out-of-log secret reference.
+        let mut rt = WorkspaceRuntime::new("ws-claude", "Team Claude", ModelProviderKind::Anthropic, "claude-sonnet-4-5");
+        rt.credential = WorkspaceCredential::SecretRef { secret_ref: "acme".into() };
+        svc.add_workspace_runtime(wid, rt.clone()).unwrap();
+
+        // It's listed on the workspace and visible from any chat (config hoist).
+        assert_eq!(svc.list_workspace_runtimes(wid).unwrap().len(), 1);
+        let loaded = svc.load(chat.id).unwrap().unwrap();
+        assert_eq!(loaded.workspace_runtimes.len(), 1);
+        assert_eq!(loaded.workspace_runtimes[0].id, "ws-claude");
+
+        // SecretRef resolves from the worker's env; Inline returns the carried secret.
+        assert_eq!(resolve_workspace_credential(&rt.credential), None);
+        std::env::set_var("HIVE_WS_SECRET_acme", "sk-workspace-123");
+        assert_eq!(resolve_workspace_credential(&rt.credential).as_deref(), Some("sk-workspace-123"));
+        std::env::remove_var("HIVE_WS_SECRET_acme");
+        assert_eq!(
+            resolve_workspace_credential(&WorkspaceCredential::Inline { secret: "sk-inline".into() }).as_deref(),
+            Some("sk-inline")
+        );
+
+        // Removal clears it everywhere.
+        svc.remove_workspace_runtime(wid, "ws-claude").unwrap();
+        assert!(svc.load(chat.id).unwrap().unwrap().workspace_runtimes.is_empty());
+    }
+
+    #[test]
+    fn config_hoists_to_the_workspace_and_is_shared_across_chats() {
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let chat_a = svc.create_chat("A", wid, "anthropic").unwrap();
+        let chat_b = svc.create_chat("B", wid, "anthropic").unwrap();
+
+        // An agent added "in" chat A is written to the workspace-config log…
+        let agent = WorkspaceAgent::new("Scout", "anthropic");
+        let agent_id = agent.id;
+        svc.add_agent(chat_a.id, wid, agent).unwrap();
+
+        // …and is therefore visible from chat B too (hoist), and from the config log.
+        let b = svc.load(chat_b.id).unwrap().unwrap();
+        assert!(b.workspace_agents.iter().any(|a| a.id == agent_id), "agent not shared to chat B");
+        let cfg = svc.load(workspace_config_session_id(wid)).unwrap().unwrap();
+        assert!(cfg.workspace_agents.iter().any(|a| a.id == agent_id));
+
+        // Removing it clears it everywhere.
+        svc.remove_agent(chat_a.id, wid, agent_id).unwrap();
+        let b = svc.load(chat_b.id).unwrap().unwrap();
+        assert!(!b.workspace_agents.iter().any(|a| a.id == agent_id));
+    }
+
+    #[test]
+    fn channels_ride_the_workspace_config_log() {
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+
+        // Creating a channel seeds the config log, the channel, and its default chat.
+        let (channel, default_chat) = svc
+            .create_channel(wid, "auth", Some("auth work".into()), "anthropic")
+            .unwrap();
+        assert_eq!(channel.name, "auth");
+        assert_eq!(channel.default_chat_id, default_chat.id.to_string());
+        assert_eq!(channel.position, 0);
+
+        // The channel is listed off the config log (id = workspace_config_session_id).
+        let channels = svc.list_channels(wid).unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].id, channel.id);
+
+        // The config log is a distinct session from the default chat.
+        let config_id = hive_core::workspace_config_session_id(wid);
+        assert_ne!(config_id, default_chat.id);
+
+        // The default chat carries its channel assignment (per-chat, session-scoped).
+        let loaded = svc.load(default_chat.id).unwrap().unwrap();
+        assert_eq!(loaded.channel_id, channel.id);
+        // ...and the config log itself has no channel assignment but holds the roster.
+        let cfg = svc.load(config_id).unwrap().unwrap();
+        assert!(cfg.channel_id.is_empty());
+        assert_eq!(cfg.channels.len(), 1);
+        assert_eq!(cfg.members.len(), 1, "config log seeds the creator as member for authz");
+
+        // A second channel gets the next position; rename + archive fold correctly.
+        let (c2, _) = svc.create_channel(wid, "ui", None, "anthropic").unwrap();
+        assert_eq!(c2.position, 1);
+        svc.rename_channel(wid, &channel.id, "authentication", None).unwrap();
+        svc.archive_channel(wid, &c2.id, true).unwrap();
+        let after = svc.list_channels(wid).unwrap();
+        assert_eq!(after.iter().find(|c| c.id == channel.id).unwrap().name, "authentication");
+        assert!(after.iter().find(|c| c.id == c2.id).unwrap().archived);
     }
 
     #[test]

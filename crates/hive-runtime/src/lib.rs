@@ -27,7 +27,7 @@ pub mod sync_engine;
 pub mod tool_loop;
 pub mod vault_fetcher;
 
-pub use chat_service::{turns_for, turns_from, ChatService};
+pub use chat_service::{resolve_workspace_credential, turns_for, turns_from, ChatService};
 pub use context::{Compactor, CompactionResult, Summarizer};
 pub use mcp::{McpRegistry, McpServerSpec, McpTool, McpTransport};
 pub use mentions::{parse_mentions, MentionTargets};

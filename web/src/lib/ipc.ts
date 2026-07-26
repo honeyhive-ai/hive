@@ -6,6 +6,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { AppInfo } from "@/bindings/AppInfo";
 import type { ChatSummaryDto } from "@/bindings/ChatSummaryDto";
+import type { ChannelDto } from "@/bindings/ChannelDto";
 import type { ChatSessionDto } from "@/bindings/ChatSessionDto";
 import type { ChatStreamEvent } from "@/bindings/ChatStreamEvent";
 import type { GitFileDiffDto } from "@/bindings/GitFileDiffDto";
@@ -25,6 +26,7 @@ import type { RelayUserDto } from "@/bindings/RelayUserDto";
 import type { IssuedRelayTokenDto } from "@/bindings/IssuedRelayTokenDto";
 
 export type { ChatSummaryDto } from "@/bindings/ChatSummaryDto";
+export type { ChannelDto } from "@/bindings/ChannelDto";
 export type { ChatSessionDto } from "@/bindings/ChatSessionDto";
 export type { ChatMessageDto } from "@/bindings/ChatMessageDto";
 export type { GitFileDiffDto } from "@/bindings/GitFileDiffDto";
@@ -45,6 +47,27 @@ export const listChats = () => invoke<ChatSummaryDto[]>("list_chats");
 
 export const createChat = (title: string) =>
   invoke<ChatSessionDto>("create_chat", { title });
+
+// ── Channels (spec §11) ──────────────────────────────────────────────────────
+export const listChannels = () => invoke<ChannelDto[]>("list_channels");
+
+export const createChannel = (name: string, purpose?: string) =>
+  invoke<ChannelDto>("create_channel", { name, purpose: purpose ?? null });
+
+export const renameChannel = (channelId: string, name: string, purpose?: string) =>
+  invoke<void>("rename_channel", { channelId, name, purpose: purpose ?? null });
+
+export const reorderChannels = (channelIds: string[]) =>
+  invoke<void>("reorder_channels", { channelIds });
+
+export const archiveChannel = (channelId: string, archived: boolean) =>
+  invoke<void>("archive_channel", { channelId, archived });
+
+export const createChatInChannel = (channelId: string, title: string) =>
+  invoke<ChatSessionDto>("create_chat_in_channel", { channelId, title });
+
+export const moveChat = (chatId: string, channelId: string) =>
+  invoke<void>("move_chat", { chatId, channelId });
 
 export const getChat = (sessionId: string) =>
   invoke<ChatSessionDto | null>("get_chat", { sessionId });

@@ -298,6 +298,11 @@ export function App() {
     const unlisten = onWorkspaceSynced(() => {
       qc.invalidateQueries({ queryKey: ["chats"] });
       qc.invalidateQueries({ queryKey: ["chat"] });
+      // Channels + skills also ride the synced log (config hoist / §11): refresh
+      // them too, or a channel/skill a headless agent created while you were
+      // offline lands in the store but not in the sidebar until a reload.
+      qc.invalidateQueries({ queryKey: ["channels"] });
+      qc.invalidateQueries({ queryKey: ["skills"] });
       qc.invalidateQueries({ queryKey: ["context-telemetry"] });
       qc.invalidateQueries({ queryKey: ["proposals"] });
       qc.invalidateQueries({ queryKey: ["members"] });
