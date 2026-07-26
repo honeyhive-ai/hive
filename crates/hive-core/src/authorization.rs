@@ -90,8 +90,14 @@ pub fn requires_projection_authz(event: &SessionEvent) -> bool {
             | SessionEvent::MemberRoleChanged { .. }
             | SessionEvent::SessionArchivedChanged { .. }
             | SessionEvent::WorkspaceRuntimesUpdated { .. }
+            | SessionEvent::WorkspaceRuntimeUpserted { .. }
+            | SessionEvent::WorkspaceRuntimeRemoved { .. }
             | SessionEvent::WorkspaceHostsUpdated { .. }
+            | SessionEvent::WorkspaceHostUpserted { .. }
+            | SessionEvent::WorkspaceHostRemoved { .. }
             | SessionEvent::AgentRosterUpdated { .. }
+            | SessionEvent::AgentUpserted { .. }
+            | SessionEvent::AgentRemoved { .. }
             | SessionEvent::SkillsUpdated { .. }
             | SessionEvent::VaultSourcesUpdated { .. }
             | SessionEvent::ChannelCreated { .. }
@@ -111,7 +117,9 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         | SessionEvent::MemberRoleChanged { .. }
         | SessionEvent::SessionArchivedChanged { .. }
         // Workspace runtimes carry credentials — governance, admin+.
-        | SessionEvent::WorkspaceRuntimesUpdated { .. } => WorkspaceRole::Admin,
+        | SessionEvent::WorkspaceRuntimesUpdated { .. }
+        | SessionEvent::WorkspaceRuntimeUpserted { .. }
+        | SessionEvent::WorkspaceRuntimeRemoved { .. } => WorkspaceRole::Admin,
         // content / collaboration
         SessionEvent::SessionSnapshot { .. }
         | SessionEvent::MessageAppended { .. }
@@ -121,6 +129,8 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         | SessionEvent::MessageReactionAdded { .. }
         | SessionEvent::MessageReactionRemoved { .. }
         | SessionEvent::AgentRosterUpdated { .. }
+        | SessionEvent::AgentUpserted { .. }
+        | SessionEvent::AgentRemoved { .. }
         | SessionEvent::SessionRuntimeChanged { .. }
         | SessionEvent::SessionTitleChanged { .. }
         | SessionEvent::SkillsUpdated { .. }
@@ -141,7 +151,9 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         | SessionEvent::ChannelReordered { .. }
         | SessionEvent::ChannelArchived { .. }
         | SessionEvent::ChatChannelChanged { .. }
-        | SessionEvent::WorkspaceHostsUpdated { .. } => WorkspaceRole::Contributor,
+        | SessionEvent::WorkspaceHostsUpdated { .. }
+        | SessionEvent::WorkspaceHostUpserted { .. }
+        | SessionEvent::WorkspaceHostRemoved { .. } => WorkspaceRole::Contributor,
         // A newer-client event this build can't author or interpret — require
         // the highest role so it can never be produced locally by accident.
         SessionEvent::Unknown => WorkspaceRole::Owner,
@@ -238,11 +250,31 @@ pub fn evaluate(
     }
     // Presence seam: managing only your *own* hosts (worker self-registration /
     // heartbeat) is permitted for a non-member; touching another actor's host
-    // falls through to the Contributor gate.
-    if let SessionEvent::WorkspaceHostsUpdated { hosts } = event {
-        if let Some(decision) = self_host_allowance(hosts, actor_id, session) {
-            return decision;
+    // falls through to the Contributor gate. Covers both the per-item deltas
+    // (new writes) and the legacy whole-list event (backward-compat).
+    match event {
+        // A single-host upsert (register/heartbeat) of a host the actor owns.
+        SessionEvent::WorkspaceHostUpserted { host } if host.owner_actor_id == actor_id => {
+            return AuthzDecision::allow_reason(AuthzReason::SelfHost);
         }
+        // Removing a host the actor owns — look the current owner up by id. An
+        // unknown id (nothing owned) falls through to the role gate.
+        SessionEvent::WorkspaceHostRemoved { host_id } => {
+            let owns = session
+                .workspace_hosts
+                .iter()
+                .any(|h| &h.id == host_id && h.owner_actor_id == actor_id);
+            if owns {
+                return AuthzDecision::allow_reason(AuthzReason::SelfHost);
+            }
+        }
+        // Legacy whole-list carve-out (old clients still emit this).
+        SessionEvent::WorkspaceHostsUpdated { hosts } => {
+            if let Some(decision) = self_host_allowance(hosts, actor_id, session) {
+                return decision;
+            }
+        }
+        _ => {}
     }
 
     if actor_role.rank() < min_role_for(event).rank() {
@@ -487,6 +519,83 @@ mod tests {
             },
         };
         assert!(!evaluate(&demote, "outsider", WorkspaceRole::Viewer, &s).allowed);
+    }
+
+    // ── Per-item config deltas: gating + self-host carve-out ───────────────
+
+    #[test]
+    fn non_member_may_upsert_its_own_host_delta_but_not_a_foreign_one() {
+        // The self-host carve-out extends to the per-item `WorkspaceHostUpserted`
+        // (worker self-registration / heartbeat as a single-host delta).
+        let s = session_with_members(vec![("owner", WorkspaceRole::Owner)]);
+        let own = SessionEvent::WorkspaceHostUpserted { host: host_owned("box1", "worker") };
+        let d = evaluate(&own, "worker", WorkspaceRole::Viewer, &s);
+        assert!(d.allowed);
+        assert_eq!(d.reason, AuthzReason::SelfHost);
+
+        // A non-member registering someone else's host is gated → denied.
+        let foreign = SessionEvent::WorkspaceHostUpserted { host: host_owned("box2", "someone-else") };
+        let d = evaluate(&foreign, "worker", WorkspaceRole::Viewer, &s);
+        assert!(!d.allowed);
+        assert_eq!(d.reason, AuthzReason::InsufficientRole);
+    }
+
+    #[test]
+    fn non_member_may_remove_its_own_host_delta_but_not_a_foreign_one() {
+        let mut s = session_with_members(vec![("owner", WorkspaceRole::Owner)]);
+        s.workspace_hosts = vec![host_owned("box1", "worker"), host_owned("box2", "someone-else")];
+        // Removing a host the actor owns → self-scoped, allowed.
+        let own = SessionEvent::WorkspaceHostRemoved { host_id: "box1".into() };
+        assert_eq!(evaluate(&own, "worker", WorkspaceRole::Viewer, &s).reason, AuthzReason::SelfHost);
+        // Removing a foreign host → gated → denied for a non-member.
+        let foreign = SessionEvent::WorkspaceHostRemoved { host_id: "box2".into() };
+        assert!(!evaluate(&foreign, "worker", WorkspaceRole::Viewer, &s).allowed);
+    }
+
+    #[test]
+    fn agent_delta_needs_contributor_runtime_delta_needs_admin() {
+        use crate::runtime::ModelProviderKind;
+        use crate::workspace_runtime::WorkspaceRuntime;
+        let s = session_with_members(vec![("a", WorkspaceRole::Viewer)]);
+        let agent = SessionEvent::AgentUpserted {
+            agent: crate::agent::WorkspaceAgent::new("r", "ws-claude"),
+        };
+        // Agent upsert/remove: Contributor floor (same as list `AgentRosterUpdated`).
+        assert!(!evaluate(&agent, "a", WorkspaceRole::Viewer, &s).allowed);
+        assert!(evaluate(&agent, "a", WorkspaceRole::Contributor, &s).allowed);
+        let agent_rm = SessionEvent::AgentRemoved { agent_id: uuid::Uuid::nil() };
+        assert!(!evaluate(&agent_rm, "a", WorkspaceRole::Viewer, &s).allowed);
+        assert!(evaluate(&agent_rm, "a", WorkspaceRole::Contributor, &s).allowed);
+
+        // Runtime upsert/remove: Admin floor (credentials — same as the list form).
+        let rt = SessionEvent::WorkspaceRuntimeUpserted {
+            runtime: WorkspaceRuntime::new("rt1", "One", ModelProviderKind::Anthropic, "m"),
+        };
+        assert!(!evaluate(&rt, "a", WorkspaceRole::Contributor, &s).allowed);
+        assert!(evaluate(&rt, "a", WorkspaceRole::Admin, &s).allowed);
+        let rt_rm = SessionEvent::WorkspaceRuntimeRemoved { runtime_id: "rt1".into() };
+        assert!(!evaluate(&rt_rm, "a", WorkspaceRole::Contributor, &s).allowed);
+        assert!(evaluate(&rt_rm, "a", WorkspaceRole::Admin, &s).allowed);
+    }
+
+    #[test]
+    fn config_deltas_are_projection_gated() {
+        // All six deltas must be re-authorized during projection (governance/
+        // config), same as the whole-list events they replace.
+        for ev in [
+            SessionEvent::AgentUpserted { agent: crate::agent::WorkspaceAgent::new("r", "ws-claude") },
+            SessionEvent::AgentRemoved { agent_id: uuid::Uuid::nil() },
+            SessionEvent::WorkspaceHostUpserted { host: host_owned("b", "o") },
+            SessionEvent::WorkspaceHostRemoved { host_id: "b".into() },
+            SessionEvent::WorkspaceRuntimeUpserted {
+                runtime: crate::workspace_runtime::WorkspaceRuntime::new(
+                    "rt", "n", crate::runtime::ModelProviderKind::Anthropic, "m",
+                ),
+            },
+            SessionEvent::WorkspaceRuntimeRemoved { runtime_id: "rt".into() },
+        ] {
+            assert!(requires_projection_authz(&ev), "{} must be projection-gated", ev.kind_str());
+        }
     }
 
     #[test]
