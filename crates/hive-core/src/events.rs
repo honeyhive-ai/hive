@@ -465,6 +465,17 @@ pub fn project(envelopes: &[SessionEventEnvelope]) -> Option<ChatSession> {
     };
     session.updated_at = ordered[base].timestamp;
     for env in &ordered[base + 1..] {
+        // Ingest-time authorization (spec: defense against a malicious member).
+        // A governance/config event is dropped unless its author held the role
+        // in the roster projected *so far*. Deterministic over the canonical
+        // fold ⇒ every device drops the same events ⇒ convergence preserved.
+        if crate::authorization::requires_projection_authz(&env.payload) {
+            let author = env.actor_stamp.as_ref().map(|s| s.actor.id.as_str()).unwrap_or("");
+            let role = session.role_of(author);
+            if !crate::authorization::evaluate(&env.payload, author, role, &session).allowed {
+                continue;
+            }
+        }
         session.apply(&env.payload);
         session.updated_at = env.timestamp;
     }
@@ -564,9 +575,61 @@ mod tests {
         assert!(!s.messages[0].is_streaming);
     }
 
+    fn owner_and_viewer_base() -> ChatSession {
+        let mut b = base_session();
+        b.members.push(member("owner", "owner", WorkspaceRole::Owner));
+        b.members.push(member("mallory", "mallory", WorkspaceRole::Viewer));
+        b
+    }
+
+    #[test]
+    fn ingest_authz_rejects_forged_governance_from_a_viewer() {
+        // The B1 takeover attack: a malicious member (Viewer) signs governance
+        // events AS THEMSELVES (so they pass the envelope verifier) and syncs
+        // them. Projection must drop them — the author lacked the role.
+        let base = owner_and_viewer_base();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let forged = vec![
+            snapshot_env(base, 1),
+            // Self-promotion Viewer → Owner (validly signed by mallory).
+            by("mallory", env(sid, wid, 2, SessionEvent::MemberRoleChanged {
+                change: MemberRoleChange {
+                    member_id: "mallory".into(),
+                    old_role: WorkspaceRole::Viewer,
+                    new_role: WorkspaceRole::Owner,
+                },
+            })),
+            // Eviction of the real owner (forged MemberRemoved → also a trust DoS).
+            by("mallory", env(sid, wid, 3, SessionEvent::MemberRemoved { member_id: "owner".into() })),
+        ];
+        let s = project(&forged).unwrap();
+        assert_eq!(s.role_of("mallory"), WorkspaceRole::Viewer, "forged self-promotion must be dropped");
+        assert!(s.members.iter().any(|m| m.id == "owner"), "forged owner-removal must be dropped");
+
+        // Control: the SAME role change, authored by the owner, IS applied.
+        let legit_base = owner_and_viewer_base();
+        let (sid2, wid2) = (legit_base.id, legit_base.workspace_id);
+        let legit = vec![
+            snapshot_env(legit_base, 1),
+            by("owner", env(sid2, wid2, 2, SessionEvent::MemberRoleChanged {
+                change: MemberRoleChange {
+                    member_id: "mallory".into(),
+                    old_role: WorkspaceRole::Viewer,
+                    new_role: WorkspaceRole::Contributor,
+                },
+            })),
+        ];
+        assert_eq!(
+            project(&legit).unwrap().role_of("mallory"),
+            WorkspaceRole::Contributor,
+            "an owner-authored role change is still applied"
+        );
+    }
+
     #[test]
     fn member_add_remove_and_role_change() {
-        let base = base_session();
+        let mut base = base_session();
+        base.members.push(member("owner", "owner", WorkspaceRole::Owner));
         let sid = base.id;
         let wid = base.workspace_id;
         let member = WorkspaceMember {
@@ -577,32 +640,41 @@ mod tests {
             index: 0,
             joined_at: Timestamp::epoch(),
         };
+        // Governance events must be authored by a privileged member (the owner)
+        // to pass the ingest-time authorization gate in `project`.
         let envs = vec![
             snapshot_env(base, 1),
-            SessionEventEnvelope::new(
-                sid,
-                wid,
-                2,
-                SessionEvent::MemberAdded {
-                    member: member.clone(),
-                },
-            ),
-            SessionEventEnvelope::new(
-                sid,
-                wid,
-                3,
-                SessionEvent::MemberRoleChanged {
-                    change: MemberRoleChange {
-                        member_id: "m1".into(),
-                        old_role: WorkspaceRole::Contributor,
-                        new_role: WorkspaceRole::Admin,
+            by(
+                "owner",
+                SessionEventEnvelope::new(
+                    sid,
+                    wid,
+                    2,
+                    SessionEvent::MemberAdded {
+                        member: member.clone(),
                     },
-                },
+                ),
+            ),
+            by(
+                "owner",
+                SessionEventEnvelope::new(
+                    sid,
+                    wid,
+                    3,
+                    SessionEvent::MemberRoleChanged {
+                        change: MemberRoleChange {
+                            member_id: "m1".into(),
+                            old_role: WorkspaceRole::Contributor,
+                            new_role: WorkspaceRole::Admin,
+                        },
+                    },
+                ),
             ),
         ];
         let s = project(&envs).unwrap();
-        assert_eq!(s.members.len(), 1);
-        assert_eq!(s.members[0].role, WorkspaceRole::Admin);
+        // owner (seeded) + m1; m1 was promoted to Admin.
+        assert_eq!(s.members.len(), 2);
+        assert_eq!(s.role_of("m1"), WorkspaceRole::Admin);
 
         // membership events are workspace-scoped
         assert_eq!(
@@ -669,6 +741,26 @@ mod tests {
         SessionEventEnvelope::new(sid, wid, lamport, payload)
     }
 
+    /// Attribute an envelope to `author` (as `append_signed` does in production),
+    /// so ingest-time authorization can evaluate the author's role. Governance/
+    /// config events need this to pass the projection gate.
+    fn by(author: &str, mut e: SessionEventEnvelope) -> SessionEventEnvelope {
+        e.actor_stamp = Some(ActorStamp {
+            actor: ActorIdentity::new(author, author, ActorKind::Human),
+            recorded_at: Timestamp::epoch(),
+        });
+        e
+    }
+
+    /// A base session that already has an Owner (`owner`) — the realistic starting
+    /// point for a workspace, so governance events authored by the owner are
+    /// authorized during projection.
+    fn owned_base() -> ChatSession {
+        let mut s = base_session();
+        s.members.push(member("owner", "owner", WorkspaceRole::Owner));
+        s
+    }
+
     fn member(id: &str, actor: &str, role: WorkspaceRole) -> WorkspaceMember {
         WorkspaceMember {
             id: id.into(),
@@ -714,20 +806,23 @@ mod tests {
     /// and a reaction add→remove→add (the resurrection bug).
     #[test]
     fn projection_converges_across_all_permutations() {
-        let base = base_session();
+        let mut base = base_session();
+        base.members.push(member("owner", "owner", WorkspaceRole::Owner));
         let (sid, wid) = (base.id, base.workspace_id);
         let msg = ChatMessage::new(MessageRole::Assistant, "Hive", "draft");
         let mid = msg.id;
 
+        // Governance events are authored by the owner (stamped), as in production;
+        // content events don't need attribution.
         let events = vec![
             env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
             env(sid, wid, 2, SessionEvent::MessageAppended { message: msg }),
-            env(sid, wid, 3, SessionEvent::MemberAdded { member: member("m1", "u1", WorkspaceRole::Contributor) }),
-            env(sid, wid, 4, SessionEvent::MemberAdded { member: member("m2", "u2", WorkspaceRole::Contributor) }),
+            by("owner", env(sid, wid, 3, SessionEvent::MemberAdded { member: member("m1", "u1", WorkspaceRole::Contributor) })),
+            by("owner", env(sid, wid, 4, SessionEvent::MemberAdded { member: member("m2", "u2", WorkspaceRole::Contributor) })),
             env(sid, wid, 5, SessionEvent::SessionTitleChanged { title: "Foo".into() }),
             env(sid, wid, 6, SessionEvent::MessageReactionAdded { message_id: mid, reaction: reaction("u1", "👍") }),
-            env(sid, wid, 7, SessionEvent::MemberRoleChanged { change: MemberRoleChange { member_id: "m1".into(), old_role: WorkspaceRole::Contributor, new_role: WorkspaceRole::Admin } }),
-            env(sid, wid, 8, SessionEvent::MemberRemoved { member_id: "m2".into() }),
+            by("owner", env(sid, wid, 7, SessionEvent::MemberRoleChanged { change: MemberRoleChange { member_id: "m1".into(), old_role: WorkspaceRole::Contributor, new_role: WorkspaceRole::Admin } })),
+            by("owner", env(sid, wid, 8, SessionEvent::MemberRemoved { member_id: "m2".into() })),
             env(sid, wid, 9, SessionEvent::SessionTitleChanged { title: "Bar".into() }),
             env(sid, wid, 10, SessionEvent::MessageReactionRemoved { message_id: mid, actor_id: "u1".into(), emoji: "👍".into() }),
             env(sid, wid, 11, SessionEvent::MessageReactionAdded { message_id: mid, reaction: reaction("u2", "🎉") }),
@@ -737,9 +832,11 @@ mod tests {
         let expected = project(&events).expect("session");
         // Correct deterministic resolution (not just self-consistency):
         assert_eq!(expected.title, "Bar", "latest title wins by canonical order");
-        assert_eq!(expected.members.len(), 1, "m2 removed");
-        assert_eq!(expected.members[0].id, "m1");
-        assert_eq!(expected.members[0].role, WorkspaceRole::Admin, "role change applied");
+        // owner (seeded) + m1; m2 was added then removed.
+        assert_eq!(expected.members.len(), 2, "m2 removed, owner + m1 remain");
+        assert!(expected.members.iter().any(|m| m.id == "owner"));
+        assert!(!expected.members.iter().any(|m| m.id == "m2"), "m2 removed");
+        assert_eq!(expected.role_of("m1"), WorkspaceRole::Admin, "role change applied");
         assert_eq!(expected.messages[0].body, "final");
         assert_eq!(expected.messages[0].reactions.len(), 1, "no resurrection: 👍 stays removed");
         assert_eq!(expected.messages[0].reactions[0].actor_id, "u2");
@@ -756,18 +853,20 @@ mod tests {
     /// earliest snapshot replays every delta, so nothing is lost.
     #[test]
     fn compaction_never_drops_a_concurrent_delta() {
-        let base = base_session();
+        let mut base = base_session();
+        base.members.push(member("owner", "owner", WorkspaceRole::Owner));
         let (sid, wid) = (base.id, base.workspace_id);
 
         // A device compacted after seeing m1 but BEFORE a concurrent m2 from a peer.
         let mut compacted = base_session();
+        compacted.members.push(member("owner", "owner", WorkspaceRole::Owner));
         compacted.members.push(member("m1", "u1", WorkspaceRole::Contributor));
 
         let events = vec![
             env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
-            env(sid, wid, 2, SessionEvent::MemberAdded { member: member("m1", "u1", WorkspaceRole::Contributor) }),
+            by("owner", env(sid, wid, 2, SessionEvent::MemberAdded { member: member("m1", "u1", WorkspaceRole::Contributor) })),
             // Concurrent — authored by a peer, canonically before the snapshot below.
-            env(sid, wid, 3, SessionEvent::MemberAdded { member: member("m2", "u2", WorkspaceRole::Contributor) }),
+            by("owner", env(sid, wid, 3, SessionEvent::MemberAdded { member: member("m2", "u2", WorkspaceRole::Contributor) })),
             // A later snapshot whose captured state is missing m2.
             env(sid, wid, 5, SessionEvent::SessionSnapshot { session: Box::new(compacted) }),
         ];
