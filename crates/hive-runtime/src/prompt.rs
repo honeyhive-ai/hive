@@ -66,7 +66,7 @@ mention someone when you need their input."
 }
 
 fn workflow_guidance() -> &'static str {
-    r#"When asked to set up a multi-stage pipeline, you can author a workflow by ending a reply with a [[workflow: {…}]] directive. It is saved (never run) — a human runs it from the Workflows pane. Format:
+    r#"When asked to set up a multi-stage pipeline, you can author a workflow by ending a reply with a [[workflow: {…}]] directive. Authoring saves it — a human then launches the run from the Workflows pane (workflows do execute: their stages run as the DAG's ready-set clears). Format:
 [[workflow: {"name": "…", "description": "…", "inputLabel": "…", "stages": [
   {"id": "slug", "name": "…", "kind": "agent", "agent": "<roster agent name, omit for primary>", "prompt": "… {{input}} … {{nodes.<id>.output}} …", "after": ["<upstream ids>"]},
   {"id": "check", "kind": "gate", "title": "…", "body": "…", "approvals": 1, "onReject": "halt", "after": ["slug"]}
