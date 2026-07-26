@@ -46,6 +46,21 @@ pub struct SyncEngine {
     keyring: BTreeMap<u32, [u8; 32]>,
 }
 
+/// Outcome of decoding one fetched relay body. Separating the two failure
+/// classes is what keeps a single bad body from halting the stream:
+/// - `Malformed` bodies are **provably** un-openable (bad JSON, or an AEAD tag
+///   that fails under a key we DO hold = tampered/corrupt/wrong-key). Re-fetching
+///   can't help, so the cursor advances past them.
+/// - `NotYetOpenable` bodies are well-formed but sealed under an epoch key we
+///   don't hold *yet* (a lagging rotation, or a foreign-room post). A later key
+///   might open them, so the cursor is held just before them to retry — while
+///   later openable events are still applied this pass.
+enum Decoded {
+    Ready(Box<SessionEventEnvelope>),
+    Malformed(String),
+    NotYetOpenable(String),
+}
+
 impl SyncEngine {
     pub fn new(relay: RelayClient, workspace: impl Into<String>) -> Self {
         Self {
@@ -82,20 +97,41 @@ impl SyncEngine {
         }
     }
 
-    /// Decode a relay body back into an envelope. A sealed body is opened with
-    /// the key for **its** epoch; `None` if we don't hold that epoch's key yet
-    /// (a foreign room, or a rotation that hasn't reached us) — phase-7 fetch
-    /// durability then retries it rather than skipping it for good.
-    fn decode(&self, body: &Value) -> Result<Option<SessionEventEnvelope>, SyncError> {
+    /// Decode a relay body back into an envelope, classifying failures so a bad
+    /// body can never halt the stream (see [`Decoded`]). A sealed body is opened
+    /// with the key for **its** epoch.
+    fn decode(&self, body: &Value) -> Decoded {
         if body.get("ciphertext").is_some() {
-            let sealed: SealedEnvelope = serde_json::from_value(body.clone())?;
-            let Some(k) = self.keyring.get(&sealed.version) else { return Ok(None) };
+            // Claims to be sealed. If it doesn't even parse as a SealedEnvelope
+            // it's provably garbage (e.g. a hostile `{"ciphertext":1}`) — advance.
+            let sealed: SealedEnvelope = match serde_json::from_value(body.clone()) {
+                Ok(s) => s,
+                Err(e) => return Decoded::Malformed(format!("not a sealed envelope: {e}")),
+            };
+            // Well-formed, but we don't hold this epoch's key yet (lagging
+            // rotation, or a foreign-room post): a later key might open it → retry.
+            let Some(k) = self.keyring.get(&sealed.version) else {
+                return Decoded::NotYetOpenable(format!("no key for epoch {}", sealed.version));
+            };
             match open_symmetric(k, &sealed) {
-                Ok(plain) => Ok(Some(serde_json::from_slice(&plain)?)),
-                Err(_) => Ok(None),
+                Ok(plain) => match serde_json::from_slice(&plain) {
+                    Ok(env) => Decoded::Ready(Box::new(env)),
+                    Err(e) => Decoded::Malformed(format!("opened but not an envelope: {e}")),
+                },
+                // We hold this epoch's key yet the AEAD tag fails to verify: the
+                // body is tampered/corrupt (or foreign ciphertext colliding on
+                // this epoch, incl. a wrong workspace key). Re-fetching can't
+                // help → advance past it.
+                Err(_) => Decoded::Malformed(format!(
+                    "AEAD open failed at epoch {} (tampered/corrupt or wrong key)",
+                    sealed.version
+                )),
             }
         } else {
-            Ok(Some(serde_json::from_value(body.clone())?))
+            match serde_json::from_value(body.clone()) {
+                Ok(env) => Decoded::Ready(Box::new(env)),
+                Err(e) => Decoded::Malformed(format!("not a session envelope: {e}")),
+            }
         }
     }
 
@@ -159,30 +195,56 @@ impl SyncEngine {
     }
 
     /// Fetch raw remote bodies past the cursor (async; no store). The cursor is
-    /// **not** advanced here — it only moves in `apply_fetched` once events are
-    /// durably ingested, so an event fetched before its decryption key is
-    /// available can't be permanently skipped.
+    /// **not** advanced here — it only moves in `apply_fetched`, so a body fetched
+    /// before its decryption key is available can be re-fetched and isn't lost.
     pub async fn fetch_new(&self) -> Result<Vec<(u64, Value)>, SyncError> {
         Ok(self.relay.fetch_values(&self.workspace, self.last_fetched_seq).await?)
     }
 
     /// Decode + ingest fetched bodies into the store (sync; no IO awaits), then
-    /// advance the cursor. A body we can't open (missing/incorrect key — e.g. it
-    /// arrived before a key rotation reached us) **stops** the batch: the cursor
-    /// is left before it so a later round retries, rather than skipping it for
-    /// good. Returns how many were newly applied.
+    /// advance the cursor. Returns how many were newly applied.
+    ///
+    /// **Cursor / retry semantics.** A single bad body must never halt the stream
+    /// (the old code either aborted the pull on a decode error or `break`ed the
+    /// batch, leaving the cursor before the offender so every later pull re-fetched
+    /// it forever and applied nothing after it). Instead we classify each body and
+    /// keep the cursor **monotonic**, advancing it to the highest CONTIGUOUS
+    /// resolved sequence that sits *below the lowest not-yet-openable body*:
+    /// - `Malformed`/quarantined bodies are provably bad and stable — we skip them
+    ///   and let the cursor advance past them (re-fetching can't help).
+    /// - A `NotYetOpenable` body (well-formed sealed body under an epoch key we
+    ///   lack) becomes the **retry point**: the cursor is held just before the
+    ///   lowest such sequence so a later pull re-fetches it once its key arrives —
+    ///   but every openable event *after* it is still applied this pass (deduped,
+    ///   idempotent), so a missing-key body can't strand readable events behind it.
+    ///
+    /// A genuinely un-openable-forever body under a *held* epoch (foreign/tampered
+    /// ciphertext) is `Malformed`, so it advances and cannot permanently wedge.
     pub fn apply_fetched(
         &mut self,
         store: &mut EventStore,
         fetched: &[(u64, Value)],
     ) -> Result<usize, SyncError> {
-        // Decode the contiguous openable prefix (phase 7: stop at the first body
-        // we can't open, so a missing-key event is retried, not skipped).
+        // Classify every body; never stop early. `resolved` = sequences the cursor
+        // may pass (openable or provably-bad); `retry_at` = lowest sequence we must
+        // re-fetch later (a not-yet-openable body), which caps how far the cursor
+        // may advance this pass.
         let mut decoded: Vec<(u64, SessionEventEnvelope)> = Vec::new();
+        let mut resolved: Vec<u64> = Vec::new();
+        let mut retry_at: Option<u64> = None;
         for (seq, body) in fetched {
-            match self.decode(body)? {
-                Some(env) => decoded.push((*seq, env)),
-                None => break,
+            match self.decode(body) {
+                Decoded::Ready(env) => decoded.push((*seq, *env)),
+                Decoded::Malformed(reason) => {
+                    tracing::warn!(seq = *seq, reason, "skipping a malformed relay body; advancing the cursor past it");
+                    resolved.push(*seq);
+                }
+                Decoded::NotYetOpenable(reason) => {
+                    // Decrypt-failure log: previously silent, which made a wrong
+                    // workspace key an invisible onboarding failure.
+                    tracing::warn!(seq = *seq, reason, "cannot open a fetched body yet (missing epoch key); holding the cursor before it to retry");
+                    retry_at = Some(retry_at.map_or(*seq, |r| r.min(*seq)));
+                }
             }
         }
 
@@ -201,14 +263,24 @@ impl SyncEngine {
             if let Verdict::Quarantine(reason) = verdict_for(&roster, env) {
                 tracing::warn!(?reason, event_id = %env.event_id, "quarantined a fetched event");
                 // Provably bad and stable — advance past it (re-fetching won't help).
-                self.last_fetched_seq = self.last_fetched_seq.max(*seq);
+                resolved.push(*seq);
                 continue;
             }
             self.seen.insert(env.event_id);
             if store.ingest(env)? {
                 applied += 1;
             }
-            self.last_fetched_seq = self.last_fetched_seq.max(*seq);
+            resolved.push(*seq);
+        }
+
+        // Advance the cursor to the highest resolved sequence, but never to or
+        // past the lowest not-yet-openable sequence (so it's re-fetched), and
+        // never backwards. Later openable events above `retry_at` were still
+        // applied above; the cursor just waits for the gap to fill.
+        for seq in resolved {
+            if retry_at.is_none_or(|r| seq < r) {
+                self.last_fetched_seq = self.last_fetched_seq.max(seq);
+            }
         }
         Ok(applied)
     }
@@ -363,12 +435,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn undecodable_events_do_not_advance_the_cursor() {
+    async fn not_yet_openable_events_do_not_advance_the_cursor() {
         let base = spawn_relay().await;
         let workspace = Uuid::new_v4().to_string();
-        let key = hive_core::derive_workspace_key("real room key");
+        // A seals under an epoch (1) that B does not hold yet.
+        let k1 = hive_core::e2ee::generate_workspace_key().unwrap();
 
-        // A publishes two sealed events.
+        // A publishes two sealed events under epoch 1.
         let mut store_a = EventStore::open_in_memory().unwrap();
         let (sid, wid) = seed_chat(&mut store_a);
         store_a
@@ -381,22 +454,118 @@ mod tests {
                 },
             ))
             .unwrap();
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace);
+        sync_a.add_key(1, k1);
         sync_a.push_new(&store_a).await.unwrap();
 
-        // B pulls with the WRONG key: it can't open anything, applies nothing —
-        // and crucially does NOT advance its cursor past the events.
+        // B holds NO key for epoch 1: the bodies are well-formed but not-yet-
+        // openable, so it applies nothing AND does NOT advance its cursor past
+        // them (they must be retried once the key arrives).
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace)
-            .with_key(hive_core::derive_workspace_key("wrong"));
+        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace);
         assert_eq!(sync_b.pull(&mut store_b).await.unwrap(), 0);
-        assert_eq!(sync_b.cursor(), 0, "undecodable events must not be skipped");
+        assert_eq!(sync_b.cursor(), 0, "not-yet-openable events must not be skipped");
 
-        // The correct key arrives (e.g. a rotation reaches B). The previously
-        // undecodable events are still fetched and now converge — not lost.
-        sync_b.set_key(key);
+        // The epoch-1 key reaches B (e.g. a rotation catches up). The retained
+        // events are re-fetched and now converge — not lost.
+        sync_b.add_key(1, k1);
         assert_eq!(sync_b.pull(&mut store_b).await.unwrap(), 2);
         assert_eq!(store_b.load_session(sid).unwrap().unwrap().messages.len(), 1);
+    }
+
+    #[test]
+    fn malformed_body_is_skipped_and_cursor_advances_past_it() {
+        // A garbage `{"ciphertext":1}` (hostile or corrupt) sitting between two
+        // good plaintext events must not halt the stream: the good events apply
+        // and the cursor advances past the bad one, so it's never re-fetched.
+        let session = ChatSession::new("Shared", Uuid::new_v4(), "anthropic");
+        let sid = session.id;
+        let wid = session.workspace_id;
+        let snap = SessionEventEnvelope::new(
+            sid,
+            wid,
+            1,
+            SessionEvent::SessionSnapshot { session: Box::new(session) },
+        );
+        let msg = SessionEventEnvelope::new(
+            sid,
+            wid,
+            2,
+            SessionEvent::MessageAppended {
+                message: ChatMessage::new(MessageRole::User, "A", "still delivered"),
+            },
+        );
+        let batch: Vec<(u64, Value)> = vec![
+            (1, serde_json::to_value(&snap).unwrap()),
+            (2, serde_json::json!({ "ciphertext": 1 })), // provably malformed
+            (3, serde_json::to_value(&msg).unwrap()),
+        ];
+
+        let mut store = EventStore::open_in_memory().unwrap();
+        let mut eng =
+            SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string());
+        assert_eq!(eng.apply_fetched(&mut store, &batch).unwrap(), 2);
+        assert!(store.has_event(snap.event_id).unwrap());
+        assert!(store.has_event(msg.event_id).unwrap(), "event after the bad body applies");
+        assert_eq!(eng.cursor(), 3, "cursor advances past the malformed body");
+        // No infinite re-fetch: re-applying the same batch does nothing new.
+        assert_eq!(eng.apply_fetched(&mut store, &batch).unwrap(), 0);
+        assert_eq!(eng.cursor(), 3);
+    }
+
+    #[test]
+    fn missing_epoch_key_does_not_strand_later_openable_events() {
+        // A body sealed under an epoch the engine LACKS, followed by an event it
+        // CAN open: the openable event must still apply (not be stranded), the
+        // cursor must stay before the not-yet-openable body (retry point), and
+        // the behavior must be deterministic across repeated passes.
+        let held = hive_core::derive_workspace_key("held epoch 0");
+        let missing = hive_core::e2ee::generate_workspace_key().unwrap(); // epoch 7, unheld
+        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
+            .with_key(held);
+
+        let session = ChatSession::new("Shared", Uuid::new_v4(), "anthropic");
+        let sid = session.id;
+        let wid = session.workspace_id;
+        let snap = SessionEventEnvelope::new(
+            sid,
+            wid,
+            1,
+            SessionEvent::SessionSnapshot { session: Box::new(session) },
+        );
+        let msg = SessionEventEnvelope::new(
+            sid,
+            wid,
+            2,
+            SessionEvent::MessageAppended {
+                message: ChatMessage::new(MessageRole::User, "A", "reachable"),
+            },
+        );
+        let seal = |k: &[u8; 32], ver: u32, e: &SessionEventEnvelope| -> Value {
+            let plain = serde_json::to_vec(e).unwrap();
+            serde_json::to_value(seal_symmetric(k, ver, &plain).unwrap()).unwrap()
+        };
+        let batch: Vec<(u64, Value)> = vec![
+            (1, seal(&missing, 7, &snap)), // not-yet-openable (epoch 7 unheld)
+            (2, seal(&held, 0, &msg)),     // openable
+        ];
+
+        let mut store = EventStore::open_in_memory().unwrap();
+        assert_eq!(eng.apply_fetched(&mut store, &batch).unwrap(), 1);
+        assert!(store.has_event(msg.event_id).unwrap(), "later openable event is not stranded");
+        assert!(!store.has_event(snap.event_id).unwrap(), "not-yet-openable body is not applied");
+        assert_eq!(eng.cursor(), 0, "cursor stays before the not-yet-openable seq (retry point)");
+
+        // Deterministic: another pass over the same batch changes nothing.
+        assert_eq!(eng.apply_fetched(&mut store, &batch).unwrap(), 0);
+        assert_eq!(eng.cursor(), 0);
+
+        // Once the missing epoch key arrives, the retained body converges too and
+        // the cursor jumps forward.
+        eng.add_key(7, missing);
+        assert_eq!(eng.apply_fetched(&mut store, &batch).unwrap(), 1);
+        assert!(store.has_event(snap.event_id).unwrap());
+        assert_eq!(eng.cursor(), 2);
     }
 
     #[test]
