@@ -904,6 +904,7 @@ fn proposal_dto(p: &ActionProposal) -> ProposalDto {
         id: p.id.to_string(),
         title: p.title.clone(),
         body: p.body.clone(),
+        author_actor_id: p.author_actor_id.clone(),
         kind: kind.to_string(),
         status: status.to_string(),
         required_approvals: p.required_approvals,
@@ -2984,7 +2985,8 @@ fn create_proposal(
         "command" => ProposalKind::Command,
         _ => ProposalKind::Decision,
     };
-    let mut proposal = ActionProposal::new(title, pkind);
+    let actor = local_actor(&state);
+    let mut proposal = ActionProposal::new(title, pkind, actor.id);
     proposal.body = body;
     proposal.required_approvals = required_approvals.max(1);
     let mut svc = state.service.lock().unwrap();
@@ -3002,10 +3004,16 @@ fn vote_proposal(
     let pid = Uuid::parse_str(&proposal_id).map_err(map_err)?;
     let actor = local_actor(&state);
     let mut svc = state.service.lock().unwrap();
-    // The local workspace owner votes (single-user default; multi-user roles
-    // resolve from membership once invites land).
+    // Cast the voter's real workspace role (from the projected roster) so the
+    // proposal's `approval_role_floor` is actually enforced; non-members fall to
+    // the Viewer floor via `role_of`.
+    let role = svc
+        .load(sid)
+        .map_err(map_err)?
+        .map(|s| s.role_of(&actor.id))
+        .unwrap_or(WorkspaceRole::Viewer);
     let updated = svc
-        .vote_on_proposal(sid, state.active_workspace_id(), pid, actor.id, WorkspaceRole::Owner, approved)
+        .vote_on_proposal(sid, state.active_workspace_id(), pid, actor.id, role, approved)
         .map_err(map_err)?;
     drop(svc);
     // A settled vote may be a workflow gate — wake that run's driver so it

@@ -46,6 +46,11 @@ pub struct ActionProposal {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// Actor who created the proposal. Their own approval does not count toward
+    /// quorum (no self-approval). Empty for authorless proposals (e.g. workflow
+    /// gates), where the guard excludes no one.
+    #[serde(default)]
+    pub author_actor_id: String,
     pub kind: ProposalKind,
     pub status: ProposalStatus,
     /// How many qualifying up-votes are needed (0 = no quorum required).
@@ -65,11 +70,16 @@ fn default_floor() -> WorkspaceRole {
 }
 
 impl ActionProposal {
-    pub fn new(title: impl Into<String>, kind: ProposalKind) -> Self {
+    pub fn new(
+        title: impl Into<String>,
+        kind: ProposalKind,
+        author_actor_id: impl Into<String>,
+    ) -> Self {
         Self {
             id: Uuid::new_v4(),
             title: title.into(),
             body: String::new(),
+            author_actor_id: author_actor_id.into(),
             kind,
             status: ProposalStatus::Open,
             required_approvals: 1,
@@ -86,12 +96,19 @@ impl ActionProposal {
         self.recompute_status();
     }
 
-    /// Up-votes from members whose role meets the floor.
+    /// Whether `actor_id` authored this proposal (never true for an authorless
+    /// proposal, so the self-approval guard excludes no one there).
+    fn is_author(&self, actor_id: &str) -> bool {
+        !self.author_actor_id.is_empty() && self.author_actor_id == actor_id
+    }
+
+    /// Up-votes from members whose role meets the floor. The author's own
+    /// approval does not count — a proposal can't self-satisfy its quorum.
     pub fn qualifying_approvals(&self) -> usize {
         let floor = self.approval_role_floor.rank();
         self.approvals
             .iter()
-            .filter(|a| a.approved && a.role.rank() >= floor)
+            .filter(|a| a.approved && a.role.rank() >= floor && !self.is_author(&a.actor_id))
             .count()
     }
 
@@ -138,7 +155,7 @@ mod tests {
 
     #[test]
     fn quorum_counts_only_qualifying_roles() {
-        let mut p = ActionProposal::new("Ship it", ProposalKind::Decision);
+        let mut p = ActionProposal::new("Ship it", ProposalKind::Decision, "");
         p.required_approvals = 2;
         p.approval_role_floor = WorkspaceRole::Contributor;
 
@@ -156,7 +173,7 @@ mod tests {
 
     #[test]
     fn latest_vote_per_actor_wins() {
-        let mut p = ActionProposal::new("X", ProposalKind::Command);
+        let mut p = ActionProposal::new("X", ProposalKind::Command, "");
         p.required_approvals = 1;
         p.cast_vote(vote("c1", WorkspaceRole::Contributor, true));
         assert_eq!(p.status, ProposalStatus::Approved);
@@ -168,12 +185,63 @@ mod tests {
 
     #[test]
     fn qualifying_rejection_blocks() {
-        let mut p = ActionProposal::new("X", ProposalKind::FileDiff);
+        let mut p = ActionProposal::new("X", ProposalKind::FileDiff, "");
         p.required_approvals = 1;
         p.approval_role_floor = WorkspaceRole::Admin;
         p.cast_vote(vote("a1", WorkspaceRole::Admin, true));
         assert_eq!(p.status, ProposalStatus::Approved);
         p.cast_vote(vote("o1", WorkspaceRole::Owner, false));
         assert_eq!(p.status, ProposalStatus::Rejected);
+    }
+
+    #[test]
+    fn author_self_approval_does_not_reach_quorum() {
+        let mut p = ActionProposal::new("Mine", ProposalKind::Decision, "author");
+        p.required_approvals = 1;
+        // Author approves their own proposal — does not count toward quorum.
+        p.cast_vote(vote("author", WorkspaceRole::Owner, true));
+        assert_eq!(p.qualifying_approvals(), 0);
+        assert!(!p.is_quorum_met());
+        assert_eq!(p.status, ProposalStatus::Open);
+        // A second, non-author approval satisfies the gate.
+        p.cast_vote(vote("other", WorkspaceRole::Contributor, true));
+        assert_eq!(p.qualifying_approvals(), 1);
+        assert_eq!(p.status, ProposalStatus::Approved);
+    }
+
+    #[test]
+    fn role_floor_enforced_against_voter_role() {
+        let mut p = ActionProposal::new("Floor", ProposalKind::Decision, "author");
+        p.required_approvals = 1;
+        p.approval_role_floor = WorkspaceRole::Contributor;
+        // Viewer up-vote is below the floor → doesn't qualify.
+        p.cast_vote(vote("v1", WorkspaceRole::Viewer, true));
+        assert_eq!(p.qualifying_approvals(), 0);
+        assert_eq!(p.status, ProposalStatus::Open);
+        // Contributor up-vote qualifies.
+        p.cast_vote(vote("c1", WorkspaceRole::Contributor, true));
+        assert_eq!(p.qualifying_approvals(), 1);
+        assert_eq!(p.status, ProposalStatus::Approved);
+    }
+
+    #[test]
+    fn author_downvote_still_vetoes() {
+        let mut p = ActionProposal::new("Mine", ProposalKind::Decision, "author");
+        p.required_approvals = 1;
+        p.cast_vote(vote("other", WorkspaceRole::Contributor, true));
+        assert_eq!(p.status, ProposalStatus::Approved);
+        // A qualifying down-vote vetoes regardless of who casts it.
+        p.cast_vote(vote("veto", WorkspaceRole::Contributor, false));
+        assert_eq!(p.status, ProposalStatus::Rejected);
+    }
+
+    #[test]
+    fn empty_author_excludes_no_one() {
+        // Authorless (e.g. workflow gate) proposal: any qualifying approval counts.
+        let mut p = ActionProposal::new("Gate", ProposalKind::Decision, "");
+        p.required_approvals = 1;
+        p.cast_vote(vote("someone", WorkspaceRole::Contributor, true));
+        assert_eq!(p.qualifying_approvals(), 1);
+        assert_eq!(p.status, ProposalStatus::Approved);
     }
 }

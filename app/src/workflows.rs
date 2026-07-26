@@ -265,7 +265,9 @@ async fn drive_run_inner(
                         .chars()
                         .take(160)
                         .collect();
-                    let mut proposal = ActionProposal::new(title, ProposalKind::Decision);
+                    // A workflow gate has no human author; empty author means the
+                    // self-approval guard excludes no one.
+                    let mut proposal = ActionProposal::new(title, ProposalKind::Decision, "");
                     proposal.body = wf::render_template(body_template, &run.input, &outputs);
                     proposal.required_approvals = (*required_approvals).max(1);
                     let pid = proposal.id;
