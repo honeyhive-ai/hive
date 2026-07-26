@@ -22,12 +22,16 @@
 //!   hive send <chat-id> <…>  post a message (add --push to sync it out)
 //!   hive sync                run one sync round with the relay (add --watch to loop)
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use hive_core::{workspace_config_session_id, derive_workspace_key};
-use hive_runtime::{ChatService, EventStore, FileKeyVault, IdentityStore, RelayClient, SyncEngine};
+use hive_core::{derive_workspace_key, workspace_config_session_id, MessageRole, ModelProviderKind};
+use hive_runtime::{
+    dispatch, parse_mentions, turns_for, ChatService, EventStore, FileKeyVault, IdentityStore,
+    RelayClient, ResolvedRuntime, SyncEngine,
+};
 use uuid::Uuid;
 
 struct Config {
@@ -189,6 +193,119 @@ async fn cmd_sync(cfg: &Config, watch: bool) -> Result<()> {
     }
 }
 
+fn cmd_new(cfg: &Config, title: String) -> Result<()> {
+    let mut svc = open_service(cfg)?;
+    let ws = uuid_of_room(&cfg.room);
+    let session = svc.create_chat(title, ws, "")?;
+    println!("{}", session.id);
+    Ok(())
+}
+
+/// Build a runtime target from env (HIVE_PROVIDER / HIVE_MODEL / a key). This is
+/// a PERSONAL credential today — spec §12.5's workspace-owned credential for a
+/// detached worker doesn't exist yet.
+fn resolve_runtime_from_env() -> Result<(ResolvedRuntime, String)> {
+    let provider_str = env_opt("HIVE_PROVIDER").unwrap_or_else(|| "anthropic".into());
+    let model = env_opt("HIVE_MODEL").unwrap_or_else(|| "claude-sonnet-4-5".into());
+    let (provider, endpoint, key_env): (ModelProviderKind, String, &str) =
+        match provider_str.to_lowercase().as_str() {
+            "anthropic" => (ModelProviderKind::Anthropic, String::new(), "ANTHROPIC_API_KEY"),
+            "openai" => (
+                ModelProviderKind::OpenAI,
+                "https://api.openai.com/v1/chat/completions".into(),
+                "OPENAI_API_KEY",
+            ),
+            "openrouter" => (
+                ModelProviderKind::OpenRouter,
+                "https://openrouter.ai/api/v1/chat/completions".into(),
+                "OPENROUTER_API_KEY",
+            ),
+            "ollama" => (
+                ModelProviderKind::Ollama,
+                env_opt("HIVE_MODEL_BASE_URL")
+                    .unwrap_or_else(|| "http://localhost:11434/v1/chat/completions".into()),
+                "",
+            ),
+            other => bail!("unsupported HIVE_PROVIDER '{other}' (anthropic|openai|openrouter|ollama)"),
+        };
+    let api_key = env_opt("HIVE_PROVIDER_API_KEY")
+        .or_else(|| (!key_env.is_empty()).then(|| env_opt(key_env)).flatten());
+    let rt = ResolvedRuntime {
+        provider,
+        model: model.clone(),
+        endpoint,
+        api_key,
+        args: Vec::new(),
+        model_provider_id: None,
+        model_base_url: None,
+    };
+    Ok((rt, format!("{provider_str}/{model}")))
+}
+
+/// v1 — act as an agent. After each sync, reply (as the primary responder) to
+/// any new user message that is un-mentioned or `@primary`, via the configured
+/// provider, and post + sync the reply back as signed events.
+async fn cmd_agent(cfg: &Config, name: String) -> Result<()> {
+    let (rt, rt_label) = resolve_runtime_from_env()?;
+    if rt.api_key.is_none() && rt.provider != ModelProviderKind::Ollama {
+        bail!("no provider API key (set HIVE_PROVIDER_API_KEY or ANTHROPIC_API_KEY/OPENAI_API_KEY)");
+    }
+    // Seed "seen" with existing messages so we don't reply to history.
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    {
+        let svc = open_service(cfg)?;
+        for id in svc.store().list_session_ids()? {
+            if let Some(s) = svc.load(id)? {
+                seen.extend(s.messages.iter().map(|m| m.id));
+            }
+        }
+    }
+    println!("agent @{name} online ({rt_label}); replying to @primary / un-mentioned turns. Ctrl-C to stop.");
+    let system = format!(
+        "You are @{name}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully."
+    );
+    loop {
+        if cfg.relay_url.is_some() {
+            if let Err(e) = sync_once(cfg).await {
+                eprintln!("sync: {e}");
+            }
+        }
+        let mut svc = open_service(cfg)?;
+        for id in svc.store().list_session_ids()? {
+            let Some(s) = svc.load(id)? else { continue };
+            if id == workspace_config_session_id(s.workspace_id) {
+                continue; // the config log isn't a chat
+            }
+            let Some(last) = s.messages.last() else { continue };
+            let respond =
+                last.role == MessageRole::User && !seen.contains(&last.id) && {
+                    let t = parse_mentions(&last.body, &s);
+                    t.primary || t.is_empty()
+                };
+            seen.extend(s.messages.iter().map(|m| m.id));
+            if !respond {
+                continue;
+            }
+            // Non-Send store is held across .await — cmd_agent runs on a
+            // current-thread runtime (see run()), so this is allowed.
+            let turns = turns_for(&s);
+            print!("↳ @{name} replying in {} … ", s.id);
+            let reply = dispatch::stream(&rt, Some(&system), &turns, None, &[], 1024, |_| {})
+                .await
+                .map_err(|e| anyhow!("provider: {e}"))?;
+            let mid = svc.begin_assistant_message(s.id, s.workspace_id, name.clone(), rt_label.clone())?;
+            svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
+            seen.insert(mid);
+            println!("done");
+        }
+        drop(svc);
+        if cfg.relay_url.is_some() {
+            let _ = sync_once(cfg).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
 /// Deterministic workspace id for a relay room (mirrors the app's
 /// `room_workspace_id`), so config-log filtering matches the app.
 fn uuid_of_room(room: &str) -> Uuid {
@@ -211,9 +328,11 @@ fn usage() -> ! {
          USAGE:\n  \
          hive whoami\n  \
          hive chats\n  \
+         hive new [title]\n  \
          hive tail <chat-id> [--watch]\n  \
          hive send <chat-id> <message…> [--push]\n  \
-         hive sync [--watch]\n\n\
+         hive sync [--watch]\n  \
+         hive agent [name]              reply as the primary agent (needs a provider key)\n\n\
          Config via env: HIVE_DATA_DIR, HIVE_RELAY_URL, HIVE_RELAY_ACCESS_TOKEN,\n\
          HIVE_WORKSPACE, HIVE_WORKSPACE_KEY."
     );
@@ -235,9 +354,18 @@ fn run() -> Result<()> {
     let has = |flag: &str| rest.iter().any(|a| a == flag);
     let positional: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
 
+    // A current-thread runtime is all the CLI needs — it only ever `block_on`s
+    // (never spawns), and keeps the non-Send EventStore on one thread.
+    let rt = || -> Result<tokio::runtime::Runtime> {
+        Ok(tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?)
+    };
+
     match cmd {
         "whoami" => cmd_whoami(&cfg),
         "chats" => cmd_chats(&cfg),
+        "new" => cmd_new(&cfg, positional.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ")),
         "tail" => {
             let id = positional
                 .first()
@@ -257,9 +385,13 @@ fn run() -> Result<()> {
             if body.trim().is_empty() {
                 bail!("message is empty");
             }
-            tokio::runtime::Runtime::new()?.block_on(cmd_send(&cfg, chat_id, body, has("--push")))
+            rt()?.block_on(cmd_send(&cfg, chat_id, body, has("--push")))
         }
-        "sync" => tokio::runtime::Runtime::new()?.block_on(cmd_sync(&cfg, has("--watch"))),
+        "sync" => rt()?.block_on(cmd_sync(&cfg, has("--watch"))),
+        "agent" => {
+            let name = positional.first().map(|s| s.as_str()).unwrap_or("assistant").to_string();
+            rt()?.block_on(cmd_agent(&cfg, name))
+        }
         _ => usage(),
     }
 }

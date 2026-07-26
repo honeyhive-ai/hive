@@ -1069,12 +1069,6 @@ impl ChatService {
         }
         Ok(Some(session))
     }
-
-    /// Raw projection with no config overlay — for the read-modify-write config
-    /// methods, which must see only the config log's own roster.
-    fn load_raw(&self, session_id: Uuid) -> Result<Option<ChatSession>> {
-        Ok(self.store.load_session(session_id)?)
-    }
 }
 
 /// Map a session's transcript into provider wire turns.
