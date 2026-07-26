@@ -68,6 +68,10 @@ jobs:
       - name: Cargo test (workspace)
         run: cargo test --workspace
 
+      - name: Web tests (vitest)
+        working-directory: web
+        run: bun run test
+
       - name: Web typecheck + build
         working-directory: web
         run: bun run build

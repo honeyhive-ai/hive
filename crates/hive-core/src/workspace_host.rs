@@ -31,18 +31,31 @@ pub struct WorkspaceHost {
     /// Actor who registered/owns the host (empty if unset).
     #[serde(default)]
     pub owner_actor_id: String,
+    /// Last heartbeat (`touch_host`). A host is considered **online** when this
+    /// is recent; a mention to an agent on an offline host is *queued* work
+    /// (spec §12.5) until the host returns or the agent is moved to a worker.
+    #[serde(default)]
+    pub last_seen: Timestamp,
     #[serde(default)]
     pub created_at: Timestamp,
 }
 
 impl WorkspaceHost {
     pub fn new(id: impl Into<String>, kind: HostKind, label: impl Into<String>) -> Self {
+        let now = Timestamp::now();
         Self {
             id: id.into(),
             kind,
             label: label.into(),
             owner_actor_id: String::new(),
-            created_at: Timestamp::now(),
+            last_seen: now,
+            created_at: now,
         }
+    }
+
+    /// True when the host's last heartbeat is within `window_secs` of `now`.
+    /// Presence for the queue/offline handoff.
+    pub fn is_online(&self, now: &Timestamp, window_secs: i64) -> bool {
+        now.inner().unix_timestamp() - self.last_seen.inner().unix_timestamp() <= window_secs
     }
 }

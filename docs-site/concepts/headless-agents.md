@@ -65,7 +65,13 @@ hive worker --label prod-box                 # always-on; @reviewer is now answe
 ```
 
 The worker *enforces* the §12.5 rule — a detached agent must use a workspace
-runtime, so it never falls back to a personal key. See the
+runtime, so it never falls back to a personal key. It also **drains queued work**:
+an unanswered `@mention` waits for its agent's host, and the worker answers every
+one bound to it — backlog included — so it catches up on mentions addressed while
+it was down. `hive queue` shows what's waiting and whether each agent's host is
+online; if a member's device host is offline, `hive set-agent-host <agent>
+<worker>` reassigns the agent to a worker to drain it ("run on worker instead").
+See the
 [CLI README](https://github.com/honeyhive-ai/hive/blob/main/crates/hive-cli/README.md#the-worker-daemon-spec-124)
 for the full daemon behaviour.
 
