@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::WorkspaceAgent;
+use crate::channel::Channel;
 use crate::chat::{ChatMessage, MessageReaction};
 use crate::crypto::DeviceCertificate;
 use crate::identity::{ActorStamp, WorkspaceMember, WorkspaceRole};
@@ -112,6 +113,23 @@ pub enum SessionEvent {
     DeviceCertificateAdded {
         certificate: DeviceCertificate,
     },
+    /// Create (or upsert by id) a channel. Rides the workspace-config log
+    /// (spec §11); folded into `ChatSession.channels`. Workspace-scoped.
+    ChannelCreated { channel: Channel },
+    /// Rename a channel and/or set its one-line purpose (by id).
+    ChannelRenamed {
+        channel_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        purpose: Option<String>,
+    },
+    /// Reorder channels; `channel_ids` is the new order (ascending position).
+    ChannelReordered { channel_ids: Vec<String> },
+    /// Soft delete / restore a channel and its chats (by id).
+    ChannelArchived { channel_id: String, archived: bool },
+    /// Assign THIS chat to a channel (per-chat, session-scoped — not on the
+    /// config log). Empty clears the assignment.
+    ChatChannelChanged { channel_id: String },
     /// Forward-compat catch-all: an event `kind` this build does not recognize
     /// (produced by a newer client). Serde deserializes an unknown tag here
     /// instead of failing the whole stream; it projects as a no-op. The raw
@@ -148,6 +166,11 @@ impl SessionEvent {
             SessionEvent::MessageReactionRemoved { .. } => "messageReactionRemoved",
             SessionEvent::AccountKeyRegistered { .. } => "accountKeyRegistered",
             SessionEvent::DeviceCertificateAdded { .. } => "deviceCertificateAdded",
+            SessionEvent::ChannelCreated { .. } => "channelCreated",
+            SessionEvent::ChannelRenamed { .. } => "channelRenamed",
+            SessionEvent::ChannelReordered { .. } => "channelReordered",
+            SessionEvent::ChannelArchived { .. } => "channelArchived",
+            SessionEvent::ChatChannelChanged { .. } => "chatChannelChanged",
             SessionEvent::Unknown => "unknown",
         }
     }
@@ -160,7 +183,11 @@ impl SessionEvent {
             | SessionEvent::MemberRoleChanged { .. }
             | SessionEvent::AgentRosterUpdated { .. }
             | SessionEvent::AccountKeyRegistered { .. }
-            | SessionEvent::DeviceCertificateAdded { .. } => EventScope::Workspace,
+            | SessionEvent::DeviceCertificateAdded { .. }
+            | SessionEvent::ChannelCreated { .. }
+            | SessionEvent::ChannelRenamed { .. }
+            | SessionEvent::ChannelReordered { .. }
+            | SessionEvent::ChannelArchived { .. } => EventScope::Workspace,
             SessionEvent::WorkflowRunUpserted { .. } => EventScope::Run,
             _ => EventScope::Session,
         }
@@ -346,11 +373,41 @@ impl ChatSession {
                         .retain(|r| !(&r.actor_id == actor_id && &r.emoji == emoji));
                 }
             }
-            // Unrecognized (newer-client) event — inert in this build.
+            // Channels — folded on the workspace-config log (upsert/patch by id).
+            SessionEvent::ChannelCreated { channel } => {
+                if let Some(slot) = self.channels.iter_mut().find(|c| c.id == channel.id) {
+                    *slot = channel.clone();
+                } else {
+                    self.channels.push(channel.clone());
+                }
+            }
+            SessionEvent::ChannelRenamed { channel_id, name, purpose } => {
+                if let Some(c) = self.channels.iter_mut().find(|c| &c.id == channel_id) {
+                    c.name = name.clone();
+                    c.purpose = purpose.clone();
+                }
+            }
+            SessionEvent::ChannelReordered { channel_ids } => {
+                for (pos, id) in channel_ids.iter().enumerate() {
+                    if let Some(c) = self.channels.iter_mut().find(|c| &c.id == id) {
+                        c.position = pos as i32;
+                    }
+                }
+            }
+            SessionEvent::ChannelArchived { channel_id, archived } => {
+                if let Some(c) = self.channels.iter_mut().find(|c| &c.id == channel_id) {
+                    c.archived = *archived;
+                }
+            }
+            // Per-chat channel assignment (session-scoped).
+            SessionEvent::ChatChannelChanged { channel_id } => {
+                self.channel_id = channel_id.clone();
+            }
             // Trust metadata — inert in the session projection; consumed only by
             // the device-roster builder (see hive-runtime::envelope_verifier).
             SessionEvent::AccountKeyRegistered { .. }
             | SessionEvent::DeviceCertificateAdded { .. } => {}
+            // Unrecognized (newer-client) event — inert in this build.
             SessionEvent::Unknown => {}
         }
     }

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent::WorkspaceAgent;
+use crate::channel::Channel;
 use crate::chat::ChatMessage;
 use crate::identity::WorkspaceMember;
 use crate::proposals::ActionProposal;
@@ -60,6 +61,14 @@ pub struct ChatSession {
     /// answers un-`@mentioned` messages. Empty on legacy sessions (→ local).
     #[serde(default)]
     pub creator_actor_id: String,
+    /// Channels defined on the workspace. Only populated when this session IS
+    /// the workspace-config log (§11); empty on ordinary chats.
+    #[serde(default)]
+    pub channels: Vec<Channel>,
+    /// This chat's channel assignment (channel id). Empty = unfiled (pre-channel
+    /// or the config log itself).
+    #[serde(default)]
+    pub channel_id: String,
     #[serde(default)]
     pub created_at: Timestamp,
     #[serde(default)]
@@ -85,6 +94,8 @@ impl ChatSession {
             workflow_runs: Vec::new(),
             archived: false,
             creator_actor_id: String::new(),
+            channels: Vec::new(),
+            channel_id: String::new(),
             created_at: now,
             updated_at: now,
         }
