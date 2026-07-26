@@ -52,6 +52,7 @@ hive hosts                         # list workspace hosts (devices + workers)
 hive register-worker [--label <name>]      # register this box as a worker host
 hive set-agent-host <agent> <host-id>      # bind an agent to a host
 hive worker [--label <name>]       # run the worker daemon (spec §12.4)
+hive queue                         # show queued work (unanswered mentions + host status)
 hive agent [name] [--runtime <id>] # act as the primary responder (see below)
 ```
 
@@ -164,10 +165,29 @@ and bindings; `hive set-agent-host <agent> <host>` re-binds.
 agent isn't bound to one (or its secret isn't on the box), the worker logs a skip
 rather than falling back to a personal key.
 
-**Behaviour on (re)start:** the worker seeds on the existing backlog so a restart
-doesn't re-answer old messages; it responds to mentions that arrive while it's up.
-(Picking up work addressed while it was *down* — the "queued work" handoff — is a
-tracked follow-up.)
+### Queued work & the offline handoff (spec §12.5)
+
+An unanswered `@mention` of an agent is **queued work** — it waits for that
+agent's host. `hive queue` lists it and shows whether each agent's host is online:
+
+```
+@reviewer   in <chat>  [prod-box · online]
+@bob-claude in <chat>  [Bob's Mac · OFFLINE → queued]
+@scout      in <chat>  [owner-device]
+```
+
+The worker **drains** the queue: it answers every *unanswered* mention for the
+agents bound to it — backlog included — so it catches up on work addressed while
+it was **down**, and picks up an agent the instant it's **reassigned** to it. It
+heartbeats its presence so hosts show online/offline, and won't tight-loop retry
+a hard-failed turn.
+
+**Run on worker instead.** When an agent's own host is offline, move it to a
+running worker to drain its queue:
+
+```sh
+hive set-agent-host bob-claude <worker-host-id>   # reassign; the worker answers it next tick
+```
 
 ## Limits & security (spec §12)
 
@@ -177,8 +197,8 @@ tracked follow-up.)
 - **Personal vs workspace credential.** Without `--runtime`, `hive agent` runs on
   a *personal* env key. With `--runtime <id>` — and always inside `hive worker` —
   it runs on a **workspace-owned** runtime (§12.5); the worker daemon *enforces*
-  that a detached agent uses one. What's still missing from §12.4–12.5 is the
-  **queue/offline handoff** (picking up work addressed while a host was down, and
-  the "run on worker instead" reassignment) and live host presence.
+  that a detached agent uses one. The **queue/offline handoff** and host presence
+  are implemented (above). What's still CLI-only is the *app-side* surfacing —
+  showing queued work and a one-click "run on worker instead" in the desktop UI.
 - **Agents never touch another machine's filesystem** (spec §12.6): what crosses
   the relay is chat and, eventually, diffs — not remote file writes.

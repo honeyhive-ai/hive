@@ -789,6 +789,31 @@ impl ChatService {
         Ok(())
     }
 
+    /// Heartbeat this box's host presence (spec §12.5). Throttled: re-emits the
+    /// host with a fresh `last_seen` only if the prior heartbeat is older than
+    /// `throttle_secs`, so it doesn't bloat the log. Returns whether it emitted.
+    pub fn touch_host(&mut self, workspace_id: Uuid, host_id: &str, throttle_secs: i64) -> Result<bool> {
+        let config_id = workspace_config_session_id(workspace_id);
+        let mut hosts = self
+            .load(config_id)?
+            .map(|s| s.workspace_hosts)
+            .unwrap_or_default();
+        let Some(host) = hosts.iter_mut().find(|h| h.id == host_id) else {
+            return Ok(false);
+        };
+        let now = Timestamp::now();
+        if now.inner().unix_timestamp() - host.last_seen.inner().unix_timestamp() < throttle_secs {
+            return Ok(false);
+        }
+        host.last_seen = now;
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::WorkspaceHostsUpdated { hosts },
+        )?;
+        Ok(true)
+    }
+
     /// Bind an agent to a host (empty = the owner's device). A worker host makes
     /// the agent detached (spec §12.4).
     pub fn set_agent_host(&mut self, workspace_id: Uuid, agent_id: Uuid, host_id: &str) -> Result<()> {
@@ -1213,6 +1238,48 @@ impl ChatService {
     }
 }
 
+/// One unanswered agent-directed mention — the unit of "queued" work (spec
+/// §12.5): a message waiting for its agent's host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingMention {
+    pub session_id: Uuid,
+    pub message_id: Uuid,
+    pub agent_id: Uuid,
+    pub agent_name: String,
+}
+
+/// Unanswered agent mentions in a session: a user message that `@mentions` an
+/// agent with **no later assistant reply authored by that agent**. This is the
+/// "queue" a worker drains and `hive queue` surfaces — keeping only the latest
+/// unanswered mention per agent (the state a responder should act on).
+pub fn pending_mentions(session: &ChatSession) -> Vec<PendingMention> {
+    let mut out: Vec<PendingMention> = Vec::new();
+    for (i, m) in session.messages.iter().enumerate() {
+        if m.role != MessageRole::User {
+            continue;
+        }
+        let targets = crate::mentions::parse_mentions(&m.body, session);
+        for aid in &targets.agents {
+            let Some(agent) = session.workspace_agents.iter().find(|a| &a.id == aid) else {
+                continue;
+            };
+            let answered = session.messages[i + 1..]
+                .iter()
+                .any(|later| later.role == MessageRole::Assistant && later.author == agent.name);
+            if !answered {
+                out.retain(|p| p.agent_id != *aid);
+                out.push(PendingMention {
+                    session_id: session.id,
+                    message_id: m.id,
+                    agent_id: *aid,
+                    agent_name: agent.name.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Resolve a workspace runtime's credential to a usable secret — where a
 /// headless worker turns a **workspace-owned** runtime into an actual key (spec
 /// §12.5), never a personal one. `SecretRef` reads the worker's out-of-band env
@@ -1265,6 +1332,54 @@ mod tests {
         // No account id → publish_identity is a no-op (local-only, unverifiable).
         let author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
         (ChatService::new(store, device_id, kp, account_kp, author), public)
+    }
+
+    #[test]
+    fn pending_mentions_track_unanswered_work() {
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+        let agent = WorkspaceAgent::new("reviewer", "ws-claude");
+        let agent_id = agent.id;
+        svc.add_agent(chat.id, wid, agent).unwrap();
+
+        // A user @mentions the agent → queued (pending) work.
+        svc.post_user_message(chat.id, wid, "@reviewer take a look").unwrap();
+        let s = svc.load(chat.id).unwrap().unwrap();
+        let pend = pending_mentions(&s);
+        assert_eq!(pend.len(), 1);
+        assert_eq!(pend[0].agent_id, agent_id);
+        assert_eq!(pend[0].agent_name, "reviewer");
+
+        // The agent replies → no longer pending.
+        let mid = svc.begin_assistant_message(chat.id, wid, "reviewer", "ws-claude").unwrap();
+        svc.complete_assistant_message(chat.id, wid, mid, "done").unwrap();
+        let s = svc.load(chat.id).unwrap().unwrap();
+        assert!(pending_mentions(&s).is_empty(), "answered mention should not be pending");
+
+        // A fresh mention after the reply is pending again (catch-up on the latest).
+        svc.post_user_message(chat.id, wid, "@reviewer another").unwrap();
+        let s = svc.load(chat.id).unwrap().unwrap();
+        assert_eq!(pending_mentions(&s).len(), 1, "a new unanswered mention re-queues");
+    }
+
+    #[test]
+    fn host_heartbeat_and_presence() {
+        use hive_core::{HostKind, WorkspaceHost};
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let hid = svc.device_id().to_string();
+        svc.register_host(wid, WorkspaceHost::new(hid.clone(), HostKind::Worker, "box")).unwrap();
+
+        let now = Timestamp::now();
+        let hosts = svc.list_hosts(wid).unwrap();
+        assert!(hosts[0].is_online(&now, 90), "just-registered host is online");
+        // A heartbeat right after registration is throttled (no new event).
+        assert!(!svc.touch_host(wid, &hid, 60).unwrap(), "recent heartbeat throttled");
+
+        // A host last seen at the epoch is offline.
+        let stale = WorkspaceHost { last_seen: Timestamp::from_unix_seconds(0), ..hosts[0].clone() };
+        assert!(!stale.is_online(&now, 90), "stale host is offline");
     }
 
     #[test]
