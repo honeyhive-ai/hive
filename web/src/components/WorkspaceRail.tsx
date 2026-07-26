@@ -1,7 +1,8 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   listWorkspaces,
+  listAllMentionStates,
   setActiveWorkspace,
   setWorkspaceIcon,
   syncStatus,
@@ -42,6 +43,19 @@ export function WorkspaceRail({
     queryKey: ["workspaces", sync.data?.relayConfigured, sync.data?.room],
     queryFn: listWorkspaces,
   });
+  // Cross-workspace self-mentions: light a dot on any *background* workspace
+  // holding an unread mention. Read state is the same per-session localStorage
+  // cursor the Sidebar maintains (`hive.read.<sessionId>` = message count at
+  // last open); a mention past that cursor is unread.
+  const mentions = useQuery({ queryKey: ["all-mention-states"], queryFn: listAllMentionStates });
+  const unreadWorkspaces = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of mentions.data ?? []) {
+      const cursor = Number(window.localStorage.getItem(`hive.read.${m.sessionId}`)) || 0;
+      if (m.lastMentionOrdinal > cursor) set.add(m.workspaceId);
+    }
+    return set;
+  }, [mentions.data]);
   const [menu, setMenu] = useState<{ ws: WorkspaceInfoDto; x: number; y: number } | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const iconTarget = useRef<string | null>(null);
@@ -83,6 +97,7 @@ export function WorkspaceRail({
     await setActiveWorkspace(id);
     await qc.invalidateQueries({ queryKey: ["workspaces"] });
     await qc.invalidateQueries({ queryKey: ["chats"] });
+    await qc.invalidateQueries({ queryKey: ["all-mention-states"] });
   }
 
   async function refresh() {
@@ -127,6 +142,9 @@ export function WorkspaceRail({
     >
       {(workspaces.data ?? []).map((w) => {
         const local = w.kind === "local";
+        // Flag a background workspace holding an unread self-mention (the active
+        // one already surfaces mentions in its own sidebar).
+        const hasMention = !w.active && unreadWorkspaces.has(w.id);
         return (
           <div key={w.id} className="relative flex w-full items-center justify-center">
             {/* Leading-edge pip so the active workspace reads even at a glance,
@@ -163,6 +181,17 @@ export function WorkspaceRail({
                 <span>{roomInitials(w.name)}</span>
               )}
             </button>
+            {hasMention && (
+              <span
+                className="absolute right-0 top-0 h-2.5 w-2.5 rounded-full"
+                style={{
+                  background: "var(--hive-accent-cool)",
+                  boxShadow: "0 0 0 2px var(--hive-sidebar-bottom)",
+                }}
+                aria-label={`${w.name} — unread mention`}
+                title={`${w.name} — you were mentioned`}
+              />
+            )}
           </div>
         );
       })}

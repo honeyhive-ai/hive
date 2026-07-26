@@ -2007,6 +2007,7 @@ fn list_workspace_hosts(state: State<AppState>) -> Result<Vec<WorkspaceHostDto>,
             .to_string(),
             label: h.label.clone(),
             online: h.is_online(&now, 90),
+            last_seen: rfc3339(h.last_seen.clone()),
         })
         .collect())
 }
@@ -2058,21 +2059,89 @@ fn list_mention_states(state: State<AppState>) -> Result<Vec<MentionStateDto>, S
         if !session_in_workspace(s.workspace_id, &s.creator_actor_id, active, &me, &known_rooms) {
             continue;
         }
-        let my_role = s.members.iter().find(|m| m.actor.id == me).map(|m| m.role);
-        let mut last_ordinal = 0u32;
-        for (i, msg) in s.messages.iter().enumerate() {
-            // A message you wrote never highlights against you.
-            let by_me = msg.actor_identity.as_ref().map(|a| a.id == me).unwrap_or(false);
-            if !by_me && message_mentions_me(&msg.body, &s, &me, my_role) {
-                last_ordinal = (i + 1) as u32;
-            }
-        }
-        if last_ordinal > 0 {
+        if let Some((last_ordinal, count)) = mention_state_for(&s, &me) {
             out.push(MentionStateDto {
                 session_id: s.id.to_string(),
+                workspace_id: active.to_string(),
                 channel_id: s.channel_id.clone(),
                 last_mention_ordinal: last_ordinal,
-                message_count: s.messages.len() as u32,
+                message_count: count,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The position of the local user's last unread-relevant `@`-mention in `session`
+/// and the session's message count, or `None` if they're never mentioned. Shared
+/// by the active-workspace scan and the cross-workspace scan.
+fn mention_state_for(session: &hive_core::ChatSession, me: &str) -> Option<(u32, u32)> {
+    let my_role = session.members.iter().find(|m| m.actor.id == me).map(|m| m.role);
+    let mut last_ordinal = 0u32;
+    for (i, msg) in session.messages.iter().enumerate() {
+        // A message you wrote never highlights against you.
+        let by_me = msg.actor_identity.as_ref().map(|a| a.id == me).unwrap_or(false);
+        if !by_me && message_mentions_me(&msg.body, session, me, my_role) {
+            last_ordinal = (i + 1) as u32;
+        }
+    }
+    (last_ordinal > 0).then_some((last_ordinal, session.messages.len() as u32))
+}
+
+/// Which known workspace a session belongs to, mirroring `session_in_workspace`
+/// but resolving the *owning* workspace id instead of testing one. Room-stamped
+/// chats belong to that room; otherwise a locally-authored (or legacy) chat is
+/// homed to the local workspace. Returns `None` for a synced room chat whose
+/// room this device doesn't know.
+fn workspace_of_session(
+    session_workspace_id: Uuid,
+    creator_actor_id: &str,
+    local_id: Uuid,
+    me: &str,
+    known_rooms: &std::collections::HashSet<Uuid>,
+) -> Option<Uuid> {
+    if known_rooms.contains(&session_workspace_id) {
+        return Some(session_workspace_id);
+    }
+    (creator_actor_id.is_empty() || creator_actor_id == me).then_some(local_id)
+}
+
+/// Self-mention state across **every** known workspace (not just the active
+/// one), each DTO tagged with its `workspace_id`. The workspace switcher groups
+/// by that id to flag a background workspace holding an unread self-mention.
+///
+/// This is a single flat scan: the event store spans all workspaces, so the
+/// same `list_session_ids` walk that powers `list_mention_states` yields other
+/// workspaces' chats too — we just resolve each chat's owning workspace instead
+/// of filtering to the active one.
+#[tauri::command]
+fn list_all_mention_states(state: State<AppState>) -> Result<Vec<MentionStateDto>, String> {
+    let local_id = state.local_workspace_id;
+    let me = state.local_actor_id();
+    let known_rooms = state.known_room_ids();
+    let svc = state.service.lock().unwrap();
+    let ids = svc.store().list_session_ids().map_err(map_err)?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(s) = svc.load(id).map_err(map_err)? else {
+            continue;
+        };
+        let Some(wid) =
+            workspace_of_session(s.workspace_id, &s.creator_actor_id, local_id, &me, &known_rooms)
+        else {
+            continue;
+        };
+        // Each workspace's config log is a pseudo-session, not a chat.
+        if id == hive_core::workspace_config_session_id(wid) {
+            continue;
+        }
+        if let Some((last_ordinal, count)) = mention_state_for(&s, &me) {
+            out.push(MentionStateDto {
+                session_id: s.id.to_string(),
+                workspace_id: wid.to_string(),
+                channel_id: s.channel_id.clone(),
+                last_mention_ordinal: last_ordinal,
+                message_count: count,
             });
         }
     }
@@ -7357,6 +7426,7 @@ pub fn run() {
             list_workspace_hosts,
             set_agent_host,
             list_mention_states,
+            list_all_mention_states,
             list_skills,
             add_skill_inline,
             install_skill,
