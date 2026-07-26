@@ -87,6 +87,27 @@ impl Drop for DriverRegistration {
     }
 }
 
+/// Pure crash-recovery selector: given every persisted run's `(id, status)`
+/// and the set of run ids that already have a live in-process driver, return
+/// the ids that need a driver re-spawned. A run qualifies iff it is
+/// `Running`/`AwaitingGate` (interruptible states) *and* has no live driver.
+/// Terminal runs (Completed/Failed/Halted/Canceled) and already-driven runs
+/// are excluded, so re-running this after spawning is idempotent.
+pub(crate) fn runs_needing_recovery(
+    runs: impl IntoIterator<Item = (Uuid, WorkflowRunStatus)>,
+    live: &std::collections::HashSet<Uuid>,
+) -> Vec<Uuid> {
+    runs.into_iter()
+        .filter(|(id, status)| {
+            matches!(
+                status,
+                WorkflowRunStatus::Running | WorkflowRunStatus::AwaitingGate
+            ) && !live.contains(id)
+        })
+        .map(|(id, _)| id)
+        .collect()
+}
+
 pub(crate) async fn drive_run(
     app: AppHandle,
     session_id: Uuid,
@@ -781,8 +802,9 @@ pub(crate) fn definition_from_dto(
     })
 }
 
-pub(crate) fn run_dto(run: &wf::WorkflowRun) -> WorkflowRunDto {
+pub(crate) fn run_dto(run: &wf::WorkflowRun, driver_alive: bool) -> WorkflowRunDto {
     WorkflowRunDto {
+        driver_alive,
         id: run.id.to_string(),
         definition_id: run.definition_id.to_string(),
         definition_name: run.definition.name.clone(),
@@ -882,12 +904,19 @@ pub(crate) fn list_workflow_runs(
     session_id: String,
 ) -> Result<Vec<WorkflowRunDto>, String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let live = state.run_wakers.lock().unwrap();
     let svc = state.service.lock().unwrap();
     Ok(svc
         .load(sid)
         .map_err(map_err)?
         // Newest first for the runs list.
-        .map(|s| s.workflow_runs.iter().rev().map(run_dto).collect())
+        .map(|s| {
+            s.workflow_runs
+                .iter()
+                .rev()
+                .map(|r| run_dto(r, live.contains_key(&r.id)))
+                .collect()
+        })
         .unwrap_or_default())
 }
 
@@ -1117,5 +1146,49 @@ mod directive_tests {
     fn slug_mirrors_frontend() {
         assert_eq!(slug("Judge results!"), "judge-results");
         assert_eq!(slug("  "), "stage");
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn selects_only_interrupted_runs_without_a_live_driver() {
+        let running = Uuid::new_v4();
+        let awaiting = Uuid::new_v4();
+        let already_live = Uuid::new_v4();
+        let completed = Uuid::new_v4();
+        let failed = Uuid::new_v4();
+        let halted = Uuid::new_v4();
+        let canceled = Uuid::new_v4();
+
+        let runs = vec![
+            (running, WorkflowRunStatus::Running),
+            (awaiting, WorkflowRunStatus::AwaitingGate),
+            (already_live, WorkflowRunStatus::Running),
+            (completed, WorkflowRunStatus::Completed),
+            (failed, WorkflowRunStatus::Failed),
+            (halted, WorkflowRunStatus::Halted),
+            (canceled, WorkflowRunStatus::Canceled),
+        ];
+        // `already_live` has a driver, so it must be skipped even though Running.
+        let live: HashSet<Uuid> = [already_live].into_iter().collect();
+
+        let need: HashSet<Uuid> = runs_needing_recovery(runs, &live).into_iter().collect();
+        assert_eq!(need, [running, awaiting].into_iter().collect());
+    }
+
+    #[test]
+    fn recovery_is_idempotent_once_drivers_are_live() {
+        let running = Uuid::new_v4();
+        let runs = vec![(running, WorkflowRunStatus::Running)];
+        // First pass: no live drivers → recover it.
+        let live = HashSet::new();
+        assert_eq!(runs_needing_recovery(runs.clone(), &live), vec![running]);
+        // Second pass after the driver registered → nothing left to recover.
+        let live: HashSet<Uuid> = [running].into_iter().collect();
+        assert!(runs_needing_recovery(runs, &live).is_empty());
     }
 }

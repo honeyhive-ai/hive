@@ -8,4 +8,10 @@ export type WorkflowRunDto = { id: string, definitionId: string, definitionName:
 /**
  * "running" | "awaitingGate" | "completed" | "failed" | "halted" | "canceled"
  */
-status: string, nodes: Array<WorkflowNodeRunDto>, startedAt: string, };
+status: string, nodes: Array<WorkflowNodeRunDto>, startedAt: string, 
+/**
+ * Whether an in-process driver is live for this run right now. False after
+ * an app restart until crash-recovery re-spawns the driver; gates the
+ * frontend's Resume affordance.
+ */
+driverAlive: boolean, };

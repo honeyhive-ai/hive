@@ -225,6 +225,10 @@ export function WorkflowsPane({
 function RunCard({ sessionId, run }: { sessionId: string; run: WorkflowRunDto }) {
   const qc = useQueryClient();
   const live = run.status === "running" || run.status === "awaitingGate";
+  // A resumable run in an interruptible state whose in-process driver is gone
+  // (e.g. after an app restart). When the driver is alive, Resume would only
+  // return "already being driven", so hide it.
+  const resumable = live && !run.driverAlive;
   const tone = statusTone(run.status);
 
   async function act(fn: () => Promise<void>) {
@@ -289,7 +293,9 @@ function RunCard({ sessionId, run }: { sessionId: string; run: WorkflowRunDto })
       {live && (
         <div className="mt-2 flex gap-2 text-xs">
           <Button onClick={() => act(() => cancelWorkflowRun(sessionId, run.id))}>Cancel</Button>
-          <Button onClick={() => act(() => resumeWorkflowRun(sessionId, run.id))}>Resume</Button>
+          {resumable && (
+            <Button onClick={() => act(() => resumeWorkflowRun(sessionId, run.id))}>Resume</Button>
+          )}
         </div>
       )}
     </div>
