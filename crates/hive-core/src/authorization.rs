@@ -80,8 +80,11 @@ pub fn requires_authz(event: &SessionEvent) -> bool {
 /// legitimate collaboration. Trust-bootstrap events (`AccountKeyRegistered`,
 /// `DeviceCertificateAdded`) are excluded — they are validated by the cert chain,
 /// not by role, and gating them would break a joiner establishing trust.
-/// `SessionSnapshot` is excluded pending a separate seed-trust-root fix (a forged
-/// low-lamport snapshot can still rewrite the base — tracked as a follow-up).
+/// `SessionSnapshot` is handled out of band, not here: the base *seed* is gated by
+/// `events::is_self_consistent_seed` and a mid-stream (non-seed) snapshot
+/// by [`nonseed_snapshot_authorized`], because both need the projected-so-far
+/// state / the embedded snapshot to decide — which the generic role check lacks
+/// (security residual B2, closed in `events::project`).
 pub fn requires_projection_authz(event: &SessionEvent) -> bool {
     matches!(
         event,
@@ -106,6 +109,46 @@ pub fn requires_projection_authz(event: &SessionEvent) -> bool {
             | SessionEvent::ChannelArchived { .. }
             | SessionEvent::ChatChannelChanged { .. }
     )
+}
+
+/// Whether a **non-seed** `SessionSnapshot` — one folded *after* the base seed,
+/// i.e. a compaction checkpoint — may be applied during projection. A snapshot is
+/// a full-state overwrite, so a mid-stream one must be constrained to what its
+/// author could already express through governance deltas, or a malicious member
+/// could rewrite the roster wholesale from a single event. Authorized iff:
+///   * the author is an Owner in the roster projected *so far*, AND
+///   * it preserves `creator_actor_id` (compaction never re-founds the workspace),
+///     AND
+///   * it promotes no member to Owner who was not already one (no silent
+///     elevation of the author or a confederate).
+///
+/// A plain compaction snapshot by an Owner that preserves the roster/creator
+/// passes; a forged one that re-founds or elevates is dropped.
+///
+/// Determinism: this reads only `new_state`, `author`, and the fold-so-far
+/// `projected`, so every device reaches the identical decision ⇒ convergence.
+///
+/// NOTE: `ChatSession::apply` currently folds a non-seed snapshot as a no-op, so
+/// this gate is defense-in-depth — it becomes load-bearing only if compaction
+/// gains subsuming semantics. The live B2 risk is *seed* selection (see
+/// `crate::events::project`).
+pub fn nonseed_snapshot_authorized(
+    new_state: &ChatSession,
+    author: &str,
+    projected: &ChatSession,
+) -> bool {
+    if projected.role_of(author) != WorkspaceRole::Owner {
+        return false;
+    }
+    if new_state.creator_actor_id != projected.creator_actor_id {
+        return false;
+    }
+    // Reject any Owner in the incoming state who was not already an Owner in the
+    // roster projected so far (a member absent so far counts as "not an Owner").
+    let elevates_a_new_owner = new_state.members.iter().any(|m| {
+        m.role == WorkspaceRole::Owner && projected.role_of(&m.id) != WorkspaceRole::Owner
+    });
+    !elevates_a_new_owner
 }
 
 /// The minimum role allowed to emit `event`.
@@ -596,6 +639,31 @@ mod tests {
         ] {
             assert!(requires_projection_authz(&ev), "{} must be projection-gated", ev.kind_str());
         }
+    }
+
+    #[test]
+    fn nonseed_snapshot_gate() {
+        // Projected-so-far: alice Owner, bob Contributor, founded by alice.
+        let mut projected = session_with_members(vec![
+            ("alice", WorkspaceRole::Owner),
+            ("bob", WorkspaceRole::Contributor),
+        ]);
+        projected.creator_actor_id = "alice".into();
+
+        // A compaction by the owner preserving roster + creator: allowed.
+        let mut snap = projected.clone();
+        assert!(nonseed_snapshot_authorized(&snap, "alice", &projected));
+        // Authored by a non-owner: rejected.
+        assert!(!nonseed_snapshot_authorized(&snap, "bob", &projected));
+        // Re-founding (creator changed): rejected even by the owner.
+        snap.creator_actor_id = "bob".into();
+        assert!(!nonseed_snapshot_authorized(&snap, "alice", &projected));
+        // Silent elevation (bob → Owner): rejected even by the owner.
+        let mut elevate = projected.clone();
+        if let Some(b) = elevate.members.iter_mut().find(|m| m.id == "bob") {
+            b.role = WorkspaceRole::Owner;
+        }
+        assert!(!nonseed_snapshot_authorized(&elevate, "alice", &projected));
     }
 
     #[test]
