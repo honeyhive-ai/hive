@@ -519,6 +519,26 @@ pub struct WorkspaceHostDto {
     pub online: bool,
 }
 
+/// Where the local user was last `@`-mentioned in a chat, so the sidebar can
+/// highlight the channel (and chat) until it's read. Read state is per-device
+/// (localStorage), so this DTO carries only the raw positions: a mention at
+/// `last_mention_ordinal` is *unread* when it exceeds the read cursor the client
+/// stored when it last opened the chat (≈ `message_count` at that time).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct MentionStateDto {
+    pub session_id: String,
+    /// The channel the chat is filed under (empty = unfiled).
+    pub channel_id: String,
+    /// 1-based position (in canonical message order) of the last message that
+    /// mentions the local user. Always ≥ 1 (chats with none are omitted).
+    pub last_mention_ordinal: u32,
+    /// Total messages in the chat — the value the client stores as its read
+    /// cursor when it opens the chat.
+    pub message_count: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,5 +582,6 @@ mod tests {
         IssuedRelayTokenDto::export_all(&cfg).unwrap();
         QueuedWorkDto::export_all(&cfg).unwrap();
         WorkspaceHostDto::export_all(&cfg).unwrap();
+        MentionStateDto::export_all(&cfg).unwrap();
     }
 }

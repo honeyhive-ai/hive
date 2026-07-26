@@ -22,9 +22,9 @@ use hive_core::{ActorIdentity, ActorKind, VaultSource, WorkspaceMember};
 use hive_proto::{
     ApprovalDto, AppInfo, AppSettingsDto, ChannelDto, ChatMessageDto, ChatSessionDto,
     ChatStreamEvent, ChatSummaryDto, ContextTelemetryDto, GitFileDiffDto, McpServerDto, ProposalDto,
-    IssuedRelayTokenDto, QueuedWorkDto, ReactionDto, RelayTokenDto, RelayUserDto, RuntimeSummaryDto,
-    SkillDto, VaultSourceDto, WorkspaceAgentDto, WorkspaceHostDto, WorkspaceInfoDto,
-    WorkspaceMemberDto,
+    IssuedRelayTokenDto, MentionStateDto, QueuedWorkDto, ReactionDto, RelayTokenDto, RelayUserDto,
+    RuntimeSummaryDto, SkillDto, VaultSourceDto, WorkspaceAgentDto, WorkspaceHostDto,
+    WorkspaceInfoDto, WorkspaceMemberDto,
 };
 use hive_runtime::provider::anthropic::AnthropicResponse;
 use hive_runtime::tool_loop::{self, MessagesApi, ToolExecutor};
@@ -2017,6 +2017,66 @@ fn set_agent_host(state: State<AppState>, agent_id: String, host_id: String) -> 
     let aid = Uuid::parse_str(&agent_id).map_err(map_err)?;
     let mut svc = state.service.lock().unwrap();
     svc.set_agent_host(state.active_workspace_id(), aid, &host_id).map_err(map_err)
+}
+
+/// True if `body` `@`-mentions the local user — broadcast (`@you`/`@all`), by
+/// handle, or by their role group. The single predicate behind both desktop
+/// mention notifications and the sidebar's channel highlights.
+fn message_mentions_me(
+    body: &str,
+    session: &hive_core::ChatSession,
+    me: &str,
+    my_role: Option<hive_core::WorkspaceRole>,
+) -> bool {
+    let m = parse_mentions(body, session);
+    m.human_broadcast
+        || m.humans.iter().any(|h| h == me)
+        || my_role.map(|r| m.roles.contains(&r)).unwrap_or(false)
+}
+
+/// Every chat in the active workspace where the local user has been
+/// `@`-mentioned, with the position of the last such mention. The sidebar
+/// compares `last_mention_ordinal` against its per-chat read cursor to highlight
+/// channels (and chats) that hold an unread mention. Read state is per-device,
+/// so it never leaves the client.
+#[tauri::command]
+fn list_mention_states(state: State<AppState>) -> Result<Vec<MentionStateDto>, String> {
+    let active = state.active_workspace_id();
+    let me = state.local_actor_id();
+    let known_rooms = state.known_room_ids();
+    let svc = state.service.lock().unwrap();
+    let config_id = hive_core::workspace_config_session_id(active);
+    let ids = svc.store().list_session_ids().map_err(map_err)?;
+    let mut out = Vec::new();
+    for id in ids {
+        if id == config_id {
+            continue;
+        }
+        let Some(s) = svc.load(id).map_err(map_err)? else {
+            continue;
+        };
+        if !session_in_workspace(s.workspace_id, &s.creator_actor_id, active, &me, &known_rooms) {
+            continue;
+        }
+        let my_role = s.members.iter().find(|m| m.actor.id == me).map(|m| m.role);
+        let mut last_ordinal = 0u32;
+        for (i, msg) in s.messages.iter().enumerate() {
+            // A message you wrote never highlights against you.
+            let by_me = msg.actor_identity.as_ref().map(|a| a.id == me).unwrap_or(false);
+            if !by_me && message_mentions_me(&msg.body, &s, &me, my_role) {
+                last_ordinal = (i + 1) as u32;
+            }
+        }
+        if last_ordinal > 0 {
+            out.push(MentionStateDto {
+                session_id: s.id.to_string(),
+                channel_id: s.channel_id.clone(),
+                last_mention_ordinal: last_ordinal,
+                message_count: s.messages.len() as u32,
+            });
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -4069,15 +4129,12 @@ fn notify_mentions(
         if authored_by_me {
             None
         } else {
-            let m = parse_mentions(&last.body, &session);
             let my_role = session
                 .members
                 .iter()
                 .find(|mem| mem.actor.id == me)
                 .map(|mem| mem.role);
-            let mentioned = m.human_broadcast
-                || m.humans.iter().any(|h| h == &me)
-                || my_role.map(|r| m.roles.contains(&r)).unwrap_or(false);
+            let mentioned = message_mentions_me(&last.body, &session, &me, my_role);
             mentioned.then(|| (last.id, last.author.clone()))
         }
     };
@@ -7299,6 +7356,7 @@ pub fn run() {
             list_queued_work,
             list_workspace_hosts,
             set_agent_host,
+            list_mention_states,
             list_skills,
             add_skill_inline,
             install_skill,

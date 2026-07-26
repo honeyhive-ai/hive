@@ -26,6 +26,7 @@ import type { RelayUserDto } from "@/bindings/RelayUserDto";
 import type { IssuedRelayTokenDto } from "@/bindings/IssuedRelayTokenDto";
 import type { QueuedWorkDto } from "@/bindings/QueuedWorkDto";
 import type { WorkspaceHostDto } from "@/bindings/WorkspaceHostDto";
+import type { MentionStateDto } from "@/bindings/MentionStateDto";
 
 export type { ChatSummaryDto } from "@/bindings/ChatSummaryDto";
 export type { ChannelDto } from "@/bindings/ChannelDto";
@@ -498,6 +499,15 @@ export const listWorkspaceHosts = () =>
 /// device.
 export const setAgentHost = (agentId: string, hostId: string) =>
   invoke<void>("set_agent_host", { agentId, hostId });
+
+// ── Mention highlights: chats where the local user was @-mentioned ───────────
+export type { MentionStateDto } from "@/bindings/MentionStateDto";
+
+/// Every chat in the active workspace where the local user has been mentioned,
+/// with the position of the last mention. The sidebar compares it against a
+/// per-chat read cursor (localStorage) to highlight unread mentions.
+export const listMentionStates = () =>
+  invoke<MentionStateDto[]>("list_mention_states");
 
 export const listSkills = (sessionId: string) =>
   invoke<SkillDto[]>("list_skills", { sessionId });

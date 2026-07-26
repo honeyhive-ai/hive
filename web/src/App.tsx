@@ -311,6 +311,9 @@ export function App() {
       // Queued work (unanswered mentions + host status) rides the log too, so a
       // mention/host-heartbeat that synced while offline updates the queue live.
       qc.invalidateQueries({ queryKey: ["queued-work"] });
+      // Mention highlights: a synced message may @-mention the local user, so
+      // refresh which channels/chats light up in the sidebar.
+      qc.invalidateQueries({ queryKey: ["mention-states"] });
       // Cross-device dispatch: if a teammate's message just synced into the open
       // chat and we own the responder, answer it (no-op otherwise).
       if (selectedId) {
@@ -399,6 +402,7 @@ export function App() {
       qc.invalidateQueries({ queryKey: ["agents"] }),
       qc.invalidateQueries({ queryKey: ["proposals"] }),
       qc.invalidateQueries({ queryKey: ["diffs"] }),
+      qc.invalidateQueries({ queryKey: ["mention-states"] }),
     ]);
   }
 
