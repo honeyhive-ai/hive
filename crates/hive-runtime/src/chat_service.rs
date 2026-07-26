@@ -382,7 +382,7 @@ impl ChatService {
     /// Add (or replace, by id) a workspace agent, emitting the full new roster.
     pub fn add_agent(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         agent: WorkspaceAgent,
     ) -> Result<()> {
@@ -411,7 +411,7 @@ impl ChatService {
     /// no-op error. Passing `None` for a field clears it.
     pub fn set_agent_avatar(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         agent_id: Uuid,
         avatar_url: Option<String>,
@@ -447,7 +447,7 @@ impl ChatService {
     /// Remove a workspace agent by id, emitting the full new roster.
     pub fn remove_agent(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         agent_id: Uuid,
     ) -> Result<()> {
@@ -695,7 +695,7 @@ impl ChatService {
     /// Install (or replace, by name) a loaded skill, emitting the new set.
     pub fn add_skill(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         skill: SkillProfile,
     ) -> Result<()> {
@@ -718,7 +718,7 @@ impl ChatService {
     /// Remove a loaded skill by id.
     pub fn remove_skill(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         skill_id: Uuid,
     ) -> Result<()> {
@@ -855,7 +855,7 @@ impl ChatService {
     /// Add (dedup by raw URL) a vault source.
     pub fn add_vault_source(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         source: VaultSource,
     ) -> Result<()> {
@@ -876,7 +876,7 @@ impl ChatService {
     /// Remove a vault source by its raw URL.
     pub fn remove_vault_source(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         raw_url: &str,
     ) -> Result<()> {
