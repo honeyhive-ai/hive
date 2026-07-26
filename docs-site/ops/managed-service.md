@@ -11,7 +11,7 @@ That's powerful but the friction is real — every device must agree on a relay
 URL, the relay must be up and current, and you pair by codes. A managed service
 removes that:
 
-- **Always-on hosted relay** → sync / short codes / revocation "just work", no
+- **Always-on hosted relay** → sync / invites / revocation "just work", no
   babysitting, no version skew.
 - **GitHub identity** → sign in once; invite teammates by `@handle` instead of
   codes; commits an agent makes are attributed to the real person for free.
@@ -43,7 +43,7 @@ The GitHub user is the **account**; each machine is a **device** under it.
 - **P0 — Hosted relay (deploy).** Run the relay ([github.com/honeyhive-ai/relay](https://github.com/honeyhive-ai/relay))
   somewhere always on — Docker/Fly per its README (`deploy/fly.toml`). For a
   tailnet, run it as a launchd/systemd service. Bake a default relay URL into the
-  app so there's zero config. *(This alone makes short codes/sync reliable.)*
+  app so there's zero config. *(This alone makes sync reliable.)*
 - **P1 — GitHub sign-in (device flow).** Desktop OAuth **device flow** (no client
   secret): show a code, user authorizes at github.com/login/device, app gets a
   token, fetches the profile, and binds the account id + name + email. Each
@@ -51,7 +51,7 @@ The GitHub user is the **account**; each machine is a **device** under it.
 - **P2 — Directory + invite-by-handle.** Authenticated relay endpoints:
   `register(account, device, signing_pub, ka_pub, device_cert)` and
   `lookup(handle|account) → devices`. Pairing becomes "invite `@handle`" → seal
-  the workspace key to all their devices. Short codes stay as a fallback.
+  the workspace key to all their devices — the key never transits the relay.
 - **P3 — Teams as servers.** Server-side workspace membership + roles (owner
   removes → rotate to remaining devices), presence, unread, push.
 - **P4 — Productionize.** Multi-tenant isolation, durable storage (relay state is

@@ -19,25 +19,25 @@ code** to share. Anyone who pastes it joins and syncs with you.
 
 **Join** — paste an invite code someone shared with you and click
 **Join workspace**. The code carries the relay, room, and key, so
-joining is a single paste — nothing else to configure.
+joining is a single paste — nothing else to configure. You show up in
+the workspace **roster immediately** on joining — no need to open a
+chat first before the rest of the team sees you.
 
 Invite codes look like `hivews1:…` (see the
 [invite code reference](../reference/invite-payload.md) for the
 format). Because the code embeds the workspace key, treat it like a
 secret — share it over a channel you trust.
 
-### Short speakable codes
+The relay-brokered **short code** — a brief token (e.g. `K7P2QX`) that
+published the full invite to the relay so a peer could redeem it — has
+been **removed**: it put the workspace key on the relay, which E2EE now
+forbids (see [Security & trust](../concepts/security.md)). Share the
+full `hivews1:` code out-of-band instead, or use
+[invite by GitHub handle](#invite-by-github-handle) for a paste-free
+path that keeps the key off the relay.
 
-For pasting into chat or reading aloud, use a **short code** instead.
-From the modal's *Your team workspaces* list, click **Short code**:
-Hive registers the full invite with the relay and hands back a brief
-token (e.g. `K7P2QX`) that **expires in about ten minutes**. The
-recipient enters it under **Join → or a short code**, and Hive
-resolves it back to the full invite behind the scenes. Short codes
-need a relay (the relay brokers the lookup).
-
-You can also **Copy invite** (the full `hivews1:` code) or **Leave**
-a workspace from this same list.
+You can **Copy invite** (the full `hivews1:` code) or **Leave** a
+workspace from the *Your team workspaces* list.
 
 ## Invite by GitHub handle
 

@@ -170,13 +170,17 @@ path).
 
 ## Security
 
-By default the relay is **open** — anyone with the URL + room id can join that
-room. Three things control access:
+By default the relay is **open** at the *connection* layer — anyone with the URL
++ room id can reach that room. Content privacy is a separate, mandatory layer;
+see [Security & trust](../concepts/security.md) for the full model. Three things
+control access:
 
-- **Set a workspace key.** With it, every envelope is sealed with
-  ChaCha20-Poly1305 *before* it leaves the device; the relay only ever stores
-  ciphertext. Settings shows `🔒 encrypted` when it's on. This is what keeps your
-  data private even on an open relay.
+- **The workspace key is required to sync.** E2EE is mandatory for relay sync:
+  Hive refuses to push plaintext, so a workspace with no key does not sync (the
+  app shows a Sync error until you set one). With a key, every envelope is sealed
+  with ChaCha20-Poly1305 *before* it leaves the device; the relay only ever
+  stores ciphertext, and the key never transits the relay. Settings shows
+  `🔒 encrypted` when it's on.
 - **Use an unguessable room id.** To revoke read access, rotate the key and/or
   room.
 - **Optionally gate connections** with `HIVE_RELAY_ACCESS_TOKENS` (see above) if
@@ -194,6 +198,34 @@ room. Three things control access:
   follow-up).
 - Memory grows with `(workspaces × devices × queued events)` — tiny for a small
   team. CPU is negligible.
+
+### Retention & memory bounds
+
+The memory store keeps recent E2EE envelopes so a peer can catch up after being
+offline. Three env vars bound it:
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `HIVE_RELAY_MAX_ENVELOPES` | `50000` | Per-workspace retained-envelope cap — the primary memory bound. `0` = unbounded. |
+| `HIVE_RELAY_RETENTION_DAYS` | `0` (off) | Also prune envelopes older than N days. |
+| `HIVE_RELAY_MAX_BODY_BYTES` | `4194304` (4 MiB) | Max request body size. |
+
+The relay is a **cache of recent E2EE traffic**, not a system of record. A device
+offline past the retention window re-syncs the gap from a peer that still has it,
+or from the Postgres backend (`DATABASE_URL`) if you run one for unbounded
+history. Size the cap for your longest expected offline gap.
+
+### Health probes
+
+`/v1/health` round-trips the store, so it reports real liveness/readiness, not
+just process-up: `200 ok` when the store answers, `503` when it doesn't. Point
+your orchestrator's liveness/readiness probes at it.
+
+```bash
+curl -fsS https://relay.example.com/v1/health      # → ok (200), or 503 if unhealthy
+```
+
+Pairing-code redemption is **rate-limited** to blunt code enumeration.
 
 ## Where the source lives
 
