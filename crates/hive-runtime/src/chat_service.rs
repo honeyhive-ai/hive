@@ -128,15 +128,18 @@ impl ChatService {
         }
     }
 
-    /// The acting actor's role in a session — members carry roles; a non-member
-    /// (e.g. the local workspace creator) is treated as owner.
+    /// The acting actor's role in the projected roster. A non-member gets the
+    /// **safe floor** (`Viewer`), never Owner — so being absent from the roster
+    /// can't grant governance powers (PR #61 seam). The one bootstrap that needs
+    /// to act without a roster role — a device adding *itself* — is handled by the
+    /// self-enroll allowance in `authorization::evaluate`, not by this floor.
     fn actor_role(&self, session: &ChatSession) -> WorkspaceRole {
         session
             .members
             .iter()
             .find(|m| m.actor.id == self.author.id)
             .map(|m| m.role)
-            .unwrap_or(WorkspaceRole::Owner)
+            .unwrap_or(WorkspaceRole::Viewer)
     }
 
     /// Append a signed envelope carrying `payload`, assigning the next sequence.
@@ -154,7 +157,8 @@ impl ChatService {
             // the config roster itself. Closes the self-member staleness gap where
             // a role differed per-chat.
             if let Some(session) = self.load(session_id)? {
-                let decision = authorize(&payload, self.actor_role(&session), &session);
+                let decision =
+                    authorize(&payload, &self.author.id, self.actor_role(&session), &session);
                 if !decision.allowed {
                     return Err(ChatError::Unauthorized(decision.summary));
                 }
@@ -1656,6 +1660,32 @@ mod tests {
     }
 
     #[test]
+    fn non_member_worker_manages_its_own_host_but_not_governance() {
+        // The self-host carve-out: a worker box (not a workspace member, so
+        // Viewer-floored) may register + heartbeat the host it owns, yet still
+        // can't perform governance. Proves the #61-hardening worker regression
+        // is closed without enrolling the worker as a member.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        {
+            let mut owner = svc_on(&path, "owner", "Owner");
+            owner.create_chat("A", wid, "anthropic").unwrap();
+            owner.ensure_workspace_config(wid).unwrap();
+        }
+        let mut worker = svc_on(&path, "worker", "Worker");
+        // register_host stamps owner_actor_id = self → allowed via the carve-out.
+        worker
+            .register_host(wid, hive_core::WorkspaceHost::new("box1", hive_core::HostKind::Worker, "prod"))
+            .unwrap();
+        // Heartbeat its own host (throttle 0 forces an emit) → allowed.
+        assert!(worker.touch_host(wid, "box1", 0).unwrap());
+        // But governance stays denied — the Viewer floor holds for member adds.
+        let victim = test_member("victim", "V", WorkspaceRole::Contributor);
+        assert!(worker.add_member(wid, wid, victim).is_err());
+    }
+
+    #[test]
     fn member_added_in_one_chat_is_visible_in_another_chat() {
         // (a) The staleness gap: a member added "in" chat A must appear in the
         // roster of a *different* chat B in the same workspace after load().
@@ -1784,6 +1814,109 @@ mod tests {
             let cfg = a.load(workspace_config_session_id(wid)).unwrap().unwrap();
             assert!(cfg.members.iter().any(|m| m.id == "u3"));
         }
+    }
+
+    // ── Authz hardening: bootstrap preserved, Owner fallback closed (#61 seams) ─
+
+    #[test]
+    fn bootstrap_creator_seeds_owner_and_can_add_a_second_member() {
+        // Fresh workspace: the creator is Owner and governance works for them.
+        let (mut svc, _) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+        let cfg = svc.load(workspace_config_session_id(wid));
+        // (config log is seeded lazily; first governance call seeds it)
+        assert!(cfg.unwrap().is_none());
+        svc.add_member(chat.id, wid, test_member("u2", "Bo", WorkspaceRole::Contributor))
+            .unwrap();
+        let cfg = svc.load(workspace_config_session_id(wid)).unwrap().unwrap();
+        assert_eq!(cfg.members.iter().find(|m| m.id == "u1").unwrap().role, WorkspaceRole::Owner);
+        assert!(cfg.members.iter().any(|m| m.id == "u2"));
+    }
+
+    #[test]
+    fn non_member_cannot_remove_or_demote_via_owner_fallback() {
+        // Previously a non-member fell back to Owner and could govern. Now the
+        // floor is Viewer: a stranger's device is denied removal *and* demotion.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        let chat_id = {
+            let mut a = svc_on(&path, "u1", "Ana");
+            let chat = a.create_chat("A", wid, "anthropic").unwrap();
+            a.add_member(chat.id, wid, test_member("u2", "Bo", WorkspaceRole::Contributor)).unwrap();
+            chat.id
+        };
+        let mut x = svc_on(&path, "outsider", "Eve");
+        assert!(
+            matches!(x.remove_member(chat_id, wid, "u2"), Err(ChatError::Unauthorized(_))),
+            "a non-member must not remove an existing member"
+        );
+        assert!(
+            matches!(
+                x.set_member_role(chat_id, wid, "u2", WorkspaceRole::Viewer),
+                Err(ChatError::Unauthorized(_))
+            ),
+            "a non-member must not demote an existing member"
+        );
+        // The roster is untouched.
+        let cfg = svc_on(&path, "u1", "Ana").load(workspace_config_session_id(wid)).unwrap().unwrap();
+        assert_eq!(cfg.members.iter().find(|m| m.id == "u2").unwrap().role, WorkspaceRole::Contributor);
+    }
+
+    #[test]
+    fn contributor_denied_governance_admin_allowed() {
+        // Role gating on the hoisted roster: a Contributor member can't govern; an
+        // Admin member can.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        let chat_id = {
+            let mut a = svc_on(&path, "u1", "Ana");
+            let chat = a.create_chat("A", wid, "anthropic").unwrap();
+            a.add_member(chat.id, wid, test_member("con", "Con", WorkspaceRole::Contributor)).unwrap();
+            a.add_member(chat.id, wid, test_member("adm", "Adm", WorkspaceRole::Admin)).unwrap();
+            chat.id
+        };
+        let mut con = svc_on(&path, "con", "Con");
+        assert!(
+            matches!(
+                con.add_member(chat_id, wid, test_member("x", "X", WorkspaceRole::Viewer)),
+                Err(ChatError::Unauthorized(_))
+            ),
+            "a Contributor must not add members"
+        );
+        let mut adm = svc_on(&path, "adm", "Adm");
+        adm.add_member(chat_id, wid, test_member("x", "X", WorkspaceRole::Viewer)).unwrap();
+        let cfg = svc_on(&path, "u1", "Ana").load(workspace_config_session_id(wid)).unwrap().unwrap();
+        assert!(cfg.members.iter().any(|m| m.id == "x"));
+    }
+
+    #[test]
+    fn non_member_cannot_self_enroll_as_owner() {
+        // No self-escalation: the self-`MemberAdded` bootstrap path can't grant
+        // governance. A device may only self-enroll at a non-governance role.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        let chat_id = {
+            let mut a = svc_on(&path, "u1", "Ana");
+            let chat = a.create_chat("A", wid, "anthropic").unwrap();
+            a.ensure_workspace_config(wid).unwrap();
+            chat.id
+        };
+        let mut eve = svc_on(&path, "eve", "Eve");
+        // Directly attempt the self-escalation the allowance must reject.
+        let cfg_id = workspace_config_session_id(wid);
+        let escalate = eve.add_member(cfg_id, wid, test_member("eve", "Eve", WorkspaceRole::Owner));
+        assert!(
+            matches!(escalate, Err(ChatError::Unauthorized(_))),
+            "self-enroll as Owner must be denied, got {escalate:?}"
+        );
+        // But an honest self-enroll (Contributor, via ensure_self_member) succeeds.
+        assert!(eve.ensure_self_member(chat_id, wid).unwrap());
+        let cfg = svc_on(&path, "u1", "Ana").load(cfg_id).unwrap().unwrap();
+        assert_eq!(cfg.members.iter().find(|m| m.id == "eve").unwrap().role, WorkspaceRole::Contributor);
     }
 
     #[test]
