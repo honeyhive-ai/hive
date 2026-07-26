@@ -11,7 +11,7 @@ use crate::agent::WorkspaceAgent;
 use crate::channel::Channel;
 use crate::workspace_runtime::WorkspaceRuntime;
 use crate::chat::ChatMessage;
-use crate::identity::WorkspaceMember;
+use crate::identity::{WorkspaceMember, WorkspaceRole};
 use crate::proposals::ActionProposal;
 use crate::skills::SkillProfile;
 use crate::time_util::Timestamp;
@@ -85,6 +85,18 @@ pub struct ChatSession {
 }
 
 impl ChatSession {
+    /// The workspace role `actor_id` holds in this session's projected roster,
+    /// or the safe floor (`Viewer`) if they're not a member. Mirrors the
+    /// authoring-side floor (`ChatService::actor_role`) so ingest/projection
+    /// authz and author-time authz agree on a non-member's privileges.
+    pub fn role_of(&self, actor_id: &str) -> WorkspaceRole {
+        self.members
+            .iter()
+            .find(|m| m.id == actor_id)
+            .map(|m| m.role)
+            .unwrap_or(WorkspaceRole::Viewer)
+    }
+
     pub fn new(title: impl Into<String>, workspace_id: Uuid, runtime_id: impl Into<String>) -> Self {
         let now = Timestamp::now();
         Self {

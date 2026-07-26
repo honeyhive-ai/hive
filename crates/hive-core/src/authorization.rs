@@ -65,6 +65,43 @@ pub fn requires_authz(event: &SessionEvent) -> bool {
     )
 }
 
+/// The subset of events that must be **re-authorized during projection**, not
+/// only at authoring time — because a malicious member can sign one as themselves
+/// (passing the envelope verifier) and sync it to every peer. Without an ingest
+/// check, a Viewer's forged `MemberRoleChanged{self→Owner}` (or a forged
+/// `MemberRemoved` of the real owner, or planted agents/skills/runtimes) is
+/// projected by everyone → workspace takeover / prompt injection. Gating these in
+/// the canonical fold makes every device reach the identical drop decision, so
+/// convergence is preserved.
+///
+/// Scope is deliberately narrow: **governance + workspace-config** only. Chat
+/// content (messages/reactions/proposals/title) is excluded — impersonation is
+/// already caught by the envelope verifier, and gating it would risk dropping
+/// legitimate collaboration. Trust-bootstrap events (`AccountKeyRegistered`,
+/// `DeviceCertificateAdded`) are excluded — they are validated by the cert chain,
+/// not by role, and gating them would break a joiner establishing trust.
+/// `SessionSnapshot` is excluded pending a separate seed-trust-root fix (a forged
+/// low-lamport snapshot can still rewrite the base — tracked as a follow-up).
+pub fn requires_projection_authz(event: &SessionEvent) -> bool {
+    matches!(
+        event,
+        SessionEvent::MemberAdded { .. }
+            | SessionEvent::MemberRemoved { .. }
+            | SessionEvent::MemberRoleChanged { .. }
+            | SessionEvent::SessionArchivedChanged { .. }
+            | SessionEvent::WorkspaceRuntimesUpdated { .. }
+            | SessionEvent::WorkspaceHostsUpdated { .. }
+            | SessionEvent::AgentRosterUpdated { .. }
+            | SessionEvent::SkillsUpdated { .. }
+            | SessionEvent::VaultSourcesUpdated { .. }
+            | SessionEvent::ChannelCreated { .. }
+            | SessionEvent::ChannelRenamed { .. }
+            | SessionEvent::ChannelReordered { .. }
+            | SessionEvent::ChannelArchived { .. }
+            | SessionEvent::ChatChannelChanged { .. }
+    )
+}
+
 /// The minimum role allowed to emit `event`.
 pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
     match event {
