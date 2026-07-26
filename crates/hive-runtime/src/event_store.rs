@@ -373,25 +373,6 @@ impl EventStore {
             .flatten())
     }
 
-    /// Envelopes from the latest snapshot onward (insertion order). The snapshot
-    /// seeds `project`; later deltas fold onto it. Falls back to the whole
-    /// stream if no snapshot exists.
-    fn envelopes_from_latest_snapshot(
-        &self,
-        session_id: Uuid,
-    ) -> Result<Vec<SessionEventEnvelope>> {
-        match self.latest_snapshot_row(session_id)? {
-            Some(row) => self.query_envelopes(
-                "SELECT envelope_json FROM events WHERE session_id = ?1 AND row_id >= ?2 ORDER BY row_id ASC",
-                rusqlite::params![session_id.to_string(), row],
-            ),
-            None => self.query_envelopes(
-                "SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY row_id ASC",
-                [session_id.to_string()],
-            ),
-        }
-    }
-
     /// How many events a session has accumulated since its latest snapshot —
     /// drives periodic re-snapshotting.
     pub fn rows_since_last_snapshot(&self, session_id: Uuid) -> Result<i64> {
@@ -689,12 +670,9 @@ mod tests {
             )
             .unwrap();
 
-        // Replay starts at the latest snapshot (just 2 envelopes), full state intact.
+        // One event (the "after" message) has landed since the snapshot, and a
+        // full projection still reconstructs the complete state.
         assert_eq!(store.rows_since_last_snapshot(sid).unwrap(), 1);
-        assert_eq!(
-            store.envelopes_from_latest_snapshot(sid).unwrap().len(),
-            2 // snapshot + the one "after" message
-        );
         let s = store.load_session(sid).unwrap().unwrap();
         assert_eq!(s.messages.len(), 4);
         assert_eq!(s.messages[3].body, "after");
