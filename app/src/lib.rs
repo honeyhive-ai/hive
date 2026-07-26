@@ -30,8 +30,8 @@ use hive_runtime::provider::anthropic::AnthropicResponse;
 use hive_runtime::tool_loop::{self, MessagesApi, ToolExecutor};
 use hive_runtime::{
     chat_service::ChatService, dispatch, identity_store::FileKeyVault, mcp::McpTransport, mentions::parse_mentions,
-    prompt, resolve_manifest_url, turns_from, vault_fetcher, AnthropicClient, ChatTurn, EventStore,
-    IdentityStore, McpRegistry, McpServerSpec, ProviderError, ResolvedRuntime,
+    pending_mentions, prompt, resolve_manifest_url, turns_from, vault_fetcher, AnthropicClient, ChatTurn,
+    EventStore, IdentityStore, McpRegistry, McpServerSpec, ProviderError, ResolvedRuntime,
 };
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
