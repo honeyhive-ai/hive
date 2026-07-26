@@ -8,7 +8,7 @@
 //! this gates the originating side.
 
 use crate::events::{MemberRoleChange, SessionEvent};
-use crate::identity::WorkspaceRole;
+use crate::identity::{WorkspaceMember, WorkspaceRole};
 use crate::session::ChatSession;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,6 +16,9 @@ pub enum AuthzReason {
     Allowed,
     InsufficientRole,
     TargetIsLastOwner,
+    /// Adding yourself is a permitted bootstrap (empty roster, or a pure
+    /// self-enroll at a non-governance role that changes no existing member).
+    SelfEnroll,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +33,13 @@ impl AuthzDecision {
         Self {
             allowed: true,
             reason: AuthzReason::Allowed,
+            summary: String::new(),
+        }
+    }
+    fn allow_reason(reason: AuthzReason) -> Self {
+        Self {
+            allowed: true,
+            reason,
             summary: String::new(),
         }
     }
@@ -105,12 +115,58 @@ fn owner_count(session: &ChatSession) -> usize {
         .count()
 }
 
-/// Evaluate whether `actor_role` may emit `event` in `session`.
+/// The **bootstrap allowance** for `MemberAdded`: the narrow set of self-adds an
+/// actor who is *not yet* an Admin+ in the roster may perform. Returns `Some` iff
+/// the self-add is allowed; `None` means "no special allowance — fall through to
+/// the normal role gate" (so a non-permitted self-add is still denied).
+///
+/// Scoped hard to `member.id == actor_id` (adding *yourself*). Adding another
+/// actor, or removing/demoting anyone, never reaches here and is governed solely
+/// by the role gate.
+fn self_enroll_allowance(
+    member: &WorkspaceMember,
+    actor_id: &str,
+    session: &ChatSession,
+) -> Option<AuthzDecision> {
+    // Only a self-add qualifies for the bootstrap allowance.
+    if member.id != actor_id {
+        return None;
+    }
+    // First member of a brand-new workspace: the creator seeds themselves.
+    if session.members.is_empty() {
+        return Some(AuthzDecision::allow_reason(AuthzReason::SelfEnroll));
+    }
+    match session.members.iter().find(|m| m.id == actor_id) {
+        // Already a member: allowed only if the role is unchanged (idempotent
+        // re-add). A role bump on yourself is a governance change — needs Admin+,
+        // so fall through to the role gate.
+        Some(existing) => (existing.role == member.role)
+            .then(|| AuthzDecision::allow_reason(AuthzReason::SelfEnroll)),
+        // Not yet a member, joining a non-empty workspace: pure self-enroll is
+        // allowed only at a *non-governance* floor (Viewer/Contributor). Granting
+        // yourself Admin/Owner falls through to the role gate → denied.
+        None => (member.role.rank() < WorkspaceRole::Admin.rank())
+            .then(|| AuthzDecision::allow_reason(AuthzReason::SelfEnroll)),
+    }
+}
+
+/// Evaluate whether the actor (`actor_id`, holding `actor_role` in the projected
+/// roster) may emit `event` in `session`.
 pub fn evaluate(
     event: &SessionEvent,
+    actor_id: &str,
     actor_role: WorkspaceRole,
     session: &ChatSession,
 ) -> AuthzDecision {
+    // Bootstrap seam: a self-scoped `MemberAdded` can be permitted for an actor
+    // who isn't (yet) Admin+ — but *only* the narrow self-enroll cases below.
+    // Everything else (adding others, removing/demoting anyone) is role-gated.
+    if let SessionEvent::MemberAdded { member } = event {
+        if let Some(decision) = self_enroll_allowance(member, actor_id, session) {
+            return decision;
+        }
+    }
+
     if actor_role.rank() < min_role_for(event).rank() {
         return AuthzDecision::deny(
             AuthzReason::InsufficientRole,
@@ -182,11 +238,14 @@ mod tests {
         }
     }
     fn add_member() -> SessionEvent {
+        add_member_role("new", WorkspaceRole::Contributor)
+    }
+    fn add_member_role(id: &str, role: WorkspaceRole) -> SessionEvent {
         SessionEvent::MemberAdded {
             member: WorkspaceMember {
-                id: "new".into(),
-                actor: ActorIdentity::new("new", "New", ActorKind::Human),
-                role: WorkspaceRole::Contributor,
+                id: id.into(),
+                actor: ActorIdentity::new(id, id, ActorKind::Human),
+                role,
                 title: String::new(),
                 index: 0,
                 joined_at: Default::default(),
@@ -196,11 +255,13 @@ mod tests {
 
     #[test]
     fn viewer_cannot_post_or_govern() {
-        let s = session_with_members(vec![]);
-        assert!(!evaluate(&msg(), WorkspaceRole::Viewer, &s).allowed);
-        assert!(evaluate(&msg(), WorkspaceRole::Contributor, &s).allowed);
-        assert!(!evaluate(&add_member(), WorkspaceRole::Contributor, &s).allowed);
-        assert!(evaluate(&add_member(), WorkspaceRole::Admin, &s).allowed);
+        // Roster is non-empty and the actor ("actor") is adding *another* member
+        // ("new") — the self-enroll allowance never applies, so it's role-gated.
+        let s = session_with_members(vec![("actor", WorkspaceRole::Viewer)]);
+        assert!(!evaluate(&msg(), "actor", WorkspaceRole::Viewer, &s).allowed);
+        assert!(evaluate(&msg(), "actor", WorkspaceRole::Contributor, &s).allowed);
+        assert!(!evaluate(&add_member(), "actor", WorkspaceRole::Contributor, &s).allowed);
+        assert!(evaluate(&add_member(), "actor", WorkspaceRole::Admin, &s).allowed);
     }
 
     #[test]
@@ -208,7 +269,7 @@ mod tests {
         let s = session_with_members(vec![("o1", WorkspaceRole::Owner)]);
         let remove = SessionEvent::MemberRemoved { member_id: "o1".into() };
         assert_eq!(
-            evaluate(&remove, WorkspaceRole::Owner, &s).reason,
+            evaluate(&remove, "o1", WorkspaceRole::Owner, &s).reason,
             AuthzReason::TargetIsLastOwner
         );
         let demote = SessionEvent::MemberRoleChanged {
@@ -218,7 +279,7 @@ mod tests {
                 new_role: WorkspaceRole::Admin,
             },
         };
-        assert!(!evaluate(&demote, WorkspaceRole::Owner, &s).allowed);
+        assert!(!evaluate(&demote, "o1", WorkspaceRole::Owner, &s).allowed);
     }
 
     #[test]
@@ -228,7 +289,74 @@ mod tests {
             ("o2", WorkspaceRole::Owner),
         ]);
         let remove = SessionEvent::MemberRemoved { member_id: "o1".into() };
-        assert!(evaluate(&remove, WorkspaceRole::Owner, &s).allowed);
+        assert!(evaluate(&remove, "o2", WorkspaceRole::Owner, &s).allowed);
+    }
+
+    // ── Bootstrap / self-enroll allowance (PR #61 seam) ────────────────────
+
+    #[test]
+    fn first_member_of_empty_roster_may_self_seed() {
+        // Brand-new workspace: the creator seeds themselves, even as Owner, at the
+        // Viewer floor a non-member gets. Only a *self*-add qualifies.
+        let s = session_with_members(vec![]);
+        let seed_self = add_member_role("creator", WorkspaceRole::Owner);
+        assert!(evaluate(&seed_self, "creator", WorkspaceRole::Viewer, &s).allowed);
+        // Seeding *someone else* into an empty roster is not a self-enroll → gated.
+        let seed_other = add_member_role("victim", WorkspaceRole::Owner);
+        assert!(!evaluate(&seed_other, "creator", WorkspaceRole::Viewer, &s).allowed);
+    }
+
+    #[test]
+    fn non_member_may_self_enroll_at_non_governance_role() {
+        // A device joining a non-empty workspace: Viewer/Contributor self-enroll ok.
+        let s = session_with_members(vec![("owner", WorkspaceRole::Owner)]);
+        let join = add_member_role("newbie", WorkspaceRole::Contributor);
+        let d = evaluate(&join, "newbie", WorkspaceRole::Viewer, &s);
+        assert!(d.allowed);
+        assert_eq!(d.reason, AuthzReason::SelfEnroll);
+    }
+
+    #[test]
+    fn non_member_cannot_self_enroll_as_owner_or_admin() {
+        // No self-escalation: granting yourself governance while joining is denied.
+        let s = session_with_members(vec![("owner", WorkspaceRole::Owner)]);
+        for role in [WorkspaceRole::Admin, WorkspaceRole::Owner] {
+            let escalate = add_member_role("newbie", role);
+            let d = evaluate(&escalate, "newbie", WorkspaceRole::Viewer, &s);
+            assert!(!d.allowed, "self-enroll at {role:?} must be denied");
+            assert_eq!(d.reason, AuthzReason::InsufficientRole);
+        }
+    }
+
+    #[test]
+    fn self_re_add_cannot_change_own_role() {
+        // An existing Contributor re-adding self at Owner is a governance change on
+        // themselves — the idempotent allowance only covers an unchanged role.
+        let s = session_with_members(vec![("me", WorkspaceRole::Contributor)]);
+        let bump = add_member_role("me", WorkspaceRole::Owner);
+        assert!(!evaluate(&bump, "me", WorkspaceRole::Contributor, &s).allowed);
+        // Same role → idempotent no-op is allowed.
+        let same = add_member_role("me", WorkspaceRole::Contributor);
+        assert!(evaluate(&same, "me", WorkspaceRole::Contributor, &s).allowed);
+    }
+
+    #[test]
+    fn non_member_cannot_remove_or_demote_others() {
+        // Privilege floor: a non-member (Viewer floor) can't govern anyone.
+        let s = session_with_members(vec![
+            ("owner", WorkspaceRole::Owner),
+            ("victim", WorkspaceRole::Contributor),
+        ]);
+        let remove = SessionEvent::MemberRemoved { member_id: "victim".into() };
+        assert!(!evaluate(&remove, "outsider", WorkspaceRole::Viewer, &s).allowed);
+        let demote = SessionEvent::MemberRoleChanged {
+            change: MemberRoleChange {
+                member_id: "victim".into(),
+                old_role: WorkspaceRole::Contributor,
+                new_role: WorkspaceRole::Viewer,
+            },
+        };
+        assert!(!evaluate(&demote, "outsider", WorkspaceRole::Viewer, &s).allowed);
     }
 
     #[test]
