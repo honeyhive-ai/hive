@@ -22,15 +22,16 @@ use hive_core::{ActorIdentity, ActorKind, VaultSource, WorkspaceMember};
 use hive_proto::{
     ApprovalDto, AppInfo, AppSettingsDto, ChannelDto, ChatMessageDto, ChatSessionDto,
     ChatStreamEvent, ChatSummaryDto, ContextTelemetryDto, GitFileDiffDto, McpServerDto, ProposalDto,
-    IssuedRelayTokenDto, ReactionDto, RelayTokenDto, RelayUserDto, RuntimeSummaryDto, SkillDto,
-    VaultSourceDto, WorkspaceAgentDto, WorkspaceInfoDto, WorkspaceMemberDto,
+    IssuedRelayTokenDto, QueuedWorkDto, ReactionDto, RelayTokenDto, RelayUserDto, RuntimeSummaryDto,
+    SkillDto, VaultSourceDto, WorkspaceAgentDto, WorkspaceHostDto, WorkspaceInfoDto,
+    WorkspaceMemberDto,
 };
 use hive_runtime::provider::anthropic::AnthropicResponse;
 use hive_runtime::tool_loop::{self, MessagesApi, ToolExecutor};
 use hive_runtime::{
     chat_service::ChatService, dispatch, identity_store::FileKeyVault, mcp::McpTransport, mentions::parse_mentions,
-    prompt, resolve_manifest_url, turns_from, vault_fetcher, AnthropicClient, ChatTurn, EventStore,
-    IdentityStore, McpRegistry, McpServerSpec, ProviderError, ResolvedRuntime,
+    pending_mentions, prompt, resolve_manifest_url, turns_from, vault_fetcher, AnthropicClient, ChatTurn,
+    EventStore, IdentityStore, McpRegistry, McpServerSpec, ProviderError, ResolvedRuntime,
 };
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -1926,6 +1927,96 @@ fn remove_agent(state: State<AppState>, session_id: String, agent_id: String) ->
     let aid = Uuid::parse_str(&agent_id).map_err(map_err)?;
     let mut svc = state.service.lock().unwrap();
     svc.remove_agent(sid, state.active_workspace_id(), aid).map_err(map_err)
+}
+
+// ---------------------------------------------------------------------------
+// Commands — queued work (unanswered agent mentions + host status; spec §12.5).
+// The desktop counterpart of the CLI's `hive queue` + `hive set-agent-host`.
+// ---------------------------------------------------------------------------
+
+/// Every unanswered agent mention in the active workspace, tagged with the host
+/// its agent is bound to and that host's live status. Mirrors `list_chats`'
+/// workspace scan (skipping the config log), then overlays each session's
+/// `pending_mentions` onto the host roster.
+#[tauri::command]
+fn list_queued_work(state: State<AppState>) -> Result<Vec<QueuedWorkDto>, String> {
+    let active = state.active_workspace_id();
+    let me = state.local_actor_id();
+    let known_rooms = state.known_room_ids();
+    let svc = state.service.lock().unwrap();
+    let config_id = hive_core::workspace_config_session_id(active);
+    let hosts = svc.list_hosts(active).map_err(map_err)?;
+    let now = hive_core::Timestamp::now();
+    let ids = svc.store().list_session_ids().map_err(map_err)?;
+    let mut out = Vec::new();
+    for id in ids {
+        if id == config_id {
+            continue;
+        }
+        let Some(s) = svc.load(id).map_err(map_err)? else {
+            continue;
+        };
+        if !session_in_workspace(s.workspace_id, &s.creator_actor_id, active, &me, &known_rooms) {
+            continue;
+        }
+        for pm in pending_mentions(&s) {
+            // The agent's bound host: empty ⇒ owner's device (not a worker).
+            let host_id = s
+                .workspace_agents
+                .iter()
+                .find(|a| a.id == pm.agent_id)
+                .map(|a| a.host_id.clone())
+                .unwrap_or_default();
+            let (host_label, host_status) = if host_id.is_empty() {
+                (String::new(), "device")
+            } else if let Some(h) = hosts.iter().find(|h| h.id == host_id) {
+                (h.label.clone(), if h.is_online(&now, 90) { "online" } else { "offline" })
+            } else {
+                (String::new(), "unknown")
+            };
+            out.push(QueuedWorkDto {
+                session_id: pm.session_id.to_string(),
+                chat_title: s.title.clone(),
+                agent_id: pm.agent_id.to_string(),
+                agent_name: pm.agent_name,
+                host_id,
+                host_label,
+                host_status: host_status.to_string(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// The active workspace's registered hosts (for the "run on worker" menu).
+#[tauri::command]
+fn list_workspace_hosts(state: State<AppState>) -> Result<Vec<WorkspaceHostDto>, String> {
+    let active = state.active_workspace_id();
+    let svc = state.service.lock().unwrap();
+    let now = hive_core::Timestamp::now();
+    Ok(svc
+        .list_hosts(active)
+        .map_err(map_err)?
+        .iter()
+        .map(|h| WorkspaceHostDto {
+            id: h.id.clone(),
+            kind: match h.kind {
+                hive_core::HostKind::Device => "device",
+                hive_core::HostKind::Worker => "worker",
+            }
+            .to_string(),
+            label: h.label.clone(),
+            online: h.is_online(&now, 90),
+        })
+        .collect())
+}
+
+/// Bind an agent to a host (empty = owner's device); "run on worker instead".
+#[tauri::command]
+fn set_agent_host(state: State<AppState>, agent_id: String, host_id: String) -> Result<(), String> {
+    let aid = Uuid::parse_str(&agent_id).map_err(map_err)?;
+    let mut svc = state.service.lock().unwrap();
+    svc.set_agent_host(state.active_workspace_id(), aid, &host_id).map_err(map_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -7205,6 +7296,9 @@ pub fn run() {
             list_agents,
             add_agent,
             remove_agent,
+            list_queued_work,
+            list_workspace_hosts,
+            set_agent_host,
             list_skills,
             add_skill_inline,
             install_skill,

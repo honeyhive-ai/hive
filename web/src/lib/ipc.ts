@@ -24,6 +24,8 @@ import type { WorkflowRunDto } from "@/bindings/WorkflowRunDto";
 import type { WorkflowRunEvent } from "@/bindings/WorkflowRunEvent";
 import type { RelayUserDto } from "@/bindings/RelayUserDto";
 import type { IssuedRelayTokenDto } from "@/bindings/IssuedRelayTokenDto";
+import type { QueuedWorkDto } from "@/bindings/QueuedWorkDto";
+import type { WorkspaceHostDto } from "@/bindings/WorkspaceHostDto";
 
 export type { ChatSummaryDto } from "@/bindings/ChatSummaryDto";
 export type { ChannelDto } from "@/bindings/ChannelDto";
@@ -479,6 +481,23 @@ export const addAgent = (
 
 export const removeAgent = (sessionId: string, agentId: string) =>
   invoke<void>("remove_agent", { sessionId, agentId });
+
+// ── Queued work (spec §12.5): unanswered agent mentions + host status ────────
+export type { QueuedWorkDto } from "@/bindings/QueuedWorkDto";
+export type { WorkspaceHostDto } from "@/bindings/WorkspaceHostDto";
+
+/// Every unanswered agent mention in the active workspace, each tagged with its
+/// agent's host status ("online" | "offline" | "device" | "unknown").
+export const listQueuedWork = () => invoke<QueuedWorkDto[]>("list_queued_work");
+
+/// The active workspace's registered hosts (devices + workers) with live state.
+export const listWorkspaceHosts = () =>
+  invoke<WorkspaceHostDto[]>("list_workspace_hosts");
+
+/// Reassign an agent to a host — "run on worker instead". Empty host = owner's
+/// device.
+export const setAgentHost = (agentId: string, hostId: string) =>
+  invoke<void>("set_agent_host", { agentId, hostId });
 
 export const listSkills = (sessionId: string) =>
   invoke<SkillDto[]>("list_skills", { sessionId });

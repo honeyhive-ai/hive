@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addAgent,
@@ -23,12 +23,15 @@ import {
   listMembers,
   presenceList,
   listProposals,
+  listQueuedWork,
   listRuntimes,
   listSkills,
   listVaults,
+  listWorkspaceHosts,
   previewVault,
   removeAgent,
   setAgentAvatar,
+  setAgentHost,
   removeMcpServer,
   removeSkill,
   removeVault,
@@ -39,6 +42,8 @@ import {
   voteProposal,
   type RuntimeSummaryDto,
   type McpServerDto,
+  type QueuedWorkDto,
+  type WorkspaceHostDto,
 } from "@/lib/ipc";
 import { LogsView } from "@/components/LogsView";
 import { Avatar } from "@/components/Avatar";
@@ -55,6 +60,9 @@ import {
   SelectField,
   FormDisclosure,
   EmptyHint,
+  Popover,
+  PopoverHeader,
+  PopoverItem,
   SELECT_TINT,
 } from "@/components/ui";
 import {
@@ -730,6 +738,172 @@ function RuntimeCard({
   );
 }
 
+// ─── Queued work (spec §12.5) ────────────────────────────────────────────────
+// Unanswered agent mentions in the workspace, tagged with each agent's host
+// status. The desktop counterpart of the CLI's `hive queue`: an agent bound to
+// an offline host (or a member's device) has its mentions *queued* until the
+// host returns — so we surface a one-click "run on worker" handoff
+// (`hive set-agent-host`) to move it to an always-on worker instead.
+
+/// Status pill for a queued item's host: online = success, offline = warn
+/// ("OFFLINE → queued"), device/unknown = neutral. All tints route through
+/// --hive-* tokens (R1).
+function HostStatusBadge({ item }: { item: QueuedWorkDto }) {
+  const style: { bg: string; fg: string; label: string } = (() => {
+    switch (item.hostStatus) {
+      case "online":
+        return {
+          bg: "color-mix(in srgb, var(--hive-success) 18%, transparent)",
+          fg: "var(--hive-success)",
+          label: item.hostLabel ? `online · ${item.hostLabel}` : "online",
+        };
+      case "offline":
+        return {
+          bg: "color-mix(in srgb, var(--hive-accent-warm) 18%, transparent)",
+          fg: "var(--hive-accent-warm)",
+          label: "OFFLINE → queued",
+        };
+      case "device":
+        return {
+          bg: "var(--hive-mist)",
+          fg: "var(--hive-ink-soft)",
+          label: "device",
+        };
+      default:
+        return {
+          bg: "var(--hive-mist)",
+          fg: "var(--hive-ink-soft)",
+          label: "unknown host",
+        };
+    }
+  })();
+  return (
+    <span
+      className="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.06em]"
+      style={{ background: style.bg, color: style.fg }}
+    >
+      {style.label}
+    </span>
+  );
+}
+
+/// "Run on worker" affordance: a small menu of the online workers. Selecting
+/// one reassigns the agent's host and refreshes the queue + roster.
+function RunOnWorkerMenu({
+  workers,
+  onReassign,
+}: {
+  workers: WorkspaceHostDto[];
+  onReassign: (hostId: string) => void;
+}) {
+  const anchorRef = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        ref={anchorRef}
+        onClick={() => setOpen((v) => !v)}
+        className="shrink-0 rounded-lg border px-2 py-1 text-[11.5px] font-medium transition-colors hover:bg-[color:var(--hive-overlay)]"
+        style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)", color: "var(--hive-ink)" }}
+      >
+        Run on worker
+      </button>
+      {open && (
+        <Popover anchorRef={anchorRef} onDismiss={() => setOpen(false)} align="right" minWidth={200}>
+          <PopoverHeader>Online workers</PopoverHeader>
+          {workers.length === 0 ? (
+            <div className="px-2 py-1.5 text-[12px]" style={{ color: "var(--hive-ink-soft)" }}>
+              No online workers.
+            </div>
+          ) : (
+            workers.map((w) => (
+              <PopoverItem
+                key={w.id}
+                label={w.label || w.id}
+                onSelect={() => {
+                  setOpen(false);
+                  onReassign(w.id);
+                }}
+              />
+            ))
+          )}
+        </Popover>
+      )}
+    </>
+  );
+}
+
+function QueuedWorkRow({
+  item,
+  workers,
+  onReassign,
+}: {
+  item: QueuedWorkDto;
+  workers: WorkspaceHostDto[];
+  onReassign: (agentId: string, hostId: string) => void;
+}) {
+  const needsHandoff = item.hostStatus === "offline" || item.hostStatus === "device";
+  return (
+    <Card className="px-3 py-2.5">
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-1.5">
+            <span className="truncate text-[13px] font-medium">@{item.agentName}</span>
+            <HostStatusBadge item={item} />
+          </div>
+          <div className="truncate text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+            {item.chatTitle || "Untitled chat"}
+          </div>
+        </div>
+        {needsHandoff && (
+          <RunOnWorkerMenu
+            workers={workers}
+            onReassign={(hostId) => onReassign(item.agentId, hostId)}
+          />
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/// The "Queued work" section: unanswered agent mentions across the workspace,
+/// each with its host status + a "run on worker" handoff for offline/device
+/// agents.
+function QueuedWorkSection() {
+  const qc = useQueryClient();
+  const queued = useQuery({ queryKey: ["queued-work"], queryFn: listQueuedWork });
+  const hosts = useQuery({ queryKey: ["workspace-hosts"], queryFn: listWorkspaceHosts });
+  const workers = (hosts.data ?? []).filter((h) => h.kind === "worker" && h.online);
+
+  const reassign = useMutation({
+    mutationFn: (v: { agentId: string; hostId: string }) => setAgentHost(v.agentId, v.hostId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["queued-work"] });
+      qc.invalidateQueries({ queryKey: ["agents"] });
+      toast.success("Moved to worker — it'll run there.");
+    },
+    onError: (e) => toast.error(`Couldn't reassign: ${errMsg(e)}`),
+  });
+
+  const items = queued.data ?? [];
+  return (
+    <Section title="Queued work">
+      {items.length === 0 ? (
+        <EmptyHint text="Nothing queued." />
+      ) : (
+        items.map((item) => (
+          <QueuedWorkRow
+            key={`${item.sessionId}:${item.agentId}`}
+            item={item}
+            workers={workers}
+            onReassign={(agentId, hostId) => reassign.mutate({ agentId, hostId })}
+          />
+        ))
+      )}
+    </Section>
+  );
+}
+
 function ReviewPane({ sessionId }: { sessionId: string }) {
   const qc = useQueryClient();
   const proposals = useQuery({
@@ -739,6 +913,7 @@ function ReviewPane({ sessionId }: { sessionId: string }) {
 
   return (
     <RailFrame title="Review" subtitle="Pending decisions and proposal quorum for this chat.">
+      <QueuedWorkSection />
       <Section title="Pending Proposals">
         {(proposals.data ?? []).map((proposal) => (
           <Card key={proposal.id} className="px-4 py-4">

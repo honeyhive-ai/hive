@@ -308,6 +308,9 @@ export function App() {
       qc.invalidateQueries({ queryKey: ["members"] });
       qc.invalidateQueries({ queryKey: ["agents"] });
       qc.invalidateQueries({ queryKey: ["vaults"] });
+      // Queued work (unanswered mentions + host status) rides the log too, so a
+      // mention/host-heartbeat that synced while offline updates the queue live.
+      qc.invalidateQueries({ queryKey: ["queued-work"] });
       // Cross-device dispatch: if a teammate's message just synced into the open
       // chat and we own the responder, answer it (no-op otherwise).
       if (selectedId) {
