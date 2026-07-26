@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   listWorkspaces,
@@ -48,6 +48,15 @@ export function WorkspaceRail({
   // cursor the Sidebar maintains (`hive.read.<sessionId>` = message count at
   // last open); a mention past that cursor is unread.
   const mentions = useQuery({ queryKey: ["all-mention-states"], queryFn: listAllMentionStates });
+  // Read cursors live in localStorage, not React state, so a mention being read
+  // (Sidebar writes `hive.read.*`) wouldn't otherwise recompute the memo below.
+  // Bump on the Sidebar's "hive:read-cursor" event so the badge clears promptly.
+  const [cursorTick, setCursorTick] = useState(0);
+  useEffect(() => {
+    const onCursor = () => setCursorTick((t) => t + 1);
+    window.addEventListener("hive:read-cursor", onCursor);
+    return () => window.removeEventListener("hive:read-cursor", onCursor);
+  }, []);
   const unreadWorkspaces = useMemo(() => {
     const set = new Set<string>();
     for (const m of mentions.data ?? []) {
@@ -55,7 +64,7 @@ export function WorkspaceRail({
       if (m.lastMentionOrdinal > cursor) set.add(m.workspaceId);
     }
     return set;
-  }, [mentions.data]);
+  }, [mentions.data, cursorTick]);
   const [menu, setMenu] = useState<{ ws: WorkspaceInfoDto; x: number; y: number } | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const iconTarget = useRef<string | null>(null);

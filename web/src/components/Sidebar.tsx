@@ -198,6 +198,9 @@ export function Sidebar({
     if (selectedCount > cursorOf(selectedId)) {
       window.localStorage.setItem(`hive.read.${selectedId}`, String(selectedCount));
       setReadCursors((prev) => ({ ...prev, [selectedId]: selectedCount }));
+      // Nudge sibling views (WorkspaceRail's cross-workspace mention badge) that
+      // read a `hive.read.*` cursor but don't share our React state.
+      window.dispatchEvent(new CustomEvent("hive:read-cursor"));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedId, selectedCount, readCursors]);

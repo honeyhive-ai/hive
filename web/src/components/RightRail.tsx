@@ -1003,8 +1003,14 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
   });
   const onlineActors = new Set((presence.data ?? []).map((p) => p.actorId));
   // Registered devices/workers for this workspace. Shares the ["workspace-hosts"]
-  // cache with the queue's "run on worker" menu.
-  const hosts = useQuery({ queryKey: ["workspace-hosts"], queryFn: listWorkspaceHosts });
+  // cache with the queue's "run on worker" menu. Poll on the same cadence as
+  // member presence so online/offline + "last seen" stay live (only with a
+  // relay — solo has no remote hosts to refresh).
+  const hosts = useQuery({
+    queryKey: ["workspace-hosts"],
+    queryFn: listWorkspaceHosts,
+    refetchInterval: sync.data?.relayConfigured ? 5000 : false,
+  });
 
   // Show `#index` only on names that actually collide; matchable as `@Name#N`.
   const nameCounts = new Map<string, number>();
