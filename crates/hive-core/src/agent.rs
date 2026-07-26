@@ -28,6 +28,10 @@ pub struct WorkspaceAgent {
     /// `avatar_color_hex`, then to initials-on-color.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avatar_url: Option<String>,
+    /// Host this agent runs on (spec §12.4) — a device or worker id. Empty =
+    /// the owner's device (default). A worker id makes the agent detached.
+    #[serde(default)]
+    pub host_id: String,
     #[serde(default)]
     pub created_at: Timestamp,
 }
@@ -42,6 +46,7 @@ impl WorkspaceAgent {
             role: String::new(),
             avatar_color_hex: None,
             avatar_url: None,
+            host_id: String::new(),
             created_at: Timestamp::now(),
         }
     }

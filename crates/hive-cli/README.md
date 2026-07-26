@@ -46,6 +46,12 @@ hive runtimes                      # list workspace-owned runtimes (spec §12.5)
 hive add-runtime <id> <name> <provider> <model>
        [--endpoint <url>] [--secret-ref <name> | --secret <value>]
 hive rm-runtime <id>
+hive agents                        # list workspace agents
+hive add-agent <name> <runtime-id> [--host <id>] [--role <role>]
+hive hosts                         # list workspace hosts (devices + workers)
+hive register-worker [--label <name>]      # register this box as a worker host
+hive set-agent-host <agent> <host-id>      # bind an agent to a host
+hive worker [--label <name>]       # run the worker daemon (spec §12.4)
 hive agent [name] [--runtime <id>] # act as the primary responder (see below)
 ```
 
@@ -125,16 +131,54 @@ HIVE_WS_SECRET_acme=sk-… hive agent teambot --runtime ws-claude
 runtime; without `--runtime` it falls back to a **personal** env key
 (`HIVE_PROVIDER`/`HIVE_MODEL` + key).
 
+## The worker daemon (spec §12.4)
+
+A **host** is a machine that executes an agent's turns — a member's `device` or an
+always-on `worker` the workspace owns. An agent binds to a host; an agent bound to
+a **worker** is *detached* — it keeps running when its owner's laptop is closed.
+
+`hive worker` is that always-on process. It registers this box as a worker host
+(its host id **is** the box's device id — no extra provisioning), then continuously
+hosts the agents bound to it: when a hosted agent is `@mentioned`, it replies via
+that agent's **workspace runtime** (§12.5) and posts the reply. A failing turn is
+isolated and logged; the loop keeps running.
+
+Full setup on a worker box:
+
+```sh
+# once, to define the shared roster (syncs to everyone):
+hive add-runtime ws-claude "Team Claude" anthropic claude-sonnet-4-5 --secret-ref acme
+hive register-worker --label prod-box            # → prints this box's host id
+hive add-agent reviewer ws-claude --host <host-id> --role "Reviews diffs"
+hive sync
+
+# then run the daemon (with the workspace secret provisioned):
+HIVE_WS_SECRET_acme=sk-…  hive worker --label prod-box
+```
+
+Now `@reviewer` in any chat is answered by this worker, on the workspace credential
+— even while every human is offline. `hive hosts` / `hive agents` show the roster
+and bindings; `hive set-agent-host <agent> <host>` re-binds.
+
+**Enforced:** a detached agent must run on a *workspace* runtime. If a hosted
+agent isn't bound to one (or its secret isn't on the box), the worker logs a skip
+rather than falling back to a personal key.
+
+**Behaviour on (re)start:** the worker seeds on the existing backlog so a restart
+doesn't re-answer old messages; it responds to mentions that arrive while it's up.
+(Picking up work addressed while it was *down* — the "queued work" handoff — is a
+tracked follow-up.)
+
 ## Limits & security (spec §12)
 
 - **Credentials are provisioned out-of-band.** The relay token and workspace
   key must be handed to the box (env/secret); there's no headless self-service
   for either.
 - **Personal vs workspace credential.** Without `--runtime`, `hive agent` runs on
-  a *personal* env key. With `--runtime <id>` it runs on a **workspace-owned**
-  runtime (spec §12.5, above) — the credential a detached, workspace-funded worker
-  should use. What's still missing is the *host* side of §12.4–12.5 (a worker
-  daemon + the queue/offline handoff) and enforcement that detached agents may
-  *only* use workspace runtimes; today it's by convention.
+  a *personal* env key. With `--runtime <id>` — and always inside `hive worker` —
+  it runs on a **workspace-owned** runtime (§12.5); the worker daemon *enforces*
+  that a detached agent uses one. What's still missing from §12.4–12.5 is the
+  **queue/offline handoff** (picking up work addressed while a host was down, and
+  the "run on worker instead" reassignment) and live host presence.
 - **Agents never touch another machine's filesystem** (spec §12.6): what crosses
   the relay is chat and, eventually, diffs — not remote file writes.

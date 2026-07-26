@@ -51,13 +51,23 @@ but it can be **self-hosted**. This is the setup that lets an agent keep working
 while your laptop is closed: the relay's **store-and-forward** holds the agent's
 events, and your app catches up when it next comes online.
 
-Provision the relay URL, token, room, and workspace key out-of-band, and run the
-agent on a **workspace-owned credential** (never your personal key):
+Provision the relay URL, token, room, and workspace key out-of-band, then run the
+**worker daemon** — it registers the box as a host and runs every agent bound to
+it on a **workspace-owned credential** (never your personal key):
 
 ```sh
-HIVE_RELAY_URL=…  HIVE_RELAY_ACCESS_TOKEN=…  HIVE_WORKSPACE=acme  HIVE_WORKSPACE_KEY=… \
-HIVE_WS_SECRET_acme=sk-…  hive agent teambot --runtime ws-claude
+export HIVE_RELAY_URL=…  HIVE_RELAY_ACCESS_TOKEN=…  HIVE_WORKSPACE=acme  HIVE_WORKSPACE_KEY=…
+export HIVE_WS_SECRET_acme=sk-…
+hive register-worker --label prod-box        # → this box's host id
+hive add-agent reviewer ws-claude --host <host-id>
+hive sync
+hive worker --label prod-box                 # always-on; @reviewer is now answered here
 ```
+
+The worker *enforces* the §12.5 rule — a detached agent must use a workspace
+runtime, so it never falls back to a personal key. See the
+[CLI README](https://github.com/honeyhive-ai/hive/blob/main/crates/hive-cli/README.md#the-worker-daemon-spec-124)
+for the full daemon behaviour.
 
 Do **not** try to substitute a network filesystem (SSHFS/NFS) for the relay —
 SQLite over a network mount is corruption-prone. Use the relay.

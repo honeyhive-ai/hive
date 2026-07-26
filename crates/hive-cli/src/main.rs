@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use hive_core::{
-    derive_workspace_key, workspace_config_session_id, MessageRole, ModelProviderKind,
-    WorkspaceCredential, WorkspaceRuntime,
+    derive_workspace_key, workspace_config_session_id, HostKind, MessageRole, ModelProviderKind,
+    WorkspaceAgent, WorkspaceCredential, WorkspaceHost, WorkspaceRuntime,
 };
 use hive_runtime::{
     dispatch, parse_mentions, resolve_workspace_credential, turns_for, ChatService, EventStore,
@@ -405,6 +405,188 @@ async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Re
     }
 }
 
+/// Create a workspace agent (bound to a runtime; optionally a host + role).
+fn cmd_add_agent(
+    cfg: &Config,
+    name: &str,
+    runtime_id: &str,
+    host: Option<String>,
+    role: Option<String>,
+) -> Result<()> {
+    let ws = uuid_of_room(&cfg.room);
+    let mut agent = WorkspaceAgent::new(name, runtime_id);
+    agent.role = role.unwrap_or_default();
+    agent.host_id = host.unwrap_or_default();
+    let mut svc = open_service(cfg)?;
+    agent.owner_actor_id = svc.author().id.clone();
+    svc.add_agent(ws, ws, agent)?;
+    println!("agent @{name} created on runtime '{runtime_id}' (sync to share).");
+    Ok(())
+}
+
+fn cmd_agents(cfg: &Config) -> Result<()> {
+    let svc = open_service(cfg)?;
+    let ws = uuid_of_room(&cfg.room);
+    let agents = svc.load(workspace_config_session_id(ws))?.map(|s| s.workspace_agents).unwrap_or_default();
+    if agents.is_empty() {
+        println!("(no agents — `hive add-agent <name> <runtime-id>`)");
+    }
+    for a in agents {
+        let host = if a.host_id.is_empty() { "owner-device".into() } else { a.host_id.clone() };
+        println!("@{:<20} runtime={:<14} host={}", a.name, a.runtime_id, host);
+    }
+    Ok(())
+}
+
+// ── Hosts + worker daemon (spec §12.4) ──────────────────────────────────────
+
+fn cmd_hosts(cfg: &Config) -> Result<()> {
+    let svc = open_service(cfg)?;
+    let me = svc.device_id().to_string();
+    let hosts = svc.list_hosts(uuid_of_room(&cfg.room))?;
+    if hosts.is_empty() {
+        println!("(no hosts — `hive register-worker` to register this box)");
+    }
+    for h in hosts {
+        let mark = if h.id == me { "  ← this box" } else { "" };
+        println!("{:<38} {:?}  {}{mark}", h.id, h.kind, h.label);
+    }
+    Ok(())
+}
+
+fn cmd_register_worker(cfg: &Config, label: Option<String>) -> Result<String> {
+    let mut svc = open_service(cfg)?;
+    let id = svc.device_id().to_string();
+    let label = label.or_else(|| env_opt("HOSTNAME")).unwrap_or_else(|| "worker".into());
+    svc.register_host(uuid_of_room(&cfg.room), WorkspaceHost::new(id.clone(), HostKind::Worker, label))?;
+    Ok(id)
+}
+
+fn cmd_set_agent_host(cfg: &Config, agent_name: &str, host_id: &str) -> Result<()> {
+    let mut svc = open_service(cfg)?;
+    let ws = uuid_of_room(&cfg.room);
+    let agents = svc
+        .load(workspace_config_session_id(ws))?
+        .map(|s| s.workspace_agents)
+        .unwrap_or_default();
+    let agent = agents
+        .iter()
+        .find(|a| a.name == agent_name)
+        .ok_or_else(|| anyhow!("no agent '{agent_name}' in this workspace"))?;
+    let aid = agent.id;
+    svc.set_agent_host(ws, aid, host_id)?;
+    println!("bound @{agent_name} to host {host_id} (sync to apply).");
+    Ok(())
+}
+
+/// Build a ResolvedRuntime for an agent from its workspace runtime. A detached
+/// agent MUST use a workspace runtime (§12.5) — this returns an error if the
+/// agent's runtime isn't a workspace-owned one, so a worker never runs on a
+/// personal key.
+fn agent_workspace_runtime(
+    runtimes: &[WorkspaceRuntime],
+    agent: &WorkspaceAgent,
+) -> Result<(ResolvedRuntime, String)> {
+    let wr = runtimes
+        .iter()
+        .find(|r| r.id == agent.runtime_id)
+        .ok_or_else(|| anyhow!("@{} is not bound to a workspace runtime ('{}')", agent.name, agent.runtime_id))?;
+    let api_key = resolve_workspace_credential(&wr.credential);
+    if api_key.is_none() && wr.provider != ModelProviderKind::Ollama {
+        bail!("workspace runtime '{}' has no secret on this box (provision HIVE_WS_SECRET_…)", wr.name);
+    }
+    let rt = ResolvedRuntime {
+        provider: wr.provider,
+        model: wr.model.clone(),
+        endpoint: wr.endpoint.clone(),
+        api_key,
+        args: Vec::new(),
+        model_provider_id: None,
+        model_base_url: None,
+    };
+    Ok((rt, wr.id.clone()))
+}
+
+/// The worker daemon (spec §12.4). Registers this box as a worker host, then
+/// continuously hosts the agents bound to it: when a hosted agent is @mentioned,
+/// it replies via that agent's workspace runtime and posts the reply. A failing
+/// turn is isolated and logged; the loop keeps running.
+async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
+    let ws = uuid_of_room(&cfg.room);
+    let my_host = cmd_register_worker(cfg, label)?;
+    if cfg.relay_url.is_some() {
+        let _ = sync_once(cfg).await;
+    }
+    let mut seen: HashSet<Uuid> = HashSet::new();
+    {
+        let svc = open_service(cfg)?;
+        for id in svc.store().list_session_ids()? {
+            if let Some(s) = svc.load(id)? {
+                seen.extend(s.messages.iter().map(|m| m.id));
+            }
+        }
+    }
+    println!("worker {my_host} online — hosting agents bound to this host. Ctrl-C to stop.");
+    loop {
+        if cfg.relay_url.is_some() {
+            if let Err(e) = sync_once(cfg).await {
+                eprintln!("sync: {e}");
+            }
+        }
+        let mut svc = open_service(cfg)?;
+        let cfg_session = svc.load(workspace_config_session_id(ws))?;
+        let hosted: Vec<WorkspaceAgent> = cfg_session
+            .map(|s| s.workspace_agents)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.host_id == my_host)
+            .collect();
+        let runtimes = svc.list_workspace_runtimes(ws)?;
+        for id in svc.store().list_session_ids()? {
+            let Some(s) = svc.load(id)? else { continue };
+            if id == workspace_config_session_id(s.workspace_id) {
+                continue;
+            }
+            let Some(last) = s.messages.last() else { continue };
+            let fresh = last.role == MessageRole::User && !seen.contains(&last.id);
+            seen.extend(s.messages.iter().map(|m| m.id));
+            if !fresh {
+                continue;
+            }
+            let targets = parse_mentions(&last.body, &s);
+            for agent in hosted.iter().filter(|a| targets.agents.contains(&a.id)) {
+                let (rt, rt_label) = match agent_workspace_runtime(&runtimes, agent) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("skip @{}: {e}", agent.name);
+                        continue;
+                    }
+                };
+                let turns = turns_for(&s);
+                let system = format!(
+                    "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.",
+                    agent.name
+                );
+                print!("↳ @{} replying in {} … ", agent.name, s.id);
+                match dispatch::stream(&rt, Some(&system), &turns, None, &[], 1024, |_| {}).await {
+                    Ok(reply) => {
+                        let mid = svc.begin_assistant_message(s.id, s.workspace_id, agent.name.clone(), rt_label.clone())?;
+                        svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
+                        seen.insert(mid);
+                        println!("done");
+                    }
+                    Err(e) => println!("failed: {e}"),
+                }
+            }
+        }
+        drop(svc);
+        if cfg.relay_url.is_some() {
+            let _ = sync_once(cfg).await;
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+}
+
 /// Deterministic workspace id for a relay room (mirrors the app's
 /// `room_workspace_id`), so config-log filtering matches the app.
 fn uuid_of_room(room: &str) -> Uuid {
@@ -432,7 +614,11 @@ fn usage() -> ! {
          hive send <chat-id> <message…> [--push]\n  \
          hive sync [--watch]\n  \
          hive runtimes                  list workspace-owned runtimes (spec §12.5)\n  \
-         hive agent [name] [--runtime <id>]   reply as the primary agent; --runtime uses a\n                                       workspace-owned credential (else a personal env key)\n\n\
+         hive agent [name] [--runtime <id>]   reply as the primary agent; --runtime uses a\n                                       workspace-owned credential (else a personal env key)\n  \
+         hive hosts                     list workspace hosts (devices + workers)\n  \
+         hive register-worker [--label <name>]   register this box as a worker host\n  \
+         hive set-agent-host <agent> <host-id>   bind an agent to a host\n  \
+         hive worker [--label <name>]   run the worker daemon (host detached agents, §12.4)\n\n\
          Config via env: HIVE_DATA_DIR, HIVE_RELAY_URL, HIVE_RELAY_ACCESS_TOKEN,\n\
          HIVE_WORKSPACE, HIVE_WORKSPACE_KEY."
     );
@@ -460,7 +646,7 @@ fn run() -> Result<()> {
     };
     // Positional args exclude flags and any value immediately after a known
     // value-flag (so `agent bot --runtime ws1` → positional = [bot]).
-    let value_flags = ["--runtime", "--endpoint", "--secret-ref", "--secret"];
+    let value_flags = ["--runtime", "--endpoint", "--secret-ref", "--secret", "--label", "--host"];
     let mut positional: Vec<&String> = Vec::new();
     let mut skip = false;
     for a in rest {
@@ -531,6 +717,26 @@ fn run() -> Result<()> {
             let id = positional.first().ok_or_else(|| anyhow!("usage: hive rm-runtime <id>"))?;
             cmd_rm_runtime(&cfg, id)
         }
+        "agents" => cmd_agents(&cfg),
+        "add-agent" => {
+            if positional.len() < 2 {
+                bail!("usage: hive add-agent <name> <runtime-id> [--host <id>] [--role <role>]");
+            }
+            cmd_add_agent(&cfg, positional[0], positional[1], flag_val("--host"), flag_val("--role"))
+        }
+        "hosts" => cmd_hosts(&cfg),
+        "register-worker" => {
+            let id = cmd_register_worker(&cfg, flag_val("--label"))?;
+            println!("registered this box as worker host {id} (sync to share).");
+            Ok(())
+        }
+        "set-agent-host" => {
+            if positional.len() < 2 {
+                bail!("usage: hive set-agent-host <agent-name> <host-id>");
+            }
+            cmd_set_agent_host(&cfg, positional[0], positional[1])
+        }
+        "worker" => rt()?.block_on(cmd_worker(&cfg, flag_val("--label"))),
         "agent" => {
             let name = positional.first().map(|s| s.as_str()).unwrap_or("assistant").to_string();
             let runtime_id = flag_val("--runtime").or_else(|| env_opt("HIVE_RUNTIME"));

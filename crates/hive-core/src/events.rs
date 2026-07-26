@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::agent::WorkspaceAgent;
 use crate::channel::Channel;
 use crate::chat::{ChatMessage, MessageReaction};
+use crate::workspace_host::WorkspaceHost;
 use crate::workspace_runtime::WorkspaceRuntime;
 use crate::crypto::DeviceCertificate;
 use crate::identity::{ActorStamp, WorkspaceMember, WorkspaceRole};
@@ -134,6 +135,9 @@ pub enum SessionEvent {
     /// Replace the workspace-owned runtime set (spec §12.5) — detached/headless
     /// agents run on these. Rides the config log; workspace-scoped.
     WorkspaceRuntimesUpdated { runtimes: Vec<WorkspaceRuntime> },
+    /// Replace the workspace host roster (spec §12.4) — devices + workers.
+    /// Rides the config log; workspace-scoped.
+    WorkspaceHostsUpdated { hosts: Vec<WorkspaceHost> },
     /// Forward-compat catch-all: an event `kind` this build does not recognize
     /// (produced by a newer client). Serde deserializes an unknown tag here
     /// instead of failing the whole stream; it projects as a no-op. The raw
@@ -176,6 +180,7 @@ impl SessionEvent {
             SessionEvent::ChannelArchived { .. } => "channelArchived",
             SessionEvent::ChatChannelChanged { .. } => "chatChannelChanged",
             SessionEvent::WorkspaceRuntimesUpdated { .. } => "workspaceRuntimesUpdated",
+            SessionEvent::WorkspaceHostsUpdated { .. } => "workspaceHostsUpdated",
             SessionEvent::Unknown => "unknown",
         }
     }
@@ -193,7 +198,8 @@ impl SessionEvent {
             | SessionEvent::ChannelRenamed { .. }
             | SessionEvent::ChannelReordered { .. }
             | SessionEvent::ChannelArchived { .. }
-            | SessionEvent::WorkspaceRuntimesUpdated { .. } => EventScope::Workspace,
+            | SessionEvent::WorkspaceRuntimesUpdated { .. }
+            | SessionEvent::WorkspaceHostsUpdated { .. } => EventScope::Workspace,
             SessionEvent::WorkflowRunUpserted { .. } => EventScope::Run,
             _ => EventScope::Session,
         }
@@ -411,6 +417,9 @@ impl ChatSession {
             }
             SessionEvent::WorkspaceRuntimesUpdated { runtimes } => {
                 self.workspace_runtimes = runtimes.clone();
+            }
+            SessionEvent::WorkspaceHostsUpdated { hosts } => {
+                self.workspace_hosts = hosts.clone();
             }
             // Trust metadata — inert in the session projection; consumed only by
             // the device-roster builder (see hive-runtime::envelope_verifier).

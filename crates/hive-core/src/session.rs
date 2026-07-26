@@ -17,6 +17,7 @@ use crate::skills::SkillProfile;
 use crate::time_util::Timestamp;
 use crate::vault::VaultSource;
 use crate::workflow::{WorkflowDefinition, WorkflowRun};
+use crate::workspace_host::WorkspaceHost;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -74,6 +75,9 @@ pub struct ChatSession {
     /// these. Populated on the config log; overlaid onto chats like other config.
     #[serde(default)]
     pub workspace_runtimes: Vec<WorkspaceRuntime>,
+    /// Workspace hosts (spec §12.4) — devices + workers agents run on.
+    #[serde(default)]
+    pub workspace_hosts: Vec<WorkspaceHost>,
     #[serde(default)]
     pub created_at: Timestamp,
     #[serde(default)]
@@ -102,6 +106,7 @@ impl ChatSession {
             channels: Vec::new(),
             channel_id: String::new(),
             workspace_runtimes: Vec::new(),
+            workspace_hosts: Vec::new(),
             created_at: now,
             updated_at: now,
         }
