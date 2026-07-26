@@ -28,6 +28,12 @@ pub enum SyncError {
     Json(#[from] serde_json::Error),
     #[error("crypto error: {0}")]
     Crypto(#[from] hive_core::CryptoError),
+    /// A relay push was attempted with no workspace key. E2EE is mandatory for
+    /// relay sync — we refuse to send plaintext to the relay rather than
+    /// silently degrading (B4). The caller must configure a key or stay
+    /// local-only. No plaintext value is ever produced in this case.
+    #[error("refusing to push plaintext to the relay: no workspace key configured (E2EE is mandatory for relay sync)")]
+    RelayRequiresEncryption,
 }
 
 /// Drives one workspace's relay sync. Holds cursors so repeated rounds only
@@ -42,7 +48,8 @@ pub struct SyncEngine {
     /// Key epoch → workspace key. New events are sealed under the **highest**
     /// epoch; a fetched body is opened with the key for **its** epoch (stamped on
     /// the `SealedEnvelope`). Retaining older epochs is what keeps history
-    /// readable across rotations. Empty ⇒ plaintext (no E2EE on the wire).
+    /// readable across rotations. Empty ⇒ no key: relay pushes are **refused**
+    /// (E2EE is mandatory on the wire — see [`SyncEngine::encode`]).
     keyring: BTreeMap<u32, [u8; 32]>,
 }
 
@@ -84,8 +91,11 @@ impl SyncEngine {
         self
     }
 
-    /// Encode an envelope for the relay: sealed ciphertext if a key is set,
-    /// else plaintext JSON.
+    /// Encode an envelope for the relay: sealed ciphertext under the current
+    /// (highest-epoch) key. With **no** key this **refuses** with
+    /// [`SyncError::RelayRequiresEncryption`] instead of emitting plaintext —
+    /// E2EE is mandatory for relay sync, so the relay never sees cleartext
+    /// bodies, the member roster, or inline credentials (B4).
     fn encode(&self, env: &SessionEventEnvelope) -> Result<Value, SyncError> {
         // Seal under the highest epoch we hold — the current key.
         match self.keyring.iter().next_back() {
@@ -93,7 +103,8 @@ impl SyncEngine {
                 let plain = serde_json::to_vec(env)?;
                 Ok(serde_json::to_value(seal_symmetric(k, version, &plain)?)?)
             }
-            None => Ok(serde_json::to_value(env)?),
+            // No key: never originate plaintext to a relay. Refuse the push.
+            None => Err(SyncError::RelayRequiresEncryption),
         }
     }
 
@@ -183,7 +194,18 @@ impl SyncEngine {
     /// dropping the tail.
     pub async fn push_envelopes(&mut self, envelopes: &[SessionEventEnvelope]) -> Result<(), SyncError> {
         for (i, env) in envelopes.iter().enumerate() {
-            let body = self.encode(env)?;
+            // `encode` refuses when there's no key (E2EE mandatory); roll back
+            // the optimistic `seen` marks just like a network failure so the
+            // envelopes are re-attempted once a key is configured.
+            let body = match self.encode(env) {
+                Ok(body) => body,
+                Err(e) => {
+                    for unsent in &envelopes[i..] {
+                        self.seen.remove(&unsent.event_id);
+                    }
+                    return Err(e);
+                }
+            };
             if let Err(e) = self.relay.push_value(&self.workspace, &body).await {
                 for unsent in &envelopes[i..] {
                     self.seen.remove(&unsent.event_id);
@@ -192,6 +214,13 @@ impl SyncEngine {
             }
         }
         Ok(())
+    }
+
+    /// Whether relay pushes will be sealed (a key is configured). `false` means
+    /// every push would be refused — callers should stay local-only or surface
+    /// an actionable "no workspace key" error rather than attempting to sync.
+    pub fn is_encrypted(&self) -> bool {
+        !self.keyring.is_empty()
     }
 
     /// Fetch raw remote bodies past the cursor (async; no store). The cursor is
@@ -350,12 +379,14 @@ mod tests {
         );
         store_a.ingest(&msg).unwrap();
 
-        // A pushes; B pulls into an empty store.
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace);
+        // A pushes; B pulls into an empty store. E2EE is mandatory for relay
+        // sync, so both carry the shared workspace key.
+        let key = hive_core::derive_workspace_key("converge room secret");
+        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
         assert_eq!(sync_a.push_new(&store_a).await.unwrap(), 2);
 
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace);
+        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
         let applied = sync_b.pull(&mut store_b).await.unwrap();
         assert_eq!(applied, 2);
 
@@ -423,7 +454,8 @@ mod tests {
         // Relay pointed at a closed port → every push errors mid-batch.
         let mut store = EventStore::open_in_memory().unwrap();
         seed_chat(&mut store); // one event (the snapshot)
-        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:9"), Uuid::new_v4().to_string());
+        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:9"), Uuid::new_v4().to_string())
+            .with_key(hive_core::derive_workspace_key("rollback room"));
 
         let batch = eng.take_unpushed(&store).unwrap();
         assert_eq!(batch.len(), 1);
@@ -432,6 +464,55 @@ mod tests {
         assert!(eng.push_envelopes(&batch).await.is_err());
         let retry = eng.take_unpushed(&store).unwrap();
         assert_eq!(retry.len(), 1, "unsent events must be retryable after a failed push");
+    }
+
+    #[tokio::test]
+    async fn keyless_relay_push_is_refused_no_plaintext() {
+        // B4: a relay-targeted engine with NO key must REFUSE to push rather
+        // than send plaintext. Pointed at a LIVE, reachable relay to prove the
+        // refusal isn't merely a network failure: the distinct
+        // `RelayRequiresEncryption` error is produced and NOTHING is written to
+        // the relay. The events roll back to unpushed so a later keyed round
+        // re-sends them.
+        let base = spawn_relay().await;
+        let workspace = Uuid::new_v4().to_string();
+        let mut store = EventStore::open_in_memory().unwrap();
+        seed_chat(&mut store); // one event (the snapshot)
+
+        let mut eng = SyncEngine::new(RelayClient::new(&base), &workspace);
+        assert!(!eng.is_encrypted(), "no key configured");
+
+        let batch = eng.take_unpushed(&store).unwrap();
+        assert_eq!(batch.len(), 1);
+        let err = eng.push_envelopes(&batch).await.unwrap_err();
+        assert!(
+            matches!(err, SyncError::RelayRequiresEncryption),
+            "keyless push must refuse with RelayRequiresEncryption, got {err:?}"
+        );
+        // No plaintext value was produced or sent: the relay holds nothing.
+        assert!(
+            RelayClient::new(&base).fetch_values(&workspace, 0).await.unwrap().is_empty(),
+            "a refused keyless push must not write anything to the relay"
+        );
+        // Rolled back → retryable once a key is configured (not silently dropped).
+        let retry = eng.take_unpushed(&store).unwrap();
+        assert_eq!(
+            retry.len(),
+            1,
+            "refused envelopes must remain unpushed for a later keyed round"
+        );
+
+        // With a key, those same events now seal and land on the relay as
+        // ciphertext (a keyed workspace still syncs).
+        eng.set_key(hive_core::derive_workspace_key("now keyed"));
+        assert!(eng.is_encrypted());
+        eng.push_envelopes(&retry).await.unwrap();
+        let raw = RelayClient::new(&base).fetch_values(&workspace, 0).await.unwrap();
+        assert_eq!(raw.len(), 1);
+        assert!(
+            raw[0].1.get("ciphertext").is_some(),
+            "a keyed push must seal — the relay must only ever see ciphertext"
+        );
     }
 
     #[tokio::test]
@@ -712,14 +793,15 @@ mod tests {
         let base = spawn_relay().await;
         let workspace = Uuid::new_v4().to_string();
 
+        let key = hive_core::derive_workspace_key("round trip room");
         let mut store_a = EventStore::open_in_memory().unwrap();
         let (sid, wid) = seed_chat(&mut store_a);
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace);
+        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
         sync_a.sync_once(&mut store_a).await.unwrap();
 
         // B joins, syncs, then replies.
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace);
+        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
         sync_b.sync_once(&mut store_b).await.unwrap();
         let reply = SessionEventEnvelope::new(
             sid,

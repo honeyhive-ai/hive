@@ -5595,22 +5595,43 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                     }
                     None => build_keyring(None, passphrase_key, &[]),
                 };
+                // B4: E2EE is mandatory for relay sync. A relay-configured
+                // workspace with NO workspace key must never push plaintext
+                // (message bodies, the member roster, inline credentials) to the
+                // relay. Refuse to sync and surface an actionable error instead
+                // of silently degrading. (The genuinely local-only, no-relay
+                // path is the `_ =>` arm below and stays untouched.)
+                if keyring.is_empty() {
+                    engine = None;
+                    let msg = "sync paused: this workspace is configured for a relay but \
+                               has no end-to-end-encryption key — set a workspace passphrase \
+                               (Settings → Team) to sync encrypted, or clear the relay URL to \
+                               work local-only. Refusing to send plaintext to the relay."
+                        .to_string();
+                    if last_sync_err.as_deref() != Some(msg.as_str()) {
+                        eprintln!("{msg}");
+                        last_sync_err = Some(msg.clone());
+                    }
+                    *app.state::<AppState>().conn_health.lock().unwrap() = ConnHealth {
+                        state: "error".to_string(),
+                        last_error: Some(msg.clone()),
+                    };
+                    let _ = app.emit("workspace://sync-error", msg);
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    continue;
+                }
                 let sig: ConnSig = (url.clone(), room.clone(), keyring.clone());
                 let changed = engine.as_ref().map(|(_, s)| s != &sig).unwrap_or(true);
                 if changed {
-                    let mut e = hive_runtime::SyncEngine::new(
+                    let e = hive_runtime::SyncEngine::new(
                         hive_runtime::RelayClient::new(&url)
                             .with_auth(access_token.clone())
                             .with_github_token(github_token.clone()),
                         room.clone(),
-                    );
-                    let encrypted = !keyring.is_empty();
-                    if encrypted {
-                        e = e.with_keyring(keyring.clone());
-                    }
+                    )
+                    .with_keyring(keyring.clone());
                     eprintln!(
-                        "sync: relay {url} room {room} ({}, {} epoch key(s))",
-                        if encrypted { "encrypted" } else { "plaintext" },
+                        "sync: relay {url} room {room} (encrypted, {} epoch key(s))",
                         keyring.len()
                     );
                     engine = Some((e, sig));
@@ -7225,20 +7246,31 @@ async fn p2p_share_code(state: State<'_, AppState>) -> Result<ShortCodeDto, Stri
     }
 }
 
-/// Publish a workspace invite behind a short, speakable pairing code.
+/// The short relay-brokered pairing code for **workspace** invites is removed
+/// (B3): a workspace invite carries the E2EE workspace `key`, and the pairing
+/// broker (`/v1/pair`) stores its payload in cleartext on the relay — handing
+/// the workspace key to the exact adversary E2EE defends against. There is no
+/// seal-to-recipient path through the broker (the joiner's key-agreement public
+/// isn't known to the sharer at publish time), so the key can't be brokered
+/// safely. Key exchange stays **out-of-band**: `workspace_invite` returns the
+/// `hivews1:` code the sharer conveys over a trusted channel, and the joiner
+/// pastes it (`join_workspace`). The relay never sees the key.
+///
+/// This command is retained (so the existing IPC surface still links) but
+/// refuses, steering callers to the out-of-band invite.
 #[tauri::command]
 async fn workspace_share_code(
     state: State<'_, AppState>,
     workspace_id: String,
 ) -> Result<ShortCodeDto, String> {
-    let relay = configured_relay(&state)?;
-    let invite = workspace_invite(state.clone(), workspace_id)?;
-    let (short, ttl) = state
-        .relay_client(&relay)
-        .publish_pairing(&invite, Some(600))
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(ShortCodeDto { code: short, expires_in: ttl })
+    // Validate the workspace exists so the caller gets a sensible error, but
+    // never publish the invite (which contains the E2EE key) to the relay.
+    let _ = workspace_invite(state.clone(), workspace_id)?;
+    Err("Relay-brokered workspace share codes are disabled: the short code would \
+         route this workspace's end-to-end-encryption key through the relay in \
+         cleartext. Use “Copy invite” to share the hivews1:… code over a trusted \
+         channel instead — the joiner pastes it to join."
+        .to_string())
 }
 
 /// Resolve a short pairing code and act on it: add a peer (friend code) or join
