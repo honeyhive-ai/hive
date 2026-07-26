@@ -3308,7 +3308,7 @@ fn recover_workflow_runs(app: &AppHandle) {
 /// the responder is unowned (legacy / local-only) or owned by us; otherwise the
 /// owner's device answers (and the reply syncs back).
 fn owns_responder(local_actor_id: &str, responder: &Responder) -> bool {
-    responder.owner_actor_id.is_empty() || responder.owner_actor_id == local_actor_id
+    crate::workflows::stage_owner_runs_here(local_actor_id, &responder.owner_actor_id)
 }
 
 /// Who, if anyone, a message should be answered by.
@@ -5604,6 +5604,14 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                             }
                             if pulled > 0 {
                                 let _ = app.emit("workspace://synced", pulled);
+                                // Wake every live workflow driver so a stage
+                                // suspended on a remote reply (or a remote gate
+                                // vote) reacts within sync latency instead of on
+                                // its safety-net poll.
+                                let state = app.state::<AppState>();
+                                for w in state.run_wakers.lock().unwrap().values() {
+                                    w.notify_waiters();
+                                }
                             }
                         }
                         Err(e) => {
