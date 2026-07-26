@@ -52,6 +52,11 @@ hive agent [name] [--runtime <id>] # act as the primary responder (see below)
 Chat ids come from `hive chats` (or `hive sync` then `hive chats` to pull a
 workspace the app created).
 
+> **Where should the agent run?** See
+> [Headless agents & setups](../../docs-site/concepts/headless-agents.md) for the
+> four topologies (shared data dir · local relay · remote worker · team) and how
+> to pick one.
+
 ## Using this as an agent
 
 `hive agent [name]` is the built-in loop: after each sync it replies — as the
