@@ -3,4 +3,13 @@
 /**
  * A chat as listed in the sidebar.
  */
-export type ChatSummaryDto = { id: string, title: string, lastActivityAt: string, messageCount: number, archived: boolean, };
+export type ChatSummaryDto = { id: string, title: string, lastActivityAt: string, messageCount: number, archived: boolean, 
+/**
+ * The channel this chat is filed under (empty = unfiled). Spec §11.
+ */
+channelId: string, 
+/**
+ * True when this chat is its channel's drop-in default — not movable,
+ * renamable, or deletable on its own.
+ */
+isChannelDefault: boolean, };

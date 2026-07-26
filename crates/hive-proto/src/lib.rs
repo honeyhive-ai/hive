@@ -125,6 +125,27 @@ pub struct ChatSummaryDto {
     pub last_activity_at: String,
     pub message_count: u32,
     pub archived: bool,
+    /// The channel this chat is filed under (empty = unfiled). Spec §11.
+    #[serde(default)]
+    pub channel_id: String,
+    /// True when this chat is its channel's drop-in default — not movable,
+    /// renamable, or deletable on its own.
+    #[serde(default)]
+    pub is_channel_default: bool,
+}
+
+/// A workspace channel — organization only, no config (spec §11).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ChannelDto {
+    pub id: String,
+    pub name: String,
+    pub purpose: Option<String>,
+    pub position: i32,
+    pub archived: bool,
+    /// The channel's drop-in default chat (created with it).
+    pub default_chat_id: String,
 }
 
 /// One file's uncommitted change, for the Diff canvas.
@@ -483,6 +504,7 @@ mod tests {
         ToolCallDto::export_all(&cfg).unwrap();
         ToolResultDto::export_all(&cfg).unwrap();
         ChatSummaryDto::export_all(&cfg).unwrap();
+        ChannelDto::export_all(&cfg).unwrap();
         ChatSessionDto::export_all(&cfg).unwrap();
         ChatStreamEvent::export_all(&cfg).unwrap();
         GitFileDiffDto::export_all(&cfg).unwrap();

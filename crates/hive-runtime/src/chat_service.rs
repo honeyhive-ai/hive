@@ -12,10 +12,10 @@
 use hive_core::crypto::{sign_envelope, DeviceCertificate};
 use hive_core::events::MemberRoleChange;
 use hive_core::{
-    ActionProposal, ActorIdentity, ActorStamp, ChatMessage, ChatSession, MessageReaction,
-    MessageRole, ProposalApproval, SessionEvent, SessionEventEnvelope, SigningKeypair,
-    SkillProfile, Timestamp, VaultSource, WorkflowDefinition, WorkflowRun, WorkspaceAgent,
-    WorkspaceMember, WorkspaceRole,
+    workspace_config_session_id, ActionProposal, ActorIdentity, ActorStamp, Channel, ChatMessage,
+    ChatSession, MessageReaction, MessageRole, ProposalApproval, SessionEvent, SessionEventEnvelope,
+    SigningKeypair, SkillProfile, Timestamp, VaultSource, WorkflowDefinition, WorkflowRun,
+    WorkspaceAgent, WorkspaceMember, WorkspaceRole,
 };
 use uuid::Uuid;
 
@@ -529,6 +529,145 @@ impl ChatService {
         Ok(())
     }
 
+    // ── Channels (spec §11) ────────────────────────────────────────────────
+    // Channels live on the workspace-config log — a reserved session whose id is
+    // derived from the workspace id. It syncs like any other session. Its members
+    // roster (seeded here) is what authorizes config-log edits.
+
+    /// Ensure the workspace-config log exists, seeded with the creator as the
+    /// first Owner member so its authz has a roster. Idempotent. Returns the
+    /// config-log session id.
+    pub fn ensure_workspace_config(&mut self, workspace_id: Uuid) -> Result<Uuid> {
+        let config_id = workspace_config_session_id(workspace_id);
+        if self.load(config_id)?.is_none() {
+            let mut session = ChatSession::new("", workspace_id, "");
+            session.id = config_id;
+            session.creator_actor_id = self.author.id.clone();
+            session.members.push(WorkspaceMember {
+                id: self.author.id.clone(),
+                actor: self.author.clone(),
+                role: WorkspaceRole::Owner,
+                title: String::new(),
+                index: 1,
+                joined_at: Timestamp::now(),
+            });
+            self.append_signed(
+                config_id,
+                workspace_id,
+                SessionEvent::SessionSnapshot { session: Box::new(session) },
+            )?;
+            self.publish_identity(config_id, workspace_id)?;
+        }
+        Ok(config_id)
+    }
+
+    /// The workspace's channels, ordered by position.
+    pub fn list_channels(&self, workspace_id: Uuid) -> Result<Vec<Channel>> {
+        let config_id = workspace_config_session_id(workspace_id);
+        let mut channels = self
+            .load(config_id)?
+            .map(|s| s.channels)
+            .unwrap_or_default();
+        channels.sort_by(|a, b| a.position.cmp(&b.position).then(a.id.cmp(&b.id)));
+        Ok(channels)
+    }
+
+    /// Create a channel and its drop-in default chat (titled after the channel).
+    /// Returns (channel, default_chat).
+    pub fn create_channel(
+        &mut self,
+        workspace_id: Uuid,
+        name: impl Into<String>,
+        purpose: Option<String>,
+        runtime_id: impl Into<String>,
+    ) -> Result<(Channel, ChatSession)> {
+        self.ensure_workspace_config(workspace_id)?;
+        let config_id = workspace_config_session_id(workspace_id);
+        let name = name.into();
+        let channel_id = Uuid::new_v4().to_string();
+        // The default chat lives in the channel from birth.
+        let default_chat = self.create_chat(name.clone(), workspace_id, runtime_id)?;
+        self.set_chat_channel(default_chat.id, workspace_id, &channel_id)?;
+        let next_pos = self
+            .load(config_id)?
+            .map(|s| s.channels.iter().map(|c| c.position).max().unwrap_or(-1) + 1)
+            .unwrap_or(0);
+        let mut channel = Channel::new(channel_id, name);
+        channel.purpose = purpose.filter(|p| !p.trim().is_empty());
+        channel.position = next_pos;
+        channel.default_chat_id = default_chat.id.to_string();
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::ChannelCreated { channel: channel.clone() },
+        )?;
+        self.maybe_snapshot(config_id, workspace_id)?;
+        Ok((channel, default_chat))
+    }
+
+    /// Rename a channel and/or set its purpose.
+    pub fn rename_channel(
+        &mut self,
+        workspace_id: Uuid,
+        channel_id: impl Into<String>,
+        name: impl Into<String>,
+        purpose: Option<String>,
+    ) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::ChannelRenamed {
+                channel_id: channel_id.into(),
+                name: name.into(),
+                purpose: purpose.filter(|p| !p.trim().is_empty()),
+            },
+        )?;
+        Ok(())
+    }
+
+    /// Set the channel order (ascending position).
+    pub fn reorder_channels(&mut self, workspace_id: Uuid, channel_ids: Vec<String>) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::ChannelReordered { channel_ids },
+        )?;
+        Ok(())
+    }
+
+    /// Archive (or restore) a channel.
+    pub fn archive_channel(
+        &mut self,
+        workspace_id: Uuid,
+        channel_id: impl Into<String>,
+        archived: bool,
+    ) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::ChannelArchived { channel_id: channel_id.into(), archived },
+        )?;
+        Ok(())
+    }
+
+    /// File a chat into a channel (per-chat, session-scoped). Empty id unfiles.
+    pub fn set_chat_channel(
+        &mut self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        channel_id: impl Into<String>,
+    ) -> Result<()> {
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::ChatChannelChanged { channel_id: channel_id.into() },
+        )?;
+        Ok(())
+    }
+
     /// Install (or replace, by name) a loaded skill, emitting the new set.
     pub fn add_skill(
         &mut self,
@@ -904,6 +1043,47 @@ mod tests {
         // No account id → publish_identity is a no-op (local-only, unverifiable).
         let author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
         (ChatService::new(store, device_id, kp, account_kp, author), public)
+    }
+
+    #[test]
+    fn channels_ride_the_workspace_config_log() {
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+
+        // Creating a channel seeds the config log, the channel, and its default chat.
+        let (channel, default_chat) = svc
+            .create_channel(wid, "auth", Some("auth work".into()), "anthropic")
+            .unwrap();
+        assert_eq!(channel.name, "auth");
+        assert_eq!(channel.default_chat_id, default_chat.id.to_string());
+        assert_eq!(channel.position, 0);
+
+        // The channel is listed off the config log (id = workspace_config_session_id).
+        let channels = svc.list_channels(wid).unwrap();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0].id, channel.id);
+
+        // The config log is a distinct session from the default chat.
+        let config_id = hive_core::workspace_config_session_id(wid);
+        assert_ne!(config_id, default_chat.id);
+
+        // The default chat carries its channel assignment (per-chat, session-scoped).
+        let loaded = svc.load(default_chat.id).unwrap().unwrap();
+        assert_eq!(loaded.channel_id, channel.id);
+        // ...and the config log itself has no channel assignment but holds the roster.
+        let cfg = svc.load(config_id).unwrap().unwrap();
+        assert!(cfg.channel_id.is_empty());
+        assert_eq!(cfg.channels.len(), 1);
+        assert_eq!(cfg.members.len(), 1, "config log seeds the creator as member for authz");
+
+        // A second channel gets the next position; rename + archive fold correctly.
+        let (c2, _) = svc.create_channel(wid, "ui", None, "anthropic").unwrap();
+        assert_eq!(c2.position, 1);
+        svc.rename_channel(wid, &channel.id, "authentication", None).unwrap();
+        svc.archive_channel(wid, &c2.id, true).unwrap();
+        let after = svc.list_channels(wid).unwrap();
+        assert_eq!(after.iter().find(|c| c.id == channel.id).unwrap().name, "authentication");
+        assert!(after.iter().find(|c| c.id == c2.id).unwrap().archived);
     }
 
     #[test]

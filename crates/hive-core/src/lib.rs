@@ -26,7 +26,7 @@ pub mod workflow;
 // Flat re-exports of the core domain types for ergonomic downstream use.
 pub use agent::WorkspaceAgent;
 pub use authorization::{evaluate as authorize, AuthzDecision, AuthzReason};
-pub use channel::Channel;
+pub use channel::{workspace_config_session_id, Channel};
 pub use chat::{
     ChatMessage, ChatToolCall, ChatToolResult, MessageReaction, MessageRole, TranscriptEventKind,
 };

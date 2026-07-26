@@ -20,8 +20,8 @@ use hive_core::{
 };
 use hive_core::{ActorIdentity, ActorKind, VaultSource, WorkspaceMember};
 use hive_proto::{
-    ApprovalDto, AppInfo, AppSettingsDto, ChatMessageDto, ChatSessionDto, ChatStreamEvent,
-    ChatSummaryDto, ContextTelemetryDto, GitFileDiffDto, McpServerDto, ProposalDto,
+    ApprovalDto, AppInfo, AppSettingsDto, ChannelDto, ChatMessageDto, ChatSessionDto,
+    ChatStreamEvent, ChatSummaryDto, ContextTelemetryDto, GitFileDiffDto, McpServerDto, ProposalDto,
     IssuedRelayTokenDto, ReactionDto, RelayTokenDto, RelayUserDto, RuntimeSummaryDto, SkillDto,
     VaultSourceDto, WorkspaceAgentDto, WorkspaceInfoDto, WorkspaceMemberDto,
 };
@@ -1342,9 +1342,12 @@ fn member_dto(m: &WorkspaceMember, self_actor_id: &str) -> WorkspaceMemberDto {
     }
 }
 
-fn summary_dto(s: &ChatSession) -> ChatSummaryDto {
+fn summary_dto(s: &ChatSession, default_chat_ids: &std::collections::HashSet<String>) -> ChatSummaryDto {
+    let id = s.id.to_string();
     ChatSummaryDto {
-        id: s.id.to_string(),
+        is_channel_default: default_chat_ids.contains(&id),
+        channel_id: s.channel_id.clone(),
+        id,
         title: s.title.clone(),
         last_activity_at: rfc3339(s.last_activity_at()),
         message_count: s.messages.len() as u32,
@@ -1557,11 +1560,23 @@ fn list_chats(state: State<AppState>) -> Result<Vec<ChatSummaryDto>, String> {
     let known_rooms = state.known_room_ids();
     let svc = state.service.lock().unwrap();
     let ids = svc.store().list_session_ids().map_err(map_err)?;
+    // The workspace-config log is a session too, but it's not a chat — never list it.
+    let config_id = hive_core::workspace_config_session_id(active);
+    // Chats that are a channel's drop-in default (not independently movable).
+    let default_chat_ids: std::collections::HashSet<String> = svc
+        .list_channels(active)
+        .map_err(map_err)?
+        .iter()
+        .map(|c| c.default_chat_id.clone())
+        .collect();
     let mut out = Vec::new();
     for id in ids {
+        if id == config_id {
+            continue;
+        }
         if let Some(s) = svc.load(id).map_err(map_err)? {
             if session_in_workspace(s.workspace_id, &s.creator_actor_id, active, &me, &known_rooms) {
-                out.push(summary_dto(&s));
+                out.push(summary_dto(&s, &default_chat_ids));
             }
         }
     }
@@ -1691,6 +1706,110 @@ fn create_chat(state: State<AppState>, title: String) -> Result<ChatSessionDto, 
         .create_chat(title, state.active_workspace_id(), &state.current_default_runtime_id())
         .map_err(map_err)?;
     Ok(session_dto(&session))
+}
+
+fn channel_dto(c: &hive_core::Channel) -> ChannelDto {
+    ChannelDto {
+        id: c.id.clone(),
+        name: c.name.clone(),
+        purpose: c.purpose.clone(),
+        position: c.position,
+        archived: c.archived,
+        default_chat_id: c.default_chat_id.clone(),
+    }
+}
+
+/// The workspace's channels (spec §11), ordered by position.
+#[tauri::command]
+fn list_channels(state: State<AppState>) -> Result<Vec<ChannelDto>, String> {
+    let svc = state.service.lock().unwrap();
+    Ok(svc
+        .list_channels(state.active_workspace_id())
+        .map_err(map_err)?
+        .iter()
+        .map(channel_dto)
+        .collect())
+}
+
+/// Create a channel and its drop-in default chat, titled after the channel.
+#[tauri::command]
+fn create_channel(
+    state: State<AppState>,
+    name: String,
+    purpose: Option<String>,
+) -> Result<ChannelDto, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("channel name is required".into());
+    }
+    let wid = state.active_workspace_id();
+    let rt = state.current_default_runtime_id();
+    let mut svc = state.service.lock().unwrap();
+    let (channel, _default_chat) = svc.create_channel(wid, name, purpose, &rt).map_err(map_err)?;
+    Ok(channel_dto(&channel))
+}
+
+#[tauri::command]
+fn rename_channel(
+    state: State<AppState>,
+    channel_id: String,
+    name: String,
+    purpose: Option<String>,
+) -> Result<(), String> {
+    let wid = state.active_workspace_id();
+    let mut svc = state.service.lock().unwrap();
+    svc.rename_channel(wid, channel_id, name.trim(), purpose).map_err(map_err)
+}
+
+#[tauri::command]
+fn reorder_channels(state: State<AppState>, channel_ids: Vec<String>) -> Result<(), String> {
+    let wid = state.active_workspace_id();
+    let mut svc = state.service.lock().unwrap();
+    svc.reorder_channels(wid, channel_ids).map_err(map_err)
+}
+
+/// Archive (or restore) a channel and all its chats (spec §11 rule 7).
+#[tauri::command]
+fn archive_channel(state: State<AppState>, channel_id: String, archived: bool) -> Result<(), String> {
+    let wid = state.active_workspace_id();
+    let mut svc = state.service.lock().unwrap();
+    svc.archive_channel(wid, &channel_id, archived).map_err(map_err)?;
+    // Archive/restore the channel's chats alongside it.
+    let ids = svc.store().list_session_ids().map_err(map_err)?;
+    for id in ids {
+        if let Some(s) = svc.load(id).map_err(map_err)? {
+            if s.channel_id == channel_id && s.archived != archived {
+                svc.set_archived(id, wid, archived).map_err(map_err)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Create a focused chat filed into a channel (from the channel header).
+#[tauri::command]
+fn create_chat_in_channel(
+    state: State<AppState>,
+    channel_id: String,
+    title: String,
+) -> Result<ChatSessionDto, String> {
+    let title = if title.trim().is_empty() { "New chat".to_string() } else { title };
+    let wid = state.active_workspace_id();
+    let rt = state.current_default_runtime_id();
+    let mut svc = state.service.lock().unwrap();
+    let session = svc.create_chat(title, wid, &rt).map_err(map_err)?;
+    svc.set_chat_channel(session.id, wid, &channel_id).map_err(map_err)?;
+    let session = svc.load(session.id).map_err(map_err)?.unwrap_or(session);
+    Ok(session_dto(&session))
+}
+
+/// Move a (focused) chat into a different channel.
+#[tauri::command]
+fn move_chat(state: State<AppState>, chat_id: String, channel_id: String) -> Result<(), String> {
+    let id = Uuid::parse_str(&chat_id).map_err(map_err)?;
+    let wid = state.active_workspace_id();
+    let mut svc = state.service.lock().unwrap();
+    svc.set_chat_channel(id, wid, &channel_id).map_err(map_err)
 }
 
 #[tauri::command]
@@ -7057,6 +7176,13 @@ pub fn run() {
             workflows::resume_workflow_run,
             list_chats,
             create_chat,
+            list_channels,
+            create_channel,
+            rename_channel,
+            reorder_channels,
+            archive_channel,
+            create_chat_in_channel,
+            move_chat,
             get_chat,
             get_context_telemetry,
             archive_chat,
