@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use hive_core::ModelProviderKind;
+use hive_core::{ModelProviderKind, WorkspaceRole};
 use hive_runtime::provider::anthropic::{content_value, AnthropicResponse};
 use hive_runtime::tool_loop::{self, MessagesApi, ToolExecutor};
 use hive_runtime::{dispatch, AnthropicClient, ChatTurn, McpRegistry, ProviderError, ResolvedRuntime};
@@ -27,12 +27,54 @@ use crate::mcp_config;
 const MAX_TOKENS: u32 = 1024;
 const MAX_TOOL_ITERS: usize = 6;
 
+/// Env var that raises (or lowers) the minimum author role required before a
+/// headless reply is allowed to execute MCP tools. See [`parse_min_role`].
+pub const MIN_ROLE_ENV: &str = "HIVE_MCP_MIN_ROLE";
+
+/// Parse `HIVE_MCP_MIN_ROLE` (viewer|contributor|admin|owner, case-insensitive)
+/// into the minimum author role that unlocks the MCP tool loop. Unknown or
+/// absent → `Contributor` (the safe default: a Viewer can never drive tools).
+pub fn parse_min_role(v: Option<&str>) -> WorkspaceRole {
+    match v.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("viewer") => WorkspaceRole::Viewer,
+        Some("contributor") => WorkspaceRole::Contributor,
+        Some("admin") => WorkspaceRole::Admin,
+        Some("owner") => WorkspaceRole::Owner,
+        _ => WorkspaceRole::Contributor,
+    }
+}
+
+/// The configured minimum author role, read from `HIVE_MCP_MIN_ROLE`.
+pub fn mcp_min_role() -> WorkspaceRole {
+    parse_min_role(std::env::var(MIN_ROLE_ENV).ok().as_deref())
+}
+
+/// Whether the triggering message's author is privileged enough to have MCP
+/// tools executed on their behalf. `None` = author could not be resolved (no
+/// `actor_identity`) → fail closed (denied). This is the H1 gate: a low-
+/// privilege member must not be able to drive the worker's tools on the
+/// victim's key.
+pub fn mcp_allowed_for(author_role: Option<WorkspaceRole>, min_role: WorkspaceRole) -> bool {
+    match author_role {
+        Some(role) => role.rank() >= min_role.rank(),
+        None => false,
+    }
+}
+
 /// Produce one reply for `turns` under `system`. Runs the MCP tool loop when an
-/// Anthropic runtime has a key and `HIVE_MCP_CONFIG` yields ≥1 enabled tool;
-/// otherwise streams a single completion (the original behavior).
-pub async fn generate_reply(rt: &ResolvedRuntime, system: &str, turns: &[ChatTurn]) -> Result<String> {
-    if let Some(text) = try_tool_loop(rt, system, turns).await? {
-        return Ok(text);
+/// Anthropic runtime has a key, `HIVE_MCP_CONFIG` yields ≥1 enabled tool, **and**
+/// `allow_mcp_tools` is set (the triggering author cleared the role gate);
+/// otherwise streams a single completion (the original, tool-free behavior).
+pub async fn generate_reply(
+    rt: &ResolvedRuntime,
+    system: &str,
+    turns: &[ChatTurn],
+    allow_mcp_tools: bool,
+) -> Result<String> {
+    if allow_mcp_tools {
+        if let Some(text) = try_tool_loop(rt, system, turns).await? {
+            return Ok(text);
+        }
     }
     dispatch::stream(rt, Some(system), turns, None, &[], MAX_TOKENS, |_| {})
         .await
@@ -135,4 +177,54 @@ fn turns_to_messages(turns: &[ChatTurn]) -> Vec<Value> {
         .iter()
         .map(|t| json!({ "role": t.role, "content": content_value(&t.content) }))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hive_core::WorkspaceRole::*;
+
+    #[test]
+    fn viewer_denied_at_default() {
+        let min = parse_min_role(None);
+        assert_eq!(min, Contributor);
+        assert!(!mcp_allowed_for(Some(Viewer), min));
+    }
+
+    #[test]
+    fn contributor_allowed_at_default() {
+        assert!(mcp_allowed_for(Some(Contributor), parse_min_role(None)));
+        // and everyone above the floor
+        assert!(mcp_allowed_for(Some(Admin), parse_min_role(None)));
+        assert!(mcp_allowed_for(Some(Owner), parse_min_role(None)));
+    }
+
+    #[test]
+    fn raised_min_role_denies_contributor() {
+        let min = parse_min_role(Some("admin"));
+        assert_eq!(min, Admin);
+        assert!(!mcp_allowed_for(Some(Contributor), min));
+        assert!(mcp_allowed_for(Some(Admin), min));
+    }
+
+    #[test]
+    fn env_parse_is_case_insensitive_and_trims() {
+        assert_eq!(parse_min_role(Some("  Owner ")), Owner);
+        assert_eq!(parse_min_role(Some("VIEWER")), Viewer);
+        assert_eq!(parse_min_role(Some("Contributor")), Contributor);
+    }
+
+    #[test]
+    fn unknown_or_absent_env_defaults_to_contributor() {
+        assert_eq!(parse_min_role(None), Contributor);
+        assert_eq!(parse_min_role(Some("")), Contributor);
+        assert_eq!(parse_min_role(Some("superuser")), Contributor);
+    }
+
+    #[test]
+    fn unresolved_author_is_denied() {
+        // No actor_identity → None → fail closed at any threshold.
+        assert!(!mcp_allowed_for(None, parse_min_role(None)));
+        assert!(!mcp_allowed_for(None, parse_min_role(Some("viewer"))));
+    }
 }

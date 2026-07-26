@@ -392,8 +392,22 @@ async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Re
             // current-thread runtime (see run()), so this is allowed.
             let turns = turns_for(&s);
             print!("↳ @{name} replying in {} … ", s.id);
-            // MCP tools when HIVE_MCP_CONFIG provisions them, else a plain stream.
-            let reply = reply::generate_reply(&rt, &system, &turns).await?;
+            // H1 gate: only execute MCP tools when the triggering author holds
+            // ≥ HIVE_MCP_MIN_ROLE (default Contributor). Unresolved author →
+            // fail closed. Under-privileged requesters still get a tool-free
+            // reply, but cannot drive tools on this worker's key.
+            let author_role = last.actor_identity.as_ref().map(|a| s.role_of(&a.id));
+            let min_role = reply::mcp_min_role();
+            let allow_mcp = reply::mcp_allowed_for(author_role, min_role);
+            if !allow_mcp {
+                eprintln!(
+                    "withholding MCP tools for message {} — author role {:?} below minimum {:?}",
+                    last.id, author_role, min_role
+                );
+            }
+            // MCP tools when HIVE_MCP_CONFIG provisions them and the gate allows,
+            // else a plain stream.
+            let reply = reply::generate_reply(&rt, &system, &turns, allow_mcp).await?;
             let mid = svc.begin_assistant_message(s.id, s.workspace_id, name.clone(), rt_label.clone())?;
             svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
             seen.insert(mid);
@@ -568,8 +582,27 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
                     agent.name
                 );
                 print!("↳ @{} replying in {} … ", agent.name, s.id);
-                // MCP tools when HIVE_MCP_CONFIG provisions them, else a plain stream.
-                match reply::generate_reply(&rt, &system, &turns).await {
+                // H1 gate: resolve the triggering message's author + role and
+                // only execute MCP tools when they clear HIVE_MCP_MIN_ROLE
+                // (default Contributor). Unresolved author → fail closed. An
+                // under-privileged requester still gets a tool-free reply.
+                let author_role = s
+                    .messages
+                    .iter()
+                    .find(|m| m.id == pm.message_id)
+                    .and_then(|m| m.actor_identity.as_ref())
+                    .map(|a| s.role_of(&a.id));
+                let min_role = reply::mcp_min_role();
+                let allow_mcp = reply::mcp_allowed_for(author_role, min_role);
+                if !allow_mcp {
+                    eprintln!(
+                        "withholding MCP tools for message {} — author role {:?} below minimum {:?}",
+                        pm.message_id, author_role, min_role
+                    );
+                }
+                // MCP tools when HIVE_MCP_CONFIG provisions them and the gate
+                // allows, else a plain stream.
+                match reply::generate_reply(&rt, &system, &turns, allow_mcp).await {
                     Ok(reply) => {
                         let mid = svc.begin_assistant_message(s.id, s.workspace_id, agent.name.clone(), rt_label.clone())?;
                         svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
