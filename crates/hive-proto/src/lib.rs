@@ -517,6 +517,9 @@ pub struct WorkspaceHostDto {
     pub kind: String,
     pub label: String,
     pub online: bool,
+    /// Last heartbeat as an RFC 3339 string, so the presence UI can render a
+    /// relative "last seen 3m ago".
+    pub last_seen: String,
 }
 
 /// Where the local user was last `@`-mentioned in a chat, so the sidebar can
@@ -529,6 +532,10 @@ pub struct WorkspaceHostDto {
 #[ts(rename_all = "camelCase")]
 pub struct MentionStateDto {
     pub session_id: String,
+    /// The workspace this chat belongs to (local workspace id, or a relay-room
+    /// workspace id). Lets the client group cross-workspace mention state so a
+    /// background workspace's switcher entry can flag an unread self-mention.
+    pub workspace_id: String,
     /// The channel the chat is filed under (empty = unfiled).
     pub channel_id: String,
     /// 1-based position (in canonical message order) of the last message that

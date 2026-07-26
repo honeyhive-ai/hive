@@ -7,4 +7,9 @@ export type WorkspaceHostDto = { id: string,
 /**
  * "device" | "worker"
  */
-kind: string, label: string, online: boolean, };
+kind: string, label: string, online: boolean, 
+/**
+ * Last heartbeat as an RFC 3339 string, so the presence UI can render a
+ * relative "last seen 3m ago".
+ */
+lastSeen: string, };

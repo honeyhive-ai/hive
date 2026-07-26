@@ -9,6 +9,12 @@
  */
 export type MentionStateDto = { sessionId: string, 
 /**
+ * The workspace this chat belongs to (local workspace id, or a relay-room
+ * workspace id). Lets the client group cross-workspace mention state so a
+ * background workspace's switcher entry can flag an unread self-mention.
+ */
+workspaceId: string, 
+/**
  * The channel the chat is filed under (empty = unfiled).
  */
 channelId: string, 

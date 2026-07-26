@@ -1002,6 +1002,9 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
     refetchInterval: sync.data?.relayConfigured ? 5000 : false,
   });
   const onlineActors = new Set((presence.data ?? []).map((p) => p.actorId));
+  // Registered devices/workers for this workspace. Shares the ["workspace-hosts"]
+  // cache with the queue's "run on worker" menu.
+  const hosts = useQuery({ queryKey: ["workspace-hosts"], queryFn: listWorkspaceHosts });
 
   // Show `#index` only on names that actually collide; matchable as `@Name#N`.
   const nameCounts = new Map<string, number>();
@@ -1355,8 +1358,60 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
           </>
         )}
       </Section>
+
+      <Section title="Workers & hosts">
+        {(hosts.data ?? []).length === 0 ? (
+          <EmptyHint text="No hosts registered." />
+        ) : (
+          (hosts.data ?? []).map((host) => <HostRow key={host.id} host={host} />)
+        )}
+      </Section>
     </RailFrame>
   );
+}
+
+/// A single registered device/worker: label, a kind chip, an online/offline
+/// status dot, and a relative "last seen".
+function HostRow({ host }: { host: WorkspaceHostDto }) {
+  return (
+    <Card className="flex items-center justify-between gap-2 px-3 py-2">
+      <div className="flex min-w-0 items-center gap-2">
+        <span
+          className="h-2.5 w-2.5 shrink-0 rounded-full"
+          style={{ background: host.online ? "var(--hive-success)" : "var(--hive-line)" }}
+          title={host.online ? "Online" : "Offline"}
+        />
+        <span className="truncate font-medium">{host.label || "Unnamed host"}</span>
+        <span
+          className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider"
+          style={{
+            background: "color-mix(in srgb, var(--hive-accent-cool) 15%, transparent)",
+            color: "var(--hive-accent-cool)",
+          }}
+        >
+          {host.kind}
+        </span>
+      </div>
+      <span className="shrink-0 text-[11px]" style={{ color: "var(--hive-ink-soft)" }}>
+        {host.online ? "online" : relativeAgo(host.lastSeen)}
+      </span>
+    </Card>
+  );
+}
+
+/// Coarse "3m ago" / "2h ago" from an RFC 3339 timestamp. Empty/unparseable
+/// input renders nothing meaningful ("—").
+function relativeAgo(iso: string): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "—";
+  const secs = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (secs < 60) return "just now";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.round(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.round(hrs / 24);
+  return `${days}d ago`;
 }
 
 function VaultsPane({ sessionId }: { sessionId: string }) {

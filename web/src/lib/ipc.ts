@@ -509,6 +509,12 @@ export type { MentionStateDto } from "@/bindings/MentionStateDto";
 export const listMentionStates = () =>
   invoke<MentionStateDto[]>("list_mention_states");
 
+/// Self-mention state across every known workspace (each DTO tagged with its
+/// `workspaceId`), so the workspace switcher can flag a background workspace
+/// holding an unread self-mention. Grouped client-side by `workspaceId`.
+export const listAllMentionStates = () =>
+  invoke<MentionStateDto[]>("list_all_mention_states");
+
 export const listSkills = (sessionId: string) =>
   invoke<SkillDto[]>("list_skills", { sessionId });
 
