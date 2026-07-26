@@ -131,6 +131,33 @@ export function FriendsView({
 
   const data = overview.data;
 
+  // A failed overview read must not render as an empty collaborator list (which
+  // reads as "everyone gone"). Show a recoverable error state instead.
+  if (overview.isError && !data) {
+    return (
+      <div className="mx-auto max-w-xl p-8 text-sm" style={{ color: "var(--hive-ink)" }}>
+        <div
+          className="rounded-2xl border p-6 text-center"
+          style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+        >
+          <h1 className="text-lg font-semibold tracking-tight" style={{ color: "var(--hive-danger)" }}>
+            Couldn't load collaborators
+          </h1>
+          <p className="mt-2 opacity-70">
+            Your connections couldn't be reached. Nothing has changed — retry to reconnect.
+          </p>
+          <button
+            onClick={() => void overview.refetch()}
+            className="mt-4 rounded-xl px-4 py-2 text-sm font-semibold text-white transition-all hover:brightness-105"
+            style={{ background: "var(--hive-accent-cool)" }}
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (data && !data.enabled) {
     return (
       <div className="mx-auto max-w-xl p-8 text-sm" style={{ color: "var(--hive-ink)" }}>

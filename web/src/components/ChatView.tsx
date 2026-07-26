@@ -43,7 +43,7 @@ import { toast, errMsg } from "@/components/Toast";
 import { SkeletonBubbles } from "@/components/Skeleton";
 import { EmojiPicker } from "@/components/EmojiPicker";
 import { Avatar } from "@/components/Avatar";
-import { Popover, PopoverItem, candidateKey } from "@/components/ui";
+import { Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui";
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
 import { applyStreamDelta, retireStream } from "@/lib/streams";
@@ -95,6 +95,9 @@ export function ChatView({
   // messageId → accumulated text. A Map (not a single slot) because workflow
   // fan-out streams several assistant messages into the chat concurrently.
   const [streams, setStreams] = useState<Map<string, string>>(new Map());
+  // Set when a turn dies mid-stream (phase "error") so a failed generation is
+  // visibly distinct from a finished one; cleared on the next send / session.
+  const [streamError, setStreamError] = useState<string | null>(null);
   // Autoscroll only when already pinned to the bottom; otherwise surface a pill.
   const [atBottom, setAtBottom] = useState(true);
   const [hasNew, setHasNew] = useState(false);
@@ -181,7 +184,12 @@ export function ChatView({
         setStreams((prev) => applyStreamDelta(prev, e.messageId, e.text));
       } else {
         // completed/error: retire only this message's live stream; others may
-        // still be in flight (parallel workflow stages).
+        // still be in flight (parallel workflow stages). An "error" phase means
+        // the turn died mid-generation — flag it distinctly (a died-mid-stream
+        // turn must not read as a finished one).
+        if (e.phase === "error") {
+          setStreamError(e.text?.trim() || "Generation failed or was interrupted.");
+        }
         qc.invalidateQueries({ queryKey: ["chat", sessionRef.current] });
         qc.invalidateQueries({ queryKey: ["chats"] });
         setStreams((prev) => retireStream(prev, e.messageId));
@@ -196,6 +204,7 @@ export function ChatView({
 
   useEffect(() => {
     setStreams(new Map());
+    setStreamError(null);
     setOptimisticUser(null);
     setSending(false);
     setInput("");
@@ -438,6 +447,7 @@ export function ChatView({
     setAttachments([]);
     setMention(null);
     setSlash(null);
+    setStreamError(null);
     clearTyping();
     setOptimisticUser(body);
     setSending(true);
@@ -515,7 +525,15 @@ export function ChatView({
         <div className="relative flex min-h-0 flex-1 flex-col">
         <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-1 py-2">
           {chat.isLoading && messages.length === 0 && <SkeletonBubbles count={3} />}
-          {!chat.isLoading && messages.length === 0 && !optimisticUser && (
+          {chat.isError && messages.length === 0 && (
+            <div className="max-w-md">
+              <ErrorState
+                text="Couldn't load this conversation."
+                onRetry={() => void chat.refetch()}
+              />
+            </div>
+          )}
+          {!chat.isLoading && !chat.isError && messages.length === 0 && !optimisticUser && (
             <div
               className="max-w-lg rounded-3xl border p-6"
               style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
@@ -603,6 +621,34 @@ export function ChatView({
           ))}
           {sending && streams.size === 0 && <TypingDots label={`${streamAuthor} is thinking`} />}
           {typingNames.length > 0 && <TypingDots label={typingLabel(typingNames)} />}
+          {streamError && (
+            <div
+              className="mt-2 flex items-start gap-2.5 rounded-2xl border px-3.5 py-2.5 text-sm"
+              style={{
+                borderColor: "color-mix(in srgb, var(--hive-danger) 30%, transparent)",
+                background: "color-mix(in srgb, var(--hive-danger) 10%, transparent)",
+              }}
+              role="alert"
+            >
+              <span aria-hidden className="mt-px shrink-0" style={{ color: "var(--hive-danger)" }}>
+                <IconInfo size={14} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="font-medium" style={{ color: "var(--hive-danger)" }}>
+                  Generation failed or was interrupted
+                </div>
+                <div className="mt-0.5 break-words opacity-70">{streamError}</div>
+              </div>
+              <button
+                onClick={() => setStreamError(null)}
+                className="shrink-0 rounded-md px-1.5 py-0.5 leading-none opacity-50 transition-opacity hover:opacity-100"
+                title="Dismiss"
+                aria-label="Dismiss"
+              >
+                <IconX size={12} />
+              </button>
+            </div>
+          )}
         </div>
           {hasNew && !atBottom && (
             <button

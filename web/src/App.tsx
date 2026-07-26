@@ -43,6 +43,7 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { WorkspaceRail } from "@/components/WorkspaceRail";
 import { FriendsView } from "@/components/FriendsView";
 import { AddWorkspaceModal } from "@/components/AddWorkspaceModal";
+import { PaneErrorBoundary } from "@/components/ErrorBoundary";
 import {
   applyTheme,
   loadMode,
@@ -468,6 +469,57 @@ export function App() {
     window.addEventListener("pointerup", stopResize);
   }
 
+  // A failed settings read must not fall through to the shell with empty
+  // defaults (which reads as "onboarded, everything lost"). Show a recoverable
+  // error shell that retries the load instead.
+  if (settings.isError) {
+    return (
+      <div
+        className="flex h-full flex-col items-center justify-center p-6"
+        style={{ background: "var(--hive-canvas)", color: "var(--hive-ink)" }}
+      >
+        <ToastHost />
+        <div
+          className="w-full max-w-md rounded-2xl border p-6 text-center"
+          style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
+        >
+          <h1 className="text-lg font-semibold tracking-tight" style={{ color: "var(--hive-danger)" }}>
+            Couldn't load your settings
+          </h1>
+          <p className="mt-2 text-sm opacity-70">
+            Hive couldn't read this workspace's configuration. Nothing has been lost — retry the
+            load, or reload the app.
+          </p>
+          <div className="mt-4 flex items-center justify-center gap-2">
+            <button
+              onClick={() => void settings.refetch()}
+              className="rounded-xl px-4 py-2 text-sm font-semibold text-white transition-all hover:brightness-105"
+              style={{ background: "var(--hive-accent-cool)" }}
+            >
+              Retry
+            </button>
+            <button
+              onClick={() => location.reload()}
+              className="rounded-xl border px-4 py-2 text-sm font-medium transition-colors"
+              style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)", color: "var(--hive-ink)" }}
+            >
+              Reload
+            </button>
+          </div>
+          <details className="mt-4 text-left">
+            <summary className="cursor-pointer text-xs opacity-55">Error details</summary>
+            <pre
+              className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg p-3 text-[11px] leading-5"
+              style={{ background: "var(--hive-mist)", color: "var(--hive-ink)" }}
+            >
+              {errMsg(settings.error)}
+            </pre>
+          </details>
+        </div>
+      </div>
+    );
+  }
+
   if (needsOnboarding) {
     return (
       <Onboarding
@@ -574,14 +626,16 @@ export function App() {
 
       <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {view === "friends" ? (
-          <FriendsView
-            onOpenSettings={(tab) => openSettings(tab)}
-            onOpenDm={() => {
-              setSelectedId(null);
-              setMode("chat");
-              setView("workspace");
-            }}
-          />
+          <PaneErrorBoundary label="Friends">
+            <FriendsView
+              onOpenSettings={(tab) => openSettings(tab)}
+              onOpenDm={() => {
+                setSelectedId(null);
+                setMode("chat");
+                setView("workspace");
+              }}
+            />
+          </PaneErrorBoundary>
         ) : !selectedId ? (
           <div className="flex flex-1 items-center justify-center opacity-60">
             Select or create a chat to begin.
@@ -638,6 +692,7 @@ export function App() {
 
             <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
               <div className="min-w-0 flex-1">
+                <PaneErrorBoundary label="This view">
                 {workflowDraft && workflowDraft.sessionId === selectedId ? (
                   <Suspense
                     fallback={
@@ -678,6 +733,7 @@ export function App() {
                 )}
                   </>
                 )}
+                </PaneErrorBoundary>
               </div>
 
               {showUtilityPane && (
@@ -687,16 +743,18 @@ export function App() {
                     ariaLabel="Resize chat and utility panes"
                   />
 
-                  <RightRail
-                    width={utilityPaneWidth}
-                    sessionId={selectedId}
-                    pane={utilityPane}
-                    activeRuntimeId={activeChat.data?.runtimeId ?? currentRuntime?.id ?? ""}
-                    onChangePane={setUtilityPane}
-                    onEditWorkflow={(def) =>
-                      selectedId && setWorkflowDraft({ sessionId: selectedId, def })
-                    }
-                  />
+                  <PaneErrorBoundary label="This panel">
+                    <RightRail
+                      width={utilityPaneWidth}
+                      sessionId={selectedId}
+                      pane={utilityPane}
+                      activeRuntimeId={activeChat.data?.runtimeId ?? currentRuntime?.id ?? ""}
+                      onChangePane={setUtilityPane}
+                      onEditWorkflow={(def) =>
+                        selectedId && setWorkflowDraft({ sessionId: selectedId, def })
+                      }
+                    />
+                  </PaneErrorBoundary>
                 </>
               )}
             </div>

@@ -2,6 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { App } from "@/App";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import "@/styles.css";
 // NOTE: Monaco is intentionally NOT imported here — it's the bulk of the JS
 // bundle. It loads lazily with the Diff view (App.tsx + DiffView.tsx) so the
@@ -24,8 +25,10 @@ const queryClient = new QueryClient({
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <QueryClientProvider client={queryClient}>
-      <App />
-    </QueryClientProvider>
+    <ErrorBoundary variant="root">
+      <QueryClientProvider client={queryClient}>
+        <App />
+      </QueryClientProvider>
+    </ErrorBoundary>
   </React.StrictMode>,
 );

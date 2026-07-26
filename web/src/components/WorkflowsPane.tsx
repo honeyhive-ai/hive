@@ -18,7 +18,7 @@ import {
 } from "@/lib/ipc";
 import { toast, errMsg } from "@/components/Toast";
 import { confirmThen } from "@/lib/confirm";
-import { Button, Section } from "@/components/ui";
+import { Button, Section, ErrorState } from "@/components/ui";
 import { RailFrame, Stack, EmptyHint, panelStyle, fieldStyle } from "@/components/RightRail";
 
 /// Visual tone for a node/run status chip. Exported for tests.
@@ -197,8 +197,12 @@ export function WorkflowsPane({
               )}
             </div>
           ))}
-          {(workflows.data ?? []).length === 0 && (
-            <EmptyHint text="No workflows yet. Start from a preset below, or build your own." />
+          {workflows.isError ? (
+            <ErrorState text="Couldn't load workflows." onRetry={() => void workflows.refetch()} />
+          ) : (
+            (workflows.data ?? []).length === 0 && (
+              <EmptyHint text="No workflows yet. Start from a preset below, or build your own." />
+            )
           )}
         </Stack>
         <div className="mt-2 flex flex-wrap gap-2">
@@ -215,7 +219,11 @@ export function WorkflowsPane({
           {(runs.data ?? []).map((run) => (
             <RunCard key={run.id} sessionId={sessionId} run={run} />
           ))}
-          {(runs.data ?? []).length === 0 && <EmptyHint text="No runs yet." />}
+          {runs.isError ? (
+            <ErrorState text="Couldn't load runs." onRetry={() => void runs.refetch()} />
+          ) : (
+            (runs.data ?? []).length === 0 && <EmptyHint text="No runs yet." />
+          )}
         </Stack>
       </Section>
     </RailFrame>

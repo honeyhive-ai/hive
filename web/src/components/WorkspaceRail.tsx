@@ -103,10 +103,14 @@ export function WorkspaceRail({
   }
 
   async function select(id: string) {
-    await setActiveWorkspace(id);
-    await qc.invalidateQueries({ queryKey: ["workspaces"] });
-    await qc.invalidateQueries({ queryKey: ["chats"] });
-    await qc.invalidateQueries({ queryKey: ["all-mention-states"] });
+    try {
+      await setActiveWorkspace(id);
+      await qc.invalidateQueries({ queryKey: ["workspaces"] });
+      await qc.invalidateQueries({ queryKey: ["chats"] });
+      await qc.invalidateQueries({ queryKey: ["all-mention-states"] });
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
   }
 
   async function refresh() {
