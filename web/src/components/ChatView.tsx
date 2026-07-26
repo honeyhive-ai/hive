@@ -43,6 +43,7 @@ import { toast, errMsg } from "@/components/Toast";
 import { SkeletonBubbles } from "@/components/Skeleton";
 import { EmojiPicker } from "@/components/EmojiPicker";
 import { Avatar } from "@/components/Avatar";
+import { Popover, PopoverItem, candidateKey } from "@/components/ui";
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
 import { applyStreamDelta, retireStream } from "@/lib/streams";
@@ -684,49 +685,35 @@ export function ChatView({
               if (e.dataTransfer.types.includes("Files")) e.preventDefault();
             }}
           >
+            {/* Composer autocomplete rides the shared Popover (R5) — backdrop
+                off so the textarea stays clickable; Escape / input-state dismiss. */}
             {slash && slashItems.length > 0 && (
-              <div
-                className="absolute bottom-full left-0 z-20 mb-2 w-80 overflow-hidden rounded-xl border p-1 shadow-xl"
-                style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
-              >
+              <Popover anchorRef={taRef} backdrop={false} minWidth={300} onDismiss={() => setSlash(null)}>
                 {slashItems.map((c, i) => (
-                  <button
+                  <PopoverItem
                     key={c.id}
-                    onMouseEnter={() => setSlashActive(i)}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      c.run();
-                    }}
-                    className="flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-left text-sm transition-colors"
-                    style={{ background: i === slashActive ? "var(--hive-mist)" : "transparent" }}
-                  >
-                    <span className="truncate">{c.label}</span>
-                    <span className="shrink-0 text-xs opacity-45">{c.hint}</span>
-                  </button>
+                    label={c.label}
+                    kind={c.hint}
+                    active={i === slashActive}
+                    onHover={() => setSlashActive(i)}
+                    onSelect={() => c.run()}
+                  />
                 ))}
-              </div>
+              </Popover>
             )}
             {mention && mentionMatches.length > 0 && (
-              <div
-                className="absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border p-1 shadow-xl"
-                style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
-              >
+              <Popover anchorRef={taRef} backdrop={false} minWidth={280} onDismiss={() => setMention(null)}>
                 {mentionMatches.map((c, i) => (
-                  <button
+                  <PopoverItem
                     key={c.handle}
-                    onMouseEnter={() => setMentionActive(i)}
-                    onMouseDown={(e) => {
-                      e.preventDefault();
-                      acceptMention(c.handle);
-                    }}
-                    className="flex w-full items-center justify-between gap-3 rounded-lg px-2.5 py-2 text-left text-sm transition-colors"
-                    style={{ background: i === mentionActive ? "var(--hive-mist)" : "transparent" }}
-                  >
-                    <span className="truncate font-medium">@{c.handle}</span>
-                    <span className="shrink-0 text-xs capitalize opacity-45">{c.kind}</span>
-                  </button>
+                    label={<span className="font-medium">@{c.handle}</span>}
+                    kind={c.kind}
+                    active={i === mentionActive}
+                    onHover={() => setMentionActive(i)}
+                    onSelect={() => acceptMention(c.handle)}
+                  />
                 ))}
-              </div>
+              </Popover>
             )}
             <textarea
               ref={taRef}
@@ -751,52 +738,40 @@ export function ChatView({
                 if (v.trim()) pingTyping();
                 else clearTyping();
               }}
-              onBlur={clearTyping}
+              onBlur={() => {
+                clearTyping();
+                // Close autocomplete when focus leaves the composer. Picking an
+                // item preventDefaults its mousedown, so it never blurs here.
+                setSlash(null);
+                setMention(null);
+              }}
               onKeyDown={(e) => {
-                if (slash && slashItems.length > 0) {
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setSlashActive((a) => Math.min(a + 1, slashItems.length - 1));
-                    return;
-                  }
-                  if (e.key === "ArrowUp") {
-                    e.preventDefault();
-                    setSlashActive((a) => Math.max(a - 1, 0));
-                    return;
-                  }
-                  if (e.key === "Enter" || e.key === "Tab") {
-                    e.preventDefault();
-                    slashItems[slashActive].run();
-                    return;
-                  }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    setSlash(null);
-                    return;
-                  }
-                }
-                if (mention && mentionMatches.length > 0) {
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setMentionActive((a) => Math.min(a + 1, mentionMatches.length - 1));
-                    return;
-                  }
-                  if (e.key === "ArrowUp") {
-                    e.preventDefault();
-                    setMentionActive((a) => Math.max(a - 1, 0));
-                    return;
-                  }
-                  if (e.key === "Enter" || e.key === "Tab") {
-                    e.preventDefault();
-                    acceptMention(mentionMatches[mentionActive].handle);
-                    return;
-                  }
-                  if (e.key === "Escape") {
-                    e.preventDefault();
-                    setMention(null);
-                    return;
-                  }
-                }
+                // One shared reducer (↑↓ move · ↩/⇥ accept · esc dismiss) for both
+                // composer menus (R5).
+                if (
+                  slash &&
+                  slashItems.length > 0 &&
+                  candidateKey(e, {
+                    count: slashItems.length,
+                    active: slashActive,
+                    setActive: setSlashActive,
+                    onAccept: (i) => slashItems[i].run(),
+                    onDismiss: () => setSlash(null),
+                  })
+                )
+                  return;
+                if (
+                  mention &&
+                  mentionMatches.length > 0 &&
+                  candidateKey(e, {
+                    count: mentionMatches.length,
+                    active: mentionActive,
+                    setActive: setMentionActive,
+                    onAccept: (i) => acceptMention(mentionMatches[i].handle),
+                    onDismiss: () => setMention(null),
+                  })
+                )
+                  return;
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
                   handleSend();

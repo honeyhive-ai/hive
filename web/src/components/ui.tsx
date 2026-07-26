@@ -643,12 +643,17 @@ export function Popover({
   onDismiss,
   minWidth = 240,
   align = "left",
+  backdrop = true,
   children,
 }: {
   anchorRef: RefObject<HTMLElement | null>;
   onDismiss: () => void;
   minWidth?: number;
   align?: "left" | "right";
+  /// A click-away backdrop (default). Discrete menus want it; an autocomplete
+  /// anchored to a live input sets it false so the input stays clickable and
+  /// relies on Escape / input-state to dismiss.
+  backdrop?: boolean;
   children: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -675,7 +680,7 @@ export function Popover({
 
   return (
     <>
-      <div className="fixed inset-0 z-[60]" onMouseDown={onDismiss} aria-hidden />
+      {backdrop && <div className="fixed inset-0 z-[60]" onMouseDown={onDismiss} aria-hidden />}
       <div
         ref={ref}
         role="menu"
