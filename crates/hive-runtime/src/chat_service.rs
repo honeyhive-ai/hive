@@ -15,7 +15,8 @@ use hive_core::{
     workspace_config_session_id, ActionProposal, ActorIdentity, ActorStamp, Channel, ChatMessage,
     ChatSession, MessageReaction, MessageRole, ProposalApproval, SessionEvent, SessionEventEnvelope,
     SigningKeypair, SkillProfile, Timestamp, VaultSource, WorkflowDefinition, WorkflowRun,
-    WorkspaceAgent, WorkspaceCredential, WorkspaceMember, WorkspaceRole, WorkspaceRuntime,
+    WorkspaceAgent, WorkspaceCredential, WorkspaceHost, WorkspaceMember, WorkspaceRole,
+    WorkspaceRuntime,
 };
 use uuid::Uuid;
 
@@ -731,6 +732,83 @@ impl ChatService {
         Ok(())
     }
 
+    // ── Hosts (spec §12.4) ─────────────────────────────────────────────────
+    // Devices + workers that execute agents' turns. Ride the config log.
+
+    /// This device's id — used as this machine's host id.
+    pub fn device_id(&self) -> Uuid {
+        self.device_id
+    }
+
+    /// The workspace's registered hosts.
+    pub fn list_hosts(&self, workspace_id: Uuid) -> Result<Vec<WorkspaceHost>> {
+        Ok(self
+            .load(workspace_config_session_id(workspace_id))?
+            .map(|s| s.workspace_hosts)
+            .unwrap_or_default())
+    }
+
+    /// Register (or replace by id) a host. The id is a machine's device id.
+    pub fn register_host(&mut self, workspace_id: Uuid, mut host: WorkspaceHost) -> Result<()> {
+        if host.owner_actor_id.is_empty() {
+            host.owner_actor_id = self.author.id.clone();
+        }
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let mut hosts = self
+            .load(config_id)?
+            .map(|s| s.workspace_hosts)
+            .unwrap_or_default();
+        if let Some(slot) = hosts.iter_mut().find(|h| h.id == host.id) {
+            *slot = host;
+        } else {
+            hosts.push(host);
+        }
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::WorkspaceHostsUpdated { hosts },
+        )?;
+        Ok(())
+    }
+
+    /// Remove a host by id.
+    pub fn remove_host(&mut self, workspace_id: Uuid, id: &str) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let hosts: Vec<WorkspaceHost> = self
+            .load(config_id)?
+            .map(|s| s.workspace_hosts)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|h| h.id != id)
+            .collect();
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::WorkspaceHostsUpdated { hosts },
+        )?;
+        Ok(())
+    }
+
+    /// Bind an agent to a host (empty = the owner's device). A worker host makes
+    /// the agent detached (spec §12.4).
+    pub fn set_agent_host(&mut self, workspace_id: Uuid, agent_id: Uuid, host_id: &str) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let mut agents = self
+            .load(config_id)?
+            .map(|s| s.workspace_agents)
+            .unwrap_or_default();
+        let Some(slot) = agents.iter_mut().find(|a| a.id == agent_id) else {
+            return Err(ChatError::NotFound("unknown agent".into()));
+        };
+        slot.host_id = host_id.to_string();
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::AgentRosterUpdated { agents },
+        )?;
+        Ok(())
+    }
+
     /// File a chat into a channel (per-chat, session-scoped). Empty id unfiles.
     pub fn set_chat_channel(
         &mut self,
@@ -1124,6 +1202,11 @@ impl ChatService {
                         session.workspace_runtimes.push(r);
                     }
                 }
+                for h in cfg.workspace_hosts {
+                    if !session.workspace_hosts.iter().any(|x| x.id == h.id) {
+                        session.workspace_hosts.push(h);
+                    }
+                }
             }
         }
         Ok(Some(session))
@@ -1182,6 +1265,34 @@ mod tests {
         // No account id → publish_identity is a no-op (local-only, unverifiable).
         let author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
         (ChatService::new(store, device_id, kp, account_kp, author), public)
+    }
+
+    #[test]
+    fn hosts_and_agent_binding_sync() {
+        use hive_core::{HostKind, WorkspaceHost};
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+        let agent = WorkspaceAgent::new("reviewer", "ws-claude");
+        let agent_id = agent.id;
+        svc.add_agent(chat.id, wid, agent).unwrap();
+
+        // Register this box as a worker host and bind the agent to it.
+        let host_id = svc.device_id().to_string();
+        svc.register_host(wid, WorkspaceHost::new(host_id.clone(), HostKind::Worker, "box-1")).unwrap();
+        svc.set_agent_host(wid, agent_id, &host_id).unwrap();
+
+        // Host + binding are visible from any chat (config hoist).
+        let hosts = svc.list_hosts(wid).unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].kind, HostKind::Worker);
+        let s = svc.load(chat.id).unwrap().unwrap();
+        let bound = s.workspace_agents.iter().find(|a| a.id == agent_id).unwrap();
+        assert_eq!(bound.host_id, host_id, "agent should be bound to the worker host");
+        assert!(s.workspace_hosts.iter().any(|h| h.id == host_id));
+
+        svc.remove_host(wid, &host_id).unwrap();
+        assert!(svc.list_hosts(wid).unwrap().is_empty());
     }
 
     #[test]
