@@ -18,7 +18,7 @@ use hive_core::{
     ActionProposal, ChatMessage, ChatSession, GitContextReader, MessageRole, ModelProviderKind,
     ProposalKind, ProposalStatus, RuntimeTarget, SkillProfile, WorkspaceAgent, WorkspaceRole,
 };
-use hive_core::{ActorIdentity, ActorKind, VaultSource, WorkspaceMember};
+use hive_core::{ActorIdentity, ActorKind, MountedVault, VaultSource, WorkspaceMember};
 use hive_proto::{
     ApprovalDto, AppInfo, AppSettingsDto, ChannelDto, ChatMessageDto, ChatSessionDto,
     ChatStreamEvent, ChatSummaryDto, ContextTelemetryDto, GitFileDiffDto, McpServerDto, ProposalDto,
@@ -2488,7 +2488,16 @@ fn skill_dto(s: &SkillProfile) -> SkillDto {
         name: s.name.clone(),
         instructions: s.instructions.clone(),
         source_url: s.source_url.clone(),
+        agent_ids: s.agent_ids.iter().map(|id| id.to_string()).collect(),
     }
+}
+
+/// Parse an optional list of agent-id strings into UUIDs. `None`/empty ⇒ global.
+fn parse_agent_ids(ids: Option<Vec<String>>) -> Result<Vec<Uuid>, String> {
+    ids.unwrap_or_default()
+        .iter()
+        .map(|id| Uuid::parse_str(id).map_err(map_err))
+        .collect()
 }
 
 #[tauri::command]
@@ -2508,9 +2517,11 @@ fn add_skill_inline(
     session_id: String,
     name: String,
     instructions: String,
+    agent_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let skill = SkillProfile::new(name, instructions);
+    let mut skill = SkillProfile::new(name, instructions);
+    skill.agent_ids = parse_agent_ids(agent_ids)?;
     let mut svc = state.service.lock().unwrap();
     svc.add_skill(id, state.active_workspace_id(), skill).map_err(map_err)
 }
@@ -2523,8 +2534,10 @@ async fn install_skill(
     session_id: String,
     name: String,
     source: String,
+    agent_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let targets = parse_agent_ids(agent_ids)?;
     let url = resolve_manifest_url(&source).map_err(map_err)?;
     let instructions = vault_fetcher::fetch_text(&url).await.map_err(map_err)?;
     let mut skill = SkillProfile::new(
@@ -2532,6 +2545,7 @@ async fn install_skill(
         instructions,
     );
     skill.source_url = Some(url);
+    skill.agent_ids = targets;
     let mut svc = state.service.lock().unwrap();
     svc.add_skill(id, state.active_workspace_id(), skill).map_err(map_err)
 }
@@ -2855,8 +2869,8 @@ async fn linear_issues_context(state: State<'_, AppState>) -> Result<String, Str
 // Commands — vaults (reference material sources)
 // ---------------------------------------------------------------------------
 
-fn vault_dto(v: &VaultSource) -> VaultSourceDto {
-    let kind = match v {
+fn vault_dto(v: &MountedVault) -> VaultSourceDto {
+    let kind = match v.source {
         VaultSource::GitHub { .. } => "github",
         VaultSource::GitLab { .. } => "gitlab",
         VaultSource::Https { .. } => "https",
@@ -2865,6 +2879,7 @@ fn vault_dto(v: &VaultSource) -> VaultSourceDto {
         kind: kind.to_string(),
         label: v.label(),
         url: v.raw_url(),
+        agent_ids: v.agent_ids.iter().map(|id| id.to_string()).collect(),
     }
 }
 
@@ -2921,11 +2936,16 @@ fn add_vault(
     session_id: String,
     kind: String,
     reference: String,
+    agent_ids: Option<Vec<String>>,
 ) -> Result<(), String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let source = parse_vault_source(&kind, reference.trim())?;
+    let vault = MountedVault {
+        source,
+        agent_ids: parse_agent_ids(agent_ids)?,
+    };
     let mut svc = state.service.lock().unwrap();
-    svc.add_vault_source(id, state.active_workspace_id(), source).map_err(map_err)
+    svc.add_vault_source(id, state.active_workspace_id(), vault).map_err(map_err)
 }
 
 #[tauri::command]
@@ -3116,6 +3136,9 @@ fn toggle_reaction(
 /// Who is about to respond, and how to execute their turn.
 struct Responder {
     system_base: String,
+    /// The responding agent's id, or `None` for the primary runtime. Drives
+    /// per-agent scoping of injected vaults (and, via the system prompt, skills).
+    agent_id: Option<Uuid>,
     author: String,
     runtime_id: String,
     runtime: ResolvedRuntime,
@@ -3182,6 +3205,7 @@ fn responder_for(state: &AppState, session: &ChatSession, agent: Option<&Workspa
     match agent {
         Some(a) => Responder {
             system_base: prompt::agent_system_prompt(session, a),
+            agent_id: Some(a.id),
             author: a.name.clone(),
             runtime_id: a.runtime_id.clone(),
             runtime: state.resolve_runtime(&a.runtime_id),
@@ -3189,6 +3213,7 @@ fn responder_for(state: &AppState, session: &ChatSession, agent: Option<&Workspa
         },
         None => Responder {
             system_base: prompt::primary_system_prompt(session),
+            agent_id: None,
             author: "Hive".to_string(),
             runtime_id: session.runtime_id.clone(),
             runtime: state.resolve_runtime(&session.runtime_id),
@@ -3383,7 +3408,7 @@ async fn windowed_context(
     // Reference vaults ride in the system prompt (capped; cached per app run).
     // Like the summary below, this is appended after the window plan — the
     // caps keep the skew small and the output/summary reserves absorb it.
-    let vault_section = vault_context_section(state, session).await;
+    let vault_section = vault_context_section(state, session, responder.agent_id).await;
 
     if plan.overflow.is_empty() {
         state.summary_cache.lock().unwrap().remove(&session_id);
@@ -3436,12 +3461,23 @@ const VAULT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 /// vault sources. Content is fetched once per app run (cached by raw URL);
 /// fetch failures degrade to a labeled "unavailable" line rather than
 /// blocking the reply.
-async fn vault_context_section(state: &State<'_, AppState>, session: &ChatSession) -> String {
-    if session.vault_sources.is_empty() {
+async fn vault_context_section(
+    state: &State<'_, AppState>,
+    session: &ChatSession,
+    responder: Option<Uuid>,
+) -> String {
+    // Filter to the vaults that apply to this responder (globals + any that
+    // target its agent id), then apply the source/char caps to the remainder.
+    let applicable: Vec<&MountedVault> = session
+        .vault_sources
+        .iter()
+        .filter(|v| v.applies_to(responder))
+        .collect();
+    if applicable.is_empty() {
         return String::new();
     }
     let mut entries: Vec<(String, Option<String>)> = Vec::new();
-    for source in session.vault_sources.iter().take(VAULT_MAX_SOURCES) {
+    for source in applicable.into_iter().take(VAULT_MAX_SOURCES) {
         let url = source.raw_url();
         let cached = state.vault_cache.lock().unwrap().get(&url).cloned();
         let content = match cached {

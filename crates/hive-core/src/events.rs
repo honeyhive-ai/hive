@@ -26,7 +26,7 @@ use crate::proposals::{ActionProposal, ProposalApproval};
 use crate::session::ChatSession;
 use crate::skills::SkillProfile;
 use crate::time_util::Timestamp;
-use crate::vault::VaultSource;
+use crate::vault::MountedVault;
 use crate::workflow::{WorkflowDefinition, WorkflowRun};
 
 /// Which log a signed event belongs to. Workspace-scoped events fold into the
@@ -95,7 +95,7 @@ pub enum SessionEvent {
         approval: ProposalApproval,
     },
     /// Replace the session's vault source set.
-    VaultSourcesUpdated { sources: Vec<VaultSource> },
+    VaultSourcesUpdated { sources: Vec<MountedVault> },
     /// Replace the session's workflow definition set.
     WorkflowDefinitionsUpdated { definitions: Vec<WorkflowDefinition> },
     /// Create or update a workflow run (upsert by id) — full snapshot.

@@ -5,6 +5,7 @@
 //! they can reach them with `@mentions`.
 
 use hive_core::{ChatSession, WorkspaceAgent};
+use uuid::Uuid;
 
 /// A human-readable roster of everyone in the workspace and how to address them.
 pub fn workspace_roster(session: &ChatSession) -> String {
@@ -36,21 +37,29 @@ pub fn workspace_roster(session: &ChatSession) -> String {
     lines.join("\n")
 }
 
-/// Instruction block for the skills loaded into the session, or empty.
-pub fn skills_section(session: &ChatSession) -> String {
-    if session.loaded_skills.is_empty() {
+/// Instruction block for the skills that apply to a given responder, or empty.
+///
+/// `responder` is `None` for the primary runtime (only global skills apply) or
+/// `Some(agent_id)` for a specific agent (global skills plus any that target it).
+pub fn skills_section(session: &ChatSession, responder: Option<Uuid>) -> String {
+    let applicable: Vec<_> = session
+        .loaded_skills
+        .iter()
+        .filter(|s| s.applies_to(responder))
+        .collect();
+    if applicable.is_empty() {
         return String::new();
     }
     let mut lines = vec!["Loaded skills (follow these):".to_string()];
-    for skill in &session.loaded_skills {
+    for skill in applicable {
         lines.push(format!("## {}\n{}", skill.name, skill.instructions));
     }
     lines.join("\n\n")
 }
 
-/// Append the skills section to a base prompt when any are loaded.
-fn with_skills(base: String, session: &ChatSession) -> String {
-    let skills = skills_section(session);
+/// Append the skills section to a base prompt when any apply to the responder.
+fn with_skills(base: String, session: &ChatSession, responder: Option<Uuid>) -> String {
+    let skills = skills_section(session, responder);
     if skills.is_empty() {
         base
     } else {
@@ -84,7 +93,7 @@ coordinate the conversation and may take actions or answer directly.\n\n{roster}
         guide = mention_guidance(),
         wf = workflow_guidance(),
     );
-    with_skills(base, session)
+    with_skills(base, session, None)
 }
 
 /// System prompt for a specific agent: its identity + the shared roster.
@@ -105,7 +114,7 @@ other agents.\n\n{roster}\n\n{guide}\n\n{wf}",
         guide = mention_guidance(),
         wf = workflow_guidance(),
     );
-    with_skills(base, session)
+    with_skills(base, session, Some(agent.id))
 }
 
 #[cfg(test)]
@@ -161,7 +170,7 @@ mod tests {
     #[test]
     fn loaded_skills_are_injected_into_prompts() {
         let mut s = session();
-        assert_eq!(skills_section(&s), "");
+        assert_eq!(skills_section(&s, None), "");
         s.loaded_skills.push(hive_core::SkillProfile::new(
             "Concise",
             "Always answer in under 100 words.",
@@ -170,5 +179,34 @@ mod tests {
         assert!(p.contains("Loaded skills"));
         assert!(p.contains("Concise"));
         assert!(p.contains("under 100 words"));
+    }
+
+    #[test]
+    fn global_skill_injects_into_primary_and_every_agent() {
+        let mut s = session();
+        s.loaded_skills
+            .push(hive_core::SkillProfile::new("Global", "applies everywhere"));
+        let agent = s.workspace_agents[0].clone();
+        assert!(primary_system_prompt(&s).contains("Global"));
+        assert!(agent_system_prompt(&s, &agent).contains("Global"));
+    }
+
+    #[test]
+    fn agent_targeted_skill_injects_only_into_that_agent() {
+        let mut s = session();
+        // Two agents: Scout (already present) and a second one.
+        let mut other = WorkspaceAgent::new("Nova", "r1");
+        other.role = "writer".into();
+        s.workspace_agents.push(other);
+        let scout = s.workspace_agents[0].clone();
+        let nova = s.workspace_agents[1].clone();
+
+        let mut skill = hive_core::SkillProfile::new("ScoutOnly", "only Scout sees this");
+        skill.agent_ids = vec![scout.id];
+        s.loaded_skills.push(skill);
+
+        assert!(agent_system_prompt(&s, &scout).contains("ScoutOnly"));
+        assert!(!agent_system_prompt(&s, &nova).contains("ScoutOnly"));
+        assert!(!primary_system_prompt(&s).contains("ScoutOnly"));
     }
 }

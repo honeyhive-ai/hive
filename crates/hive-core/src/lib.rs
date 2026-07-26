@@ -56,7 +56,7 @@ pub use schedule::ScheduleTrigger;
 pub use session::ChatSession;
 pub use skills::SkillProfile;
 pub use time_util::Timestamp;
-pub use vault::VaultSource;
+pub use vault::{MountedVault, VaultSource};
 pub use workflow::{
     GateRejectPolicy, NodeRunState, NodeRunStatus, WorkflowDefinition, WorkflowNode,
     WorkflowNodeKind, WorkflowRun, WorkflowRunStatus,

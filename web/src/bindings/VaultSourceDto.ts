@@ -7,4 +7,8 @@ export type VaultSourceDto = {
 /**
  * "github" | "gitlab" | "https"
  */
-kind: string, label: string, url: string, };
+kind: string, label: string, url: string, 
+/**
+ * Agent ids this vault targets. Empty ⇒ global (primary + all agents).
+ */
+agentIds: Array<string>, };

@@ -3,4 +3,8 @@
 /**
  * A loaded skill (instruction bundle injected into prompts).
  */
-export type SkillDto = { id: string, name: string, instructions: string, sourceUrl: string | null, };
+export type SkillDto = { id: string, name: string, instructions: string, sourceUrl: string | null, 
+/**
+ * Agent ids this skill targets. Empty ⇒ global (primary + all agents).
+ */
+agentIds: Array<string>, };
