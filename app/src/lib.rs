@@ -97,6 +97,25 @@ struct AppState {
     gate_runs: Mutex<HashMap<Uuid, Uuid>>,
     /// Runs asked to cancel; their drivers check between transitions.
     canceled_runs: Mutex<std::collections::HashSet<Uuid>>,
+    /// Live relay connection health, updated by the background sync loop's
+    /// error/success arms so the UI can distinguish "Live" from a dead relay /
+    /// expired token / wrong key instead of showing "Live" forever.
+    conn_health: Mutex<ConnHealth>,
+}
+
+/// Coarse connection health for the active relay, surfaced via `sync_status`.
+/// `state` is `"live"` (last sync ok), `"error"` (last sync failed — see
+/// `last_error`), or `"offline"` (no relay configured).
+#[derive(Clone, serde::Serialize)]
+struct ConnHealth {
+    state: String,
+    last_error: Option<String>,
+}
+
+impl Default for ConnHealth {
+    fn default() -> Self {
+        Self { state: "offline".to_string(), last_error: None }
+    }
 }
 
 /// Editable-at-runtime settings, persisted to `<data_dir>/settings.json`.
@@ -4049,7 +4068,10 @@ async fn send_message(
         let session = svc.load(sid).map_err(map_err)?.ok_or("unknown session")?;
         let workspace_id = session.workspace_id;
         svc.post_user_message(sid, workspace_id, &body).map_err(map_err)?;
-        let session = svc.load(sid).map_err(map_err)?.unwrap();
+        // The session can be deleted mid-turn (normal use). Bail gracefully —
+        // never `.unwrap()` under the `service` lock, or a None poisons the
+        // global mutex and bricks every future `service.lock()` this process.
+        let Some(session) = svc.load(sid).map_err(map_err)? else { return Ok(()) };
         (workspace_id, dispatch_target(&body, &session))
     };
 
@@ -4090,7 +4112,10 @@ async fn send_message(
         // Notify humans if the reply pings them.
         let reloaded = {
             let svc = state.service.lock().unwrap();
-            svc.load(sid).map_err(map_err)?.unwrap()
+            // Session deleted mid-stream: bail without `.unwrap()`, which would
+            // poison the `service` mutex while held and brick the whole app.
+            let Some(reloaded) = svc.load(sid).map_err(map_err)? else { return Ok(()) };
+            reloaded
         };
         let reply_mentions = parse_mentions(&reply, &reloaded);
         if reply_mentions.human_broadcast || !reply_mentions.humans.is_empty() {
@@ -4212,15 +4237,16 @@ async fn maybe_respond(
         return Ok(());
     };
 
-    // Guard against double-dispatch (two near-simultaneous sync ticks).
-    {
-        let mut inflight = state.responding.lock().unwrap();
-        if !inflight.insert(sid) {
-            return Ok(());
-        }
-    }
+    // Guard against double-dispatch (two near-simultaneous sync ticks). The RAII
+    // guard frees the `responding` slot on drop — on the Ok path *and* if
+    // `run_turn` panics — so a crashed turn can't wedge the chat as permanently
+    // "already responding" until restart. Acquire failing means another dispatch
+    // already owns the slot; that's the benign double-dispatch case → no-op.
+    let _guard = match crate::workflows::SessionBusyGuard::acquire(&app, sid) {
+        Ok(g) => g,
+        Err(_) => return Ok(()),
+    };
     let result = run_turn(&app, &state, sid, workspace_id, &responder).await;
-    state.responding.lock().unwrap().remove(&sid);
     result.map(|_| ())
 }
 
@@ -5320,6 +5346,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         run_wakers: Mutex::new(HashMap::new()),
         gate_runs: Mutex::new(HashMap::new()),
         canceled_runs: Mutex::new(std::collections::HashSet::new()),
+        conn_health: Mutex::new(ConnHealth::default()),
     })
 }
 
@@ -5602,6 +5629,9 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                             if last_sync_err.take().is_some() {
                                 eprintln!("sync: recovered");
                             }
+                            // Record health so the UI can trust "Live".
+                            *app.state::<AppState>().conn_health.lock().unwrap() =
+                                ConnHealth { state: "live".to_string(), last_error: None };
                             if pulled > 0 {
                                 let _ = app.emit("workspace://synced", pulled);
                                 // Wake every live workflow driver so a stage
@@ -5628,14 +5658,25 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                             };
                             if last_sync_err.as_deref() != Some(msg.as_str()) {
                                 eprintln!("{msg}");
-                                last_sync_err = Some(msg);
+                                last_sync_err = Some(msg.clone());
                             }
+                            // Surface the actionable error to the backend health
+                            // state and emit an event the frontend can subscribe to
+                            // (mirrors `workspace://synced` on the success path).
+                            *app.state::<AppState>().conn_health.lock().unwrap() = ConnHealth {
+                                state: "error".to_string(),
+                                last_error: Some(msg.clone()),
+                            };
+                            let _ = app.emit("workspace://sync-error", msg);
                         }
                     }
                 }
             }
             // No relay configured: idle (local-only) until the UI sets one.
-            _ => engine = None,
+            _ => {
+                engine = None;
+                *app.state::<AppState>().conn_health.lock().unwrap() = ConnHealth::default();
+            }
         }
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
@@ -5648,16 +5689,23 @@ struct SyncStatus {
     relay_url: String,
     room: String,
     encrypted: bool,
+    /// Coarse connection health from the sync loop: "live" | "error" | "offline".
+    connection_state: String,
+    /// Last actionable sync error (unauthorized, unreachable, decrypt), if any.
+    last_error: Option<String>,
 }
 
 #[tauri::command]
 fn sync_status(state: State<AppState>) -> SyncStatus {
+    let health = state.conn_health.lock().unwrap().clone();
     let s = state.settings.lock().unwrap();
     SyncStatus {
         relay_configured: s.relay_url.as_ref().map(|u| !u.is_empty()).unwrap_or(false),
         relay_url: s.relay_url.clone().unwrap_or_default(),
         room: s.sync_room.clone(),
         encrypted: s.workspace_key().is_some(),
+        connection_state: health.state,
+        last_error: health.last_error,
     }
 }
 
@@ -5794,6 +5842,18 @@ fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<
         save_settings(&state.data_dir, &s);
         drop(s);
         *state.active_workspace.lock().unwrap() = id;
+        // Announce self into the workspace-wide roster the moment the workspace is
+        // active — not lazily on first chat-open — so a fresh joiner converges into
+        // the owner's People pane immediately. Routes to the config log and is
+        // idempotent; a failure here must never block activation, so just log it.
+        {
+            let mut svc = state.service.lock().unwrap();
+            if let Err(e) =
+                svc.ensure_self_member(hive_core::workspace_config_session_id(id), id)
+            {
+                eprintln!("workspace: ensure_self_member on activate failed: {e}");
+            }
+        }
     } else {
         drop(s);
         *state.active_workspace.lock().unwrap() = state.local_workspace_id;
