@@ -251,13 +251,21 @@ function ToolsPane({
   });
 
   const selectRuntime = async (id: string) => {
-    await setChatRuntime(sessionId, id);
-    qc.invalidateQueries({ queryKey: ["chat", sessionId] });
-    qc.invalidateQueries({ queryKey: ["chats"] });
+    try {
+      await setChatRuntime(sessionId, id);
+      qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
+    } catch (e) {
+      toast.error(`Couldn't switch runtime: ${errMsg(e)}`);
+    }
   };
   const toggleMcp = async (server: McpServerDto, enabled: boolean) => {
-    await setMcpEnabled(server.id, enabled);
-    qc.invalidateQueries({ queryKey: ["mcp"] });
+    try {
+      await setMcpEnabled(server.id, enabled);
+      qc.invalidateQueries({ queryKey: ["mcp"] });
+    } catch (e) {
+      toast.error(`Couldn't ${enabled ? "enable" : "disable"} ${server.id}: ${errMsg(e)}`);
+    }
   };
 
   const runtimeList = runtimes.data ?? [];
@@ -933,8 +941,12 @@ function ReviewPane({ sessionId }: { sessionId: string }) {
                   color: "var(--hive-success)",
                 }}
                 onClick={async () => {
-                  await voteProposal(sessionId, proposal.id, true);
-                  qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+                  try {
+                    await voteProposal(sessionId, proposal.id, true);
+                    qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+                  } catch (e) {
+                    toast.error(`Couldn't approve: ${errMsg(e)}`);
+                  }
                 }}
               >
                 Approve
@@ -946,8 +958,12 @@ function ReviewPane({ sessionId }: { sessionId: string }) {
                   color: "var(--hive-danger)",
                 }}
                 onClick={async () => {
-                  await voteProposal(sessionId, proposal.id, false);
-                  qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+                  try {
+                    await voteProposal(sessionId, proposal.id, false);
+                    qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+                  } catch (e) {
+                    toast.error(`Couldn't reject: ${errMsg(e)}`);
+                  }
                 }}
               >
                 Reject
@@ -1666,7 +1682,7 @@ function ContextPane({
   const data = telemetry.data;
   const totalPlannedTokens = (data?.systemPromptTokens ?? 0) + (data?.keptTokens ?? 0);
   const budgetPct = data
-    ? Math.min(100, Math.round((totalPlannedTokens / data.contextWindowTokens) * 100))
+    ? Math.min(100, Math.round((totalPlannedTokens / Math.max(1, data.contextWindowTokens)) * 100))
     : 0;
   const budgetColor =
     budgetPct >= 90

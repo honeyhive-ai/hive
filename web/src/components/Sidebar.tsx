@@ -31,6 +31,7 @@ import {
   ChatRow,
   SectionCap,
   EmptyHint,
+  ErrorState,
   Popover,
   PopoverHeader,
   PopoverItem,
@@ -504,9 +505,21 @@ export function Sidebar({
         <div className="mt-2">
           {(chats.isLoading || channels.isLoading) && <SkeletonRows rows={5} />}
 
+          {/* A failed read must not render as "No chats yet." (which reads as
+              data loss) — surface an error with a retry instead. */}
+          {!chats.isLoading && !channels.isLoading && (chats.isError || channels.isError) && (
+            <ErrorState
+              text="Couldn't load chats."
+              onRetry={() => {
+                void chats.refetch();
+                void channels.refetch();
+              }}
+            />
+          )}
+
           {/* 4a — Flat, cross-channel list (a View is active, searching, or the
               workspace has no channels yet). Preserves the original behavior. */}
-          {!chats.isLoading && !channels.isLoading && (flatMode || !hasChannels) && (
+          {!chats.isLoading && !channels.isLoading && !chats.isError && !channels.isError && (flatMode || !hasChannels) && (
             <>
               <SectionCap
                 action={
@@ -575,7 +588,7 @@ export function Sidebar({
           )}
 
           {/* 4b — The channel tree. */}
-          {!chats.isLoading && !channels.isLoading && !flatMode && hasChannels && (
+          {!chats.isLoading && !channels.isLoading && !chats.isError && !channels.isError && !flatMode && hasChannels && (
             <>
               <SectionCap
                 action={

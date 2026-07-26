@@ -564,6 +564,31 @@ export function EmptyHint({ text, action }: { text: string; action?: ReactNode }
   );
 }
 
+/// A failed-read card: a danger-toned message plus an optional Retry that
+/// re-runs the query's `refetch`. Distinct from `EmptyHint` so a failed load
+/// never masquerades as an empty/starter state (which reads as data loss).
+export function ErrorState({ text, onRetry }: { text: string; onRetry?: () => void }) {
+  return (
+    <div
+      className="rounded-xl border px-3 py-4 text-center text-xs"
+      style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)", color: "var(--hive-ink)" }}
+    >
+      <div style={{ color: "var(--hive-danger)" }}>{text}</div>
+      {onRetry && (
+        <div className="mt-2">
+          <button
+            onClick={onRetry}
+            className="rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors hover:border-[color:var(--hive-accent-cool)]"
+            style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)", color: "var(--hive-ink)" }}
+          >
+            Retry
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /// R6 — "lists lead, forms follow". A `+ Add …` row that discloses its form
 /// inline instead of a permanently-expanded form above the list.
 export function FormDisclosure({
