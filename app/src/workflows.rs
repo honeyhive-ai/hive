@@ -11,10 +11,13 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hive_core::workflow::{self as wf, NodeRunStatus, WorkflowNodeKind, WorkflowRunStatus};
-use hive_core::{ActionProposal, ChatSession, ProposalKind, ProposalStatus, Timestamp};
+use hive_core::{
+    ActionProposal, ChatMessage, ChatSession, MessageRole, ProposalKind, ProposalStatus, Timestamp,
+    WorkspaceAgent,
+};
 use hive_proto::{
     WorkflowDefinitionDto, WorkflowNodeDto, WorkflowNodeRunDto, WorkflowRunDto, WorkflowRunEvent,
 };
@@ -25,13 +28,31 @@ use uuid::Uuid;
 
 use crate::{
     map_err, owns_responder, responder_for, rfc3339, run_prepared_turn, windowed_context,
-    AppState, Responder,
+    AppState, Responder, TurnOutcome,
 };
 
 /// How long a gate suspension sleeps between proposal re-checks. Local votes
 /// wake the driver instantly via `Notify`; this poll is the safety net for
 /// votes that arrive from other devices through the sync loop.
 const GATE_POLL: Duration = Duration::from_secs(5);
+
+/// How long a remote-stage suspension sleeps between transcript re-checks. Like
+/// `GATE_POLL` this is only the safety net: the sync loop pokes this run's waker
+/// whenever it ingests new events, so a synced reply is normally picked up
+/// within sync latency rather than on this poll.
+const REMOTE_POLL: Duration = Duration::from_secs(5);
+
+/// Bounded wait for a remote-owned stage's reply to sync back before the node is
+/// failed. Cross-device dispatch has no delivery guarantee (the owner's device /
+/// worker may be offline), so the wait is capped instead of hanging the run
+/// forever. Generous enough to cover an LLM turn plus a few sync round-trips.
+const REMOTE_STAGE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Sentinel error a remote-stage wait returns when the run is being canceled, so
+/// the driver reverts the node to `Pending` and lets the top-of-loop cancel
+/// handler skip it cleanly instead of recording a genuine failure. The NUL
+/// prefix keeps it distinct from any real provider/error string.
+const CANCELED_WHILE_WAITING: &str = "\u{0}workflow-canceled";
 
 /// Truncation for the run card's per-node output preview.
 const EXCERPT_CHARS: usize = 400;
@@ -285,20 +306,39 @@ async fn drive_run_inner(
             }
         }
 
+        // Local stages stream here; remote-owned stages were dispatched by
+        // `prepare_stage` (their prompt @mentions the agent) and only need us to
+        // wait for the owner's device / worker to sync the reply back. Both
+        // resolve to a `TurnOutcome`, so they fold into node state identically.
         let turns = prepared.into_iter().map(|(node_id, p)| {
             let state = &state;
             async move {
-                let result = run_prepared_turn(
-                    app,
-                    state,
-                    session_id,
-                    workspace_id,
-                    &p.responder,
-                    &p.session,
-                    p.system,
-                    p.turns,
-                )
-                .await;
+                let result = match p {
+                    PreparedStage::Local { responder, session, system, turns } => {
+                        run_prepared_turn(
+                            app,
+                            state,
+                            session_id,
+                            workspace_id,
+                            &responder,
+                            &session,
+                            system,
+                            turns,
+                        )
+                        .await
+                    }
+                    PreparedStage::Remote { agent_author, prompt_message_id } => {
+                        await_remote_stage(
+                            state,
+                            session_id,
+                            run_id,
+                            waker,
+                            prompt_message_id,
+                            &agent_author,
+                        )
+                        .await
+                    }
+                };
                 (node_id, result)
             }
         });
@@ -310,6 +350,15 @@ async fn drive_run_inner(
                     s.message_id = Some(outcome.message_id);
                     s.output_excerpt = outcome.body.chars().take(EXCERPT_CHARS).collect();
                 }
+                // A remote wait aborted by cancellation: revert to Pending so the
+                // top-of-loop cancel handler skips it like every other unfinished
+                // node, rather than leaving a spurious Failed in a Canceled run.
+                Err(e) if e == CANCELED_WHILE_WAITING => {
+                    s.status = NodeRunStatus::Pending;
+                    s.message_id = None;
+                    s.output_excerpt = String::new();
+                    s.error = String::new();
+                }
                 Err(e) => {
                     s.status = NodeRunStatus::Failed;
                     s.error = e;
@@ -320,11 +369,24 @@ async fn drive_run_inner(
     }
 }
 
-struct PreparedStage {
-    responder: Responder,
-    session: ChatSession,
-    system: String,
-    turns: Vec<ChatTurn>,
+/// A stage prepared for execution. A stage whose responder this device owns runs
+/// its turn locally (`Local`, streamed by `run_prepared_turn`); one owned by
+/// another member was already dispatched by posting a prompt that @mentions its
+/// agent, and the driver only waits for the synced reply (`Remote`).
+enum PreparedStage {
+    Local {
+        responder: Responder,
+        session: ChatSession,
+        system: String,
+        turns: Vec<ChatTurn>,
+    },
+    Remote {
+        /// Display name the owner's device / worker authors the reply under —
+        /// the key the reply is matched by (mirrors `pending_mentions`).
+        agent_author: String,
+        /// The stage's posted prompt; the reply must appear *after* it.
+        prompt_message_id: Uuid,
+    },
 }
 
 async fn prepare_stage(
@@ -341,13 +403,40 @@ async fn prepare_stage(
     };
 
     // Render against the transcript as it stands (all dependency outputs are
-    // in by now — deps gate readiness).
+    // in by now — deps gate readiness). Posting a user message never changes
+    // the roster, so resolve the responder from this pre-post snapshot to
+    // classify the stage before deciding how to post its prompt.
     let before = {
         let svc = state.service.lock().unwrap();
         svc.load(session_id).map_err(map_err)?.ok_or("unknown session")?
     };
     let outputs = collect_outputs(run, &before);
     let rendered = wf::render_template(prompt_template, &run.input, &outputs);
+    let agent = resolve_stage_agent(&before, agent_id, &node.name)?;
+    let responder = responder_for(state, &before, agent.as_ref());
+    let local_actor_id = state.local_actor_id();
+
+    // Remote-owned stage: dispatch it over the existing cross-device path by
+    // posting a prompt that @mentions its agent, then wait for the reply.
+    if !owns_responder(&local_actor_id, &responder) {
+        let prompt = format!(
+            "{} **[Workflow · {} → {}]**\n\n{rendered}",
+            stage_mention_token(agent.as_ref()),
+            run.definition.name,
+            node.name
+        );
+        let posted = {
+            let mut svc = state.service.lock().unwrap();
+            svc.post_user_message(session_id, workspace_id, &prompt).map_err(map_err)?
+        };
+        return Ok(PreparedStage::Remote {
+            agent_author: responder.author.clone(),
+            prompt_message_id: posted.id,
+        });
+    }
+
+    // Local stage: unchanged from single-device runs — post the plain prompt,
+    // reload so context includes it, and snapshot the windowed context.
     let prompt = format!(
         "**[Workflow · {} → {}]**\n\n{rendered}",
         run.definition.name, node.name
@@ -356,12 +445,24 @@ async fn prepare_stage(
         let mut svc = state.service.lock().unwrap();
         svc.post_user_message(session_id, workspace_id, &prompt).map_err(map_err)?;
     }
-
     let session = {
         let svc = state.service.lock().unwrap();
         svc.load(session_id).map_err(map_err)?.ok_or("unknown session")?
     };
-    let agent = match agent_id {
+    let agent = resolve_stage_agent(&session, agent_id, &node.name)?;
+    let responder = responder_for(state, &session, agent.as_ref());
+    let (system, turns) = windowed_context(state, session_id, &session, &responder).await;
+    Ok(PreparedStage::Local { responder, session, system, turns })
+}
+
+/// Resolve a stage's agent from the roster (`None` ⇒ the session's primary
+/// runtime). Errors if a named agent has since left the roster.
+fn resolve_stage_agent(
+    session: &ChatSession,
+    agent_id: &Option<Uuid>,
+    node_name: &str,
+) -> Result<Option<WorkspaceAgent>, String> {
+    match agent_id {
         Some(id) => Some(
             session
                 .workspace_agents
@@ -369,14 +470,107 @@ async fn prepare_stage(
                 .find(|a| a.id == *id)
                 .cloned()
                 .ok_or_else(|| {
-                    format!("stage '{}': its agent is no longer in the roster", node.name)
-                })?,
-        ),
-        None => None,
-    };
-    let responder = responder_for(state, &session, agent.as_ref());
-    let (system, turns) = windowed_context(state, session_id, &session, &responder).await;
-    Ok(PreparedStage { responder, session, system, turns })
+                    format!("stage '{node_name}': its agent is no longer in the roster")
+                }),
+        )
+        .transpose(),
+        None => Ok(None),
+    }
+}
+
+/// The `@mention` that routes a remote stage's prompt to its responder through
+/// the existing dispatch: `@primary` for the session runtime, else the agent's
+/// display name. Kept in step with `parse_mentions`, which the owner's device /
+/// worker uses to decide the mention is theirs to answer.
+fn stage_mention_token(agent: Option<&WorkspaceAgent>) -> String {
+    match agent {
+        Some(a) => format!("@{}", a.name),
+        None => "@primary".to_string(),
+    }
+}
+
+/// Whether a stage's responder runs on *this* device (unowned/legacy or owned by
+/// us) or must be dispatched to its owner. Single source of truth for the
+/// local-vs-remote split — `owns_responder` in `lib.rs` delegates here so the
+/// two can't drift, and this pure form is unit-testable without a `Responder`.
+pub(crate) fn stage_owner_runs_here(local_actor_id: &str, owner_actor_id: &str) -> bool {
+    owner_actor_id.is_empty() || owner_actor_id == local_actor_id
+}
+
+/// Suspend the driver until a remote-owned stage's reply syncs back, then return
+/// it as this stage's output. Matches the first assistant/agent message authored
+/// by `agent_author` that appears after the stage's prompt (`prompt_message_id`)
+/// — the same author-name correlation `pending_mentions` uses. Bounded by
+/// `REMOTE_STAGE_TIMEOUT`; honors Cancel promptly via the run waker.
+///
+/// Deferred (documented limitations of correlating by author-name over the
+/// existing dispatch, which carries no per-request id):
+///   1. Multiple remote stages ready *simultaneously* are reliably serviced only
+///      by a `hive worker` (it drains the whole mention backlog). A desktop peer
+///      answering via `maybe_respond` only sees the trailing message, so the
+///      earlier siblings wait until a worker picks them up (or time out).
+///   2. Two concurrently-ready remote stages bound to the *same* agent aren't
+///      disambiguated — the worker's per-agent latest-mention dedup collapses
+///      them, so both would match the one reply. A sequential DAG (the common
+///      shape, and every single-remote-stage ready-set) is unaffected.
+async fn await_remote_stage(
+    state: &State<'_, AppState>,
+    session_id: Uuid,
+    run_id: Uuid,
+    waker: &Notify,
+    prompt_message_id: Uuid,
+    agent_author: &str,
+) -> Result<TurnOutcome, String> {
+    let deadline = Instant::now() + REMOTE_STAGE_TIMEOUT;
+    loop {
+        // Observe (don't consume) cancellation — the top-of-loop handler still
+        // needs to see it to settle the run.
+        if state.canceled_runs.lock().unwrap().contains(&run_id) {
+            return Err(CANCELED_WHILE_WAITING.to_string());
+        }
+        let messages = {
+            let svc = state.service.lock().unwrap();
+            svc.load(session_id).map_err(map_err)?.ok_or("unknown session")?.messages
+        };
+        if let Some((message_id, body)) =
+            match_stage_reply(&messages, prompt_message_id, agent_author)
+        {
+            return Ok(TurnOutcome { message_id, body });
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "no reply from {} synced back within {}s — is its owner's device or a \
+                 worker online for this agent?",
+                agent_author,
+                REMOTE_STAGE_TIMEOUT.as_secs()
+            ));
+        }
+        tokio::select! {
+            _ = waker.notified() => {}
+            _ = tokio::time::sleep(REMOTE_POLL) => {}
+        }
+    }
+}
+
+/// A remote stage's output: the first finished assistant/agent message authored
+/// by `agent_author` appearing *after* the stage's prompt (`after_id`). Mirrors
+/// the author-name match `pending_mentions` uses to call a mention "answered",
+/// so a reply the owner's device / worker synced back is picked up identically.
+fn match_stage_reply(
+    messages: &[ChatMessage],
+    after_id: Uuid,
+    agent_author: &str,
+) -> Option<(Uuid, String)> {
+    let start = messages.iter().position(|m| m.id == after_id)?;
+    messages[start + 1..]
+        .iter()
+        .find(|m| {
+            matches!(m.role, MessageRole::Assistant | MessageRole::Agent)
+                && m.author == agent_author
+                && !m.is_streaming
+                && !m.body.is_empty()
+        })
+        .map(|m| (m.id, m.body.clone()))
 }
 
 fn load_run(
@@ -944,7 +1138,7 @@ pub(crate) fn start_workflow_run(
         (def, session)
     };
     wf::validate(&def)?;
-    ensure_stages_run_locally(&state, &session, &def)?;
+    ensure_stages_runnable(&session, &def)?;
 
     let run = wf::new_run(&def, input, state.local_actor_id());
     let run_id = run.id;
@@ -1015,7 +1209,7 @@ pub(crate) fn resume_workflow_run(
     if !matches!(run.status, WorkflowRunStatus::Running | WorkflowRunStatus::AwaitingGate) {
         return Err("only an interrupted run can be resumed".into());
     }
-    ensure_stages_run_locally(&state, &session, &run.definition)?;
+    ensure_stages_runnable(&session, &run.definition)?;
 
     // Stages that were mid-turn when the driver died restart from scratch;
     // succeeded stages keep their outputs (re-read from the transcript).
@@ -1033,35 +1227,29 @@ pub(crate) fn resume_workflow_run(
     Ok(())
 }
 
-/// v1 constraint: the starting device must own every stage's responder —
-/// runs execute wholly on the device that starts them.
-fn ensure_stages_run_locally(
-    state: &State<AppState>,
+/// Pre-flight check run at start/resume. A run may now span devices: a stage
+/// owned by another member is dispatched over the cross-device path (its prompt
+/// @mentions the agent, and the owner's device / worker answers) rather than
+/// rejected. The only genuinely-unrunnable case guarded here is a *named* agent
+/// that isn't in the roster at all — no device could service it, so fail fast
+/// with a clear error instead of dispatching into the void and timing out.
+///
+/// Note: we can't prove from this device that a remote agent actually has a live
+/// owner/worker; if none answers, the stage fails cleanly on
+/// `REMOTE_STAGE_TIMEOUT` (per-stage), which is the intended fallback.
+fn ensure_stages_runnable(
     session: &ChatSession,
     def: &wf::WorkflowDefinition,
 ) -> Result<(), String> {
-    let local = state.local_actor_id();
     for node in &def.nodes {
         let WorkflowNodeKind::Agent { agent_id, .. } = &node.kind else { continue };
-        let agent = match agent_id {
-            Some(id) => Some(
-                session
-                    .workspace_agents
-                    .iter()
-                    .find(|a| a.id == *id)
-                    .ok_or_else(|| {
-                        format!("stage '{}': its agent is not in this chat's roster", node.name)
-                    })?,
-            ),
-            None => None,
-        };
-        let responder = responder_for(state, session, agent);
-        if !owns_responder(&local, &responder) {
-            return Err(format!(
-                "stage '{}' uses an agent owned by another member; workflows currently run \
-                 entirely on the device that starts them",
-                node.name
-            ));
+        if let Some(id) = agent_id {
+            if !session.workspace_agents.iter().any(|a| a.id == *id) {
+                return Err(format!(
+                    "stage '{}': its agent is not in this chat's roster",
+                    node.name
+                ));
+            }
         }
     }
     Ok(())
@@ -1190,5 +1378,105 @@ mod recovery_tests {
         // Second pass after the driver registered → nothing left to recover.
         let live: HashSet<Uuid> = [running].into_iter().collect();
         assert!(runs_needing_recovery(runs, &live).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod cross_device_tests {
+    use super::*;
+
+    fn msg(role: MessageRole, author: &str, body: &str) -> ChatMessage {
+        ChatMessage::new(role, author, body)
+    }
+
+    // --- local-vs-remote classification (mirrors owns_responder) -------------
+
+    #[test]
+    fn unowned_and_self_owned_stages_run_here() {
+        let me = "device-A";
+        // Unowned (legacy / local-only) always runs here.
+        assert!(stage_owner_runs_here(me, ""));
+        // Owned by this device runs here.
+        assert!(stage_owner_runs_here(me, "device-A"));
+    }
+
+    #[test]
+    fn other_owned_stage_is_remote() {
+        assert!(!stage_owner_runs_here("device-A", "device-B"));
+    }
+
+    // --- the @mention that dispatches a remote stage -------------------------
+
+    #[test]
+    fn mention_token_targets_agent_or_primary() {
+        let scout = WorkspaceAgent::new("Scout", "r1");
+        assert_eq!(stage_mention_token(Some(&scout)), "@Scout");
+        assert_eq!(stage_mention_token(None), "@primary");
+        // A rendered remote prompt actually parses as a mention of that agent,
+        // so the owner's device / worker will pick it up.
+        let mut session = ChatSession::new("t", Uuid::nil(), "anthropic");
+        session.workspace_agents.push(scout.clone());
+        let prompt = format!("{} do the thing", stage_mention_token(Some(&scout)));
+        assert_eq!(
+            hive_runtime::parse_mentions(&prompt, &session).agents,
+            vec![scout.id]
+        );
+    }
+
+    // --- reply matching (mirrors pending_mentions' author-name rule) ---------
+
+    #[test]
+    fn matches_first_agent_reply_after_the_prompt() {
+        let prompt = msg(MessageRole::User, "Mara", "@Scout go");
+        let reply = msg(MessageRole::Assistant, "Scout", "done: result");
+        let after_id = prompt.id;
+        let reply_id = reply.id;
+        let messages = vec![prompt, reply];
+        let out = match_stage_reply(&messages, after_id, "Scout");
+        assert_eq!(out, Some((reply_id, "done: result".to_string())));
+    }
+
+    #[test]
+    fn ignores_replies_before_the_prompt_and_other_authors() {
+        // A stale reply by Scout *before* the prompt must not count, nor a reply
+        // by a different author after it.
+        let stale = msg(MessageRole::Assistant, "Scout", "old output");
+        let prompt = msg(MessageRole::User, "Mara", "@Scout go");
+        let other = msg(MessageRole::Assistant, "Hive", "not the stage agent");
+        let after_id = prompt.id;
+        let messages = vec![stale, prompt, other];
+        assert!(match_stage_reply(&messages, after_id, "Scout").is_none());
+    }
+
+    #[test]
+    fn skips_streaming_and_empty_placeholders() {
+        let prompt = msg(MessageRole::User, "Mara", "@Scout go");
+        let mut streaming = msg(MessageRole::Assistant, "Scout", "");
+        streaming.is_streaming = true;
+        let empty = msg(MessageRole::Assistant, "Scout", "");
+        let after_id = prompt.id;
+        let messages = vec![prompt, streaming, empty];
+        // Neither the in-flight stream nor an empty completion counts as output.
+        assert!(match_stage_reply(&messages, after_id, "Scout").is_none());
+    }
+
+    #[test]
+    fn missing_prompt_yields_no_match() {
+        let reply = msg(MessageRole::Assistant, "Scout", "done");
+        assert!(match_stage_reply(&[reply], Uuid::new_v4(), "Scout").is_none());
+    }
+
+    #[test]
+    fn agent_role_replies_also_match() {
+        // Some historical replies use MessageRole::Agent rather than Assistant.
+        let prompt = msg(MessageRole::User, "Mara", "@Scout go");
+        let reply = msg(MessageRole::Agent, "Scout", "agent-role output");
+        let after_id = prompt.id;
+        let reply_id = reply.id;
+        let messages = vec![prompt, reply];
+        assert_eq!(
+            match_stage_reply(&messages, after_id, "Scout"),
+            Some((reply_id, "agent-role output".to_string()))
+        );
     }
 }
