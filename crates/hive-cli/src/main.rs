@@ -27,10 +27,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use hive_core::{derive_workspace_key, workspace_config_session_id, MessageRole, ModelProviderKind};
+use hive_core::{
+    derive_workspace_key, workspace_config_session_id, MessageRole, ModelProviderKind,
+    WorkspaceCredential, WorkspaceRuntime,
+};
 use hive_runtime::{
-    dispatch, parse_mentions, turns_for, ChatService, EventStore, FileKeyVault, IdentityStore,
-    RelayClient, ResolvedRuntime, SyncEngine,
+    dispatch, parse_mentions, resolve_workspace_credential, turns_for, ChatService, EventStore,
+    FileKeyVault, IdentityStore, RelayClient, ResolvedRuntime, SyncEngine,
 };
 use uuid::Uuid;
 
@@ -242,13 +245,109 @@ fn resolve_runtime_from_env() -> Result<(ResolvedRuntime, String)> {
     Ok((rt, format!("{provider_str}/{model}")))
 }
 
+fn provider_kind(s: &str) -> Result<ModelProviderKind> {
+    Ok(match s.to_lowercase().as_str() {
+        "anthropic" => ModelProviderKind::Anthropic,
+        "openai" => ModelProviderKind::OpenAI,
+        "openrouter" => ModelProviderKind::OpenRouter,
+        "ollama" => ModelProviderKind::Ollama,
+        other => bail!("unknown provider '{other}' (anthropic|openai|openrouter|ollama)"),
+    })
+}
+
+/// Define (or replace by id) a workspace-owned runtime. `--secret-ref <name>`
+/// keeps the key off the synced log (worker env `HIVE_WS_SECRET_<name>`);
+/// `--secret <value>` carries it E2EE on the config log; neither = keyless.
+#[allow(clippy::too_many_arguments)]
+fn cmd_add_runtime(
+    cfg: &Config,
+    id: &str,
+    name: &str,
+    provider: &str,
+    model: &str,
+    endpoint: Option<String>,
+    secret_ref: Option<String>,
+    secret: Option<String>,
+) -> Result<()> {
+    let mut wr = WorkspaceRuntime::new(id, name, provider_kind(provider)?, model);
+    wr.endpoint = endpoint.unwrap_or_default();
+    wr.credential = match (secret_ref, secret) {
+        (Some(r), _) => WorkspaceCredential::SecretRef { secret_ref: r },
+        (None, Some(s)) => WorkspaceCredential::Inline { secret: s },
+        (None, None) => WorkspaceCredential::None,
+    };
+    let mut svc = open_service(cfg)?;
+    svc.add_workspace_runtime(uuid_of_room(&cfg.room), wr)?;
+    println!("runtime '{id}' defined (sync to share it with the workspace).");
+    Ok(())
+}
+
+fn cmd_rm_runtime(cfg: &Config, id: &str) -> Result<()> {
+    let mut svc = open_service(cfg)?;
+    svc.remove_workspace_runtime(uuid_of_room(&cfg.room), id)?;
+    println!("removed.");
+    Ok(())
+}
+
+/// List the workspace-owned runtimes synced onto this box (spec §12.5).
+fn cmd_runtimes(cfg: &Config) -> Result<()> {
+    let svc = open_service(cfg)?;
+    let rts = svc.list_workspace_runtimes(uuid_of_room(&cfg.room))?;
+    if rts.is_empty() {
+        println!("(no workspace runtimes — define one in the app, or `hive sync` a workspace that has them)");
+    }
+    for r in rts {
+        let cred = match &r.credential {
+            WorkspaceCredential::SecretRef { secret_ref } => {
+                let have = std::env::var(WorkspaceCredential::env_var(secret_ref)).is_ok();
+                format!("secretRef:{secret_ref}{}", if have { " ✓" } else { " (missing)" })
+            }
+            WorkspaceCredential::Inline { .. } => "inline".into(),
+            WorkspaceCredential::None => "keyless".into(),
+        };
+        println!("{:<16} {:<22} {:?}/{}  [{cred}]", r.id, r.name, r.provider, r.model);
+    }
+    Ok(())
+}
+
+/// Resolve the runtime an agent should use: a workspace-owned runtime by id
+/// (spec §12.5 — credential resolved via the worker's secret store, never a
+/// personal key), else the personal env fallback.
+fn resolve_agent_runtime(cfg: &Config, runtime_id: Option<&str>) -> Result<(ResolvedRuntime, String)> {
+    let Some(id) = runtime_id else {
+        return resolve_runtime_from_env();
+    };
+    let svc = open_service(cfg)?;
+    let wr = svc
+        .list_workspace_runtimes(uuid_of_room(&cfg.room))?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| anyhow!("no workspace runtime '{id}' (run `hive runtimes`, or define one in the app)"))?;
+    let api_key = resolve_workspace_credential(&wr.credential);
+    let rt = ResolvedRuntime {
+        provider: wr.provider,
+        model: wr.model.clone(),
+        endpoint: wr.endpoint.clone(),
+        api_key,
+        args: Vec::new(),
+        model_provider_id: None,
+        model_base_url: None,
+    };
+    Ok((rt, format!("workspace:{}", wr.name)))
+}
+
 /// v1 — act as an agent. After each sync, reply (as the primary responder) to
-/// any new user message that is un-mentioned or `@primary`, via the configured
-/// provider, and post + sync the reply back as signed events.
-async fn cmd_agent(cfg: &Config, name: String) -> Result<()> {
-    let (rt, rt_label) = resolve_runtime_from_env()?;
+/// any new user message that is un-mentioned or `@primary`, via the resolved
+/// runtime (a workspace-owned one with `--runtime`, else the personal env), and
+/// post + sync the reply back as signed events.
+async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Result<()> {
+    // Pull config first so a `--runtime` workspace runtime is available.
+    if cfg.relay_url.is_some() {
+        let _ = sync_once(cfg).await;
+    }
+    let (rt, rt_label) = resolve_agent_runtime(cfg, runtime_id.as_deref())?;
     if rt.api_key.is_none() && rt.provider != ModelProviderKind::Ollama {
-        bail!("no provider API key (set HIVE_PROVIDER_API_KEY or ANTHROPIC_API_KEY/OPENAI_API_KEY)");
+        bail!("runtime '{rt_label}' has no resolvable key (set a provider key, or provision HIVE_WS_SECRET_… for a workspace runtime)");
     }
     // Seed "seen" with existing messages so we don't reply to history.
     let mut seen: HashSet<Uuid> = HashSet::new();
@@ -332,7 +431,8 @@ fn usage() -> ! {
          hive tail <chat-id> [--watch]\n  \
          hive send <chat-id> <message…> [--push]\n  \
          hive sync [--watch]\n  \
-         hive agent [name]              reply as the primary agent (needs a provider key)\n\n\
+         hive runtimes                  list workspace-owned runtimes (spec §12.5)\n  \
+         hive agent [name] [--runtime <id>]   reply as the primary agent; --runtime uses a\n                                       workspace-owned credential (else a personal env key)\n\n\
          Config via env: HIVE_DATA_DIR, HIVE_RELAY_URL, HIVE_RELAY_ACCESS_TOKEN,\n\
          HIVE_WORKSPACE, HIVE_WORKSPACE_KEY."
     );
@@ -352,7 +452,30 @@ fn run() -> Result<()> {
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = &args[args.len().min(1)..];
     let has = |flag: &str| rest.iter().any(|a| a == flag);
-    let positional: Vec<&String> = rest.iter().filter(|a| !a.starts_with("--")).collect();
+    let flag_val = |flag: &str| {
+        rest.iter()
+            .position(|a| a == flag)
+            .and_then(|i| rest.get(i + 1))
+            .cloned()
+    };
+    // Positional args exclude flags and any value immediately after a known
+    // value-flag (so `agent bot --runtime ws1` → positional = [bot]).
+    let value_flags = ["--runtime", "--endpoint", "--secret-ref", "--secret"];
+    let mut positional: Vec<&String> = Vec::new();
+    let mut skip = false;
+    for a in rest {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if a.starts_with("--") {
+            if value_flags.contains(&a.as_str()) {
+                skip = true;
+            }
+            continue;
+        }
+        positional.push(a);
+    }
 
     // A current-thread runtime is all the CLI needs — it only ever `block_on`s
     // (never spawns), and keeps the non-Send EventStore on one thread.
@@ -388,9 +511,30 @@ fn run() -> Result<()> {
             rt()?.block_on(cmd_send(&cfg, chat_id, body, has("--push")))
         }
         "sync" => rt()?.block_on(cmd_sync(&cfg, has("--watch"))),
+        "runtimes" => cmd_runtimes(&cfg),
+        "add-runtime" => {
+            if positional.len() < 4 {
+                bail!("usage: hive add-runtime <id> <name> <provider> <model> [--endpoint <url>] [--secret-ref <name> | --secret <value>]");
+            }
+            cmd_add_runtime(
+                &cfg,
+                positional[0],
+                positional[1],
+                positional[2],
+                positional[3],
+                flag_val("--endpoint"),
+                flag_val("--secret-ref"),
+                flag_val("--secret"),
+            )
+        }
+        "rm-runtime" => {
+            let id = positional.first().ok_or_else(|| anyhow!("usage: hive rm-runtime <id>"))?;
+            cmd_rm_runtime(&cfg, id)
+        }
         "agent" => {
             let name = positional.first().map(|s| s.as_str()).unwrap_or("assistant").to_string();
-            rt()?.block_on(cmd_agent(&cfg, name))
+            let runtime_id = flag_val("--runtime").or_else(|| env_opt("HIVE_RUNTIME"));
+            rt()?.block_on(cmd_agent(&cfg, name, runtime_id))
         }
         _ => usage(),
     }

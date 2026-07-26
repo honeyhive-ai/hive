@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::agent::WorkspaceAgent;
 use crate::channel::Channel;
+use crate::workspace_runtime::WorkspaceRuntime;
 use crate::chat::ChatMessage;
 use crate::identity::WorkspaceMember;
 use crate::proposals::ActionProposal;
@@ -69,6 +70,10 @@ pub struct ChatSession {
     /// or the config log itself).
     #[serde(default)]
     pub channel_id: String,
+    /// Workspace-owned runtimes (spec §12.5) — detached/headless agents run on
+    /// these. Populated on the config log; overlaid onto chats like other config.
+    #[serde(default)]
+    pub workspace_runtimes: Vec<WorkspaceRuntime>,
     #[serde(default)]
     pub created_at: Timestamp,
     #[serde(default)]
@@ -96,6 +101,7 @@ impl ChatSession {
             creator_actor_id: String::new(),
             channels: Vec::new(),
             channel_id: String::new(),
+            workspace_runtimes: Vec::new(),
             created_at: now,
             updated_at: now,
         }

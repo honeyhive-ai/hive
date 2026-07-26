@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::agent::WorkspaceAgent;
 use crate::channel::Channel;
 use crate::chat::{ChatMessage, MessageReaction};
+use crate::workspace_runtime::WorkspaceRuntime;
 use crate::crypto::DeviceCertificate;
 use crate::identity::{ActorStamp, WorkspaceMember, WorkspaceRole};
 use crate::proposals::{ActionProposal, ProposalApproval};
@@ -130,6 +131,9 @@ pub enum SessionEvent {
     /// Assign THIS chat to a channel (per-chat, session-scoped — not on the
     /// config log). Empty clears the assignment.
     ChatChannelChanged { channel_id: String },
+    /// Replace the workspace-owned runtime set (spec §12.5) — detached/headless
+    /// agents run on these. Rides the config log; workspace-scoped.
+    WorkspaceRuntimesUpdated { runtimes: Vec<WorkspaceRuntime> },
     /// Forward-compat catch-all: an event `kind` this build does not recognize
     /// (produced by a newer client). Serde deserializes an unknown tag here
     /// instead of failing the whole stream; it projects as a no-op. The raw
@@ -171,6 +175,7 @@ impl SessionEvent {
             SessionEvent::ChannelReordered { .. } => "channelReordered",
             SessionEvent::ChannelArchived { .. } => "channelArchived",
             SessionEvent::ChatChannelChanged { .. } => "chatChannelChanged",
+            SessionEvent::WorkspaceRuntimesUpdated { .. } => "workspaceRuntimesUpdated",
             SessionEvent::Unknown => "unknown",
         }
     }
@@ -187,7 +192,8 @@ impl SessionEvent {
             | SessionEvent::ChannelCreated { .. }
             | SessionEvent::ChannelRenamed { .. }
             | SessionEvent::ChannelReordered { .. }
-            | SessionEvent::ChannelArchived { .. } => EventScope::Workspace,
+            | SessionEvent::ChannelArchived { .. }
+            | SessionEvent::WorkspaceRuntimesUpdated { .. } => EventScope::Workspace,
             SessionEvent::WorkflowRunUpserted { .. } => EventScope::Run,
             _ => EventScope::Session,
         }
@@ -402,6 +408,9 @@ impl ChatSession {
             // Per-chat channel assignment (session-scoped).
             SessionEvent::ChatChannelChanged { channel_id } => {
                 self.channel_id = channel_id.clone();
+            }
+            SessionEvent::WorkspaceRuntimesUpdated { runtimes } => {
+                self.workspace_runtimes = runtimes.clone();
             }
             // Trust metadata — inert in the session projection; consumed only by
             // the device-roster builder (see hive-runtime::envelope_verifier).

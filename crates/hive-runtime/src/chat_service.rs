@@ -15,7 +15,7 @@ use hive_core::{
     workspace_config_session_id, ActionProposal, ActorIdentity, ActorStamp, Channel, ChatMessage,
     ChatSession, MessageReaction, MessageRole, ProposalApproval, SessionEvent, SessionEventEnvelope,
     SigningKeypair, SkillProfile, Timestamp, VaultSource, WorkflowDefinition, WorkflowRun,
-    WorkspaceAgent, WorkspaceMember, WorkspaceRole,
+    WorkspaceAgent, WorkspaceCredential, WorkspaceMember, WorkspaceRole, WorkspaceRuntime,
 };
 use uuid::Uuid;
 
@@ -677,6 +677,60 @@ impl ChatService {
         Ok(())
     }
 
+    // ── Workspace-owned runtimes (spec §12.5) ──────────────────────────────
+    // Detached/headless agents run on these — a workspace credential, never a
+    // member's personal key. They ride the config log (synced) like other config.
+
+    /// The workspace's owned runtimes.
+    pub fn list_workspace_runtimes(&self, workspace_id: Uuid) -> Result<Vec<WorkspaceRuntime>> {
+        Ok(self
+            .load(workspace_config_session_id(workspace_id))?
+            .map(|s| s.workspace_runtimes)
+            .unwrap_or_default())
+    }
+
+    /// Add (or replace by id) a workspace-owned runtime.
+    pub fn add_workspace_runtime(
+        &mut self,
+        workspace_id: Uuid,
+        runtime: WorkspaceRuntime,
+    ) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let mut runtimes = self
+            .load(config_id)?
+            .map(|s| s.workspace_runtimes)
+            .unwrap_or_default();
+        if let Some(slot) = runtimes.iter_mut().find(|r| r.id == runtime.id) {
+            *slot = runtime;
+        } else {
+            runtimes.push(runtime);
+        }
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::WorkspaceRuntimesUpdated { runtimes },
+        )?;
+        Ok(())
+    }
+
+    /// Remove a workspace-owned runtime by id.
+    pub fn remove_workspace_runtime(&mut self, workspace_id: Uuid, id: &str) -> Result<()> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let runtimes: Vec<WorkspaceRuntime> = self
+            .load(config_id)?
+            .map(|s| s.workspace_runtimes)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.id != id)
+            .collect();
+        self.append_signed(
+            config_id,
+            workspace_id,
+            SessionEvent::WorkspaceRuntimesUpdated { runtimes },
+        )?;
+        Ok(())
+    }
+
     /// File a chat into a channel (per-chat, session-scoped). Empty id unfiles.
     pub fn set_chat_channel(
         &mut self,
@@ -1065,9 +1119,31 @@ impl ChatService {
                         session.vault_sources.push(v);
                     }
                 }
+                for r in cfg.workspace_runtimes {
+                    if !session.workspace_runtimes.iter().any(|x| x.id == r.id) {
+                        session.workspace_runtimes.push(r);
+                    }
+                }
             }
         }
         Ok(Some(session))
+    }
+}
+
+/// Resolve a workspace runtime's credential to a usable secret — where a
+/// headless worker turns a **workspace-owned** runtime into an actual key (spec
+/// §12.5), never a personal one. `SecretRef` reads the worker's out-of-band env
+/// (`HIVE_WS_SECRET_<ref>`); `Inline` returns the secret carried E2EE on the
+/// config log; `None` is keyless.
+pub fn resolve_workspace_credential(cred: &WorkspaceCredential) -> Option<String> {
+    match cred {
+        WorkspaceCredential::SecretRef { secret_ref } => {
+            std::env::var(WorkspaceCredential::env_var(secret_ref))
+                .ok()
+                .filter(|s| !s.is_empty())
+        }
+        WorkspaceCredential::Inline { secret } => (!secret.is_empty()).then(|| secret.clone()),
+        WorkspaceCredential::None => None,
     }
 }
 
@@ -1106,6 +1182,39 @@ mod tests {
         // No account id → publish_identity is a no-op (local-only, unverifiable).
         let author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
         (ChatService::new(store, device_id, kp, account_kp, author), public)
+    }
+
+    #[test]
+    fn workspace_runtimes_sync_and_resolve_credentials() {
+        use hive_core::{ModelProviderKind, WorkspaceCredential, WorkspaceRuntime};
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+
+        // Define a workspace-owned runtime with an out-of-log secret reference.
+        let mut rt = WorkspaceRuntime::new("ws-claude", "Team Claude", ModelProviderKind::Anthropic, "claude-sonnet-4-5");
+        rt.credential = WorkspaceCredential::SecretRef { secret_ref: "acme".into() };
+        svc.add_workspace_runtime(wid, rt.clone()).unwrap();
+
+        // It's listed on the workspace and visible from any chat (config hoist).
+        assert_eq!(svc.list_workspace_runtimes(wid).unwrap().len(), 1);
+        let loaded = svc.load(chat.id).unwrap().unwrap();
+        assert_eq!(loaded.workspace_runtimes.len(), 1);
+        assert_eq!(loaded.workspace_runtimes[0].id, "ws-claude");
+
+        // SecretRef resolves from the worker's env; Inline returns the carried secret.
+        assert_eq!(resolve_workspace_credential(&rt.credential), None);
+        std::env::set_var("HIVE_WS_SECRET_acme", "sk-workspace-123");
+        assert_eq!(resolve_workspace_credential(&rt.credential).as_deref(), Some("sk-workspace-123"));
+        std::env::remove_var("HIVE_WS_SECRET_acme");
+        assert_eq!(
+            resolve_workspace_credential(&WorkspaceCredential::Inline { secret: "sk-inline".into() }).as_deref(),
+            Some("sk-inline")
+        );
+
+        // Removal clears it everywhere.
+        svc.remove_workspace_runtime(wid, "ws-claude").unwrap();
+        assert!(svc.load(chat.id).unwrap().unwrap().workspace_runtimes.is_empty());
     }
 
     #[test]

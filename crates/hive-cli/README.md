@@ -42,7 +42,11 @@ hive tail <chat-id> [--watch]      # print a chat's transcript; --watch syncs + 
 hive send <chat-id> <message…>     # post a signed message
        [--push]                    #   …and sync it out to the relay
 hive sync [--watch]                # one sync round (push everything unpushed, then fetch+ingest)
-hive agent [name]                  # act as the primary responder (see below)
+hive runtimes                      # list workspace-owned runtimes (spec §12.5)
+hive add-runtime <id> <name> <provider> <model>
+       [--endpoint <url>] [--secret-ref <name> | --secret <value>]
+hive rm-runtime <id>
+hive agent [name] [--runtime <id>] # act as the primary responder (see below)
 ```
 
 Chat ids come from `hive chats` (or `hive sync` then `hive chats` to pull a
@@ -86,14 +90,46 @@ Each `send` is a signed event; the next push syncs it to every member.
 > Re-run `hive sync` before reading so you see the latest. Never invent chat ids —
 > get them from `hive chats`.
 
+## Workspace-owned runtimes (spec §12.5)
+
+A **detached** agent — one that keeps working when its owner's laptop is closed —
+must run on a **workspace-owned credential**, never a member's personal API key.
+A *workspace runtime* is that: a provider/model the workspace owns, synced to
+every member and worker via the config log, with a credential the workspace
+provides. Its raw key does **not** have to ride the synced log.
+
+Define one (owner/admin), then run an agent on it:
+
+```sh
+# key stays OFF the synced log — the worker holds it out-of-band:
+hive add-runtime ws-claude "Team Claude" anthropic claude-sonnet-4-5 --secret-ref acme
+hive sync                                   # share it with the workspace
+# on the worker, provision the workspace secret and run the agent on it:
+HIVE_WS_SECRET_acme=sk-… hive agent teambot --runtime ws-claude
+```
+
+- `--secret-ref <name>` — the worker resolves the key from env
+  `HIVE_WS_SECRET_<name>`. Raw keys never touch the synced stream. `hive runtimes`
+  shows `✓` when the secret is present on this box, `(missing)` otherwise.
+- `--secret <value>` — carries the key **E2EE on the config log**. Zero worker
+  provisioning (the workspace key already unlocks it); the key does land on every
+  member's disk, so use it only for trusted workspaces.
+- neither — a keyless runtime (e.g. local Ollama).
+
+`hive agent --runtime <id>` resolves provider/model/credential from the workspace
+runtime; without `--runtime` it falls back to a **personal** env key
+(`HIVE_PROVIDER`/`HIVE_MODEL` + key).
+
 ## Limits & security (spec §12)
 
 - **Credentials are provisioned out-of-band.** The relay token and workspace
   key must be handed to the box (env/secret); there's no headless self-service
   for either.
-- **The provider key is personal.** `hive agent` runs on the API key you give
-  it. Spec §12.5's *workspace-owned* credential for a truly detached worker
-  (owner offline, workspace-funded) does not exist yet — build that before
-  running an agent on shared, workspace-funded infrastructure.
+- **Personal vs workspace credential.** Without `--runtime`, `hive agent` runs on
+  a *personal* env key. With `--runtime <id>` it runs on a **workspace-owned**
+  runtime (spec §12.5, above) — the credential a detached, workspace-funded worker
+  should use. What's still missing is the *host* side of §12.4–12.5 (a worker
+  daemon + the queue/offline handoff) and enforcement that detached agents may
+  *only* use workspace runtimes; today it's by convention.
 - **Agents never touch another machine's filesystem** (spec §12.6): what crosses
   the relay is chat and, eventually, diffs — not remote file writes.

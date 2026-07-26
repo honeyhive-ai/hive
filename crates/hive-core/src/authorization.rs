@@ -58,7 +58,9 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         SessionEvent::MemberAdded { .. }
         | SessionEvent::MemberRemoved { .. }
         | SessionEvent::MemberRoleChanged { .. }
-        | SessionEvent::SessionArchivedChanged { .. } => WorkspaceRole::Admin,
+        | SessionEvent::SessionArchivedChanged { .. }
+        // Workspace runtimes carry credentials — governance, admin+.
+        | SessionEvent::WorkspaceRuntimesUpdated { .. } => WorkspaceRole::Admin,
         // content / collaboration
         SessionEvent::SessionSnapshot { .. }
         | SessionEvent::MessageAppended { .. }
