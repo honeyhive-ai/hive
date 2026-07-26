@@ -23,6 +23,10 @@ you (or another participant) mention.
 **governance roles** above; functional titles like *QA* or *Lead* are
 **not** mentionable groups (mention those people by name instead).
 
+When a mention names you — by handle, role, or broadcast — you get a
+desktop notification and the channel lights up in the sidebar until you
+read it. See [Mentions & notifications](mentions-and-notifications.md).
+
 Every edge works: human→agent, agent→agent, primary→agent, **agent→primary**,
 and agent→human. So a sub-agent that gets blocked can escalate:
 
