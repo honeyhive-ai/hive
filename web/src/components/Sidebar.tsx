@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -13,6 +13,7 @@ import {
   listChannels,
   listChats,
   listMembers,
+  listMentionStates,
   listSkills,
   listVaults,
   renameChannel,
@@ -115,6 +116,7 @@ export function Sidebar({
   const qc = useQueryClient();
   const chats = useQuery({ queryKey: ["chats"], queryFn: listChats });
   const channels = useQuery({ queryKey: ["channels"], queryFn: listChannels });
+  const mentionStates = useQuery({ queryKey: ["mention-states"], queryFn: listMentionStates });
   const settings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
   const members = useQuery({
     queryKey: ["members", sessionId],
@@ -174,6 +176,50 @@ export function Sidebar({
     }
     return out;
   }, [all, showArchived, search, filter]);
+
+  // ── Unread @-mention highlights ────────────────────────────────────────────
+  // Read state is per-device UI state, not workspace data — it lives in
+  // localStorage (`hive.read.<sessionId>` = the message count when the chat was
+  // last opened), mirrored into React state so updates re-render. A mention at
+  // `lastMentionOrdinal` is unread when it sits past that cursor.
+  const [readCursors, setReadCursors] = useState<Record<string, number>>({});
+  const cursorOf = (id: string): number =>
+    id in readCursors
+      ? readCursors[id]
+      : Number(window.localStorage.getItem(`hive.read.${id}`)) || 0;
+
+  // Opening a chat (and any new message while it's open) marks it read.
+  const selectedCount = useMemo(
+    () => all.find((c) => c.id === selectedId)?.messageCount ?? null,
+    [all, selectedId],
+  );
+  useEffect(() => {
+    if (!selectedId || selectedCount == null) return;
+    if (selectedCount > cursorOf(selectedId)) {
+      window.localStorage.setItem(`hive.read.${selectedId}`, String(selectedCount));
+      setReadCursors((prev) => ({ ...prev, [selectedId]: selectedCount }));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId, selectedCount, readCursors]);
+
+  // Chats (and their channels) holding an unread self-mention. The open chat is
+  // always current, so it never highlights.
+  const { unreadSessions, unreadChannels } = useMemo(() => {
+    const cur = (id: string) =>
+      id in readCursors
+        ? readCursors[id]
+        : Number(window.localStorage.getItem(`hive.read.${id}`)) || 0;
+    const sessions = new Set<string>();
+    const chans = new Set<string>();
+    for (const m of mentionStates.data ?? []) {
+      if (m.sessionId === selectedId) continue;
+      if (m.lastMentionOrdinal > cur(m.sessionId)) {
+        sessions.add(m.sessionId);
+        if (m.channelId) chans.add(m.channelId);
+      }
+    }
+    return { unreadSessions: sessions, unreadChannels: chans };
+  }, [mentionStates.data, readCursors, selectedId]);
 
   // Active channels sorted by position (archived channels are hidden — their
   // history stays attributable but they leave the list, spec §11 rule 7).
@@ -488,6 +534,7 @@ export function Sidebar({
                   key={c.id}
                   title={c.title || "Untitled"}
                   when={relTime(c.lastActivityAt)}
+                  unread={unreadSessions.has(c.id) ? 1 : 0}
                   active={c.id === selectedId && view === "workspace"}
                   onClick={() => onSelect(c.id)}
                   onOptions={(el) => {
@@ -545,6 +592,7 @@ export function Sidebar({
                 const collapsedNow = isCollapsed(ch.id);
                 const active = ch.defaultChatId === selectedId && view === "workspace";
                 const focused = focusedByChannel.get(ch.id) ?? [];
+                const hasMention = unreadChannels.has(ch.id);
                 return (
                   <div key={ch.id}>
                     {/* Header: chevron collapses; the name opens the default chat
@@ -565,11 +613,22 @@ export function Sidebar({
                       <button
                         onClick={() => onSelect(ch.defaultChatId)}
                         className="flex h-[30px] min-w-0 flex-1 items-center text-left"
-                        title={ch.purpose ?? `#${ch.name}`}
+                        title={hasMention ? `#${ch.name} — you were mentioned` : ch.purpose ?? `#${ch.name}`}
                       >
+                        {hasMention && (
+                          <span
+                            className="mr-1.5 h-1.5 w-1.5 shrink-0 rounded-full"
+                            style={{ background: "var(--hive-accent-cool)" }}
+                            aria-label="unread mention"
+                          />
+                        )}
                         <span
                           className="min-w-0 flex-1 truncate text-[13px]"
-                          style={{ fontWeight: active ? 700 : 590, letterSpacing: "-0.01em", color: "var(--hive-ink)" }}
+                          style={{
+                            fontWeight: active || hasMention ? 700 : 590,
+                            letterSpacing: "-0.01em",
+                            color: "var(--hive-ink)",
+                          }}
                         >
                           <span style={{ color: "var(--hive-ink-soft)" }}>#</span>
                           {ch.name}
@@ -607,6 +666,7 @@ export function Sidebar({
                             key={c.id}
                             title={c.title || "Untitled"}
                             when={relTime(c.lastActivityAt)}
+                            unread={unreadSessions.has(c.id) ? 1 : 0}
                             active={c.id === selectedId && view === "workspace"}
                             onClick={() => onSelect(c.id)}
                             onOptions={(el) => {
@@ -638,6 +698,7 @@ export function Sidebar({
                       key={c.id}
                       title={c.title || "Untitled"}
                       when={relTime(c.lastActivityAt)}
+                      unread={unreadSessions.has(c.id) ? 1 : 0}
                       active={c.id === selectedId && view === "workspace"}
                       onClick={() => onSelect(c.id)}
                       onOptions={(el) => {
