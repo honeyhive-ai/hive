@@ -148,7 +148,12 @@ impl ChatService {
         payload: SessionEvent,
     ) -> Result<SessionEventEnvelope> {
         if requires_authz(&payload) {
-            if let Some(session) = self.store.load_session(session_id)? {
+            // Authorize against the *projected* session — i.e. the workspace-wide
+            // roster after the member hoist (§11) unions the config-log members on
+            // (config-wins). For a config-log write this loads raw, so it gates on
+            // the config roster itself. Closes the self-member staleness gap where
+            // a role differed per-chat.
+            if let Some(session) = self.load(session_id)? {
                 let decision = authorize(&payload, self.actor_role(&session), &session);
                 if !decision.allowed {
                     return Err(ChatError::Unauthorized(decision.summary));
@@ -491,19 +496,25 @@ impl ChatService {
     /// when a device opens/joins a chat, so the People tab shows everyone who's
     /// here). Returns true if a member was added. No-op once present.
     pub fn ensure_self_member(&mut self, session_id: Uuid, workspace_id: Uuid) -> Result<bool> {
-        let Some(session) = self.load(session_id)? else {
+        if self.load(session_id)?.is_none() {
             return Ok(false);
-        };
+        }
+        // Member hoist (§11): membership is workspace-wide, held on the config log —
+        // register self there (not on this chat) so we're visible in every chat.
+        // `ensure_workspace_config` seeds the very first toucher as Owner, so a
+        // fresh workspace creator is found by the check below (no self-demote).
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let config = self.load(config_id)?.expect("config log exists after ensure");
         // Already present? Match by actor id, or by the same GitHub account — so
         // signing in (which can change the actor id) doesn't add a second "self".
-        let already = session.members.iter().any(|m| {
+        let already = config.members.iter().any(|m| {
             m.actor.id == self.author.id
                 || (self.author.account_id.is_some() && m.actor.account_id == self.author.account_id)
         });
         let added = if already {
             false
         } else {
-            let next_index = session.members.iter().map(|m| m.index).max().unwrap_or(0) + 1;
+            let next_index = config.members.iter().map(|m| m.index).max().unwrap_or(0) + 1;
             let member = WorkspaceMember {
                 id: self.author.id.clone(),
                 actor: self.author.clone(),
@@ -957,10 +968,15 @@ impl ChatService {
     /// Add a workspace member (authz: admin+).
     pub fn add_member(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         member: WorkspaceMember,
     ) -> Result<()> {
+        // Member hoist (§11): the roster is workspace-level, not per-chat — target
+        // the workspace-config log so a member added in one chat is seen in every
+        // chat (closes the self-member staleness gap). The passed-in session is
+        // shadowed by the config-log id.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         self.append_signed(session_id, workspace_id, SessionEvent::MemberAdded { member })?;
         Ok(())
     }
@@ -968,10 +984,13 @@ impl ChatService {
     /// Remove a workspace member (authz: admin+, last-owner protected).
     pub fn remove_member(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         member_id: impl Into<String>,
     ) -> Result<()> {
+        // Member hoist (§11): route to the workspace-config log so the removal
+        // propagates workspace-wide.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         self.append_signed(
             session_id,
             workspace_id,
@@ -985,11 +1004,14 @@ impl ChatService {
     /// Change a member's role (authz: admin+, last-owner protected).
     pub fn set_member_role(
         &mut self,
-        session_id: Uuid,
+        _session_id: Uuid,
         workspace_id: Uuid,
         member_id: impl Into<String>,
         new_role: WorkspaceRole,
     ) -> Result<()> {
+        // Member hoist (§11): route to the workspace-config log; read the prior
+        // role from that same (config) roster so the delta is correct.
+        let session_id = self.ensure_workspace_config(workspace_id)?;
         let member_id = member_id.into();
         let old_role = self
             .load(session_id)?
@@ -1207,6 +1229,19 @@ impl ChatService {
         let config_id = workspace_config_session_id(session.workspace_id);
         if session_id != config_id {
             if let Some(cfg) = self.store.load_session(config_id)? {
+                // Members hoist onto the config log so the roster is workspace-wide.
+                // Dedup by member id; the config-log entry is the source of truth,
+                // so it *replaces* any same-id per-session member (role/title/index
+                // are governed workspace-wide). A per-session-only member (e.g. a
+                // pre-hoist `MemberAdded` or the `create_chat` creator seed) has no
+                // config counterpart, so it's preserved (union, don't drop).
+                for m in cfg.members {
+                    if let Some(slot) = session.members.iter_mut().find(|x| x.id == m.id) {
+                        *slot = m;
+                    } else {
+                        session.members.push(m);
+                    }
+                }
                 for a in cfg.workspace_agents {
                     if !session.workspace_agents.iter().any(|x| x.id == a.id) {
                         session.workspace_agents.push(a);
@@ -1595,6 +1630,184 @@ mod tests {
         let added = svc.ensure_self_member(chat.id, chat.workspace_id).unwrap();
         assert!(!added);
         assert_eq!(svc.load(chat.id).unwrap().unwrap().members.len(), 1);
+    }
+
+    // ── Member config-hoist (§11) ──────────────────────────────────────────
+
+    fn test_member(id: &str, name: &str, role: WorkspaceRole) -> WorkspaceMember {
+        WorkspaceMember {
+            id: id.into(),
+            actor: ActorIdentity::new(id, name, hive_core::ActorKind::Human),
+            role,
+            title: String::new(),
+            index: 0,
+            joined_at: Timestamp::now(),
+        }
+    }
+
+    /// A fresh service for `author`, backed by a shared (file) store — so two
+    /// actors can act against the same workspace, as separate devices would.
+    fn svc_on(path: &std::path::Path, id: &str, name: &str) -> ChatService {
+        let store = EventStore::open(path).unwrap();
+        let kp = SigningKeypair::generate().unwrap();
+        let account_kp = SigningKeypair::generate().unwrap();
+        let author = ActorIdentity::new(id, name, hive_core::ActorKind::Human);
+        ChatService::new(store, Uuid::new_v4(), kp, account_kp, author)
+    }
+
+    #[test]
+    fn member_added_in_one_chat_is_visible_in_another_chat() {
+        // (a) The staleness gap: a member added "in" chat A must appear in the
+        // roster of a *different* chat B in the same workspace after load().
+        let (mut svc, _) = service();
+        let wid = Uuid::new_v4();
+        let chat_a = svc.create_chat("A", wid, "anthropic").unwrap();
+        let chat_b = svc.create_chat("B", wid, "anthropic").unwrap();
+
+        svc.add_member(chat_a.id, wid, test_member("u2", "Bo", WorkspaceRole::Contributor))
+            .unwrap();
+
+        let b = svc.load(chat_b.id).unwrap().unwrap();
+        assert!(
+            b.members.iter().any(|m| m.id == "u2"),
+            "member added in chat A must be visible in chat B (hoist)"
+        );
+        // …and it lives on the config log, the workspace-wide source of truth.
+        let cfg = svc.load(workspace_config_session_id(wid)).unwrap().unwrap();
+        assert!(cfg.members.iter().any(|m| m.id == "u2"));
+    }
+
+    #[test]
+    fn removing_a_member_propagates_workspace_wide() {
+        // (d) Removal in one chat clears the member from every chat.
+        let (mut svc, _) = service();
+        let wid = Uuid::new_v4();
+        let chat_a = svc.create_chat("A", wid, "anthropic").unwrap();
+        let chat_b = svc.create_chat("B", wid, "anthropic").unwrap();
+        svc.add_member(chat_a.id, wid, test_member("u2", "Bo", WorkspaceRole::Contributor))
+            .unwrap();
+        assert!(svc.load(chat_b.id).unwrap().unwrap().members.iter().any(|m| m.id == "u2"));
+
+        // Remove via chat B's service call — propagates to chat A too.
+        svc.remove_member(chat_b.id, wid, "u2").unwrap();
+        assert!(
+            !svc.load(chat_a.id).unwrap().unwrap().members.iter().any(|m| m.id == "u2"),
+            "removal must propagate to every chat"
+        );
+        let cfg = svc.load(workspace_config_session_id(wid)).unwrap().unwrap();
+        assert!(!cfg.members.iter().any(|m| m.id == "u2"));
+    }
+
+    #[test]
+    fn role_change_propagates_workspace_wide() {
+        let (mut svc, _) = service();
+        let wid = Uuid::new_v4();
+        let chat_a = svc.create_chat("A", wid, "anthropic").unwrap();
+        let chat_b = svc.create_chat("B", wid, "anthropic").unwrap();
+        svc.add_member(chat_a.id, wid, test_member("u2", "Bo", WorkspaceRole::Contributor))
+            .unwrap();
+        svc.set_member_role(chat_a.id, wid, "u2", WorkspaceRole::Admin).unwrap();
+
+        let b = svc.load(chat_b.id).unwrap().unwrap();
+        let u2 = b.members.iter().find(|m| m.id == "u2").unwrap();
+        assert_eq!(u2.role, WorkspaceRole::Admin, "role change must propagate workspace-wide");
+    }
+
+    #[test]
+    fn ensure_self_member_registers_on_config_log_workspace_wide() {
+        // (b) A joining actor's ensure_self_member writes to the config log and is
+        // therefore visible from every chat, on every device.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+
+        let (chat_a, chat_b) = {
+            let mut a = svc_on(&path, "u1", "Ana");
+            let ca = a.create_chat("A", wid, "anthropic").unwrap();
+            let cb = a.create_chat("B", wid, "anthropic").unwrap();
+            // Seed the config log with u1 as Owner (first toucher).
+            a.ensure_workspace_config(wid).unwrap();
+            (ca.id, cb.id)
+        };
+
+        // A different device/actor u2 opens chat A and registers itself.
+        {
+            let mut b = svc_on(&path, "u2", "Bo");
+            assert!(b.ensure_self_member(chat_a, wid).unwrap(), "u2 should be added");
+            // Idempotent second call.
+            assert!(!b.ensure_self_member(chat_a, wid).unwrap(), "second call is a no-op");
+        }
+
+        // From u1's device, u2 now shows up on the config log and in chat B.
+        {
+            let a = svc_on(&path, "u1", "Ana");
+            let cfg = a.load(workspace_config_session_id(wid)).unwrap().unwrap();
+            assert!(cfg.members.iter().any(|m| m.id == "u2"), "self-member missing from config log");
+            let b = a.load(chat_b).unwrap().unwrap();
+            assert!(
+                b.members.iter().any(|m| m.id == "u2"),
+                "self-member must be visible workspace-wide"
+            );
+        }
+    }
+
+    #[test]
+    fn authorization_evaluates_against_the_hoisted_roster() {
+        // (c) min-role enforcement now reads the unioned/hoisted roster: a Viewer
+        // per the workspace roster cannot add members from any chat; an Owner can.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+
+        let chat_id = {
+            let mut a = svc_on(&path, "u1", "Ana");
+            let chat = a.create_chat("A", wid, "anthropic").unwrap();
+            // Enroll u2 as a Viewer on the workspace-wide roster.
+            a.add_member(chat.id, wid, test_member("u2", "Bo", WorkspaceRole::Viewer)).unwrap();
+            chat.id
+        };
+
+        // u2 is a Viewer in the hoisted roster → cannot add members (needs Admin).
+        {
+            let mut b = svc_on(&path, "u2", "Bo");
+            let err = b.add_member(chat_id, wid, test_member("u3", "Cy", WorkspaceRole::Contributor));
+            assert!(
+                matches!(err, Err(ChatError::Unauthorized(_))),
+                "a Viewer in the hoisted roster must not add members, got {err:?}"
+            );
+        }
+
+        // The Owner u1 still can, and it lands on the workspace roster.
+        {
+            let mut a = svc_on(&path, "u1", "Ana");
+            a.add_member(chat_id, wid, test_member("u3", "Cy", WorkspaceRole::Contributor)).unwrap();
+            let cfg = a.load(workspace_config_session_id(wid)).unwrap().unwrap();
+            assert!(cfg.members.iter().any(|m| m.id == "u3"));
+        }
+    }
+
+    #[test]
+    fn config_member_wins_over_stale_per_session_member() {
+        // Dedup rule: when a chat carries a per-session member with the same id as
+        // a config-log member, the config entry (source of truth) wins on load().
+        let (mut svc, _) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+
+        // Write a stale per-session member directly onto the chat (pre-hoist shape).
+        svc.append_signed(
+            chat.id,
+            wid,
+            SessionEvent::MemberAdded { member: test_member("u2", "Bo", WorkspaceRole::Viewer) },
+        )
+        .unwrap();
+        // The authoritative config-log entry gives u2 a higher role.
+        svc.add_member(chat.id, wid, test_member("u2", "Bo", WorkspaceRole::Admin)).unwrap();
+
+        let loaded = svc.load(chat.id).unwrap().unwrap();
+        let u2: Vec<_> = loaded.members.iter().filter(|m| m.id == "u2").collect();
+        assert_eq!(u2.len(), 1, "no duplicate member after union");
+        assert_eq!(u2[0].role, WorkspaceRole::Admin, "config-log entry wins over per-session");
     }
 
     #[test]
