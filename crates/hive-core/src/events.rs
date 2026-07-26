@@ -64,6 +64,15 @@ pub enum SessionEvent {
     MemberRemoved { member_id: String },
     MemberRoleChanged { change: MemberRoleChange },
     AgentRosterUpdated { agents: Vec<WorkspaceAgent> },
+    /// Upsert a single workspace agent (by id) — the per-item delta that
+    /// supersedes the whole-list `AgentRosterUpdated`. Two admins each adding a
+    /// *different* agent concurrently from their own base both survive; the
+    /// list-replace form dropped whichever event sorted earlier in canonical
+    /// order. Rides the config log; workspace-scoped.
+    AgentUpserted { agent: WorkspaceAgent },
+    /// Remove a single workspace agent by id (delta). Idempotent — removing an
+    /// unknown id is a no-op. Supersedes list-replace `AgentRosterUpdated`.
+    AgentRemoved { agent_id: Uuid },
     SessionRuntimeChanged { runtime_id: String },
     /// Rename the session (manual, or auto-generated from the first exchange).
     SessionTitleChanged { title: String },
@@ -135,9 +144,22 @@ pub enum SessionEvent {
     /// Replace the workspace-owned runtime set (spec §12.5) — detached/headless
     /// agents run on these. Rides the config log; workspace-scoped.
     WorkspaceRuntimesUpdated { runtimes: Vec<WorkspaceRuntime> },
+    /// Upsert a single workspace runtime (by id) — the per-item delta that
+    /// supersedes whole-list `WorkspaceRuntimesUpdated`, so two concurrent adds
+    /// of different runtimes both survive. Rides the config log; workspace-scoped.
+    WorkspaceRuntimeUpserted { runtime: WorkspaceRuntime },
+    /// Remove a single workspace runtime by id (delta). Idempotent.
+    WorkspaceRuntimeRemoved { runtime_id: String },
     /// Replace the workspace host roster (spec §12.4) — devices + workers.
     /// Rides the config log; workspace-scoped.
     WorkspaceHostsUpdated { hosts: Vec<WorkspaceHost> },
+    /// Upsert a single workspace host (by id) — the per-item delta that
+    /// supersedes whole-list `WorkspaceHostsUpdated`, so two concurrent host
+    /// registrations/heartbeats don't clobber each other. Rides the config log;
+    /// workspace-scoped.
+    WorkspaceHostUpserted { host: WorkspaceHost },
+    /// Remove a single workspace host by id (delta). Idempotent.
+    WorkspaceHostRemoved { host_id: String },
     /// Forward-compat catch-all: an event `kind` this build does not recognize
     /// (produced by a newer client). Serde deserializes an unknown tag here
     /// instead of failing the whole stream; it projects as a no-op. The raw
@@ -161,6 +183,8 @@ impl SessionEvent {
             SessionEvent::MemberRemoved { .. } => "memberRemoved",
             SessionEvent::MemberRoleChanged { .. } => "memberRoleChanged",
             SessionEvent::AgentRosterUpdated { .. } => "agentRosterUpdated",
+            SessionEvent::AgentUpserted { .. } => "agentUpserted",
+            SessionEvent::AgentRemoved { .. } => "agentRemoved",
             SessionEvent::SessionRuntimeChanged { .. } => "sessionRuntimeChanged",
             SessionEvent::SessionTitleChanged { .. } => "sessionTitleChanged",
             SessionEvent::SessionArchivedChanged { .. } => "sessionArchivedChanged",
@@ -180,7 +204,11 @@ impl SessionEvent {
             SessionEvent::ChannelArchived { .. } => "channelArchived",
             SessionEvent::ChatChannelChanged { .. } => "chatChannelChanged",
             SessionEvent::WorkspaceRuntimesUpdated { .. } => "workspaceRuntimesUpdated",
+            SessionEvent::WorkspaceRuntimeUpserted { .. } => "workspaceRuntimeUpserted",
+            SessionEvent::WorkspaceRuntimeRemoved { .. } => "workspaceRuntimeRemoved",
             SessionEvent::WorkspaceHostsUpdated { .. } => "workspaceHostsUpdated",
+            SessionEvent::WorkspaceHostUpserted { .. } => "workspaceHostUpserted",
+            SessionEvent::WorkspaceHostRemoved { .. } => "workspaceHostRemoved",
             SessionEvent::Unknown => "unknown",
         }
     }
@@ -192,6 +220,8 @@ impl SessionEvent {
             | SessionEvent::MemberRemoved { .. }
             | SessionEvent::MemberRoleChanged { .. }
             | SessionEvent::AgentRosterUpdated { .. }
+            | SessionEvent::AgentUpserted { .. }
+            | SessionEvent::AgentRemoved { .. }
             | SessionEvent::AccountKeyRegistered { .. }
             | SessionEvent::DeviceCertificateAdded { .. }
             | SessionEvent::ChannelCreated { .. }
@@ -199,7 +229,11 @@ impl SessionEvent {
             | SessionEvent::ChannelReordered { .. }
             | SessionEvent::ChannelArchived { .. }
             | SessionEvent::WorkspaceRuntimesUpdated { .. }
-            | SessionEvent::WorkspaceHostsUpdated { .. } => EventScope::Workspace,
+            | SessionEvent::WorkspaceRuntimeUpserted { .. }
+            | SessionEvent::WorkspaceRuntimeRemoved { .. }
+            | SessionEvent::WorkspaceHostsUpdated { .. }
+            | SessionEvent::WorkspaceHostUpserted { .. }
+            | SessionEvent::WorkspaceHostRemoved { .. } => EventScope::Workspace,
             SessionEvent::WorkflowRunUpserted { .. } => EventScope::Run,
             _ => EventScope::Session,
         }
@@ -321,8 +355,23 @@ impl ChatSession {
                     m.role = change.new_role;
                 }
             }
+            // Whole-list replace — kept for backward-compat (old stored events).
+            // New writes use the per-item `AgentUpserted`/`AgentRemoved` deltas
+            // below; mixing the two is safe because the canonical fold order
+            // resolves them deterministically on every device.
             SessionEvent::AgentRosterUpdated { agents } => {
                 self.workspace_agents = agents.clone();
+            }
+            // Per-item agent delta — upsert by id (mirrors `ChannelCreated`).
+            SessionEvent::AgentUpserted { agent } => {
+                if let Some(slot) = self.workspace_agents.iter_mut().find(|a| a.id == agent.id) {
+                    *slot = agent.clone();
+                } else {
+                    self.workspace_agents.push(agent.clone());
+                }
+            }
+            SessionEvent::AgentRemoved { agent_id } => {
+                self.workspace_agents.retain(|a| &a.id != agent_id);
             }
             SessionEvent::SessionRuntimeChanged { runtime_id } => {
                 self.runtime_id = runtime_id.clone();
@@ -415,11 +464,35 @@ impl ChatSession {
             SessionEvent::ChatChannelChanged { channel_id } => {
                 self.channel_id = channel_id.clone();
             }
+            // Whole-list replace — kept for backward-compat (old stored events).
             SessionEvent::WorkspaceRuntimesUpdated { runtimes } => {
                 self.workspace_runtimes = runtimes.clone();
             }
+            // Per-item runtime delta — upsert / remove by id.
+            SessionEvent::WorkspaceRuntimeUpserted { runtime } => {
+                if let Some(slot) = self.workspace_runtimes.iter_mut().find(|r| r.id == runtime.id) {
+                    *slot = runtime.clone();
+                } else {
+                    self.workspace_runtimes.push(runtime.clone());
+                }
+            }
+            SessionEvent::WorkspaceRuntimeRemoved { runtime_id } => {
+                self.workspace_runtimes.retain(|r| &r.id != runtime_id);
+            }
+            // Whole-list replace — kept for backward-compat (old stored events).
             SessionEvent::WorkspaceHostsUpdated { hosts } => {
                 self.workspace_hosts = hosts.clone();
+            }
+            // Per-item host delta — upsert / remove by id.
+            SessionEvent::WorkspaceHostUpserted { host } => {
+                if let Some(slot) = self.workspace_hosts.iter_mut().find(|h| h.id == host.id) {
+                    *slot = host.clone();
+                } else {
+                    self.workspace_hosts.push(host.clone());
+                }
+            }
+            SessionEvent::WorkspaceHostRemoved { host_id } => {
+                self.workspace_hosts.retain(|h| &h.id != host_id);
             }
             // Trust metadata — inert in the session projection; consumed only by
             // the device-roster builder (see hive-runtime::envelope_verifier).
@@ -955,6 +1028,184 @@ mod tests {
         let json = serde_json::to_value(&env).unwrap();
         assert_eq!(json["payload"]["kind"], "messageAppended");
         assert_eq!(json["scope"], "session");
+    }
+
+    // ── Per-item config deltas: concurrent-add convergence ─────────────────
+    //
+    // The data-loss bug these close: with the whole-list `*Updated` events, two
+    // admins each editing from their own base emitted the FULL roster. The
+    // canonically-later event's list REPLACED the other's, so one admin's added
+    // agent/host/runtime silently vanished (convergent but lossy). The per-item
+    // `*Upserted` deltas below are additive by id, so both survive in every
+    // permutation.
+
+    fn admin_base() -> ChatSession {
+        let mut b = base_session();
+        b.members.push(member("owner", "owner", WorkspaceRole::Owner));
+        b.members.push(member("admin1", "admin1", WorkspaceRole::Admin));
+        b.members.push(member("admin2", "admin2", WorkspaceRole::Admin));
+        b
+    }
+
+    #[test]
+    fn concurrent_agent_upserts_both_survive_and_converge() {
+        let base = admin_base();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let a1 = WorkspaceAgent::new("reviewer", "ws-claude");
+        let a2 = WorkspaceAgent::new("planner", "ws-claude");
+        let (id1, id2) = (a1.id, a2.id);
+
+        // Same lamport (2) → genuinely concurrent, tie-broken by event_id. Two
+        // different authors, each adding a different agent from their own base.
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            by("admin1", env(sid, wid, 2, SessionEvent::AgentUpserted { agent: a1 })),
+            by("admin2", env(sid, wid, 2, SessionEvent::AgentUpserted { agent: a2 })),
+        ];
+        let expected = project(&events).expect("session");
+        assert_eq!(expected.workspace_agents.len(), 2, "both concurrent agent adds survive");
+        assert!(expected.workspace_agents.iter().any(|a| a.id == id1));
+        assert!(expected.workspace_agents.iter().any(|a| a.id == id2));
+
+        for seed in 0..300u64 {
+            assert_eq!(
+                project(&shuffled(events.clone(), seed | 1)).expect("s"),
+                expected,
+                "agent divergence at seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_host_upserts_both_survive_and_converge() {
+        use crate::workspace_host::{HostKind, WorkspaceHost};
+        let base = admin_base();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let mut h1 = WorkspaceHost::new("box1", HostKind::Worker, "one");
+        h1.owner_actor_id = "admin1".into();
+        let mut h2 = WorkspaceHost::new("box2", HostKind::Worker, "two");
+        h2.owner_actor_id = "admin2".into();
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            by("admin1", env(sid, wid, 2, SessionEvent::WorkspaceHostUpserted { host: h1 })),
+            by("admin2", env(sid, wid, 2, SessionEvent::WorkspaceHostUpserted { host: h2 })),
+        ];
+        let expected = project(&events).expect("session");
+        assert_eq!(expected.workspace_hosts.len(), 2, "both concurrent host adds survive");
+
+        for seed in 0..300u64 {
+            assert_eq!(
+                project(&shuffled(events.clone(), seed | 1)).expect("s"),
+                expected,
+                "host divergence at seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_runtime_upserts_both_survive_and_converge() {
+        use crate::runtime::ModelProviderKind;
+        use crate::workspace_runtime::WorkspaceRuntime;
+        let base = admin_base();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let r1 = WorkspaceRuntime::new("rt1", "One", ModelProviderKind::Anthropic, "m");
+        let r2 = WorkspaceRuntime::new("rt2", "Two", ModelProviderKind::Anthropic, "m");
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            by("admin1", env(sid, wid, 2, SessionEvent::WorkspaceRuntimeUpserted { runtime: r1 })),
+            by("admin2", env(sid, wid, 2, SessionEvent::WorkspaceRuntimeUpserted { runtime: r2 })),
+        ];
+        let expected = project(&events).expect("session");
+        assert_eq!(expected.workspace_runtimes.len(), 2, "both concurrent runtime adds survive");
+
+        for seed in 0..300u64 {
+            assert_eq!(
+                project(&shuffled(events.clone(), seed | 1)).expect("s"),
+                expected,
+                "runtime divergence at seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_delta_upsert_in_place_and_remove_by_id() {
+        let base = admin_base();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let mut a1 = WorkspaceAgent::new("reviewer", "ws-claude");
+        let id1 = a1.id;
+        let a2 = WorkspaceAgent::new("planner", "ws-claude");
+        let id2 = a2.id;
+        // A second upsert of the SAME id (renamed) updates in place — no dup.
+        let mut a1_renamed = a1.clone();
+        a1_renamed.name = "critic".into();
+        a1.name = "reviewer".into();
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            by("admin1", env(sid, wid, 2, SessionEvent::AgentUpserted { agent: a1 })),
+            by("admin1", env(sid, wid, 3, SessionEvent::AgentUpserted { agent: a2 })),
+            by("admin1", env(sid, wid, 4, SessionEvent::AgentUpserted { agent: a1_renamed })),
+            by("admin1", env(sid, wid, 5, SessionEvent::AgentRemoved { agent_id: id2 })),
+        ];
+        let s = project(&events).expect("session");
+        assert_eq!(s.workspace_agents.len(), 1, "renamed upsert is in place; id2 removed");
+        assert_eq!(s.workspace_agents[0].id, id1);
+        assert_eq!(s.workspace_agents[0].name, "critic", "later upsert wins by canonical order");
+    }
+
+    #[test]
+    fn legacy_whole_list_config_events_still_project() {
+        // Backward-compat: events written by an OLD client used the whole-list
+        // `*Updated` variants. They must still fold (canonical order handles
+        // mixing old whole-list and new per-item events on every device).
+        use crate::workspace_host::{HostKind, WorkspaceHost};
+        use crate::runtime::ModelProviderKind;
+        use crate::workspace_runtime::WorkspaceRuntime;
+        let base = admin_base();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let agents = vec![
+            WorkspaceAgent::new("a", "ws-claude"),
+            WorkspaceAgent::new("b", "ws-claude"),
+        ];
+        let hosts = vec![WorkspaceHost::new("box1", HostKind::Worker, "one")];
+        let runtimes = vec![WorkspaceRuntime::new("rt1", "One", ModelProviderKind::Anthropic, "m")];
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            by("admin1", env(sid, wid, 2, SessionEvent::AgentRosterUpdated { agents })),
+            by("admin1", env(sid, wid, 3, SessionEvent::WorkspaceHostsUpdated { hosts })),
+            by("admin1", env(sid, wid, 4, SessionEvent::WorkspaceRuntimesUpdated { runtimes })),
+        ];
+        let s = project(&events).expect("session");
+        assert_eq!(s.workspace_agents.len(), 2, "legacy agent roster projects");
+        assert_eq!(s.workspace_hosts.len(), 1, "legacy host list projects");
+        assert_eq!(s.workspace_runtimes.len(), 1, "legacy runtime list projects");
+    }
+
+    #[test]
+    fn forged_agent_upsert_from_a_viewer_is_dropped_owners_is_applied() {
+        // The projection gate: `AgentUpserted` is governance/config (Contributor
+        // floor). A Viewer's forged one is dropped during the fold; an owner's is
+        // applied — mirroring the whole-list `AgentRosterUpdated` behavior.
+        let base = owner_and_viewer_base();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let forged = WorkspaceAgent::new("evil", "ws-claude");
+        let events = vec![
+            snapshot_env(base, 1),
+            by("mallory", env(sid, wid, 2, SessionEvent::AgentUpserted { agent: forged })),
+        ];
+        assert!(project(&events).unwrap().workspace_agents.is_empty(), "Viewer's forged upsert dropped");
+
+        let legit_base = owner_and_viewer_base();
+        let (sid2, wid2) = (legit_base.id, legit_base.workspace_id);
+        let good = WorkspaceAgent::new("reviewer", "ws-claude");
+        let legit = vec![
+            snapshot_env(legit_base, 1),
+            by("owner", env(sid2, wid2, 2, SessionEvent::AgentUpserted { agent: good })),
+        ];
+        assert_eq!(project(&legit).unwrap().workspace_agents.len(), 1, "owner's upsert applied");
     }
 
     #[test]

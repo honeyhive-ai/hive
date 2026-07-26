@@ -389,7 +389,8 @@ impl ChatService {
         Ok(())
     }
 
-    /// Add (or replace, by id) a workspace agent, emitting the full new roster.
+    /// Add (or replace, by id) a workspace agent, emitting a per-item delta so
+    /// two admins adding different agents concurrently don't clobber each other.
     pub fn add_agent(
         &mut self,
         _session_id: Uuid,
@@ -399,25 +400,16 @@ impl ChatService {
         // Config hoist (§11): these records are workspace-level — target the
         // workspace-config log, not the calling chat's session.
         let session_id = self.ensure_workspace_config(workspace_id)?;
-        let mut agents = self
-            .load(session_id)?
-            .map(|s| s.workspace_agents)
-            .unwrap_or_default();
-        if let Some(slot) = agents.iter_mut().find(|a| a.id == agent.id) {
-            *slot = agent;
-        } else {
-            agents.push(agent);
-        }
         self.append_signed(
             session_id,
             workspace_id,
-            SessionEvent::AgentRosterUpdated { agents },
+            SessionEvent::AgentUpserted { agent },
         )?;
         Ok(())
     }
 
-    /// Set an agent's avatar (image `data:` URL and/or accent color), emitting
-    /// the full new roster. Only the agent's owner may edit it; a mismatch is a
+    /// Set an agent's avatar (image `data:` URL and/or accent color), emitting a
+    /// per-item upsert delta. Only the agent's owner may edit it; a mismatch is a
     /// no-op error. Passing `None` for a field clears it.
     pub fn set_agent_avatar(
         &mut self,
@@ -446,15 +438,16 @@ impl ChatService {
         }
         slot.avatar_url = avatar_url.filter(|u| !u.is_empty());
         slot.avatar_color_hex = avatar_color_hex.filter(|c| !c.is_empty());
+        let agent = slot.clone();
         self.append_signed(
             session_id,
             workspace_id,
-            SessionEvent::AgentRosterUpdated { agents },
+            SessionEvent::AgentUpserted { agent },
         )?;
         Ok(())
     }
 
-    /// Remove a workspace agent by id, emitting the full new roster.
+    /// Remove a workspace agent by id, emitting a per-item delta.
     pub fn remove_agent(
         &mut self,
         _session_id: Uuid,
@@ -464,17 +457,10 @@ impl ChatService {
         // Config hoist (§11): these records are workspace-level — target the
         // workspace-config log, not the calling chat's session.
         let session_id = self.ensure_workspace_config(workspace_id)?;
-        let agents: Vec<WorkspaceAgent> = self
-            .load(session_id)?
-            .map(|s| s.workspace_agents)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|a| a.id != agent_id)
-            .collect();
         self.append_signed(
             session_id,
             workspace_id,
-            SessionEvent::AgentRosterUpdated { agents },
+            SessionEvent::AgentRemoved { agent_id },
         )?;
         Ok(())
     }
@@ -719,19 +705,10 @@ impl ChatService {
         runtime: WorkspaceRuntime,
     ) -> Result<()> {
         let config_id = self.ensure_workspace_config(workspace_id)?;
-        let mut runtimes = self
-            .load(config_id)?
-            .map(|s| s.workspace_runtimes)
-            .unwrap_or_default();
-        if let Some(slot) = runtimes.iter_mut().find(|r| r.id == runtime.id) {
-            *slot = runtime;
-        } else {
-            runtimes.push(runtime);
-        }
         self.append_signed(
             config_id,
             workspace_id,
-            SessionEvent::WorkspaceRuntimesUpdated { runtimes },
+            SessionEvent::WorkspaceRuntimeUpserted { runtime },
         )?;
         Ok(())
     }
@@ -739,17 +716,10 @@ impl ChatService {
     /// Remove a workspace-owned runtime by id.
     pub fn remove_workspace_runtime(&mut self, workspace_id: Uuid, id: &str) -> Result<()> {
         let config_id = self.ensure_workspace_config(workspace_id)?;
-        let runtimes: Vec<WorkspaceRuntime> = self
-            .load(config_id)?
-            .map(|s| s.workspace_runtimes)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.id != id)
-            .collect();
         self.append_signed(
             config_id,
             workspace_id,
-            SessionEvent::WorkspaceRuntimesUpdated { runtimes },
+            SessionEvent::WorkspaceRuntimeRemoved { runtime_id: id.to_string() },
         )?;
         Ok(())
     }
@@ -776,19 +746,10 @@ impl ChatService {
             host.owner_actor_id = self.author.id.clone();
         }
         let config_id = self.ensure_workspace_config(workspace_id)?;
-        let mut hosts = self
-            .load(config_id)?
-            .map(|s| s.workspace_hosts)
-            .unwrap_or_default();
-        if let Some(slot) = hosts.iter_mut().find(|h| h.id == host.id) {
-            *slot = host;
-        } else {
-            hosts.push(host);
-        }
         self.append_signed(
             config_id,
             workspace_id,
-            SessionEvent::WorkspaceHostsUpdated { hosts },
+            SessionEvent::WorkspaceHostUpserted { host },
         )?;
         Ok(())
     }
@@ -796,17 +757,10 @@ impl ChatService {
     /// Remove a host by id.
     pub fn remove_host(&mut self, workspace_id: Uuid, id: &str) -> Result<()> {
         let config_id = self.ensure_workspace_config(workspace_id)?;
-        let hosts: Vec<WorkspaceHost> = self
-            .load(config_id)?
-            .map(|s| s.workspace_hosts)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|h| h.id != id)
-            .collect();
         self.append_signed(
             config_id,
             workspace_id,
-            SessionEvent::WorkspaceHostsUpdated { hosts },
+            SessionEvent::WorkspaceHostRemoved { host_id: id.to_string() },
         )?;
         Ok(())
     }
@@ -828,10 +782,11 @@ impl ChatService {
             return Ok(false);
         }
         host.last_seen = now;
+        let host = host.clone();
         self.append_signed(
             config_id,
             workspace_id,
-            SessionEvent::WorkspaceHostsUpdated { hosts },
+            SessionEvent::WorkspaceHostUpserted { host },
         )?;
         Ok(true)
     }
@@ -848,10 +803,11 @@ impl ChatService {
             return Err(ChatError::NotFound("unknown agent".into()));
         };
         slot.host_id = host_id.to_string();
+        let agent = slot.clone();
         self.append_signed(
             config_id,
             workspace_id,
-            SessionEvent::AgentRosterUpdated { agents },
+            SessionEvent::AgentUpserted { agent },
         )?;
         Ok(())
     }
