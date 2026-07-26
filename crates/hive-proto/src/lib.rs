@@ -436,6 +436,10 @@ pub struct WorkflowRunDto {
     pub status: String,
     pub nodes: Vec<WorkflowNodeRunDto>,
     pub started_at: String,
+    /// Whether an in-process driver is live for this run right now. False after
+    /// an app restart until crash-recovery re-spawns the driver; gates the
+    /// frontend's Resume affordance.
+    pub driver_alive: bool,
 }
 
 /// Pushed as a Tauri event whenever a run's persisted state changes.

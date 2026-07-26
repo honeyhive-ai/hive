@@ -3240,6 +3240,70 @@ fn session_in_workspace(
         && (creator_actor_id.is_empty() || creator_actor_id == me)
 }
 
+/// Startup crash-recovery for workflow runs. In-process drivers don't survive
+/// an app restart, so a run left `Running`/`AwaitingGate` when the app died has
+/// no driver and would otherwise stall until a manual Resume. Scan the active
+/// workspace's sessions and re-spawn a driver for every interrupted run that
+/// isn't already being driven, reusing the exact `drive_run` spawn path
+/// `start_workflow_run` uses. Idempotent: the pure selector skips any run
+/// already in `run_wakers`, and `SessionBusyGuard::acquire` fails closed if the
+/// session's slot is already held (so we never double-drive a session).
+fn recover_workflow_runs(app: &AppHandle) {
+    let state = app.state::<AppState>();
+    let active = state.active_workspace_id();
+    let me = state.local_actor_id();
+    let known_rooms = state.known_room_ids();
+    let config_id = hive_core::workspace_config_session_id(active);
+
+    // (session_id, workspace_id, run_id, status) for every run in the workspace.
+    let mut candidates: Vec<(Uuid, Uuid, Uuid, hive_core::workflow::WorkflowRunStatus)> = Vec::new();
+    {
+        let svc = state.service.lock().unwrap();
+        let Ok(ids) = svc.store().list_session_ids() else { return };
+        for id in ids {
+            if id == config_id {
+                continue;
+            }
+            let Ok(Some(s)) = svc.load(id) else { continue };
+            if !session_in_workspace(s.workspace_id, &s.creator_actor_id, active, &me, &known_rooms) {
+                continue;
+            }
+            for run in &s.workflow_runs {
+                candidates.push((id, s.workspace_id, run.id, run.status));
+            }
+        }
+    }
+
+    let live: std::collections::HashSet<Uuid> =
+        state.run_wakers.lock().unwrap().keys().copied().collect();
+    let need: std::collections::HashSet<Uuid> = crate::workflows::runs_needing_recovery(
+        candidates.iter().map(|(_, _, rid, st)| (*rid, *st)),
+        &live,
+    )
+    .into_iter()
+    .collect();
+
+    let mut recovered = 0usize;
+    for (sid, wid, rid, _) in candidates {
+        if !need.contains(&rid) {
+            continue;
+        }
+        // Fail-closed guard against double-driving: acquire the session's
+        // busy-slot first (skips if a live driver/response already holds it),
+        // then re-check `run_wakers` before spawning.
+        let Ok(guard) = crate::workflows::SessionBusyGuard::acquire(app, sid) else { continue };
+        if state.run_wakers.lock().unwrap().contains_key(&rid) {
+            drop(guard);
+            continue;
+        }
+        tauri::async_runtime::spawn(crate::workflows::drive_run(app.clone(), sid, wid, rid, guard));
+        recovered += 1;
+    }
+    if recovered > 0 {
+        eprintln!("workflow: recovered {recovered} interrupted run(s) after restart");
+    }
+}
+
 /// Whether *this* device should run the turn for `responder`. We dispatch when
 /// the responder is unowned (legacy / local-only) or owned by us; otherwise the
 /// owner's device answers (and the reply syncs back).
@@ -7356,6 +7420,9 @@ pub fn run() {
                                 Err(e) => eprintln!("ensure default channel: {e}"),
                             }
                         }
+                        // Re-spawn drivers for runs interrupted by the last
+                        // shutdown so they auto-continue instead of stalling.
+                        recover_workflow_runs(&handle);
                     }
                 });
             }
