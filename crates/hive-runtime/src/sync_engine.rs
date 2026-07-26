@@ -42,9 +42,24 @@ pub struct SyncEngine {
     relay: RelayClient,
     workspace: String,
     /// event_ids already pushed (or ingested from the relay) — never re-push.
+    /// This is a **fast-path cache** layered over the durable `pushed` table in
+    /// the event store: on first use it is seeded from that table (so a restart
+    /// resumes dedup), and it grows with this session's activity. The durable
+    /// store is the source of truth; this set is bounded by the number of events
+    /// in the workspace (same order as the durable set).
     seen: HashSet<Uuid>,
-    /// highest relay server sequence fetched so far.
+    /// highest relay server sequence fetched so far. Loaded from the durable
+    /// `sync_cursor` on first use and persisted whenever it advances, so a
+    /// restart resumes from the durable cursor instead of 0.
     last_fetched_seq: u64,
+    /// Whether durable sync state (cursor + pushed set) has been loaded from the
+    /// store yet. Guards a one-time seed on the first store-bearing call.
+    loaded: bool,
+    /// event_ids confirmed on the relay (pushed this session, or ingested from
+    /// it) that still need to be written to the durable `pushed` table. Flushed
+    /// by any store-bearing call. A **failed** push never lands here, preserving
+    /// the partial-push rollback invariant.
+    pending: Vec<Uuid>,
     /// Key epoch → workspace key. New events are sealed under the **highest**
     /// epoch; a fetched body is opened with the key for **its** epoch (stamped on
     /// the `SealedEnvelope`). Retaining older epochs is what keeps history
@@ -75,6 +90,8 @@ impl SyncEngine {
             workspace: workspace.into(),
             seen: HashSet::new(),
             last_fetched_seq: 0,
+            loaded: false,
+            pending: Vec::new(),
             keyring: BTreeMap::new(),
         }
     }
@@ -150,15 +167,48 @@ impl SyncEngine {
     /// how many were sent.
     pub async fn push_new(&mut self, store: &EventStore) -> Result<usize, SyncError> {
         let to_push = self.take_unpushed(store)?;
-        self.push_envelopes(&to_push).await?;
+        let res = self.push_envelopes(&to_push).await;
+        // Persist whatever actually reached the relay — even on a partial
+        // failure the delivered prefix is recorded in `pending`, so flushing
+        // here durably dedups it. The failed tail was rolled back out of both
+        // `seen` and `pending`, so it is never marked pushed.
+        self.persist_pending(store)?;
+        res?;
         Ok(to_push.len())
     }
 
     /// Fetch remote envelopes past the cursor and ingest the unseen ones.
     /// Returns how many were newly applied.
     pub async fn pull(&mut self, store: &mut EventStore) -> Result<usize, SyncError> {
+        // Load the durable cursor before fetching so a fresh engine resumes from
+        // it rather than re-fetching the whole room from 0.
+        self.ensure_loaded(store)?;
         let fetched = self.fetch_new().await?;
         self.apply_fetched(store, &fetched)
+    }
+
+    /// One-time seed of durable sync state (cursor + pushed set) from the store,
+    /// so a freshly-constructed engine resumes rather than restarts. Idempotent;
+    /// the cursor is merged with `max` so an in-flight advance is never lost.
+    fn ensure_loaded(&mut self, store: &EventStore) -> Result<(), SyncError> {
+        if self.loaded {
+            return Ok(());
+        }
+        self.last_fetched_seq = self.last_fetched_seq.max(store.sync_cursor(&self.workspace)?);
+        for id in store.pushed_ids(&self.workspace)? {
+            self.seen.insert(id);
+        }
+        self.loaded = true;
+        Ok(())
+    }
+
+    /// Flush `pending` (event_ids confirmed on the relay) to the durable `pushed`
+    /// table. Called by every store-bearing entry point.
+    fn persist_pending(&mut self, store: &EventStore) -> Result<(), SyncError> {
+        for id in self.pending.drain(..) {
+            store.mark_pushed(&self.workspace, id)?;
+        }
+        Ok(())
     }
 
     /// One full round: push local, then pull remote.
@@ -176,9 +226,18 @@ impl SyncEngine {
         &mut self,
         store: &EventStore,
     ) -> Result<Vec<SessionEventEnvelope>, SyncError> {
+        // Resume dedup from the durable `pushed` set, and flush any pending
+        // durable writes from a prior round (e.g. a push whose cycle bailed
+        // before persisting).
+        self.ensure_loaded(store)?;
+        self.persist_pending(store)?;
         let mut out = Vec::new();
         for session_id in store.list_session_ids()? {
             for env in store.list(session_id)? {
+                // `seen` is seeded from the durable `pushed` table, so this skips
+                // events already on the relay even across a restart. Newly
+                // collected events are marked seen optimistically; a failed push
+                // rolls them back (see `push_envelopes`).
                 if self.seen.insert(env.event_id) {
                     out.push(env);
                 }
@@ -212,6 +271,10 @@ impl SyncEngine {
                 }
                 return Err(e.into());
             }
+            // Delivered: queue it for the durable `pushed` table so a restart
+            // won't re-push it. Only reached AFTER a successful relay write, so a
+            // failed push (handled above) never marks its events pushed.
+            self.pending.push(env.event_id);
         }
         Ok(())
     }
@@ -254,6 +317,11 @@ impl SyncEngine {
         store: &mut EventStore,
         fetched: &[(u64, Value)],
     ) -> Result<usize, SyncError> {
+        // Resume the durable cursor + pushed set (so a fresh engine that only
+        // pulls still resumes), and flush any pending durable writes.
+        self.ensure_loaded(store)?;
+        self.persist_pending(store)?;
+        let cursor_before = self.last_fetched_seq;
         // Classify every body; never stop early. `resolved` = sequences the cursor
         // may pass (openable or provably-bad); `retry_at` = lowest sequence we must
         // re-fetch later (a not-yet-openable body), which caps how far the cursor
@@ -296,6 +364,9 @@ impl SyncEngine {
                 continue;
             }
             self.seen.insert(env.event_id);
+            // This event is now on the relay (we received it from there): queue
+            // it for the durable `pushed` set so a restart never bounces it back.
+            self.pending.push(env.event_id);
             if store.ingest(env)? {
                 applied += 1;
             }
@@ -310,6 +381,15 @@ impl SyncEngine {
             if retry_at.is_none_or(|r| seq < r) {
                 self.last_fetched_seq = self.last_fetched_seq.max(seq);
             }
+        }
+
+        // Persist the durable dedup markers, and the cursor iff it advanced —
+        // this is what lets a restart resume from here instead of seq 0. The
+        // retry semantics above are unchanged: the cursor still sits before the
+        // lowest not-yet-openable body, so that value is what gets persisted.
+        self.persist_pending(store)?;
+        if self.last_fetched_seq != cursor_before {
+            store.set_sync_cursor(&self.workspace, self.last_fetched_seq)?;
         }
         Ok(applied)
     }
@@ -786,6 +866,145 @@ mod tests {
         assert_eq!(sb.title, "Shared", "epoch-0 history still readable after rotation");
         assert_eq!(sb.messages.len(), 1, "epoch-1 message now readable");
         assert_eq!(sb.messages[0].body, "after rotation");
+    }
+
+    #[tokio::test]
+    async fn new_engine_resumes_from_persisted_cursor() {
+        // #2: durable cursor. After a pull persists the cursor, a NEW engine on
+        // the SAME store must resume from it and fetch nothing new — not
+        // re-fetch the whole room from seq 0.
+        let base = spawn_relay().await;
+        let workspace = Uuid::new_v4().to_string();
+        let key = hive_core::derive_workspace_key("resume room");
+
+        let mut store_a = EventStore::open_in_memory().unwrap();
+        let (sid, wid) = seed_chat(&mut store_a);
+        store_a
+            .ingest(&SessionEventEnvelope::new(
+                sid,
+                wid,
+                2,
+                SessionEvent::MessageAppended {
+                    message: ChatMessage::new(MessageRole::User, "A", "hi"),
+                },
+            ))
+            .unwrap();
+        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        assert_eq!(sync_a.push_new(&store_a).await.unwrap(), 2);
+
+        // First engine on B pulls both, persisting the cursor into store_b.
+        let mut store_b = EventStore::open_in_memory().unwrap();
+        let mut sync_b1 = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        assert_eq!(sync_b1.pull(&mut store_b).await.unwrap(), 2);
+        let cursor = sync_b1.cursor();
+        assert!(cursor > 0, "cursor advanced");
+        assert_eq!(store_b.sync_cursor(&workspace).unwrap(), cursor, "cursor is durable");
+        drop(sync_b1);
+
+        // A brand-new engine (simulating a restart) resumes from the durable
+        // cursor: it fetches nothing new and starts at the persisted cursor.
+        let mut sync_b2 = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        assert_eq!(sync_b2.pull(&mut store_b).await.unwrap(), 0, "resumes; nothing re-fetched");
+        assert_eq!(sync_b2.cursor(), cursor, "cursor restored from the durable store");
+    }
+
+    #[tokio::test]
+    async fn new_engine_does_not_repush_already_pushed() {
+        // #2: durable push-dedup. After pushing, a NEW engine on the same store
+        // must NOT re-collect or re-push the already-pushed events.
+        let base = spawn_relay().await;
+        let workspace = Uuid::new_v4().to_string();
+        let key = hive_core::derive_workspace_key("no-repush room");
+
+        let mut store = EventStore::open_in_memory().unwrap();
+        let (sid, wid) = seed_chat(&mut store);
+        store
+            .ingest(&SessionEventEnvelope::new(
+                sid,
+                wid,
+                2,
+                SessionEvent::MessageAppended {
+                    message: ChatMessage::new(MessageRole::User, "A", "hi"),
+                },
+            ))
+            .unwrap();
+
+        let mut sync1 = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        assert_eq!(sync1.push_new(&store).await.unwrap(), 2);
+        drop(sync1);
+        assert_eq!(store.pushed_ids(&workspace).unwrap().len(), 2, "pushes are durable");
+
+        // Fresh engine, same store: the durable `pushed` set makes take_unpushed
+        // collect nothing, so a restart re-push is a no-op and the relay keeps
+        // exactly two bodies (no duplicates).
+        let mut sync2 = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        assert!(sync2.take_unpushed(&store).unwrap().is_empty(), "already-pushed not re-collected");
+        assert_eq!(sync2.push_new(&store).await.unwrap(), 0, "restart re-push is a no-op");
+        let raw = RelayClient::new(&base).fetch_values(&workspace, 0).await.unwrap();
+        assert_eq!(raw.len(), 2, "no duplicate bodies on the relay after restart");
+    }
+
+    #[test]
+    fn durable_cursor_preserves_not_yet_openable_retry() {
+        // #2 + resilience: the not-yet-openable retry point must survive a
+        // restart. A body sealed under an epoch we lack sits before an openable
+        // one; the openable event applies, the cursor is held before the missing
+        // body, and BOTH the applied event and the held cursor are durable — so a
+        // fresh engine on the same store still retries the missing body (doesn't
+        // strand it or skip past it).
+        let workspace = Uuid::new_v4().to_string();
+        let held = hive_core::derive_workspace_key("held epoch 0");
+        let missing = hive_core::e2ee::generate_workspace_key().unwrap(); // epoch 7, unheld
+
+        let session = ChatSession::new("Shared", Uuid::new_v4(), "anthropic");
+        let sid = session.id;
+        let wid = session.workspace_id;
+        let snap = SessionEventEnvelope::new(
+            sid,
+            wid,
+            1,
+            SessionEvent::SessionSnapshot { session: Box::new(session) },
+        );
+        let msg = SessionEventEnvelope::new(
+            sid,
+            wid,
+            2,
+            SessionEvent::MessageAppended {
+                message: ChatMessage::new(MessageRole::User, "A", "reachable"),
+            },
+        );
+        let seal = |k: &[u8; 32], ver: u32, e: &SessionEventEnvelope| -> Value {
+            let plain = serde_json::to_vec(e).unwrap();
+            serde_json::to_value(seal_symmetric(k, ver, &plain).unwrap()).unwrap()
+        };
+        let batch: Vec<(u64, Value)> = vec![
+            (1, seal(&missing, 7, &snap)), // not-yet-openable (epoch 7 unheld)
+            (2, seal(&held, 0, &msg)),     // openable
+        ];
+
+        let mut store = EventStore::open_in_memory().unwrap();
+        let mut eng1 = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), &workspace)
+            .with_key(held);
+        assert_eq!(eng1.apply_fetched(&mut store, &batch).unwrap(), 1);
+        assert_eq!(eng1.cursor(), 0, "cursor held before the not-yet-openable seq");
+        assert_eq!(store.sync_cursor(&workspace).unwrap(), 0, "durable cursor is the retry point");
+        drop(eng1);
+
+        // Fresh engine (restart), STILL without epoch 7: resumes cursor 0, the
+        // openable event is already ingested so nothing new applies, and the
+        // cursor stays before the missing body.
+        let mut eng2 = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), &workspace)
+            .with_key(held);
+        assert_eq!(eng2.apply_fetched(&mut store, &batch).unwrap(), 0, "openable already applied");
+        assert_eq!(eng2.cursor(), 0, "resumed cursor still before the retry point");
+
+        // Epoch 7 arrives: the retained body converges and the cursor jumps,
+        // durably.
+        eng2.add_key(7, missing);
+        assert_eq!(eng2.apply_fetched(&mut store, &batch).unwrap(), 1);
+        assert!(store.has_event(snap.event_id).unwrap());
+        assert_eq!(eng2.cursor(), 2);
+        assert_eq!(store.sync_cursor(&workspace).unwrap(), 2, "durable cursor advanced past the gap");
     }
 
     #[tokio::test]

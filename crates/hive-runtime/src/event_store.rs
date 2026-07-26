@@ -75,6 +75,23 @@ impl EventStore {
                 ON events (session_id, sequence);
             CREATE INDEX IF NOT EXISTS idx_events_workspace
                 ON events (workspace_id, row_id);
+
+            -- Durable sync state (#2), keyed by relay workspace/room. Without
+            -- this the sync engine kept its cursor + pushed-set in memory only,
+            -- so every process restart re-fetched from seq 0 and re-pushed the
+            -- entire local log. `sync_cursor` is the highest relay server
+            -- sequence durably applied; `pushed` is the set of event_ids already
+            -- on the relay (we pushed them, or ingested them from there) so a
+            -- restart never re-sends them.
+            CREATE TABLE IF NOT EXISTS sync_cursor (
+                workspace        TEXT PRIMARY KEY,
+                last_fetched_seq INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pushed (
+                workspace TEXT NOT NULL,
+                event_id  TEXT NOT NULL,
+                PRIMARY KEY (workspace, event_id)
+            );
             "#,
         )?;
         Ok(Self { conn })
@@ -313,6 +330,60 @@ impl EventStore {
                 Err(e) => {
                     tracing::warn!(error = %e, "skipping unparseable event row during load");
                 }
+            }
+        }
+        Ok(out)
+    }
+
+    // --- Durable sync state (#2): survives process restarts so the sync
+    // engine resumes its fetch cursor + push-dedup instead of restarting from
+    // scratch. Keyed by the relay `workspace`/room string. ---
+
+    /// The durable fetch cursor for a workspace — the highest relay server
+    /// sequence applied so far (0 if the workspace has never synced).
+    pub fn sync_cursor(&self, workspace: &str) -> Result<u64> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT last_fetched_seq FROM sync_cursor WHERE workspace = ?1",
+                [workspace],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(seq.unwrap_or(0).max(0) as u64)
+    }
+
+    /// Persist the fetch cursor for a workspace (upsert).
+    pub fn set_sync_cursor(&self, workspace: &str, last_fetched_seq: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sync_cursor (workspace, last_fetched_seq) VALUES (?1, ?2) \
+             ON CONFLICT(workspace) DO UPDATE SET last_fetched_seq = excluded.last_fetched_seq",
+            rusqlite::params![workspace, last_fetched_seq as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Mark an event as already on the relay for a workspace (idempotent), so a
+    /// later `take_unpushed` — even after a restart — never re-pushes it.
+    pub fn mark_pushed(&self, workspace: &str, event_id: Uuid) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO pushed (workspace, event_id) VALUES (?1, ?2)",
+            rusqlite::params![workspace, event_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Every event_id already pushed for a workspace — used to seed the sync
+    /// engine's in-memory dedup cache on construction.
+    pub fn pushed_ids(&self, workspace: &str) -> Result<Vec<Uuid>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT event_id FROM pushed WHERE workspace = ?1")?;
+        let rows = stmt.query_map([workspace], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for s in rows {
+            if let Ok(id) = Uuid::parse_str(&s?) {
+                out.push(id);
             }
         }
         Ok(out)
@@ -676,6 +747,35 @@ mod tests {
         let s = store.load_session(sid).unwrap().unwrap();
         assert_eq!(s.messages.len(), 4);
         assert_eq!(s.messages[3].body, "after");
+    }
+
+    #[test]
+    fn sync_cursor_and_pushed_are_durable_per_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let (a, b) = ("room-a", "room-b");
+        let e1 = Uuid::new_v4();
+        let e2 = Uuid::new_v4();
+        {
+            let store = EventStore::open(&path).unwrap();
+            assert_eq!(store.sync_cursor(a).unwrap(), 0, "unknown workspace starts at 0");
+            store.set_sync_cursor(a, 42).unwrap();
+            store.set_sync_cursor(a, 99).unwrap(); // upsert
+            store.set_sync_cursor(b, 7).unwrap();
+            store.mark_pushed(a, e1).unwrap();
+            store.mark_pushed(a, e1).unwrap(); // idempotent
+            store.mark_pushed(a, e2).unwrap();
+        }
+        // Reopen: state survived the process boundary.
+        let store = EventStore::open(&path).unwrap();
+        assert_eq!(store.sync_cursor(a).unwrap(), 99, "cursor persisted + upserted");
+        assert_eq!(store.sync_cursor(b).unwrap(), 7, "keyed per workspace");
+        let mut ids = store.pushed_ids(a).unwrap();
+        ids.sort();
+        let mut want = vec![e1, e2];
+        want.sort();
+        assert_eq!(ids, want, "pushed set persisted, deduped");
+        assert!(store.pushed_ids(b).unwrap().is_empty(), "pushed set is per workspace");
     }
 
     #[test]
