@@ -500,7 +500,14 @@ impl ChatService {
     /// when a device opens/joins a chat, so the People tab shows everyone who's
     /// here). Returns true if a member was added. No-op once present.
     pub fn ensure_self_member(&mut self, session_id: Uuid, workspace_id: Uuid) -> Result<bool> {
-        if self.load(session_id)?.is_none() {
+        // The workspace-config log is materialized on demand by
+        // `ensure_workspace_config` below, so a fresh joiner — no chats yet, the
+        // owner's config log not yet synced — can register self by passing the
+        // config session id directly (from `join_workspace`/`set_active_workspace`).
+        // Any other session_id must already exist locally; don't invent phantom
+        // membership in a workspace this device has no presence in.
+        if session_id != workspace_config_session_id(workspace_id) && self.load(session_id)?.is_none()
+        {
             return Ok(false);
         }
         // Member hoist (§11): membership is workspace-wide, held on the config log —
@@ -1779,6 +1786,31 @@ mod tests {
                 "self-member must be visible workspace-wide"
             );
         }
+    }
+
+    #[test]
+    fn ensure_self_member_via_config_id_seeds_a_fresh_joiner() {
+        // Fix #3: `join_workspace`/`set_active_workspace` call `ensure_self_member`
+        // with the workspace-config session id the moment a workspace goes active —
+        // before any chat exists and before the owner's config log has synced. The
+        // old existence guard short-circuited that to a no-op, so a joiner stayed
+        // invisible in the roster. The config log is materialized on demand, so the
+        // joiner must now land on it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        let cfg_id = workspace_config_session_id(wid);
+
+        let mut joiner = svc_on(&path, "u2", "Bo");
+        // No chats, no synced config log — the pre-fix guard would `return Ok(false)`
+        // here without ever creating the config log.
+        joiner.ensure_self_member(cfg_id, wid).unwrap();
+
+        let cfg = joiner.load(cfg_id).unwrap().unwrap();
+        assert!(
+            cfg.members.iter().any(|m| m.id == "u2"),
+            "a fresh joiner must appear on the workspace-config roster"
+        );
     }
 
     #[test]
