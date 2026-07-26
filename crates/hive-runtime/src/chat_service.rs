@@ -1660,6 +1660,32 @@ mod tests {
     }
 
     #[test]
+    fn non_member_worker_manages_its_own_host_but_not_governance() {
+        // The self-host carve-out: a worker box (not a workspace member, so
+        // Viewer-floored) may register + heartbeat the host it owns, yet still
+        // can't perform governance. Proves the #61-hardening worker regression
+        // is closed without enrolling the worker as a member.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        {
+            let mut owner = svc_on(&path, "owner", "Owner");
+            owner.create_chat("A", wid, "anthropic").unwrap();
+            owner.ensure_workspace_config(wid).unwrap();
+        }
+        let mut worker = svc_on(&path, "worker", "Worker");
+        // register_host stamps owner_actor_id = self → allowed via the carve-out.
+        worker
+            .register_host(wid, hive_core::WorkspaceHost::new("box1", hive_core::HostKind::Worker, "prod"))
+            .unwrap();
+        // Heartbeat its own host (throttle 0 forces an emit) → allowed.
+        assert!(worker.touch_host(wid, "box1", 0).unwrap());
+        // But governance stays denied — the Viewer floor holds for member adds.
+        let victim = test_member("victim", "V", WorkspaceRole::Contributor);
+        assert!(worker.add_member(wid, wid, victim).is_err());
+    }
+
+    #[test]
     fn member_added_in_one_chat_is_visible_in_another_chat() {
         // (a) The staleness gap: a member added "in" chat A must appear in the
         // roster of a *different* chat B in the same workspace after load().

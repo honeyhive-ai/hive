@@ -10,6 +10,7 @@
 use crate::events::{MemberRoleChange, SessionEvent};
 use crate::identity::{WorkspaceMember, WorkspaceRole};
 use crate::session::ChatSession;
+use crate::workspace_host::WorkspaceHost;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthzReason {
@@ -19,6 +20,9 @@ pub enum AuthzReason {
     /// Adding yourself is a permitted bootstrap (empty roster, or a pure
     /// self-enroll at a non-governance role that changes no existing member).
     SelfEnroll,
+    /// Managing only hosts you own (e.g. a worker box registering/heartbeating
+    /// itself) — a self-scoped presence action a non-member may perform.
+    SelfHost,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,6 +154,35 @@ fn self_enroll_allowance(
     }
 }
 
+/// The hosts that differ between the current roster (`old`) and a proposed one
+/// (`new`): those added or modified (yielded as their **new** value) and those
+/// removed (yielded as their **old** value). An unchanged host is not yielded.
+fn hosts_changed<'a>(
+    old: &'a [WorkspaceHost],
+    new: &'a [WorkspaceHost],
+) -> impl Iterator<Item = &'a WorkspaceHost> {
+    let added_or_modified =
+        new.iter().filter(move |n| !old.iter().any(|o| o.id == n.id && o == *n));
+    let removed = old.iter().filter(move |o| !new.iter().any(|n| n.id == o.id));
+    added_or_modified.chain(removed)
+}
+
+/// The **self-host allowance** for `WorkspaceHostsUpdated`: a change that only
+/// adds, removes, or modifies hosts the actor *owns* (`owner_actor_id ==
+/// actor_id`) is a self-scoped presence action a non-member may perform — e.g. a
+/// worker box registering or heartbeating itself. Returns `Some(allow)` iff every
+/// changed host is actor-owned; `None` (→ fall through to the role gate) the
+/// moment it touches a host owned by anyone else.
+fn self_host_allowance(
+    new_hosts: &[WorkspaceHost],
+    actor_id: &str,
+    session: &ChatSession,
+) -> Option<AuthzDecision> {
+    let touches_foreign_host =
+        hosts_changed(&session.workspace_hosts, new_hosts).any(|h| h.owner_actor_id != actor_id);
+    (!touches_foreign_host).then(|| AuthzDecision::allow_reason(AuthzReason::SelfHost))
+}
+
 /// Evaluate whether the actor (`actor_id`, holding `actor_role` in the projected
 /// roster) may emit `event` in `session`.
 pub fn evaluate(
@@ -163,6 +196,14 @@ pub fn evaluate(
     // Everything else (adding others, removing/demoting anyone) is role-gated.
     if let SessionEvent::MemberAdded { member } = event {
         if let Some(decision) = self_enroll_allowance(member, actor_id, session) {
+            return decision;
+        }
+    }
+    // Presence seam: managing only your *own* hosts (worker self-registration /
+    // heartbeat) is permitted for a non-member; touching another actor's host
+    // falls through to the Contributor gate.
+    if let SessionEvent::WorkspaceHostsUpdated { hosts } = event {
+        if let Some(decision) = self_host_allowance(hosts, actor_id, session) {
             return decision;
         }
     }
@@ -251,6 +292,58 @@ mod tests {
                 joined_at: Default::default(),
             },
         }
+    }
+
+    fn host_owned(id: &str, owner: &str) -> WorkspaceHost {
+        let mut h = WorkspaceHost::new(id, crate::workspace_host::HostKind::Worker, id);
+        h.owner_actor_id = owner.to_string();
+        h
+    }
+    fn hosts_event(hosts: Vec<WorkspaceHost>) -> SessionEvent {
+        SessionEvent::WorkspaceHostsUpdated { hosts }
+    }
+
+    // ── Self-owned host allowance (worker self-registration; #61 seam) ─────
+
+    #[test]
+    fn non_member_may_register_its_own_host() {
+        // A worker box (Viewer floor, not a member) registers a host it owns.
+        let s = session_with_members(vec![("owner", WorkspaceRole::Owner)]);
+        let d = evaluate(&hosts_event(vec![host_owned("box1", "worker")]), "worker",
+            WorkspaceRole::Viewer, &s);
+        assert!(d.allowed);
+        assert_eq!(d.reason, AuthzReason::SelfHost);
+    }
+
+    #[test]
+    fn non_member_may_heartbeat_its_own_host() {
+        let mut s = session_with_members(vec![("owner", WorkspaceRole::Owner)]);
+        s.workspace_hosts = vec![host_owned("box1", "worker")];
+        let mut beat = host_owned("box1", "worker");
+        beat.label = "prod-box".into(); // a heartbeat mutates the host in place
+        assert!(evaluate(&hosts_event(vec![beat]), "worker", WorkspaceRole::Viewer, &s).allowed);
+    }
+
+    #[test]
+    fn non_member_cannot_touch_a_foreign_host() {
+        let mut s = session_with_members(vec![("owner", WorkspaceRole::Owner)]);
+        s.workspace_hosts = vec![host_owned("box1", "someone-else")];
+        // Removing someone else's host (empty new list) is not self-scoped → gated → denied.
+        let d = evaluate(&hosts_event(vec![]), "worker", WorkspaceRole::Viewer, &s);
+        assert!(!d.allowed);
+        assert_eq!(d.reason, AuthzReason::InsufficientRole);
+        // Hijacking (modifying) a foreign host is likewise denied.
+        let mut hijack = host_owned("box1", "someone-else");
+        hijack.label = "stolen".into();
+        assert!(!evaluate(&hosts_event(vec![hijack]), "worker", WorkspaceRole::Viewer, &s).allowed);
+    }
+
+    #[test]
+    fn contributor_manages_any_host_via_the_role_gate() {
+        // A Contributor member manages hosts (foreign included) through the gate.
+        let mut s = session_with_members(vec![("c", WorkspaceRole::Contributor)]);
+        s.workspace_hosts = vec![host_owned("box1", "someone-else")];
+        assert!(evaluate(&hosts_event(vec![]), "c", WorkspaceRole::Contributor, &s).allowed);
     }
 
     #[test]
