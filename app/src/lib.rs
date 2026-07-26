@@ -5684,6 +5684,7 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
 
 /// Sync status surfaced to the Settings pane.
 #[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct SyncStatus {
     relay_configured: bool,
     relay_url: String,
