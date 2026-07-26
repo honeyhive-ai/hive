@@ -18,11 +18,13 @@ import {
   pickWorkspaceFolder,
   onTrayNavigate,
   onWorkspaceSynced,
+  onSyncError,
   removeWorkspaceFromList,
   renameChat,
   setActiveWorkspace,
   setWorkspaceRoot,
   syncStatus,
+  type SyncStatusDto,
 } from "@/lib/ipc";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
@@ -297,6 +299,8 @@ export function App() {
 
   useEffect(() => {
     const unlisten = onWorkspaceSynced(() => {
+      // A sync succeeded: refresh the health pill (flips back to Live on recovery).
+      qc.invalidateQueries({ queryKey: ["sync-status"] });
       qc.invalidateQueries({ queryKey: ["chats"] });
       qc.invalidateQueries({ queryKey: ["chat"] });
       // Channels + skills also ride the synced log (config hoist / §11): refresh
@@ -329,6 +333,17 @@ export function App() {
       unlisten.then((fn) => fn());
     };
   }, [qc, selectedId]);
+
+  // A sync failed: refresh the health pill so it flips to "Sync error" the
+  // moment the relay/key/token goes bad (mirrors onWorkspaceSynced above).
+  useEffect(() => {
+    const unlisten = onSyncError(() => {
+      qc.invalidateQueries({ queryKey: ["sync-status"] });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [qc]);
 
   // System-tray navigation: the native menu emits a route string and we switch
   // the in-window view to match (Settings/Friends are views, not OS windows).
@@ -658,11 +673,7 @@ export function App() {
                   : null
               }
               onOpenContext={() => openUtilityPane("context")}
-              syncLabel={
-                sync.data?.relayConfigured
-                  ? `Live · room ${sync.data.room}`
-                  : "Local only"
-              }
+              syncPill={deriveSyncPill(sync.data)}
               mode={mode}
               onChangeMode={setMode}
               utilityPaneVisible={showUtilityPane}
@@ -804,9 +815,39 @@ function PaneResizeHandle({
 /// tabs, and the Tools toggle. Replaces the old two-row WorkspaceHeader +
 /// ModeStrip stack (~130px of chrome, duplicated workspace path, a dead rename
 /// button, and near-white tab text that vanished on light palettes).
+/// The header status pill, driven by real connection health (not just "a relay
+/// URL is set"): live → success tint, error → danger tint (with the failure in
+/// the tooltip), offline → a muted neutral state. All color via --hive-* tokens.
+type SyncPill = { label: string; color: string | null; title?: string };
+
+function deriveSyncPill(s: SyncStatusDto | undefined): SyncPill {
+  const state = s?.connectionState ?? "offline";
+  if (state === "live") {
+    return {
+      label: `Live · room ${s?.room ?? ""}`,
+      color: "var(--hive-success)",
+      title: "Live — syncing with your team",
+    };
+  }
+  if (state === "error") {
+    return {
+      label: "Sync error",
+      color: "var(--hive-danger)",
+      title: s?.lastError ?? "Sync failed — reconnect or check your key / token",
+    };
+  }
+  return {
+    label: s?.relayConfigured ? "Offline · not syncing" : "Local only",
+    color: null,
+    title: s?.relayConfigured
+      ? "A relay is configured but nothing is syncing right now"
+      : undefined,
+  };
+}
+
 function ChatHeaderBar({
   title,
-  syncLabel,
+  syncPill,
   mode,
   onChangeMode,
   utilityPaneVisible,
@@ -816,7 +857,7 @@ function ChatHeaderBar({
   onOpenContext,
 }: {
   title: string;
-  syncLabel: string;
+  syncPill: SyncPill;
   mode: CanvasMode;
   onChangeMode: (m: CanvasMode) => void;
   utilityPaneVisible: boolean;
@@ -846,7 +887,13 @@ function ChatHeaderBar({
         >
           <IconPencil size={13} />
         </button>
-        <span className="ml-1 hidden shrink-0 text-xs opacity-40 sm:inline">{syncLabel}</span>
+        <span
+          className="ml-1 hidden shrink-0 text-xs sm:inline"
+          style={{ color: syncPill.color ?? undefined, opacity: syncPill.color ? 1 : 0.4 }}
+          title={syncPill.title}
+        >
+          {syncPill.label}
+        </span>
       </div>
 
       {contextPct !== null && (

@@ -594,11 +594,21 @@ export const onChatStream = (
 ): Promise<UnlistenFn> =>
   listen<ChatStreamEvent>("chat://stream", (evt) => cb(evt.payload));
 
+/// Real connection health for the relay sync loop, updated on every sync
+/// attempt: `live` (last sync ok), `error` (last sync failed — see `lastError`),
+/// or `offline` (not syncing / no relay).
+export type ConnectionState = "live" | "error" | "offline";
+
 export interface SyncStatusDto {
   relayConfigured: boolean;
   relayUrl: string;
   room: string;
   encrypted: boolean;
+  /// Live health, so the UI reflects a dead relay / bad key instead of just
+  /// "a URL is set".
+  connectionState: ConnectionState;
+  /// Actionable message from the last failed sync (null when healthy).
+  lastError: string | null;
 }
 
 export const syncStatus = () => invoke<SyncStatusDto>("sync_status");
@@ -693,6 +703,12 @@ export const updateConnectionSettings = (args: {
 /// Fires when the background relay sync applies remote events.
 export const onWorkspaceSynced = (cb: () => void): Promise<UnlistenFn> =>
   listen("workspace://synced", () => cb());
+
+/// Fires when the background relay sync fails. The payload is an actionable
+/// error message (e.g. "unauthorized — check your relay token"), mirrored into
+/// `sync_status`'s `lastError` / `connectionState: "error"`.
+export const onSyncError = (cb: (message: string) => void): Promise<UnlistenFn> =>
+  listen<string>("workspace://sync-error", (evt) => cb(evt.payload));
 
 /// Fires when a system-tray menu item asks the UI to navigate. The payload is a
 /// route string: `"friends"`, `"settings"`, or `"settings:<Tab>"`.

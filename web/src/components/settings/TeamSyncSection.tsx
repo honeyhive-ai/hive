@@ -136,12 +136,25 @@ function SyncSection() {
 
   return (
     <Section title="Team sync">
-      {/* Live status */}
+      {/* Live status — driven by real connection health (connectionState), not
+          just "a relay URL is set", so a dead relay / bad key is visible here. */}
       <div className="rounded-xl border px-3 py-2.5 text-sm" style={fieldStyle}>
-        {s?.relayConfigured ? (
+        {s?.connectionState === "error" ? (
+          <div className="space-y-1">
+            <span className="flex items-center gap-1.5 font-medium" style={{ color: "var(--hive-danger)" }}>
+              <IconAlertTriangle size={13} /> Sync error
+            </span>
+            <div className="text-xs opacity-80">
+              {s.lastError ?? "The last sync attempt failed."}
+            </div>
+            <div className="text-xs" style={{ color: "var(--hive-danger)" }}>
+              Reconnect — check your relay URL, key, or access token below, then test the connection.
+            </div>
+          </div>
+        ) : s?.connectionState === "live" ? (
           <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
-            <span className="flex items-center gap-1.5 opacity-80">
-              <IconHexagon size={13} /> Relay configured
+            <span className="flex items-center gap-1.5" style={{ color: "var(--hive-success)" }}>
+              <IconHexagon size={13} /> Live
             </span>
             <span className="opacity-50">·</span>
             <code className="text-xs">{s.relayUrl}</code>
@@ -162,6 +175,8 @@ function SyncSection() {
               </span>
             )}
           </div>
+        ) : s?.relayConfigured ? (
+          <span className="opacity-70">Offline — a relay is configured but nothing is syncing right now.</span>
         ) : (
           <span className="opacity-70">Local only — not syncing with anyone yet.</span>
         )}
@@ -173,11 +188,20 @@ function SyncSection() {
         <Button onClick={() => testConnection.mutate()} disabled={testConnection.isPending}>
           {testConnection.isPending ? "Testing…" : "Test connection"}
         </Button>
-        {probe && (
+        {probe ? (
           <span className="flex items-center gap-1.5 text-xs" style={{ color: PROBE_COLOR[probe.status] }}>
             {PROBE_ICON[probe.status]}
             {probe.detail}
           </span>
+        ) : (
+          // Surface the live sync failure right next to the fix affordance until
+          // the user runs a fresh probe.
+          s?.connectionState === "error" && (
+            <span className="flex items-center gap-1.5 text-xs" style={{ color: "var(--hive-danger)" }}>
+              <IconAlertTriangle size={13} />
+              {s.lastError ?? "Sync is failing — test the connection."}
+            </span>
+          )
         )}
       </div>
 
