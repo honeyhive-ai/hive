@@ -511,15 +511,45 @@ impl ChatSession {
 /// `(lamport, event_id)` (see [`SessionEventEnvelope::canonical_key`]), so two
 /// devices that hold the same events — in any order — project identical state.
 ///
-/// The state is seeded by the **earliest** `SessionSnapshot` in canonical order,
-/// then every later event is folded on top (later snapshots are inert — see
+/// The state is seeded by the base snapshot (see base selection below), then
+/// every later event is folded on top (later snapshots are inert — see
 /// [`ChatSession::apply`]). Seeding from the *latest* snapshot instead would drop
 /// any concurrent delta that a peer authored before that snapshot but which the
 /// snapshot's creator hadn't yet seen — a real divergence/loss under multi-device
-/// compaction. Seeding from the earliest snapshot replays every delta, so nothing
-/// is dropped and all devices converge on the identical set. (A device that
-/// joined mid-stream seeds from the recent snapshot it was handed — that snapshot
-/// is simply its earliest.) Returns `None` if the set contains no snapshot.
+/// compaction. Seeding from the earliest (valid) snapshot replays every delta, so
+/// nothing is dropped and all devices converge on the identical set. (A device
+/// that joined mid-stream seeds from the recent snapshot it was handed — that
+/// snapshot is simply its earliest.) Returns `None` if the set contains no
+/// snapshot.
+///
+/// ## Seed trust root (security residual B2)
+///
+/// `lamport` is an attacker-settable envelope field and `SessionSnapshot` is a
+/// full-state overwrite, so a malicious keyholder could forge a `lamport: 0`
+/// snapshot that sorts *before* the genuine creation seed and rewrite the roster
+/// for every peer (workspace takeover). The base is therefore chosen not as the
+/// bare earliest snapshot but as the earliest **self-consistent creation seed**
+/// (see [`is_self_consistent_seed`]): one authored by the very actor it names as
+/// `creator_actor_id`, who is the *sole* Owner it grants. A forged snapshot that
+/// keeps the victim's roster while elevating the attacker, or that names a creator
+/// it was not signed by, fails this test and is skipped as a base candidate — the
+/// real creation seed (always self-consistent, per `ChatService::create_chat` /
+/// `ensure_workspace_config`) wins, and the forgery, sorting before it, is dropped
+/// entirely.
+///
+/// If the set contains no self-consistent creation seed — a joiner holding only a
+/// compaction tail (authored by a non-creator Owner, multi-owner roster), or a
+/// legacy unsigned/unstamped seed — the base falls back to the earliest snapshot
+/// of any kind, so legitimate compaction, joins, and legacy logs still project.
+/// The predicate is a deterministic function of each envelope, so every device
+/// reaches the identical base choice ⇒ convergence is preserved.
+///
+/// Residual: a fully self-consistent seed a keyholder mints *as themselves*
+/// (`creator = self`, self as the lone Owner, `lamport: 0`) is indistinguishable
+/// in-band from a genuine founding and will still displace the real seed as the
+/// base once it syncs. Closing that requires pinning the true founder out of band
+/// (the `hivews1:` invite's identity) and threading it into projection — tracked
+/// as the B2 follow-up; see the module security note.
 ///
 /// Cost note: this replays from the base snapshot rather than the newest, trading
 /// a bounded-load optimization for correctness. Causal-frontier snapshots (a
@@ -529,20 +559,40 @@ pub fn project(envelopes: &[SessionEventEnvelope]) -> Option<ChatSession> {
     let mut ordered: Vec<&SessionEventEnvelope> = envelopes.iter().collect();
     ordered.sort_by_key(|e| e.canonical_key());
 
+    // Prefer the earliest self-consistent creation seed; fall back to the earliest
+    // snapshot of any kind (compaction tail / legacy). Both are deterministic
+    // functions of the event set, so every device agrees on the base.
     let base = ordered
         .iter()
-        .position(|e| matches!(e.payload, SessionEvent::SessionSnapshot { .. }))?;
+        .position(|e| is_self_consistent_seed(e))
+        .or_else(|| {
+            ordered
+                .iter()
+                .position(|e| matches!(e.payload, SessionEvent::SessionSnapshot { .. }))
+        })?;
     let mut session = match &ordered[base].payload {
         SessionEvent::SessionSnapshot { session } => (**session).clone(),
         _ => unreachable!("position matched a snapshot"),
     };
     session.updated_at = ordered[base].timestamp;
     for env in &ordered[base + 1..] {
-        // Ingest-time authorization (spec: defense against a malicious member).
-        // A governance/config event is dropped unless its author held the role
-        // in the roster projected *so far*. Deterministic over the canonical
-        // fold ⇒ every device drops the same events ⇒ convergence preserved.
-        if crate::authorization::requires_projection_authz(&env.payload) {
+        if let SessionEvent::SessionSnapshot { session: snap } = &env.payload {
+            // A non-seed snapshot is a full-state overwrite folded mid-stream (a
+            // compaction checkpoint). Gate it like governance: its author must be
+            // an Owner and it must not re-found the workspace or elevate anyone
+            // (see authorization::nonseed_snapshot_authorized). `apply` folds a
+            // non-seed snapshot as a no-op today, so this is defense-in-depth for
+            // if compaction ever gains subsuming semantics — but it is a pure,
+            // deterministic function of the fold-so-far, so it stays convergent.
+            let author = env.actor_stamp.as_ref().map(|s| s.actor.id.as_str()).unwrap_or("");
+            if !crate::authorization::nonseed_snapshot_authorized(snap, author, &session) {
+                continue;
+            }
+        } else if crate::authorization::requires_projection_authz(&env.payload) {
+            // Ingest-time authorization (spec: defense against a malicious member).
+            // A governance/config event is dropped unless its author held the role
+            // in the roster projected *so far*. Deterministic over the canonical
+            // fold ⇒ every device drops the same events ⇒ convergence preserved.
             let author = env.actor_stamp.as_ref().map(|s| s.actor.id.as_str()).unwrap_or("");
             let role = session.role_of(author);
             if !crate::authorization::evaluate(&env.payload, author, role, &session).allowed {
@@ -553,6 +603,48 @@ pub fn project(envelopes: &[SessionEventEnvelope]) -> Option<ChatSession> {
         session.updated_at = env.timestamp;
     }
     Some(session)
+}
+
+/// Whether `env` is a **self-consistent creation seed** — the only shape trusted
+/// as a projection base without an out-of-band founder pin (security residual B2;
+/// see [`project`]). True iff the envelope is a `SessionSnapshot` that:
+///   * carries an `actor_stamp` (unstamped/legacy seeds take the fallback path —
+///     they cannot be wire-injected, as the envelope verifier rejects unsigned
+///     events), AND
+///   * is authored by the very actor it names as `creator_actor_id` (non-empty) —
+///     you may only found a workspace *as yourself*; a snapshot claiming
+///     `creator = X` but signed by `Y` is rejected, AND
+///   * grants Owner to that creator and to **no other** member — a seed may not
+///     silently hand Owner to a different actor (a forged takeover that preserves
+///     the victim's roster while elevating the attacker, or vice-versa).
+///
+/// A genuine creation seed (`create_chat` / `ensure_workspace_config`) always
+/// satisfies this: it is stamped by the creator, names them as `creator_actor_id`,
+/// and seeds them as the lone Owner. A legitimate *compaction* snapshot does not
+/// (author ≠ creator, multi-owner roster) — which is why it is never chosen over
+/// the real seed on a full-history device, and only used as base via the fallback
+/// when it is all a joiner holds.
+fn is_self_consistent_seed(env: &SessionEventEnvelope) -> bool {
+    let SessionEvent::SessionSnapshot { session } = &env.payload else {
+        return false;
+    };
+    let Some(stamp) = env.actor_stamp.as_ref() else {
+        return false;
+    };
+    let author = stamp.actor.id.as_str();
+    let creator = session.creator_actor_id.as_str();
+    if author.is_empty() || creator.is_empty() || author != creator {
+        return false;
+    }
+    let creator_is_owner = session
+        .members
+        .iter()
+        .any(|m| m.id == creator && m.role == WorkspaceRole::Owner);
+    let has_other_owner = session
+        .members
+        .iter()
+        .any(|m| m.id != creator && m.role == WorkspaceRole::Owner);
+    creator_is_owner && !has_other_owner
 }
 
 #[cfg(test)]
@@ -1252,5 +1344,154 @@ mod tests {
         // Run events ride the reserved Run scope; definitions stay session-scoped.
         assert_eq!(envs[3].scope, EventScope::Run);
         assert_eq!(envs[1].scope, EventScope::Session);
+    }
+
+    // ── B2: forged-seed takeover ────────────────────────────────────────────
+    //
+    // A `SessionSnapshot` is a full-state overwrite, and `lamport` is an
+    // attacker-settable envelope field. A malicious keyholder can craft a
+    // `lamport: 0` snapshot that sorts before the genuine creation seed and
+    // rewrites the roster for every peer. The base is now the earliest
+    // *self-consistent creation seed*, so these forgeries lose to the real seed.
+
+    /// A self-consistent creation seed: `creator` is the sole Owner, on the given
+    /// session/workspace ids (so several seeds can be placed in one log).
+    fn seed_session(creator: &str, sid: Uuid, wid: Uuid) -> ChatSession {
+        let mut s = base_session();
+        s.id = sid;
+        s.workspace_id = wid;
+        s.creator_actor_id = creator.into();
+        s.members.push(member(creator, creator, WorkspaceRole::Owner));
+        s
+    }
+
+    #[test]
+    fn forged_low_lamport_seed_cannot_take_over() {
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        // Legit creation seed: Alice founds as herself (sole Owner), lamport 5.
+        let alice = seed_session("alice", sid, wid);
+        // Forged takeover: Mallory keeps Alice's Owner roster but adds herself as a
+        // SECOND Owner and names herself creator, at lamport 0 so it sorts FIRST.
+        let mut forged = base_session();
+        forged.id = sid;
+        forged.workspace_id = wid;
+        forged.creator_actor_id = "mallory".into();
+        forged.members.push(member("alice", "alice", WorkspaceRole::Owner));
+        forged.members.push(member("mallory", "mallory", WorkspaceRole::Owner));
+
+        let events = vec![
+            by("mallory", env(sid, wid, 0, SessionEvent::SessionSnapshot { session: Box::new(forged) })),
+            by("alice", env(sid, wid, 5, SessionEvent::SessionSnapshot { session: Box::new(alice) })),
+        ];
+        let s = project(&events).expect("session");
+        assert_eq!(s.creator_actor_id, "alice", "forged seed must not rewrite the creator");
+        assert_eq!(s.role_of("alice"), WorkspaceRole::Owner, "legit creator remains Owner");
+        assert_ne!(s.role_of("mallory"), WorkspaceRole::Owner, "forged seed did not make Mallory Owner");
+        assert!(!s.members.iter().any(|m| m.id == "mallory"), "Mallory not injected into the roster");
+    }
+
+    #[test]
+    fn forged_seed_claiming_a_foreign_creator_is_rejected_as_base() {
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        let alice = seed_session("alice", sid, wid);
+        // Mallory forges a seed that NAMES Alice as creator (to mimic the real
+        // seed) but signs it herself, at lamport 0.
+        let mut forged = base_session();
+        forged.id = sid;
+        forged.workspace_id = wid;
+        forged.creator_actor_id = "alice".into();
+        forged.members.push(member("mallory", "mallory", WorkspaceRole::Owner));
+        let events = vec![
+            by("mallory", env(sid, wid, 0, SessionEvent::SessionSnapshot { session: Box::new(forged) })),
+            by("alice", env(sid, wid, 5, SessionEvent::SessionSnapshot { session: Box::new(alice) })),
+        ];
+        let s = project(&events).expect("session");
+        assert_eq!(s.role_of("alice"), WorkspaceRole::Owner, "author≠creator seed rejected → Alice wins");
+        assert_ne!(s.role_of("mallory"), WorkspaceRole::Owner);
+    }
+
+    #[test]
+    fn legit_single_creator_seed_projects() {
+        // The self-consistency invariant holds for a genuine `create_chat` seed.
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        let alice = seed_session("alice", sid, wid);
+        let events =
+            vec![by("alice", env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(alice) }))];
+        let s = project(&events).expect("session");
+        assert_eq!(s.role_of("alice"), WorkspaceRole::Owner);
+        assert_eq!(s.creator_actor_id, "alice");
+    }
+
+    #[test]
+    fn legit_compaction_snapshot_still_projects_as_a_joiner_tail() {
+        // A compaction checkpoint authored by an Admin (not the creator), with a
+        // multi-member roster where the original creator is still Owner — what a
+        // joiner is handed as its earliest event. Not a self-consistent creation
+        // seed, so it becomes base via the fallback and MUST still project.
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        let mut compacted = base_session();
+        compacted.id = sid;
+        compacted.workspace_id = wid;
+        compacted.creator_actor_id = "alice".into();
+        compacted.members.push(member("alice", "alice", WorkspaceRole::Owner));
+        compacted.members.push(member("bob", "bob", WorkspaceRole::Admin));
+        let events =
+            vec![by("bob", env(sid, wid, 9, SessionEvent::SessionSnapshot { session: Box::new(compacted) }))];
+        let s = project(&events).expect("compaction snapshot must still project");
+        assert_eq!(s.role_of("alice"), WorkspaceRole::Owner);
+        assert_eq!(s.role_of("bob"), WorkspaceRole::Admin);
+    }
+
+    #[test]
+    fn full_history_prefers_creation_seed_over_later_compaction() {
+        // Creation seed + a later compaction snapshot: the self-consistent seed is
+        // the base; the compaction snapshot folds inert; the roster is preserved.
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        let alice = seed_session("alice", sid, wid);
+        let bob = member("bob", "bob", WorkspaceRole::Admin);
+        let mut compacted = seed_session("alice", sid, wid);
+        compacted.members.push(bob.clone());
+        let events = vec![
+            by("alice", env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(alice) })),
+            by("alice", env(sid, wid, 2, SessionEvent::MemberAdded { member: bob })),
+            by("bob", env(sid, wid, 3, SessionEvent::SessionSnapshot { session: Box::new(compacted) })),
+        ];
+        let s = project(&events).expect("session");
+        assert_eq!(s.creator_actor_id, "alice");
+        assert_eq!(s.role_of("alice"), WorkspaceRole::Owner);
+        assert_eq!(s.role_of("bob"), WorkspaceRole::Admin, "bob added by alice survives");
+    }
+
+    #[test]
+    fn seed_selection_converges_across_permutations() {
+        // The seed-trust check is a deterministic function of each envelope, so the
+        // forged-seed defense is order-independent — every delivery order agrees.
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        let alice = seed_session("alice", sid, wid);
+        let mut forged = base_session();
+        forged.id = sid;
+        forged.workspace_id = wid;
+        forged.creator_actor_id = "mallory".into();
+        forged.members.push(member("alice", "alice", WorkspaceRole::Owner));
+        forged.members.push(member("mallory", "mallory", WorkspaceRole::Owner));
+        let msg = ChatMessage::new(MessageRole::User, "alice", "hi");
+        let events = vec![
+            by("mallory", env(sid, wid, 0, SessionEvent::SessionSnapshot { session: Box::new(forged) })),
+            by("alice", env(sid, wid, 5, SessionEvent::SessionSnapshot { session: Box::new(alice) })),
+            env(sid, wid, 6, SessionEvent::MessageAppended { message: msg }),
+        ];
+        let expected = project(&events).expect("session");
+        assert_eq!(expected.role_of("alice"), WorkspaceRole::Owner);
+        assert_ne!(expected.role_of("mallory"), WorkspaceRole::Owner);
+        for seed in 0..500u64 {
+            let permuted = shuffled(events.clone(), seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            assert_eq!(project(&permuted).expect("session"), expected, "divergence at seed {seed}");
+        }
     }
 }
