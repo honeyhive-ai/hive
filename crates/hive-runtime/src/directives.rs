@@ -6,8 +6,38 @@
 //! - `[[vote: 👍 👎]]` — prepopulate clickable reaction chips for others
 //! - `[[workflow: { …json… }]]` — author a workflow definition (validated and
 //!   saved by the app layer; inert until a human runs it)
+//! - `[[propose: { …json… }]]` — author an action proposal saved for human
+//!   review (approved via quorum in the Review pane; never auto-executed)
 //!
 //! Directives are stripped from the visible body. Pure + unit-tested.
+
+use hive_core::ProposalKind;
+use serde::Deserialize;
+
+/// A parsed `[[propose: …]]` directive. The app layer turns this into an
+/// `ActionProposal` authored by the responding agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedProposal {
+    pub title: String,
+    pub body: String,
+    pub kind: ProposalKind,
+    pub required_approvals: u32,
+}
+
+/// Shape of the JSON body of a `[[propose: …]]` directive. `title` is required;
+/// everything else defaults. A missing/malformed block is skipped (see
+/// [`parse_reply_directives`]).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawProposal {
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    kind: Option<ProposalKind>,
+    #[serde(default)]
+    required_approvals: Option<u32>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplyDirectives {
@@ -16,6 +46,9 @@ pub struct ReplyDirectives {
     /// Raw JSON payloads of `[[workflow: …]]` directives, in order. Parsing/
     /// validation happens in the app layer (which owns the save path).
     pub workflows: Vec<String>,
+    /// Parsed `[[propose: …]]` directives, in order. Malformed blocks are
+    /// skipped (lenient — a bad proposal doesn't fail the whole reply).
+    pub proposals: Vec<ParsedProposal>,
     /// The body with the directive markers removed.
     pub cleaned: String,
 }
@@ -25,6 +58,7 @@ pub struct ReplyDirectives {
 pub fn parse_reply_directives(body: &str) -> ReplyDirectives {
     let mut emojis: Vec<String> = Vec::new();
     let mut workflows: Vec<String> = Vec::new();
+    let mut proposals: Vec<ParsedProposal> = Vec::new();
     let mut cleaned = String::with_capacity(body.len());
     let bytes = body.as_bytes();
     let mut i = 0;
@@ -41,6 +75,33 @@ pub fn parse_reply_directives(body: &str) -> ReplyDirectives {
                         let close = after + leading_ws(&body[after..]);
                         if body[close..].starts_with("]]") {
                             workflows.push(body[json_start..json_start + obj_len].to_string());
+                            i = close + 2;
+                            continue;
+                        }
+                    }
+                }
+            }
+            // Proposal payloads are JSON too — scan the balanced object so a
+            // body containing "]]" is handled. A malformed/incomplete block is
+            // skipped (still stripped) rather than failing the reply.
+            if let Some(rest) = body[i + 2..].strip_prefix("propose:") {
+                let json_start = i + 2 + "propose:".len() + leading_ws(rest);
+                if body[json_start..].starts_with('{') {
+                    if let Some(obj_len) = scan_json_object(&body[json_start..]) {
+                        let after = json_start + obj_len;
+                        let close = after + leading_ws(&body[after..]);
+                        if body[close..].starts_with("]]") {
+                            let json = &body[json_start..json_start + obj_len];
+                            if let Ok(raw) = serde_json::from_str::<RawProposal>(json) {
+                                if !raw.title.trim().is_empty() {
+                                    proposals.push(ParsedProposal {
+                                        title: raw.title,
+                                        body: raw.body,
+                                        kind: raw.kind.unwrap_or(ProposalKind::Decision),
+                                        required_approvals: raw.required_approvals.unwrap_or(1),
+                                    });
+                                }
+                            }
                             i = close + 2;
                             continue;
                         }
@@ -73,6 +134,7 @@ pub fn parse_reply_directives(body: &str) -> ReplyDirectives {
     ReplyDirectives {
         emojis,
         workflows,
+        proposals,
         cleaned: cleaned.trim().to_string(),
     }
 }
@@ -180,6 +242,53 @@ mod tests {
         let r = parse_reply_directives(body);
         assert!(r.workflows.is_empty());
         assert_eq!(r.cleaned, body);
+    }
+
+    #[test]
+    fn parses_wellformed_proposal_and_strips() {
+        let body = "Proposing a change.\n[[propose: {\"title\": \"Bump timeout\", \"kind\": \"command\", \"body\": \"raise it to 30s\", \"requiredApprovals\": 2}]]\nLet me know.";
+        let r = parse_reply_directives(body);
+        assert_eq!(r.proposals.len(), 1);
+        let p = &r.proposals[0];
+        assert_eq!(p.title, "Bump timeout");
+        assert_eq!(p.kind, ProposalKind::Command);
+        assert_eq!(p.body, "raise it to 30s");
+        assert_eq!(p.required_approvals, 2);
+        assert_eq!(r.cleaned, "Proposing a change.\n\nLet me know.");
+    }
+
+    #[test]
+    fn proposal_defaults_kind_and_approvals() {
+        let r = parse_reply_directives(r#"[[propose: {"title": "Ship v2"}]]"#);
+        assert_eq!(r.proposals.len(), 1);
+        assert_eq!(r.proposals[0].kind, ProposalKind::Decision);
+        assert_eq!(r.proposals[0].required_approvals, 1);
+        assert_eq!(r.proposals[0].body, "");
+        assert_eq!(r.cleaned, "");
+    }
+
+    #[test]
+    fn proposal_body_may_contain_double_brackets() {
+        let body = r#"[[propose: {"title": "Note", "body": "arrays like [[1]] are fine"}]]"#;
+        let r = parse_reply_directives(body);
+        assert_eq!(r.proposals.len(), 1);
+        assert_eq!(r.proposals[0].body, "arrays like [[1]] are fine");
+        assert_eq!(r.cleaned, "");
+    }
+
+    #[test]
+    fn malformed_proposal_missing_title_is_skipped_not_fatal() {
+        // Balanced JSON but no title → skipped (and stripped), reply survives.
+        let body = "Here. [[propose: {\"kind\": \"decision\"}]] Done.";
+        let r = parse_reply_directives(body);
+        assert!(r.proposals.is_empty());
+        assert_eq!(r.cleaned, "Here.  Done.");
+    }
+
+    #[test]
+    fn no_proposal_directive_yields_empty() {
+        let r = parse_reply_directives("just a normal reply");
+        assert!(r.proposals.is_empty());
     }
 
     #[test]
