@@ -3928,6 +3928,23 @@ fn finalize_reply(
             }
         }
     }
+    // Agent-authored action proposals: saved for human review, never executed
+    // here. The author is the responding agent, so the governance self-approval
+    // guard applies — its own vote can't satisfy quorum.
+    for proposed in &parsed.proposals {
+        let mut proposal = hive_core::ActionProposal::new(&proposed.title, proposed.kind, author);
+        proposal.body = proposed.body.clone();
+        proposal.required_approvals = proposed.required_approvals;
+        svc.upsert_proposal(session_id, workspace_id, proposal).map_err(map_err)?;
+        let _ = svc.post_system_note(
+            session_id,
+            workspace_id,
+            format!(
+                "📝 {author} proposed “{}” — review and approve it in the Review pane.",
+                proposed.title
+            ),
+        );
+    }
     Ok(parsed.cleaned)
 }
 
@@ -7857,6 +7874,50 @@ mod vault_context_tests {
         assert!(s.contains("[…truncated]"));
         // Section stays bounded: cap + small formatting overhead.
         assert!(s.chars().count() < VAULT_MAX_CHARS + 200);
+    }
+}
+
+#[cfg(test)]
+mod finalize_proposal_tests {
+    use super::finalize_reply;
+    use hive_core::crypto::SigningKeypair;
+    use hive_core::{ActorIdentity, ActorKind, ProposalKind, ProposalStatus, WorkspaceAgent};
+    use hive_runtime::chat_service::ChatService;
+    use hive_runtime::EventStore;
+    use uuid::Uuid;
+
+    fn service() -> ChatService {
+        let store = EventStore::open_in_memory().unwrap();
+        let kp = SigningKeypair::generate().unwrap();
+        let account_kp = SigningKeypair::generate().unwrap();
+        let author = ActorIdentity::new("u1", "Mara", ActorKind::Human);
+        ChatService::new(store, Uuid::new_v4(), kp, account_kp, author)
+    }
+
+    #[test]
+    fn agent_reply_with_propose_creates_agent_authored_proposal() {
+        let mut svc = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+        svc.add_agent(chat.id, wid, WorkspaceAgent::new("Scout", "ws-claude")).unwrap();
+        let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude").unwrap();
+
+        let body = "Done.\n[[propose: {\"title\": \"Bump timeout\", \"kind\": \"command\", \"body\": \"30s\", \"requiredApprovals\": 2}]]";
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", body).unwrap();
+        assert_eq!(cleaned, "Done.");
+
+        let session = svc.load(chat.id).unwrap().unwrap();
+        assert_eq!(session.proposals.len(), 1);
+        let p = &session.proposals[0];
+        assert_eq!(p.title, "Bump timeout");
+        assert_eq!(p.author_actor_id, "Scout"); // authored by the responding agent
+        assert_eq!(p.kind, ProposalKind::Command);
+        assert_eq!(p.body, "30s");
+        assert_eq!(p.required_approvals, 2);
+        // Saved for review, not executed.
+        assert_eq!(p.status, ProposalStatus::Open);
+        // The agent's own approval can't satisfy quorum (self-approval guard).
+        assert_eq!(p.qualifying_approvals(), 0);
     }
 }
 

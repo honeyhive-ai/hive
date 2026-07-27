@@ -83,15 +83,22 @@ fn workflow_guidance() -> &'static str {
 Rules: stage ids are slugs; "after" edges must form a DAG (stages whose deps are all done run in parallel); {{nodes.<id>.output}} may only reference upstream stages; gates pause for human approval — "onReject" is "halt" or {"retryFrom": "<upstream id>"}."#
 }
 
+fn proposal_guidance() -> &'static str {
+    r#"To put a concrete action up for the team to approve, end a reply with a [[propose: {…}]] directive:
+[[propose: {"title": "…", "kind": "fileDiff|command|decision", "body": "…", "requiredApprovals": 1}]]
+This is saved for human review — it is NOT auto-executed. It appears in the Review pane and is approved by quorum; your own authorship does not count toward it. On approval a human dispatches it back to an agent to carry out. Use "fileDiff" for a proposed diff, "command" for a command to run, "decision" for a call to make. title is required; kind defaults to decision, requiredApprovals to 1."#
+}
+
 /// System prompt for the primary runtime: it coordinates and may act directly.
 pub fn primary_system_prompt(session: &ChatSession) -> String {
     let base = format!(
         "You are the primary runtime for the Hive workspace \"{title}\". You \
-coordinate the conversation and may take actions or answer directly.\n\n{roster}\n\n{guide}\n\n{wf}",
+coordinate the conversation and may take actions or answer directly.\n\n{roster}\n\n{guide}\n\n{wf}\n\n{prop}",
         title = session.title,
         roster = workspace_roster(session),
         guide = mention_guidance(),
         wf = workflow_guidance(),
+        prop = proposal_guidance(),
     );
     with_skills(base, session, None)
 }
@@ -106,13 +113,14 @@ pub fn agent_system_prompt(session: &ChatSession, agent: &WorkspaceAgent) -> Str
     let base = format!(
         "You are {name}, {role}, collaborating in the Hive workspace \"{title}\". \
 Stay in character as {name}; you are distinct from the primary runtime and the \
-other agents.\n\n{roster}\n\n{guide}\n\n{wf}",
+other agents.\n\n{roster}\n\n{guide}\n\n{wf}\n\n{prop}",
         name = agent.name,
         role = role,
         title = session.title,
         roster = workspace_roster(session),
         guide = mention_guidance(),
         wf = workflow_guidance(),
+        prop = proposal_guidance(),
     );
     with_skills(base, session, Some(agent.id))
 }
@@ -165,6 +173,17 @@ mod tests {
         let p = primary_system_prompt(&session());
         assert!(p.contains("primary runtime"));
         assert!(p.contains("@Scout"));
+    }
+
+    #[test]
+    fn proposal_guidance_injected_into_primary_and_agents() {
+        let s = session();
+        let agent = s.workspace_agents[0].clone();
+        for p in [primary_system_prompt(&s), agent_system_prompt(&s, &agent)] {
+            assert!(p.contains("[[propose:"));
+            assert!(p.contains("Review pane"));
+            assert!(p.contains("NOT auto-executed"));
+        }
     }
 
     #[test]
