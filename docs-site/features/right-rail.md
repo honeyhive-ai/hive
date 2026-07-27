@@ -34,8 +34,13 @@ pane header to close the rail entirely.
 - **Git**: when you want a per-file status view. The pill in the
   workspace bar shows the rollup count; the pane shows what's
   changed.
-- **Review**: when an agent has proposed a write. Lists pending
-  proposals, lets you claim / approve / disposition. It also shows
+- **Review**: when an agent has proposed a write. An agent raises a
+  proposal by ending a reply with a `[[propose: …]]` directive; it's saved
+  here for review, never auto-run. Lists pending proposals, lets you claim /
+  approve / disposition — approval counts at the voter's real role and an
+  author can't approve their own — then **Implement** once quorum is met.
+  See [agent-authored proposals](multi-agent.md#agent-authored-proposals).
+  It also shows
   **Queued work** — every unanswered `@agent` mention with its host's
   live status (online / offline / owner-device). If an agent's host is
   offline, a **Run on worker** button reassigns it to an online worker
