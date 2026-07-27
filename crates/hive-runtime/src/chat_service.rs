@@ -47,6 +47,14 @@ pub struct ChatService {
     /// published (as a public key) so peers can verify events from this device.
     account_keypair: SigningKeypair,
     author: ActorIdentity,
+    /// The out-of-band-pinned founder of the *active* workspace: the account id
+    /// carried by the `hivews1:` invite (`WorkspaceConn::founder_actor_id`). When
+    /// set, projection accepts only a base seed authored by this founder, so a
+    /// forged low-lamport `SessionSnapshot` from another keyholder cannot displace
+    /// the real founding seed (B2 residual fix). `None` = no invite / local /
+    /// legacy workspace ⇒ the earliest-self-consistent-seed fallback. Set via
+    /// [`set_trusted_founder`] whenever the active workspace changes.
+    trusted_founder: Option<String>,
 }
 
 impl ChatService {
@@ -63,7 +71,24 @@ impl ChatService {
             keypair,
             account_keypair,
             author,
+            trusted_founder: None,
         }
+    }
+
+    /// Pin (or clear, with `None`/empty) the trusted founder for the active
+    /// workspace — the account id the `hivews1:` invite names as its founder. The
+    /// caller sets this every time the active workspace changes (creation pins the
+    /// creator; joining pins the invite's founder). Read internally by [`load`] and
+    /// threaded into projection; it deliberately does not widen `load`'s signature.
+    pub fn set_trusted_founder(&mut self, founder: Option<String>) {
+        self.trusted_founder = founder
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty());
+    }
+
+    /// The currently-pinned trusted founder, if any.
+    pub fn trusted_founder(&self) -> Option<&str> {
+        self.trusted_founder.as_deref()
     }
 
     pub fn store(&self) -> &EventStore {
@@ -1193,12 +1218,20 @@ impl ChatService {
     /// (union with any pre-hoist per-chat config, so nothing vanishes before the
     /// migration). The config log itself loads raw: it IS the source.
     pub fn load(&self, session_id: Uuid) -> Result<Option<ChatSession>> {
-        let Some(mut session) = self.store.load_session(session_id)? else {
+        // Pin the base seed to the out-of-band founder (B2 residual fix). This is
+        // load-bearing for the workspace-config log — where the roster/ownership
+        // lives — so a forged low-lamport config seed can't displace the founder's.
+        // A regular chat created by a non-founder member has no founder-matching
+        // seed, so projection deterministically falls back to that chat's own
+        // self-consistent seed (see `events::project_with_founder`); the pin never
+        // breaks a legitimately member-created chat.
+        let founder = self.trusted_founder.as_deref();
+        let Some(mut session) = self.store.load_session_with_founder(session_id, founder)? else {
             return Ok(None);
         };
         let config_id = workspace_config_session_id(session.workspace_id);
         if session_id != config_id {
-            if let Some(cfg) = self.store.load_session(config_id)? {
+            if let Some(cfg) = self.store.load_session_with_founder(config_id, founder)? {
                 // Members hoist onto the config log so the roster is workspace-wide.
                 // Dedup by member id; the config-log entry is the source of truth,
                 // so it *replaces* any same-id per-session member (role/title/index

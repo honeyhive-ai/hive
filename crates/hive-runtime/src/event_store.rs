@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use hive_core::{project, ChatSession, SessionEvent, SessionEventEnvelope};
+use hive_core::{project_with_founder, ChatSession, SessionEvent, SessionEventEnvelope};
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 use uuid::Uuid;
@@ -417,18 +417,32 @@ impl EventStore {
     /// Project a session into its current state, replaying only from the latest
     /// `sessionSnapshot` so cost stays bounded on long chats (#3).
     pub fn load_session(&self, session_id: Uuid) -> Result<Option<ChatSession>> {
-        // Project the full stream. `project` folds in canonical (lamport,
-        // event_id) order and seeds from the canonical-latest snapshot, so the
-        // result is independent of *this device's* ingestion order. A row_id
-        // slice from the latest snapshot would feed `project` a different subset
-        // when a snapshot is ingested after its own deltas — reintroducing
-        // cross-device divergence. Bounded-cost compaction (canonical
-        // lamport-ordered slicing) is a follow-up; correctness comes first.
+        self.load_session_with_founder(session_id, None)
+    }
+
+    /// [`load_session`], but pinned to a `trusted_founder` — the out-of-band
+    /// workspace-founder account id from the `hivews1:` invite (B2 residual fix).
+    /// Projection then rejects any base seed not authored by that founder, so a
+    /// forged low-lamport `SessionSnapshot` from another keyholder cannot displace
+    /// the founder's seed. `None` is exactly [`load_session`] (legacy / local /
+    /// no-invite). `ChatService::load` supplies its pinned founder here.
+    pub fn load_session_with_founder(
+        &self,
+        session_id: Uuid,
+        trusted_founder: Option<&str>,
+    ) -> Result<Option<ChatSession>> {
+        // Project the full stream. `project_with_founder` folds in canonical
+        // (lamport, event_id) order and selects the base by a deterministic rule
+        // (+ the fixed founder string), so the result is independent of *this
+        // device's* ingestion order. A row_id slice from the latest snapshot would
+        // feed a different subset when a snapshot is ingested after its own deltas
+        // — reintroducing cross-device divergence. Bounded-cost compaction
+        // (canonical lamport-ordered slicing) is a follow-up; correctness first.
         let envelopes = self.query_envelopes(
             "SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY row_id ASC",
             [session_id.to_string()],
         )?;
-        Ok(project(&envelopes))
+        Ok(project_with_founder(&envelopes, trusted_founder))
     }
 
     /// Row id of the latest `sessionSnapshot` for a session, if any.

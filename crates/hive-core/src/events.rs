@@ -544,27 +544,63 @@ impl ChatSession {
 /// The predicate is a deterministic function of each envelope, so every device
 /// reaches the identical base choice ⇒ convergence is preserved.
 ///
-/// Residual: a fully self-consistent seed a keyholder mints *as themselves*
-/// (`creator = self`, self as the lone Owner, `lamport: 0`) is indistinguishable
-/// in-band from a genuine founding and will still displace the real seed as the
-/// base once it syncs. Closing that requires pinning the true founder out of band
-/// (the `hivews1:` invite's identity) and threading it into projection — tracked
-/// as the B2 follow-up; see the module security note.
+/// ## B2 residual closed: the out-of-band founder pin
+///
+/// A fully self-consistent seed a keyholder mints *as themselves* (`creator =
+/// self`, self as the lone Owner, `lamport: 0`) is indistinguishable *in-band*
+/// from a genuine founding: it satisfies [`is_self_consistent_seed`] and, sorting
+/// first, would displace the real seed as base once it syncs (a fork/eviction
+/// takeover). Closing it requires an out-of-band anchor — **who legitimately
+/// founded this workspace** — carried by the `hivews1:` invite (see
+/// `WorkspaceConn::founder_actor_id` in `app`) and threaded into projection via
+/// [`project_with_founder`].
+///
+/// When a `trusted_founder` is pinned, the base MUST be a self-consistent seed
+/// *authored by and naming that founder* as `creator_actor_id`. A forged
+/// self-consistent seed from anyone else is rejected as base **even if its lamport
+/// is lower**, so the real founder's seed wins regardless of a competing lamport-0
+/// forgery — and the forgery, sorting before the chosen base, is dropped entirely.
+/// The pin is a fixed string identical on every device (it rode the same invite),
+/// so base selection stays a deterministic function of the event set ⇒ convergence
+/// holds. [`project`] (no pin) keeps the pre-existing earliest-self-consistent-seed
+/// behavior for workspaces created locally, joined without a founder-bearing
+/// invite, or on legacy logs.
+///
+/// Residual: a peer that holds a forged seed but has **not yet synced** the real
+/// founder's seed has no founder-matching base to prefer, so it falls back to the
+/// earliest self-consistent seed (possibly the forgery) until the genuine seed
+/// arrives — at which point the pin makes the founder's seed win. Likewise a
+/// joiner who never received an invite carrying `founder_actor_id` (`None` pin)
+/// gets only the in-band self-consistency guarantee.
 ///
 /// Cost note: this replays from the base snapshot rather than the newest, trading
 /// a bounded-load optimization for correctness. Causal-frontier snapshots (a
 /// per-source watermark that lets a newer snapshot safely subsume deltas) are the
 /// future optimization; correctness comes first.
 pub fn project(envelopes: &[SessionEventEnvelope]) -> Option<ChatSession> {
+    project_with_founder(envelopes, None)
+}
+
+/// [`project`], but pinned to a `trusted_founder` (an out-of-band account id from
+/// the workspace invite) — the B2 residual fix. See [`project`] for the base
+/// selection rule and convergence argument. `None` is exactly [`project`].
+pub fn project_with_founder(
+    envelopes: &[SessionEventEnvelope],
+    trusted_founder: Option<&str>,
+) -> Option<ChatSession> {
     let mut ordered: Vec<&SessionEventEnvelope> = envelopes.iter().collect();
     ordered.sort_by_key(|e| e.canonical_key());
 
-    // Prefer the earliest self-consistent creation seed; fall back to the earliest
-    // snapshot of any kind (compaction tail / legacy). Both are deterministic
-    // functions of the event set, so every device agrees on the base.
-    let base = ordered
-        .iter()
-        .position(|e| is_self_consistent_seed(e))
+    // Base selection, in priority order — each a deterministic function of the
+    // event set (+ the fixed founder string), so every device agrees on the base:
+    //   1. With a pin: the earliest self-consistent seed authored by & naming the
+    //      trusted founder. A lower-lamport forgery from anyone else loses here.
+    //   2. The earliest self-consistent creation seed (the no-pin B2 behavior; and
+    //      the pre-sync fallback when the founder's own seed hasn't arrived yet).
+    //   3. The earliest snapshot of any kind (compaction tail / legacy).
+    let base = trusted_founder
+        .and_then(|founder| ordered.iter().position(|e| is_founder_seed(e, founder)))
+        .or_else(|| ordered.iter().position(|e| is_self_consistent_seed(e)))
         .or_else(|| {
             ordered
                 .iter()
@@ -645,6 +681,22 @@ fn is_self_consistent_seed(env: &SessionEventEnvelope) -> bool {
         .iter()
         .any(|m| m.id != creator && m.role == WorkspaceRole::Owner);
     creator_is_owner && !has_other_owner
+}
+
+/// Whether `env` is a self-consistent creation seed founded by `founder` — the
+/// base a projection accepts when the true founder is pinned out of band (B2
+/// residual; see [`project_with_founder`]). It is exactly [`is_self_consistent_seed`]
+/// plus `creator_actor_id == founder`; because self-consistency already requires
+/// `author == creator`, this also means the seed was *authored by* the founder, so
+/// no one but the founder can supply a base once the pin is set.
+fn is_founder_seed(env: &SessionEventEnvelope, founder: &str) -> bool {
+    if founder.is_empty() || !is_self_consistent_seed(env) {
+        return false;
+    }
+    match &env.payload {
+        SessionEvent::SessionSnapshot { session } => session.creator_actor_id == founder,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1492,6 +1544,109 @@ mod tests {
         for seed in 0..500u64 {
             let permuted = shuffled(events.clone(), seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
             assert_eq!(project(&permuted).expect("session"), expected, "divergence at seed {seed}");
+        }
+    }
+
+    // ── B2 residual closed: the out-of-band founder pin ─────────────────────
+    //
+    // A keyholder can mint a *fully self-consistent* seed AS THEMSELVES (sole
+    // Owner, creator = self, lamport 0), which passes `is_self_consistent_seed`
+    // and would otherwise displace the real founding seed as base once synced.
+    // `project_with_founder` closes it by pinning the true founder out of band
+    // (the invite's identity) and accepting only that founder's seed as base.
+
+    #[test]
+    fn founder_pin_defeats_self_consistent_forged_seed() {
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        // Alice's genuine founding seed, lamport 5.
+        let alice = seed_session("alice", sid, wid);
+        // Mallory mints a FULLY self-consistent seed as herself (sole Owner,
+        // creator = mallory) at lamport 0 so it sorts first — the residual the
+        // in-band self-consistency check alone cannot catch.
+        let mallory = seed_session("mallory", sid, wid);
+        let events = vec![
+            by("mallory", env(sid, wid, 0, SessionEvent::SessionSnapshot { session: Box::new(mallory) })),
+            by("alice", env(sid, wid, 5, SessionEvent::SessionSnapshot { session: Box::new(alice) })),
+        ];
+
+        // Pinned to Alice (from the invite): her seed is the base despite the
+        // lower-lamport forgery; Alice stays Owner, Mallory is not injected.
+        let s = project_with_founder(&events, Some("alice")).expect("session");
+        assert_eq!(s.creator_actor_id, "alice", "founder's seed wins over lower-lamport forgery");
+        assert_eq!(s.role_of("alice"), WorkspaceRole::Owner, "founder stays Owner");
+        assert_ne!(s.role_of("mallory"), WorkspaceRole::Owner, "forger did not become Owner");
+        assert!(!s.members.iter().any(|m| m.id == "mallory"), "Mallory not injected into the roster");
+
+        // Documented residual: with NO pin, the earliest self-consistent seed still
+        // wins — here Mallory's lamport-0 forgery — which is exactly why the pin
+        // exists (the pre-existing B2 partial behavior).
+        let unpinned = project(&events).expect("session");
+        assert_eq!(unpinned.creator_actor_id, "mallory", "no pin ⇒ earliest self-consistent seed wins");
+    }
+
+    #[test]
+    fn founder_pinned_creation_and_compaction_still_project() {
+        // Legitimate creation (founder == creator) + a later compaction snapshot
+        // must still project under the pin.
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        let alice = seed_session("alice", sid, wid);
+        let bob = member("bob", "bob", WorkspaceRole::Admin);
+        let mut compacted = seed_session("alice", sid, wid);
+        compacted.members.push(bob.clone());
+        let events = vec![
+            by("alice", env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(alice) })),
+            by("alice", env(sid, wid, 2, SessionEvent::MemberAdded { member: bob })),
+            by("bob", env(sid, wid, 3, SessionEvent::SessionSnapshot { session: Box::new(compacted) })),
+        ];
+        let s = project_with_founder(&events, Some("alice")).expect("session");
+        assert_eq!(s.creator_actor_id, "alice");
+        assert_eq!(s.role_of("alice"), WorkspaceRole::Owner);
+        assert_eq!(s.role_of("bob"), WorkspaceRole::Admin, "bob added by the founder survives");
+    }
+
+    #[test]
+    fn founder_pin_does_not_break_a_nonfounder_created_chat() {
+        // A member (not the founder) legitimately creates a chat: its seed names
+        // bob as sole-Owner creator. With the workspace founder pinned to alice,
+        // there is no alice-seed for THIS chat, so projection deterministically
+        // falls back to bob's own self-consistent seed — the pin must not blank out
+        // a member-created chat.
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        let bob = seed_session("bob", sid, wid);
+        let events =
+            vec![by("bob", env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(bob) }))];
+        let s = project_with_founder(&events, Some("alice")).expect("member-created chat must project");
+        assert_eq!(s.creator_actor_id, "bob");
+        assert_eq!(s.role_of("bob"), WorkspaceRole::Owner);
+    }
+
+    #[test]
+    fn founder_pinned_base_selection_converges_across_permutations() {
+        // The founder-pinned base choice is a deterministic function of the event
+        // set + the fixed founder string, so it is order-independent.
+        let sid = Uuid::new_v4();
+        let wid = Uuid::nil();
+        let alice = seed_session("alice", sid, wid);
+        let mallory = seed_session("mallory", sid, wid);
+        let msg = ChatMessage::new(MessageRole::User, "alice", "hi");
+        let events = vec![
+            by("mallory", env(sid, wid, 0, SessionEvent::SessionSnapshot { session: Box::new(mallory) })),
+            by("alice", env(sid, wid, 5, SessionEvent::SessionSnapshot { session: Box::new(alice) })),
+            env(sid, wid, 6, SessionEvent::MessageAppended { message: msg }),
+        ];
+        let expected = project_with_founder(&events, Some("alice")).expect("session");
+        assert_eq!(expected.creator_actor_id, "alice");
+        assert_ne!(expected.role_of("mallory"), WorkspaceRole::Owner);
+        for seed in 0..500u64 {
+            let permuted = shuffled(events.clone(), seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+            assert_eq!(
+                project_with_founder(&permuted, Some("alice")).expect("session"),
+                expected,
+                "divergence at seed {seed}"
+            );
         }
     }
 }

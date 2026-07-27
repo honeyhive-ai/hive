@@ -364,6 +364,17 @@ struct WorkspaceConn {
     /// surfaced in the Friends section instead.
     #[serde(default)]
     dm_account: Option<String>,
+    /// The account id (`github:<id>`) that legitimately founded this workspace —
+    /// the out-of-band trust anchor for projection's base-seed selection (B2
+    /// residual fix). The founder embeds their own id when generating the
+    /// `hivews1:` invite (`workspace_invite`/`create_workspace`); a joiner records
+    /// it from the invite (`join_workspace`). Pinned onto the `ChatService` when
+    /// the workspace goes active so a forged low-lamport `SessionSnapshot` from
+    /// another keyholder can't displace the founder's seed. `None` on legacy
+    /// invites/settings written before this field ⇒ the in-band self-consistency
+    /// fallback (back-compat).
+    #[serde(default)]
+    founder_actor_id: Option<String>,
 }
 
 impl WorkspaceConn {
@@ -423,10 +434,15 @@ mod workspace_invite_tests {
             key: Some("hunter2".into()),
             icon: None,
             dm_account: None,
+            founder_actor_id: Some("github:42".into()),
         };
         let invite = encode_workspace_invite(&conn);
         assert!(invite.starts_with("hivews1:"));
-        assert_eq!(decode_workspace_invite(&invite).unwrap(), conn);
+        let back = decode_workspace_invite(&invite).unwrap();
+        assert_eq!(back, conn);
+        // The founder pin (B2 anchor) survives the round trip so a joiner learns
+        // who legitimately founded the workspace.
+        assert_eq!(back.founder_actor_id.as_deref(), Some("github:42"));
     }
 
     #[test]
@@ -438,6 +454,7 @@ mod workspace_invite_tests {
             key: None,
             icon: None,
             dm_account: None,
+            founder_actor_id: None,
         };
         let invite = format!("  {}\n", encode_workspace_invite(&conn));
         let back = decode_workspace_invite(&invite).unwrap();
@@ -454,9 +471,28 @@ mod workspace_invite_tests {
     }
 
     #[test]
+    fn legacy_invite_without_founder_decodes_with_none() {
+        // Back-compat: an invite JSON minted before `founder_actor_id` existed has
+        // no such field. It must decode (serde default) with founder `None`, so old
+        // invites keep working and simply fall back to in-band self-consistency.
+        use base64::Engine;
+        let legacy = serde_json::json!({
+            "name": "Old Team",
+            "relay_url": "wss://r/v1",
+            "room": "old-room",
+            "key": "k",
+        });
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&legacy).unwrap());
+        let back = decode_workspace_invite(&format!("hivews1:{b64}")).unwrap();
+        assert_eq!(back.room, "old-room");
+        assert_eq!(back.founder_actor_id, None);
+    }
+
+    #[test]
     fn same_room_shares_workspace_id() {
-        let a = WorkspaceConn { name: "A".into(), relay_url: "x".into(), room: "shared".into(), key: None, icon: None, dm_account: None };
-        let b = WorkspaceConn { name: "B".into(), relay_url: "y".into(), room: "shared".into(), key: Some("k".into()), icon: None, dm_account: None };
+        let a = WorkspaceConn { name: "A".into(), relay_url: "x".into(), room: "shared".into(), key: None, icon: None, dm_account: None, founder_actor_id: None };
+        let b = WorkspaceConn { name: "B".into(), relay_url: "y".into(), room: "shared".into(), key: Some("k".into()), icon: None, dm_account: None, founder_actor_id: Some("github:1".into()) };
         assert_eq!(a.id(), b.id());
     }
 }
@@ -5376,6 +5412,10 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
                     key: s.workspace_passphrase.clone(),
                     icon: None,
                     dm_account: None,
+                    // Legacy single-relay migration: no invite founder is known
+                    // for this pre-existing room, so leave it unpinned (in-band
+                    // self-consistency fallback).
+                    founder_actor_id: None,
                 };
                 s.workspaces.push(conn);
             }
@@ -5912,6 +5952,10 @@ fn list_workspaces(state: State<AppState>) -> Vec<WorkspaceInfoDto> {
 fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<(), String> {
     let id = Uuid::parse_str(&workspace_id).map_err(map_err)?;
     if id == state.local_workspace_id {
+        // The local workspace has no out-of-band invite/founder; clear any pin
+        // carried over from a previously-active team workspace so its projection
+        // uses the in-band self-consistency rule.
+        state.service.lock().unwrap().set_trusted_founder(None);
         *state.active_workspace.lock().unwrap() = state.local_workspace_id;
         return Ok(());
     }
@@ -5923,6 +5967,7 @@ fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<
         s.sync_room = conn.room.clone();
         s.workspace_passphrase = conn.key.clone();
         save_settings(&state.data_dir, &s);
+        let founder = conn.founder_actor_id.clone();
         drop(s);
         *state.active_workspace.lock().unwrap() = id;
         // Announce self into the workspace-wide roster the moment the workspace is
@@ -5931,6 +5976,10 @@ fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<
         // idempotent; a failure here must never block activation, so just log it.
         {
             let mut svc = state.service.lock().unwrap();
+            // Pin the workspace's out-of-band founder (from the invite) BEFORE any
+            // projection this activation triggers, so the founder's config seed is
+            // the base and a forged low-lamport seed can't take over (B2 residual).
+            svc.set_trusted_founder(founder);
             if let Err(e) =
                 svc.ensure_self_member(hive_core::workspace_config_session_id(id), id)
             {
@@ -6009,6 +6058,10 @@ fn create_workspace(state: State<AppState>, name: String) -> Result<WorkspaceInf
     if display.is_empty() {
         return Err("workspace name can't be empty".to_string());
     }
+    // This device is founding the workspace, so its account is the founder — pin
+    // it in the invite so every joiner (and this device) selects this creator's
+    // seed as projection base, and no forged low-lamport seed can displace it (B2).
+    let founder = state.service.lock().unwrap().author().id.clone();
     let conn = {
         let mut s = state.settings.lock().unwrap();
         let room = format!("{}-{}", slugify(display), random_token(6));
@@ -6022,6 +6075,7 @@ fn create_workspace(state: State<AppState>, name: String) -> Result<WorkspaceInf
             key: Some(random_token(24)),
             icon: None,
             dm_account: None,
+            founder_actor_id: (!founder.is_empty()).then(|| founder.clone()),
         };
         s.workspaces.push(conn.clone());
         save_settings(&state.data_dir, &s);
@@ -7044,6 +7098,14 @@ async fn friend_open_dm(
             key: if i_am_owner { Some(random_token(24)) } else { None },
             icon: None,
             dm_account: Some(friend_account.clone()),
+            // The DM's deterministic owner (the lexicographically-smaller account,
+            // == `i_am_owner`) founds the config seed; both sides derive the same
+            // value, so the founder pin is consistent across the pair.
+            founder_actor_id: Some(if i_am_owner {
+                my_account.clone()
+            } else {
+                friend_account.clone()
+            }),
         };
         let mut s = state.settings.lock().unwrap();
         s.workspaces.push(conn);
