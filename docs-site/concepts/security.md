@@ -46,6 +46,11 @@ signature verifies, but the author's role at that point did not permit the
 change, so every peer drops it. Membership is workspace-wide (via the config
 log) and roles are **Owner / Admin / Contributor / Viewer**.
 
+The workspace **founder is pinned via the invite**: the invite carries the
+founding identity, and projection only accepts the real founder's seed as
+the base snapshot. So a malicious keyholder can't forge a competing base to
+hijack or fork the workspace out from under everyone else.
+
 ## What this page does not cover
 
 Private key seeds live as files on disk, not in an OS keystore — see

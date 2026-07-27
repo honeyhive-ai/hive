@@ -67,6 +67,21 @@ per-scope setting** — every skill loaded into the chat is injected in full;
 the model follows the ones relevant to the task at hand. Remove a skill from
 the Skills pane if you don't want it in context.
 
+## Targeting specific agents
+
+By default a skill is **global** — it applies to the primary and every
+agent (the behavior above). A skill can instead be **targeted at specific
+agents**, so only those agents get its instructions and the primary never
+receives it.
+
+The Skills pane's add-form has an **agent-target picker** — a row of agent
+checkboxes. Leave all unchecked for a global skill (all agents); check
+one or more to scope the skill to just those agents. Each skill row shows
+a **scope badge** (global, or the targeted agents).
+
+Utilization is otherwise unchanged: a skill's instructions are injected in
+full into the system prompt of whichever participants it targets.
+
 ## Where it lives
 
 Installed skills are workspace-level: stored in `.hive/skills.json`,

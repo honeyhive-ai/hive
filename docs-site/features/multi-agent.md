@@ -83,6 +83,25 @@ chips on the asker's own message so everyone — humans and agents — can
 just tap. Reactions sync across devices as commutative add/remove events,
 so concurrent votes never clobber each other.
 
+## Agent-authored proposals
+
+An agent can **propose a reviewable action** by ending a reply with a
+`[[propose: …]]` directive carrying a small JSON body:
+
+```text
+[[propose: {"title":"Rename the auth module","kind":"fileDiff",
+            "body":"…the change…","requiredApprovals":1}]]
+```
+
+- `kind` is one of `fileDiff`, `command`, or `decision`.
+- `requiredApprovals` is the quorum the proposal needs (defaults to 1).
+
+The proposal is **saved for human review, not auto-executed**. It lands in
+the **Review** pane, where it's approved by quorum; on approval a human
+clicks **Implement**, which dispatches it back to an agent to carry out
+through the normal consent-gated tool loop. Nothing touches the workspace
+until that deliberate "go".
+
 ## Quorum voting on proposals
 
 A proposal (a reviewed file write, command, etc.) can require **more than
@@ -100,6 +119,18 @@ required count or set a role floor.
 Each qualifying approval records the approver and their role; the proposal
 stays pending until the tally meets quorum, at which point it's eligible to
 be implemented.
+
+### How votes are counted
+
+- **A vote counts at the voter's real workspace role.** If a proposal sets
+  a role floor (`approval_role_floor`), a Viewer's up-vote doesn't qualify
+  against a Contributor floor — the floor is enforced on the voter's actual
+  role, not on whatever the vote claims.
+- **A proposal's author can't approve their own proposal.** The author's
+  own vote never counts toward quorum, so a `requiredApprovals: 1` proposal
+  still needs one approval from *someone else*.
+- **A single qualifying down-vote vetoes** the proposal regardless of the
+  approval tally.
 
 ## Agreement-gated Implement
 

@@ -39,6 +39,21 @@ Point vaults at *files*, not repository roots — a repo URL isn't a
 text document. If you need whole-repo knowledge, expose it through an
 MCP server with search tools instead.
 
+## Targeting specific agents
+
+By default a vault is **global** — its content is available to the primary
+and every agent. A vault can instead be **targeted at specific agents**, so
+only those agents see its reference content and the primary never receives
+it.
+
+The Vaults pane's add-form has an **agent-target picker** — a row of agent
+checkboxes. Leave all unchecked for a global vault (all agents); check one
+or more to scope the vault to just those agents. Each vault row shows a
+**scope badge** (global, or the targeted agents).
+
+The caps are unchanged: for any given responder the first **3 sources** it
+is entitled to see are injected, **~6,000 characters each**.
+
 ## Sharing & authorization
 
 Vault sources are workspace state: adding or removing one emits a
