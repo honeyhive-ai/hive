@@ -13,8 +13,8 @@ use hive_core::crypto::{sign_envelope, DeviceCertificate};
 use hive_core::events::MemberRoleChange;
 use hive_core::{
     workspace_config_session_id, ActionProposal, ActorIdentity, ActorStamp, Channel, ChatMessage,
-    ChatSession, MessageReaction, MessageRole, ProposalApproval, SessionEvent, SessionEventEnvelope,
-    SigningKeypair, SkillProfile, Timestamp, VaultSource, WorkflowDefinition, WorkflowRun,
+    ChatSession, MessageReaction, MessageRole, MountedVault, ProposalApproval, SessionEvent,
+    SessionEventEnvelope, SigningKeypair, SkillProfile, Timestamp, WorkflowDefinition, WorkflowRun,
     WorkspaceAgent, WorkspaceCredential, WorkspaceHost, WorkspaceMember, WorkspaceRole,
     WorkspaceRuntime,
 };
@@ -998,12 +998,13 @@ impl ChatService {
         Ok(())
     }
 
-    /// Add (dedup by raw URL) a vault source.
+    /// Add (dedup by raw URL) a vault source. If a matching URL already exists,
+    /// its agent targeting is replaced with the incoming mount's.
     pub fn add_vault_source(
         &mut self,
         _session_id: Uuid,
         workspace_id: Uuid,
-        source: VaultSource,
+        vault: MountedVault,
     ) -> Result<()> {
         // Config hoist (§11): these records are workspace-level — target the
         // workspace-config log, not the calling chat's session.
@@ -1012,8 +1013,10 @@ impl ChatService {
             .load(session_id)?
             .map(|s| s.vault_sources)
             .unwrap_or_default();
-        if !sources.iter().any(|s| s.raw_url() == source.raw_url()) {
-            sources.push(source);
+        if let Some(slot) = sources.iter_mut().find(|s| s.raw_url() == vault.raw_url()) {
+            *slot = vault;
+        } else {
+            sources.push(vault);
         }
         self.append_signed(session_id, workspace_id, SessionEvent::VaultSourcesUpdated { sources })?;
         Ok(())
@@ -1029,7 +1032,7 @@ impl ChatService {
         // Config hoist (§11): these records are workspace-level — target the
         // workspace-config log, not the calling chat's session.
         let session_id = self.ensure_workspace_config(workspace_id)?;
-        let sources: Vec<VaultSource> = self
+        let sources: Vec<MountedVault> = self
             .load(session_id)?
             .map(|s| s.vault_sources)
             .unwrap_or_default()

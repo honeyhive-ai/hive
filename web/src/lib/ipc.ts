@@ -518,11 +518,19 @@ export const listAllMentionStates = () =>
 export const listSkills = (sessionId: string) =>
   invoke<SkillDto[]>("list_skills", { sessionId });
 
-export const addSkillInline = (sessionId: string, name: string, instructions: string) =>
-  invoke<void>("add_skill_inline", { sessionId, name, instructions });
+export const addSkillInline = (
+  sessionId: string,
+  name: string,
+  instructions: string,
+  agentIds: string[] = [],
+) => invoke<void>("add_skill_inline", { sessionId, name, instructions, agentIds });
 
-export const installSkill = (sessionId: string, name: string, source: string) =>
-  invoke<void>("install_skill", { sessionId, name, source });
+export const installSkill = (
+  sessionId: string,
+  name: string,
+  source: string,
+  agentIds: string[] = [],
+) => invoke<void>("install_skill", { sessionId, name, source, agentIds });
 
 export const removeSkill = (sessionId: string, skillId: string) =>
   invoke<void>("remove_skill", { sessionId, skillId });
@@ -580,8 +588,12 @@ export const setMemberRole = (sessionId: string, memberId: string, role: string)
 export const listVaults = (sessionId: string) =>
   invoke<VaultSourceDto[]>("list_vaults", { sessionId });
 
-export const addVault = (sessionId: string, kind: string, reference: string) =>
-  invoke<void>("add_vault", { sessionId, kind, reference });
+export const addVault = (
+  sessionId: string,
+  kind: string,
+  reference: string,
+  agentIds: string[] = [],
+) => invoke<void>("add_vault", { sessionId, kind, reference, agentIds });
 
 export const removeVault = (sessionId: string, url: string) =>
   invoke<void>("remove_vault", { sessionId, url });

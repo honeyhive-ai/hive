@@ -44,6 +44,7 @@ import {
   type McpServerDto,
   type QueuedWorkDto,
   type WorkspaceHostDto,
+  type WorkspaceAgentDto,
 } from "@/lib/ipc";
 import { LogsView } from "@/components/LogsView";
 import { Avatar } from "@/components/Avatar";
@@ -1436,18 +1437,86 @@ function relativeAgo(iso: string): string {
   return `${days}d ago`;
 }
 
+/** Human label for a skill/vault's agent targeting. Empty ⇒ every participant. */
+function targetLabel(agentIds: string[], agents: WorkspaceAgentDto[]): string {
+  if (agentIds.length === 0) return "All agents";
+  const names = agentIds.map((id) => agents.find((a) => a.id === id)?.name ?? "unknown");
+  return names.join(", ");
+}
+
+/**
+ * Compact multi-select of workspace agents for scoping a skill/vault. No
+ * selection ⇒ global (primary + every agent). Colors route through --hive-*.
+ */
+function AgentTargetPicker({
+  agents,
+  selected,
+  onChange,
+}: {
+  agents: WorkspaceAgentDto[];
+  selected: string[];
+  onChange: (ids: string[]) => void;
+}) {
+  const toggle = (id: string) =>
+    onChange(selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id]);
+  return (
+    <div>
+      <div className="mb-1 text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+        Applies to {selected.length === 0 ? "all agents (global)" : `${selected.length} agent(s)`}
+      </div>
+      {agents.length === 0 ? (
+        <div className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+          No agents in this workspace — this stays global.
+        </div>
+      ) : (
+        <div
+          className="max-h-32 space-y-1 overflow-auto rounded-xl p-2"
+          style={{ background: "var(--hive-mist)" }}
+        >
+          {agents.map((agent) => (
+            <label key={agent.id} className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={selected.includes(agent.id)}
+                onChange={() => toggle(agent.id)}
+                style={{ accentColor: "var(--hive-accent-cool)" }}
+              />
+              <span className="truncate">{agent.name}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Small pill showing a skill/vault's target scope on its row. */
+function TargetBadge({ agentIds, agents }: { agentIds: string[]; agents: WorkspaceAgentDto[] }) {
+  return (
+    <span
+      className="inline-block rounded-full px-2 py-0.5 text-[10.5px] font-medium"
+      style={{ background: "var(--hive-mist)", color: "var(--hive-ink-soft)" }}
+    >
+      {targetLabel(agentIds, agents)}
+    </span>
+  );
+}
+
 function VaultsPane({ sessionId }: { sessionId: string }) {
   const qc = useQueryClient();
   const vaults = useQuery({ queryKey: ["vaults", sessionId], queryFn: () => listVaults(sessionId) });
+  const agents = useQuery({ queryKey: ["agents", sessionId], queryFn: () => listAgents(sessionId) });
   const [kind, setKind] = useState("github");
   const [reference, setReference] = useState("");
+  const [targetIds, setTargetIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<{ url: string; text: string } | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const addVaultMutation = useMutation({
-    mutationFn: () => addVault(sessionId, kind, reference.trim()),
+    mutationFn: () => addVault(sessionId, kind, reference.trim(), targetIds),
     onSuccess: () => {
       setReference("");
+      setTargetIds([]);
       setError(null);
       setShowAdd(false);
       qc.invalidateQueries({ queryKey: ["vaults", sessionId] });
@@ -1475,6 +1544,9 @@ function VaultsPane({ sessionId }: { sessionId: string }) {
                 <div className="font-medium">{vault.label}</div>
                 <div className="mt-1 truncate text-xs opacity-60">
                   {vault.kind} · {vault.url}
+                </div>
+                <div className="mt-1.5">
+                  <TargetBadge agentIds={vault.agentIds} agents={agents.data ?? []} />
                 </div>
               </div>
               <div className="flex gap-2 text-xs">
@@ -1517,6 +1589,11 @@ function VaultsPane({ sessionId }: { sessionId: string }) {
               className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
               style={fieldStyle}
             />
+            <AgentTargetPicker
+              agents={agents.data ?? []}
+              selected={targetIds}
+              onChange={setTargetIds}
+            />
             {error && (
               <div className="text-xs" style={{ color: "var(--hive-danger)" }}>
                 {error}
@@ -1535,15 +1612,18 @@ function VaultsPane({ sessionId }: { sessionId: string }) {
 function SkillsPane({ sessionId }: { sessionId: string }) {
   const qc = useQueryClient();
   const skills = useQuery({ queryKey: ["skills", sessionId], queryFn: () => listSkills(sessionId) });
+  const agents = useQuery({ queryKey: ["agents", sessionId], queryFn: () => listAgents(sessionId) });
   const [name, setName] = useState("");
   const [source, setSource] = useState("");
+  const [targetIds, setTargetIds] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const installSkillMutation = useMutation({
-    mutationFn: () => installSkill(sessionId, name.trim(), source.trim()),
+    mutationFn: () => installSkill(sessionId, name.trim(), source.trim(), targetIds),
     onSuccess: () => {
       setName("");
       setSource("");
+      setTargetIds([]);
       setError(null);
       setShowAdd(false);
       qc.invalidateQueries({ queryKey: ["skills", sessionId] });
@@ -1565,6 +1645,9 @@ function SkillsPane({ sessionId }: { sessionId: string }) {
                 <div className="font-medium">{skill.name}</div>
                 {skill.sourceUrl && <div className="mt-1 truncate text-xs opacity-55">{skill.sourceUrl}</div>}
                 <div className="mt-2 line-clamp-3 text-xs leading-5 opacity-60">{skill.instructions}</div>
+                <div className="mt-1.5">
+                  <TargetBadge agentIds={skill.agentIds} agents={agents.data ?? []} />
+                </div>
               </div>
               <button
                 onClick={() => confirmThen("Remove this skill?", () => removeSkillMutation.mutate(skill.id))}
@@ -1595,6 +1678,11 @@ function SkillsPane({ sessionId }: { sessionId: string }) {
               placeholder="skills.sh/... or owner/repo/SKILL.md"
               className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
               style={fieldStyle}
+            />
+            <AgentTargetPicker
+              agents={agents.data ?? []}
+              selected={targetIds}
+              onChange={setTargetIds}
             />
             {error && (
               <div className="text-xs" style={{ color: "var(--hive-danger)" }}>

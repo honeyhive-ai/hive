@@ -284,6 +284,8 @@ pub struct SkillDto {
     pub name: String,
     pub instructions: String,
     pub source_url: Option<String>,
+    /// Agent ids this skill targets. Empty ⇒ global (primary + all agents).
+    pub agent_ids: Vec<String>,
 }
 
 /// A configured MCP server and whether it's enabled (the inert-until-enabled
@@ -309,6 +311,8 @@ pub struct VaultSourceDto {
     pub kind: String,
     pub label: String,
     pub url: String,
+    /// Agent ids this vault targets. Empty ⇒ global (primary + all agents).
+    pub agent_ids: Vec<String>,
 }
 
 /// App + workspace settings surfaced to the Settings pane.

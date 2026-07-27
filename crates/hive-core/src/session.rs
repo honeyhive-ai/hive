@@ -15,7 +15,7 @@ use crate::identity::{WorkspaceMember, WorkspaceRole};
 use crate::proposals::ActionProposal;
 use crate::skills::SkillProfile;
 use crate::time_util::Timestamp;
-use crate::vault::VaultSource;
+use crate::vault::MountedVault;
 use crate::workflow::{WorkflowDefinition, WorkflowRun};
 use crate::workspace_host::WorkspaceHost;
 
@@ -47,7 +47,7 @@ pub struct ChatSession {
     pub proposals: Vec<ActionProposal>,
     /// Reference-material vault sources mounted into the workspace.
     #[serde(default)]
-    pub vault_sources: Vec<VaultSource>,
+    pub vault_sources: Vec<MountedVault>,
     /// Agentic workflow definitions available in this chat.
     #[serde(default)]
     pub workflow_definitions: Vec<WorkflowDefinition>,
