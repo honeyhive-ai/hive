@@ -17,6 +17,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+use crate::envelope_verifier::{build_roster, verdict_for, Verdict};
 use crate::event_store::EventStore;
 
 #[derive(Debug, Error)]
@@ -199,9 +200,30 @@ impl PeerSync {
     }
 
     /// Apply one received envelope into the store. Returns whether it was new.
+    ///
+    /// Verify-on-ingest: the P2P transport is untrusted, so — exactly like the
+    /// relay path ([`crate::sync_engine::SyncEngine::apply_fetched`]) — build the
+    /// trust roster from what we already hold plus this envelope's own trust
+    /// events, then classify it. A **provably bad** envelope (bad signature,
+    /// revoked device, impersonation) is rejected outright: it is *not* ingested,
+    /// and `apply` returns `Ok(false)`. Merely-unverifiable envelopes (unsigned,
+    /// or from a device whose cert we haven't seen yet) are accepted and
+    /// re-checked as the roster grows — never dropped. This keeps the peer path
+    /// at least as strict as the relay path.
     pub fn apply(&mut self, store: &mut EventStore, data: &[u8]) -> Result<bool, PeerError> {
         let env: SessionEventEnvelope = serde_json::from_slice(data)?;
         self.seen.insert(env.event_id);
+
+        let mut roster_src = store
+            .roster_envelopes()
+            .map_err(|e| PeerError::Store(e.to_string()))?;
+        roster_src.push(env.clone());
+        let roster = build_roster(&roster_src);
+        if let Verdict::Quarantine(reason) = verdict_for(&roster, &env) {
+            tracing::warn!(?reason, event_id = %env.event_id, "rejected a quarantined peer event");
+            return Ok(false);
+        }
+
         store.ingest(&env).map_err(|e| PeerError::Store(e.to_string()))
     }
 }
@@ -273,5 +295,105 @@ mod tests {
         assert!(!sync_b.apply(&mut store_b, &data).unwrap());
         // A doesn't re-push the same envelope.
         assert_eq!(sync_a.push_to(&la, &b, &store_a).await.unwrap(), 0);
+    }
+
+    #[test]
+    fn apply_verifies_before_ingest() {
+        use hive_core::crypto::{DeviceCertificate, SigningKeypair};
+        use hive_core::identity::{ActorIdentity, ActorKind, ActorStamp, WorkspaceMember, WorkspaceRole};
+        use hive_core::Timestamp;
+
+        let account = SigningKeypair::generate().unwrap();
+        let account_id = Uuid::new_v4();
+        let device = SigningKeypair::generate().unwrap();
+        let device_id = Uuid::new_v4();
+        let cert = DeviceCertificate::issue(
+            &account,
+            account_id,
+            device_id,
+            &device.public_key_bytes(),
+            Timestamp::epoch(),
+        );
+        let member = WorkspaceMember {
+            id: account_id.to_string(),
+            actor: ActorIdentity {
+                id: account_id.to_string(),
+                display_name: "A".into(),
+                kind: ActorKind::Human,
+                account_id: Some(account_id),
+                device_id: Some(device_id),
+                git_email: None,
+                key_agreement_public: None,
+                avatar_url: None,
+            },
+            role: WorkspaceRole::Owner,
+            title: String::new(),
+            index: 1,
+            joined_at: Timestamp::epoch(),
+        };
+
+        // Seed the store with the trust events so the roster knows `device`.
+        let plain = |lamport: i64, payload: SessionEvent| {
+            SessionEventEnvelope::new(Uuid::nil(), Uuid::nil(), lamport, payload)
+        };
+        let mut store = EventStore::open_in_memory().unwrap();
+        for e in [
+            plain(1, SessionEvent::MemberAdded { member }),
+            plain(
+                2,
+                SessionEvent::AccountKeyRegistered {
+                    account_id,
+                    signing_public_key: account.public_key_bytes().to_vec(),
+                },
+            ),
+            plain(3, SessionEvent::DeviceCertificateAdded { certificate: cert }),
+        ] {
+            store.append_envelope(&e).unwrap();
+        }
+
+        // A content event signed by `device`, stamping `claim` as author.
+        let content = |lamport: i64, claim: Uuid| -> SessionEventEnvelope {
+            let mut e = SessionEventEnvelope::new(
+                Uuid::nil(),
+                Uuid::nil(),
+                lamport,
+                SessionEvent::SessionTitleChanged { title: format!("t{lamport}") },
+            );
+            e.actor_stamp = Some(ActorStamp {
+                actor: ActorIdentity {
+                    id: claim.to_string(),
+                    display_name: "A".into(),
+                    kind: ActorKind::Human,
+                    account_id: Some(claim),
+                    device_id: Some(device_id),
+                    git_email: None,
+                    key_agreement_public: None,
+                    avatar_url: None,
+                },
+                recorded_at: Timestamp::epoch(),
+            });
+            hive_core::sign_envelope(&mut e, device_id, &device);
+            e
+        };
+
+        let good = content(100, account_id);
+        let mut tampered = content(101, account_id);
+        tampered.sequence = 9999; // breaks the signature
+        let spoof = content(102, Uuid::new_v4()); // stamps a different account
+
+        let mut sync = PeerSync::new();
+        let bytes = |e: &SessionEventEnvelope| serde_json::to_vec(e).unwrap();
+
+        // A validly-signed envelope from a known-roster device is ingested.
+        assert!(sync.apply(&mut store, &bytes(&good)).unwrap(), "valid signed event ingested");
+        assert!(store.has_event(good.event_id).unwrap());
+
+        // A tampered (forged-signature) envelope is rejected, not ingested.
+        assert!(!sync.apply(&mut store, &bytes(&tampered)).unwrap(), "tampered event rejected");
+        assert!(!store.has_event(tampered.event_id).unwrap());
+
+        // An impersonating envelope is rejected, not ingested.
+        assert!(!sync.apply(&mut store, &bytes(&spoof)).unwrap(), "impersonation rejected");
+        assert!(!store.has_event(spoof.event_id).unwrap());
     }
 }
