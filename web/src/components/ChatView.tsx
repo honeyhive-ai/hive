@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   exportChat,
@@ -21,8 +21,11 @@ import {
   toggleReaction,
   type ChatMessageDto,
   type RuntimeSummaryDto,
+  type WorkspaceAgentDto,
 } from "@/lib/ipc";
 import { attachmentMarker, splitAttachments, fileBaseName, isImagePath } from "@/lib/attachments";
+import { relTime, absTime } from "@/lib/time";
+import { PRIMARY_NAME, PRIMARY_HANDLE } from "@/lib/agent";
 import {
   IconCopy,
   IconRegenerate,
@@ -37,7 +40,9 @@ import {
   IconMessage,
   IconX,
   IconChevronDown,
+  IconChevronRight,
   IconCheck,
+  IconUsers,
 } from "@/lib/icons";
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonBubbles } from "@/components/Skeleton";
@@ -51,8 +56,6 @@ import { detectSlash } from "@/lib/slash";
 import { confirmThen } from "@/lib/confirm";
 import { promptDialog } from "@/components/Dialog";
 import { loadTemplates } from "@/lib/templates";
-
-const CLAUDE_NOTE_KEY = "hive.claudeCodeNoteDismissed";
 
 // Clickable starter prompts shown in an empty chat — concrete examples of what
 // to do, spanning understand / change / git / docs. Clicking fills the composer.
@@ -87,9 +90,6 @@ export function ChatView({
 }) {
   const qc = useQueryClient();
   const [input, setInput] = useState("");
-  const [claudeNoteDismissed, setClaudeNoteDismissed] = useState(
-    () => typeof window !== "undefined" && window.localStorage.getItem(CLAUDE_NOTE_KEY) === "1",
-  );
   const [sending, setSending] = useState(false);
   const [optimisticUser, setOptimisticUser] = useState<string | null>(null);
   // messageId → accumulated text. A Map (not a single slot) because workflow
@@ -111,6 +111,8 @@ export function ChatView({
   const [attachments, setAttachments] = useState<{ name: string; path: string; image: boolean }[]>([]);
   // Composer route pill: the "default recipient when no @mention" popover.
   const [routeOpen, setRouteOpen] = useState(false);
+  // Composer focus ring (the turn-shaped card lights its accent border).
+  const [composerFocused, setComposerFocused] = useState(false);
   const routeRef = useRef<HTMLDivElement>(null);
   const sessionRef = useRef(sessionId);
   sessionRef.current = sessionId;
@@ -289,9 +291,17 @@ export function ChatView({
     queryFn: () => listAgents(sessionId),
     enabled: Boolean(sessionId),
   });
+  // Author (handle) → roster agent, so a turn can tell a personal agent (owner
+  // device) from a workspace-owned "shared" one (empty ownerActorId), and pick
+  // up the agent's stored avatar tint as its turn accent.
+  const agentByName = useMemo(() => {
+    const m = new Map<string, WorkspaceAgentDto>();
+    for (const a of agentList.data ?? []) m.set(a.name, a);
+    return m;
+  }, [agentList.data]);
   const mentionCands = useMemo(() => {
     const out: { handle: string; kind: string }[] = [
-      { handle: "primary", kind: "Primary runtime" },
+      { handle: PRIMARY_HANDLE, kind: "Default agent" },
       { handle: "all", kind: "Everyone" },
     ];
     for (const a of agentList.data ?? []) out.push({ handle: a.name, kind: "Agent" });
@@ -472,12 +482,23 @@ export function ChatView({
   // per-message model/provider on ChatMessageDto). Derive a single "via
   // provider/model" attribution line for agent turns from it.
   const runtimeVia = currentRuntime ? runtimePickerLabel(currentRuntime) : undefined;
+  // Provenance line under an agent turn (§D11): the *runtime* only ("via
+  // claude-code"). The model already rides the turn head (.tt-model), so the
+  // attribution must not repeat it — "via claude-code / opus" said it twice.
+  const runtimeProvider =
+    currentRuntime?.provider?.trim() || currentRuntime?.label?.trim() || undefined;
+  // Where the answering runtime runs — drives the avatar host badge (F5).
+  const runtimeHost: "local" | "remote" =
+    currentRuntime?.location?.trim().toLowerCase() === "remote" ? "remote" : "local";
 
   // The composer's resolved route (mockup §7.5): the first @mention in the draft
   // routes the turn; with none, it falls back to @primary (the chat's runtime).
   const routeMention = input.match(/@([\w-]+)/)?.[1]?.toLowerCase();
+  // "@hive" and "@primary" both resolve to the default agent (no roster lookup).
+  const routeIsPrimary =
+    routeMention === "primary" || routeMention === PRIMARY_HANDLE;
   const routeHit =
-    routeMention && routeMention !== "primary"
+    routeMention && !routeIsPrimary
       ? mentionCands.find((c) => c.handle.toLowerCase() === routeMention)
       : undefined;
   const routeHandle = routeHit?.handle ?? "primary";
@@ -486,9 +507,11 @@ export function ChatView({
       ? "broadcast"
       : routeHit.kind
     : runtimeVia;
-  // Streaming/pending turns are authored by the resolved recipient, never the
-  // literal "Hive" (spec §7.4) — the @mentioned agent, else the runtime's model.
-  const streamAuthor = routeHandle !== "primary" ? routeHandle : currentRuntime?.model?.trim() || "Assistant";
+  // Streaming/pending turns are authored by the resolved recipient: the
+  // @mentioned agent, else the default agent ("Hive" / @hive) — matching the
+  // persisted turn so the head doesn't change identity when the stream lands.
+  const streamAuthor = routeHandle !== "primary" ? routeHandle : PRIMARY_NAME;
+  const streamHandle = routeHandle !== "primary" ? routeHandle : PRIMARY_HANDLE;
 
   async function selectRuntime(id: string) {
     setRouteOpen(false);
@@ -523,7 +546,7 @@ export function ChatView({
         style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
       >
         <div className="relative flex min-h-0 flex-1 flex-col">
-        <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-1 py-2">
+        <div ref={scrollRef} onScroll={onScroll} className="flex flex-1 flex-col overflow-y-auto px-1 py-2">
           {chat.isLoading && messages.length === 0 && <SkeletonBubbles count={3} />}
           {chat.isError && messages.length === 0 && (
             <div className="max-w-md">
@@ -586,62 +609,82 @@ export function ChatView({
               </div>
             </div>
           )}
+          {/* Anchor a short thread to the bottom (F18): a growing spacer pushes
+              the turns down so two turns sit just above the composer, growing
+              upward — rather than floating at the top over a dead gap. Only when
+              turns exist, so the empty-state card keeps its top placement. */}
+          {messages.length > 0 && <div className="flex-1" aria-hidden />}
           {messages
             // A message that's mid-stream is rendered by the live `streams`
             // bubble below; skip its (partially-flushed) transcript copy so it
             // doesn't render twice — happens whenever the chat query refetches
             // mid-stream (reactions, parallel workflow stages).
             .filter((m) => !(m.isStreaming && streams.has(m.id)))
-            .map((m) => (
-            <Bubble
-              key={m.id}
-              messageId={m.id}
-              role={m.role}
-              author={m.author}
-              body={m.body}
-              createdAt={m.createdAt}
-              streaming={m.isStreaming}
-              via={runtimeVia}
-              model={currentRuntime?.model || undefined}
-              // Prefer the avatar stamped/resolved on the message; for the local
-              // user's own turns, fall back to their freshly-set local avatar so
-              // older turns aren't left blank before a re-stamp.
-              avatarUrl={m.authorAvatarUrl ?? (m.author === selfName ? selfAvatarUrl : undefined)}
-              colorHex={m.authorColorHex}
-              reactions={m.reactions}
-              toolCalls={m.toolCalls}
-              toolResults={m.toolResults}
-              onReact={handleReact}
-              onRegenerate={m.id === lastAssistantId && !sending && streams.size === 0 ? handleRegenerate : undefined}
-            />
-          ))}
+            .map((m) => {
+              const rosterAgent = m.role === "user" || m.role === "system" ? undefined : agentByName.get(m.author);
+              // A workspace-owned agent (empty ownerActorId) is a "shared" turn
+              // (neutral tint); a personal agent keeps the cool agent tint and
+              // takes its stored avatar colour as the turn accent.
+              const shared = Boolean(rosterAgent) && rosterAgent!.ownerActorId.trim() === "";
+              const turnColor = rosterAgent?.avatarColorHex ?? m.authorColorHex ?? undefined;
+              // The mentionable handle for an agent turn: the roster name, else
+              // the default agent's "@hive" (its author is stored as "Hive").
+              const handle =
+                m.role === "user" || m.role === "system"
+                  ? undefined
+                  : rosterAgent?.name ?? (m.author === PRIMARY_NAME ? PRIMARY_HANDLE : m.author);
+              return (
+                <Bubble
+                  key={m.id}
+                  messageId={m.id}
+                  role={m.role}
+                  author={m.author}
+                  handle={handle}
+                  body={m.body}
+                  createdAt={m.createdAt}
+                  streaming={m.isStreaming}
+                  via={runtimeProvider}
+                  model={currentRuntime?.model || undefined}
+                  host={runtimeHost}
+                  shared={shared}
+                  // Personal agents tint the turn with their own avatar colour;
+                  // shared/human turns fall back to the theme (warm/muted/cool).
+                  turnAccent={shared ? undefined : turnColor}
+                  // Prefer the avatar stamped/resolved on the message; for the local
+                  // user's own turns, fall back to their freshly-set local avatar so
+                  // older turns aren't left blank before a re-stamp.
+                  avatarUrl={
+                    m.authorAvatarUrl ??
+                    rosterAgent?.avatarUrl ??
+                    (m.author === selfName ? selfAvatarUrl : undefined)
+                  }
+                  colorHex={rosterAgent?.avatarColorHex ?? m.authorColorHex}
+                  reactions={m.reactions}
+                  toolCalls={m.toolCalls}
+                  toolResults={m.toolResults}
+                  onReact={handleReact}
+                  onRegenerate={m.id === lastAssistantId && !sending && streams.size === 0 ? handleRegenerate : undefined}
+                />
+              );
+            })}
           {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} avatarUrl={selfAvatarUrl} />}
           {[...streams.entries()].map(([id, text]) => (
-            <Bubble key={id} role="assistant" author={streamAuthor} body={text} via={runtimeVia} model={currentRuntime?.model || undefined} streaming />
+            <Bubble key={id} role="assistant" author={streamAuthor} handle={streamHandle} body={text} via={runtimeProvider} model={currentRuntime?.model || undefined} host={runtimeHost} streaming />
           ))}
           {sending && streams.size === 0 && <TypingDots label={`${streamAuthor} is thinking`} />}
           {typingNames.length > 0 && <TypingDots label={typingLabel(typingNames)} />}
           {streamError && (
-            <div
-              className="mt-2 flex items-start gap-2.5 rounded-2xl border px-3.5 py-2.5 text-sm"
-              style={{
-                borderColor: "color-mix(in srgb, var(--hive-danger) 30%, transparent)",
-                background: "color-mix(in srgb, var(--hive-danger) 10%, transparent)",
-              }}
-              role="alert"
-            >
-              <span aria-hidden className="mt-px shrink-0" style={{ color: "var(--hive-danger)" }}>
+            <div className="tt-note bad" role="alert">
+              <span aria-hidden className="shrink-0" style={{ flex: "0 0 auto" }}>
                 <IconInfo size={14} />
               </span>
               <div className="min-w-0 flex-1">
-                <div className="font-medium" style={{ color: "var(--hive-danger)" }}>
-                  Generation failed or was interrupted
-                </div>
-                <div className="mt-0.5 break-words opacity-70">{streamError}</div>
+                <div style={{ fontWeight: 650 }}>Generation failed or was interrupted</div>
+                <div className="mt-0.5 break-words opacity-80">{streamError}</div>
               </div>
               <button
                 onClick={() => setStreamError(null)}
-                className="shrink-0 rounded-md px-1.5 py-0.5 leading-none opacity-50 transition-opacity hover:opacity-100"
+                className="shrink-0 rounded-md px-1.5 py-0.5 leading-none opacity-60 transition-opacity hover:opacity-100"
                 title="Dismiss"
                 aria-label="Dismiss"
               >
@@ -654,7 +697,7 @@ export function ChatView({
             <button
               onClick={scrollToBottom}
               className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-semibold shadow-lg transition-transform hover:scale-105"
-              style={{ background: "var(--hive-accent-cool)", color: "#fff" }}
+              style={{ background: "var(--hive-accent-fill)", color: "var(--hive-on-accent)" }}
             >
               <span aria-hidden><IconArrowDown size={13} /></span>
               New messages
@@ -662,278 +705,239 @@ export function ChatView({
           )}
         </div>
 
-        {currentRuntime?.provider === "claude-code" && !claudeNoteDismissed && (
-          <div
-            className="mx-4 mt-3 flex items-start gap-2.5 rounded-xl border px-3.5 py-2.5 text-xs leading-5"
-            style={{
-              borderColor: "var(--hive-line)",
-              background: "color-mix(in srgb, var(--hive-accent-cool) 10%, transparent)",
-            }}
-          >
-            <span aria-hidden className="mt-px shrink-0 opacity-70" style={{ color: "var(--hive-accent-cool)" }}>
-              <IconInfo size={14} />
-            </span>
-            <span className="flex-1 opacity-75">
-              Claude Code is the agent — it handles tools and permissions on this machine using your
-              Claude subscription.
-            </span>
-            <button
-              onClick={() => {
-                window.localStorage.setItem(CLAUDE_NOTE_KEY, "1");
-                setClaudeNoteDismissed(true);
-              }}
-              className="shrink-0 rounded-md px-1.5 py-0.5 leading-none opacity-50 transition-opacity hover:opacity-100"
-              title="Dismiss"
-              aria-label="Dismiss"
-            >
-              <IconX size={12} />
-            </button>
-          </div>
-        )}
-
+        {/* The Claude-Code routing note lives in the route-pill popover (below),
+            where routing is chosen — a standalone banner here just duplicated it
+            and shoved the composer down mid-session (F9). */}
         <div className="border-t px-4 py-3.5" style={{ borderColor: "var(--hive-line)" }}>
-
-          {attachments.length > 0 && (
-            <div className="mb-2 flex flex-wrap gap-2">
-              {attachments.map((a, i) => (
-                <span
-                  key={`${a.path}-${i}`}
-                  className="inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
-                  style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
-                  title={a.path}
-                >
-                  <span aria-hidden className="opacity-60">
-                    {a.image ? <IconImage size={13} /> : <IconFile size={13} />}
-                  </span>
-                  <span className="max-w-[12rem] truncate">{a.name}</span>
-                  <button
-                    className="rounded opacity-50 transition-opacity hover:opacity-100"
-                    aria-label={`Remove attachment ${a.name}`}
-                    onClick={() => setAttachments((cur) => cur.filter((_, j) => j !== i))}
-                  >
-                    <IconX size={12} />
-                  </button>
-                </span>
-              ))}
-            </div>
-          )}
-
-          <div
-            className="relative flex min-w-0 flex-col rounded-2xl border transition-colors focus-within:border-[color:var(--hive-accent-cool)]"
-            style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
-            onDrop={(e) => {
-              if (e.dataTransfer.files.length) {
-                e.preventDefault();
-                void addFiles(e.dataTransfer.files);
-              }
-            }}
-            onDragOver={(e) => {
-              if (e.dataTransfer.types.includes("Files")) e.preventDefault();
-            }}
-          >
-            {/* Composer autocomplete rides the shared Popover (R5) — backdrop
-                off so the textarea stays clickable; Escape / input-state dismiss. */}
-            {slash && slashItems.length > 0 && (
-              <Popover anchorRef={taRef} backdrop={false} minWidth={300} onDismiss={() => setSlash(null)}>
-                {slashItems.map((c, i) => (
-                  <PopoverItem
-                    key={c.id}
-                    label={c.label}
-                    kind={c.hint}
-                    active={i === slashActive}
-                    onHover={() => setSlashActive(i)}
-                    onSelect={() => c.run()}
-                  />
-                ))}
-              </Popover>
-            )}
-            {mention && mentionMatches.length > 0 && (
-              <Popover anchorRef={taRef} backdrop={false} minWidth={280} onDismiss={() => setMention(null)}>
-                {mentionMatches.map((c, i) => (
-                  <PopoverItem
-                    key={c.handle}
-                    label={<span className="font-medium">@{c.handle}</span>}
-                    kind={c.kind}
-                    active={i === mentionActive}
-                    onHover={() => setMentionActive(i)}
-                    onSelect={() => acceptMention(c.handle)}
-                  />
-                ))}
-              </Popover>
-            )}
-            <textarea
-              ref={taRef}
-              value={input}
-              onPaste={(e) => {
-                const files = Array.from(e.clipboardData.files);
-                if (files.length) {
+          {/* Composer — a turn-shaped card; the "next turn" in the transcript
+              (spec §7.5). Card lights its accent border on focus / while sending;
+              the route pill resolves the recipient, and the @ / popovers stay. */}
+          <div className={`cmp${composerFocused ? " is-focused" : ""}${sending ? " is-sending" : ""}`}>
+            <div
+              className="cmp-card"
+              onDrop={(e) => {
+                if (e.dataTransfer.files.length) {
                   e.preventDefault();
-                  void addFiles(files);
+                  void addFiles(e.dataTransfer.files);
                 }
               }}
-              onChange={(e) => {
-                const v = e.target.value;
-                const caret = e.target.selectionStart ?? v.length;
-                setInput(v);
-                autoGrow();
-                const sl = detectSlash(v, caret);
-                setSlash(sl);
-                setSlashActive(0);
-                setMention(sl ? null : detectMention(v, caret));
-                setMentionActive(0);
-                if (v.trim()) pingTyping();
-                else clearTyping();
+              onDragOver={(e) => {
+                if (e.dataTransfer.types.includes("Files")) e.preventDefault();
               }}
-              onBlur={() => {
-                clearTyping();
-                // Close autocomplete when focus leaves the composer. Picking an
-                // item preventDefaults its mousedown, so it never blurs here.
-                setSlash(null);
-                setMention(null);
-              }}
-              onKeyDown={(e) => {
-                // One shared reducer (↑↓ move · ↩/⇥ accept · esc dismiss) for both
-                // composer menus (R5).
-                if (
-                  slash &&
-                  slashItems.length > 0 &&
-                  candidateKey(e, {
-                    count: slashItems.length,
-                    active: slashActive,
-                    setActive: setSlashActive,
-                    onAccept: (i) => slashItems[i].run(),
-                    onDismiss: () => setSlash(null),
-                  })
-                )
-                  return;
-                if (
-                  mention &&
-                  mentionMatches.length > 0 &&
-                  candidateKey(e, {
-                    count: mentionMatches.length,
-                    active: mentionActive,
-                    setActive: setMentionActive,
-                    onAccept: (i) => acceptMention(mentionMatches[i].handle),
-                    onDismiss: () => setMention(null),
-                  })
-                )
-                  return;
-                if (e.key === "Enter" && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSend();
-                }
-              }}
-              rows={1}
-              placeholder="Message the room — @ to route, / for commands…"
-              className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm leading-6 outline-none"
-              style={{
-                color: "var(--hive-ink)",
-                minHeight: 48,
-                fontFamily: "inherit",
-              }}
-            />
-            <div className="flex items-center gap-1 px-2 pb-2">
-              {/* Route pill — the resolved recipient (mockup §7.5). Shows the
-                  draft's first @mention, else @primary + the chat runtime. The
-                  popover switches which runtime is primary. */}
-              <div className="relative" ref={routeRef}>
-                <button
-                  type="button"
-                  onClick={() => setRouteOpen((o) => !o)}
-                  className="inline-flex h-7 items-center gap-1.5 rounded-lg border px-2.5 text-xs transition-colors"
-                  style={{
-                    borderColor: routeOpen ? "var(--tint-cool-line)" : "transparent",
-                    background: routeOpen ? "var(--tint-cool)" : "transparent",
-                    color: "var(--hive-ink-soft)",
-                  }}
-                  title="Default recipient"
-                >
-                  <span aria-hidden style={{ color: "var(--hive-accent-cool)" }}>→</span>
-                  <span className="font-semibold" style={{ color: "var(--hive-accent-cool)" }}>@{routeHandle}</span>
-                  {routeVia && <span>· {routeVia}</span>}
-                  <span className="opacity-50"><IconChevronDown size={11} /></span>
-                </button>
-                {routeOpen && (
-                  <div
-                    className="absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border p-1.5 shadow-xl"
-                    style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
-                  >
-                    <div className="px-2 pb-1.5 pt-1 text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--hive-ink-soft)" }}>
-                      Default recipient · when no @mention
-                    </div>
-                    {runtimes.map((rt) => (
+            >
+              {attachments.length > 0 && (
+                <div className="cmp-chips">
+                  {attachments.map((a, i) => (
+                    <span key={`${a.path}-${i}`} className="chip" title={a.path}>
+                      <span aria-hidden>{a.image ? <IconImage size={12} /> : <IconFile size={12} />}</span>
+                      <b>{a.name}</b>
                       <button
-                        key={rt.id}
-                        onMouseDown={(e) => {
-                          e.preventDefault();
-                          void selectRuntime(rt.id);
-                        }}
-                        className="flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left transition-colors"
-                        style={{ background: rt.id === currentRuntimeId ? "var(--tint-cool)" : "transparent" }}
+                        aria-label={`Remove attachment ${a.name}`}
+                        onClick={() => setAttachments((cur) => cur.filter((_, j) => j !== i))}
                       >
-                        <span className="route-glyph"><IconWrench size={11} /></span>
-                        <span className="min-w-0 flex-1 truncate text-sm font-semibold">
-                          {rt.id === currentRuntimeId ? "@primary" : rt.label || rt.name}
-                        </span>
-                        <span className="shrink-0 text-xs" style={{ color: "var(--hive-ink-soft)" }}>
-                          {runtimePickerLabel(rt)}
-                        </span>
+                        <IconX size={10} />
                       </button>
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              <div className="cmp-in">
+                {/* Composer autocomplete rides the shared Popover (R5) — backdrop
+                    off so the textarea stays clickable; Escape / input-state dismiss. */}
+                {slash && slashItems.length > 0 && (
+                  <Popover anchorRef={taRef} backdrop={false} minWidth={300} onDismiss={() => setSlash(null)}>
+                    {slashItems.map((c, i) => (
+                      <PopoverItem
+                        key={c.id}
+                        label={c.label}
+                        kind={c.hint}
+                        active={i === slashActive}
+                        onHover={() => setSlashActive(i)}
+                        onSelect={() => c.run()}
+                      />
                     ))}
-                    {currentRuntime?.provider === "claude-code" && (
+                  </Popover>
+                )}
+                {mention && mentionMatches.length > 0 && (
+                  <Popover anchorRef={taRef} backdrop={false} minWidth={280} onDismiss={() => setMention(null)}>
+                    {mentionMatches.map((c, i) => (
+                      <PopoverItem
+                        key={c.handle}
+                        label={<span className="font-medium">@{c.handle}</span>}
+                        kind={c.kind}
+                        active={i === mentionActive}
+                        onHover={() => setMentionActive(i)}
+                        onSelect={() => acceptMention(c.handle)}
+                      />
+                    ))}
+                  </Popover>
+                )}
+                <textarea
+                  ref={taRef}
+                  value={input}
+                  onPaste={(e) => {
+                    const files = Array.from(e.clipboardData.files);
+                    if (files.length) {
+                      e.preventDefault();
+                      void addFiles(files);
+                    }
+                  }}
+                  onFocus={() => setComposerFocused(true)}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    const caret = e.target.selectionStart ?? v.length;
+                    setInput(v);
+                    autoGrow();
+                    const sl = detectSlash(v, caret);
+                    setSlash(sl);
+                    setSlashActive(0);
+                    setMention(sl ? null : detectMention(v, caret));
+                    setMentionActive(0);
+                    if (v.trim()) pingTyping();
+                    else clearTyping();
+                  }}
+                  onBlur={() => {
+                    clearTyping();
+                    setComposerFocused(false);
+                    // Close autocomplete when focus leaves the composer. Picking an
+                    // item preventDefaults its mousedown, so it never blurs here.
+                    setSlash(null);
+                    setMention(null);
+                  }}
+                  onKeyDown={(e) => {
+                    // One shared reducer (↑↓ move · ↩/⇥ accept · esc dismiss) for both
+                    // composer menus (R5).
+                    if (
+                      slash &&
+                      slashItems.length > 0 &&
+                      candidateKey(e, {
+                        count: slashItems.length,
+                        active: slashActive,
+                        setActive: setSlashActive,
+                        onAccept: (i) => slashItems[i].run(),
+                        onDismiss: () => setSlash(null),
+                      })
+                    )
+                      return;
+                    if (
+                      mention &&
+                      mentionMatches.length > 0 &&
+                      candidateKey(e, {
+                        count: mentionMatches.length,
+                        active: mentionActive,
+                        setActive: setMentionActive,
+                        onAccept: (i) => acceptMention(mentionMatches[i].handle),
+                        onDismiss: () => setMention(null),
+                      })
+                    )
+                      return;
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSend();
+                    }
+                  }}
+                  rows={1}
+                  placeholder="Message the room"
+                />
+              </div>
+
+              <div className="cmp-f">
+                {/* Route pill — the resolved recipient (spec §7.5). Shows the
+                    draft's first @mention, else @primary + the chat runtime. The
+                    popover switches which runtime is primary. */}
+                <div className="rp-wrap" ref={routeRef}>
+                  <button
+                    type="button"
+                    onClick={() => setRouteOpen((o) => !o)}
+                    className={`rp${routeOpen ? " on" : ""}`}
+                    title="Default recipient"
+                    aria-expanded={routeOpen}
+                  >
+                    <span className="rp-ar" aria-hidden>→</span>
+                    <b>@{routeHandle === "primary" ? PRIMARY_HANDLE : routeHandle}</b>
+                    {routeVia && (
                       <>
-                        <div className="my-1 h-px" style={{ background: "var(--hive-line)" }} />
-                        <div className="px-2 py-1 text-xs" style={{ color: "var(--hive-ink-soft)" }}>
-                          Claude Code answers with its own tools &amp; permissions, via your Claude subscription.
-                        </div>
+                        <span className="rp-sep">·</span>
+                        <span className="rp-via">via {routeVia}</span>
                       </>
                     )}
-                  </div>
-                )}
+                    <span aria-hidden style={{ opacity: 0.55 }}>
+                      <IconChevronDown size={11} />
+                    </span>
+                  </button>
+                  {routeOpen && (
+                    <div className="pop">
+                      <div className="pop-h">Default recipient · when no @mention</div>
+                      {runtimes.map((rt) => (
+                        <button
+                          key={rt.id}
+                          className={`pop-i${rt.id === currentRuntimeId ? " sel" : ""}`}
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            void selectRuntime(rt.id);
+                          }}
+                        >
+                          <span className="route-glyph"><IconWrench size={11} /></span>
+                          <span className="pop-t">
+                            <b>{rt.id === currentRuntimeId ? `@${PRIMARY_HANDLE}` : rt.label || rt.name}</b>
+                            <span>{runtimePickerLabel(rt)}</span>
+                          </span>
+                          {rt.id === currentRuntimeId && (
+                            <span aria-hidden style={{ color: "var(--hive-accent-fill)" }}>
+                              <IconCheck size={12} />
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                      {currentRuntime?.provider === "claude-code" && (
+                        <div className="pop-n">
+                          Claude Code answers with its own tools &amp; permissions, via your Claude
+                          subscription.
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+                <span className="sp" />
+                <label className="ib" title="Attach files" aria-label="Attach files">
+                  <IconPaperclip size={15} />
+                  <input
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => {
+                      if (e.target.files?.length) void addFiles(e.target.files);
+                      e.target.value = "";
+                    }}
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => void addFileRef()}
+                  className="ib"
+                  style={{ width: "auto", padding: "0 8px", fontSize: 12 }}
+                  title="Reference a workspace file (@file)"
+                >
+                  @file
+                </button>
+                <button
+                  onClick={handleSend}
+                  disabled={sending || (!input.trim() && attachments.length === 0)}
+                  className="send"
+                  aria-label="Send message"
+                  title="Send (Enter)"
+                >
+                  <IconSend size={15} />
+                </button>
               </div>
-              <label
-                className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-lg opacity-60 transition-all hover:bg-[color:var(--hive-panel)] hover:opacity-100"
-                title="Attach files"
-                aria-label="Attach files"
-              >
-                <IconPaperclip />
-                <input
-                  type="file"
-                  multiple
-                  className="hidden"
-                  onChange={(e) => {
-                    if (e.target.files?.length) void addFiles(e.target.files);
-                    e.target.value = "";
-                  }}
-                />
-              </label>
-              <button
-                type="button"
-                onClick={() => void addFileRef()}
-                className="flex h-8 items-center justify-center rounded-lg px-2 text-xs opacity-60 transition-all hover:bg-[color:var(--hive-panel)] hover:opacity-100"
-                title="Reference a workspace file (@file)"
-              >
-                @file
-              </button>
-              <div className="flex-1" />
-              <button
-                onClick={handleSend}
-                disabled={sending || (!input.trim() && attachments.length === 0)}
-                className="flex h-8 w-8 items-center justify-center rounded-lg text-white shadow-sm transition-all hover:brightness-105 disabled:cursor-not-allowed disabled:opacity-30 disabled:shadow-none disabled:hover:brightness-100"
-                style={{ background: "var(--hive-accent-cool)" }}
-                aria-label="Send message"
-                title="Send (Enter)"
-              >
-                <IconSend />
-              </button>
             </div>
-          </div>
 
-          {/* Footer hint (mockup §7.5) — the affordance legend under the composer. */}
-          <div className="hint">
-            Live — type <span className="kbd">@</span> or <span className="kbd">/</span>, attach with{" "}
-            <span className="kbd">@file</span>, send with <span className="kbd">↵</span>, newline with{" "}
-            <span className="kbd">⇧↵</span>.
+            {/* Footer hint (spec §7.5) — the affordance legend under the composer. */}
+            <div className="hint">
+              Live — type <span className="kbd">@</span> or <span className="kbd">/</span>, send with{" "}
+              <span className="kbd">↵</span>, newline with <span className="kbd">⇧↵</span>.
+            </div>
           </div>
         </div>
       </div>
@@ -1000,8 +1004,25 @@ function prettyJson(s: string): string {
   }
 }
 
-/// Inline cards for the tool calls an assistant turn made, each collapsible to
-/// its arguments + (matched-by-id) result. Exported for unit testing.
+/// A short single-line argument preview for a tool-call summary (the design's
+/// dim `arg` slot) — the first scalar value in the JSON args, else the server.
+function toolArgPreview(inputJson: string): string {
+  try {
+    const obj = JSON.parse(inputJson);
+    if (obj && typeof obj === "object") {
+      for (const v of Object.values(obj)) {
+        if (typeof v === "string") return v;
+        if (typeof v === "number" || typeof v === "boolean") return String(v);
+      }
+    }
+  } catch {
+    /* not JSON — fall through */
+  }
+  return "";
+}
+
+/// Inline tool-call activity: one dim line at rest, expanding to its arguments +
+/// (matched-by-id) result. Exported for unit testing.
 export function ToolCallCards({
   calls,
   results,
@@ -1010,57 +1031,37 @@ export function ToolCallCards({
   results: { callId: string; content: string; isError: boolean }[];
 }) {
   return (
-    <div className="mt-3 space-y-2">
+    <>
       {calls.map((c) => {
         const result = results.find((r) => r.callId === c.id);
+        const arg = toolArgPreview(c.inputJson) || c.serverId || "";
         return (
-          <details
-            key={c.id}
-            className="overflow-hidden rounded-xl border text-sm transition-colors"
-            style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
-          >
-            <summary className="flex cursor-pointer list-none items-center gap-2 px-3 py-2 transition-colors hover:bg-[color:var(--hive-overlay)]">
-              <span aria-hidden className="opacity-70"><IconWrench size={13} /></span>
-              <span className="truncate font-mono font-medium">{c.name}</span>
-              {c.serverId && <span className="shrink-0 text-xs opacity-50">· {c.serverId}</span>}
+          <details key={c.id} className="tcall">
+            <summary className="tcall-h">
+              <span aria-hidden className="tcall-chev">
+                <IconChevronRight size={11} />
+              </span>
+              <span aria-hidden>
+                <IconWrench size={12} />
+              </span>
+              <span className="tcall-n">{c.name}</span>
+              {arg && <span className="tcall-a">{arg}</span>}
               {result && (
-                <span
-                  className="ml-auto shrink-0 rounded-full px-2 py-0.5 text-[0.7rem] font-medium"
-                  style={
-                    result.isError
-                      ? { background: "color-mix(in srgb, var(--hive-danger) 16%, transparent)", color: "var(--hive-danger)" }
-                      : { background: "color-mix(in srgb, var(--hive-success) 14%, transparent)", color: "var(--hive-success)" }
-                  }
-                >
+                <span className={`tcall-badge ${result.isError ? "bad" : "ok"}`}>
                   {result.isError ? "error" : "done"}
                 </span>
               )}
             </summary>
-            <div className="space-y-2 px-3 pb-3">
-              {c.inputJson && (
-                <pre
-                  className="overflow-x-auto rounded-lg p-2 text-xs"
-                  style={{ background: "var(--hive-overlay)", border: "1px solid var(--hive-line)" }}
-                >
-                  {prettyJson(c.inputJson)}
-                </pre>
-              )}
-              {result && (
-                <pre
-                  className="overflow-x-auto rounded-lg p-2 text-xs"
-                  style={{
-                    background: result.isError ? "color-mix(in srgb, var(--hive-danger) 14%, transparent)" : "var(--hive-overlay)",
-                    border: "1px solid var(--hive-line)",
-                  }}
-                >
-                  {result.content.length > 4000 ? `${result.content.slice(0, 4000)}…` : result.content}
-                </pre>
-              )}
-            </div>
+            {c.inputJson && <pre className="tcall-o">{prettyJson(c.inputJson)}</pre>}
+            {result && (
+              <pre className={`tcall-o${result.isError ? " bad" : ""}`}>
+                {result.content.length > 4000 ? `${result.content.slice(0, 4000)}…` : result.content}
+              </pre>
+            )}
           </details>
         );
       })}
-    </div>
+    </>
   );
 }
 
@@ -1069,11 +1070,15 @@ const Bubble = memo(function Bubble({
   messageId,
   role,
   author,
+  handle,
   body,
   createdAt,
   streaming = false,
   via,
   model,
+  host,
+  shared = false,
+  turnAccent,
   avatarUrl,
   colorHex,
   reactions,
@@ -1085,11 +1090,17 @@ const Bubble = memo(function Bubble({
   messageId?: string;
   role: string;
   author: string;
+  /// The mentionable handle for an agent turn (rendered "@handle"); the human
+  /// name (`author`) is shown as-is. Falls back to `author` when absent.
+  handle?: string;
   body: string;
   createdAt?: string;
   streaming?: boolean;
   via?: string;
   model?: string;
+  host?: "local" | "remote" | null;
+  shared?: boolean;
+  turnAccent?: string;
   avatarUrl?: string | null;
   colorHex?: string | null;
   reactions?: { emoji: string; actorId: string; actorDisplayName: string }[];
@@ -1098,11 +1109,12 @@ const Bubble = memo(function Bubble({
   onReact?: (messageId: string, emoji: string) => void;
   onRegenerate?: () => void;
 }) {
-  const time = createdAt ? new Date(createdAt) : null;
-  const timeLabel =
-    time && !Number.isNaN(time.getTime())
-      ? time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      : "";
+  // One formatter, one timezone (§F3): relative age in-thread, absolute local
+  // time on hover. `relTime`/`absTime` normalize a designator-less timestamp to
+  // UTC first, so a stray naive `createdAt` can never render in the wrong zone
+  // (which made a reply look ~8h earlier than the message it answered).
+  const timeLabel = createdAt ? relTime(createdAt) : "";
+  const timeTitle = createdAt ? absTime(createdAt) : undefined;
   const isUser = role === "user";
   const isSystem = role === "system";
   const counts = new Map<string, number>();
@@ -1128,14 +1140,14 @@ const Bubble = memo(function Bubble({
   }, [reactOpen]);
 
   const content = streaming ? (
-    <div className="whitespace-pre-wrap text-[0.95rem] leading-7">
+    <span className="whitespace-pre-wrap">
       {body}
-      <span className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-[2px] animate-pulse bg-current align-middle" />
-    </div>
+      <span className="tt-caret" />
+    </span>
   ) : body ? (
     <MessageBody body={body} />
   ) : toolCalls && toolCalls.length > 0 ? null : (
-    <div className="text-[0.95rem] leading-7 opacity-50">…</div>
+    <span className="opacity-50">…</span>
   );
 
   // System messages (summaries, notices) read as centered meta, not a reply.
@@ -1150,30 +1162,55 @@ const Bubble = memo(function Bubble({
     );
   }
 
+  // Turn identity is carried by tint + avatar shape, never by side (always
+  // left-aligned): warm = human, cool/agent-hue = personal agent, muted =
+  // shared workspace agent. A personal agent overrides --turn-accent with its
+  // own stored avatar colour; the theme still owns the fill/rail lightness.
+  const kindClass = isUser ? "human" : shared ? "shared" : "agent";
+  const rowStyle: CSSProperties = streaming
+    ? {}
+    : { contentVisibility: "auto", containIntrinsicSize: "0 80px" };
+  if (!isUser && !shared && turnAccent) {
+    (rowStyle as Record<string, string>)["--turn-accent"] = turnAccent;
+  }
+
   return (
-    // Flat message row (Slack/Buzz-style): no card/tint, avatar + name + time +
-    // body, full-row hover. `content-visibility: auto` lets the engine skip
-    // layout/paint for off-screen rows — cheap virtualization for long logs.
-    <div
-      className={`group tt ${isUser ? "human" : "agent"}`}
-      style={streaming ? undefined : { contentVisibility: "auto", containIntrinsicSize: "0 80px" }}
-    >
+    // Left-aligned turn row: a whisper of tint + avatar shape carry identity.
+    // `content-visibility: auto` lets the engine skip layout/paint for off-screen
+    // rows — cheap virtualization for long logs.
+    <div className={`group tt ${kindClass}`} style={rowStyle}>
       <div className="tt-av">
         <Avatar
           name={author}
           url={avatarUrl}
           colorHex={colorHex}
           kind={isUser ? "human" : "agent"}
+          host={isUser ? undefined : host}
           size={30}
         />
       </div>
 
       <div className="tt-body">
         <div className="tt-head">
-          <span className={isUser ? "tt-name" : "tt-handle"}>{author}</span>
+          <span className={isUser ? "tt-name" : "tt-handle"}>
+            {isUser ? author : `@${handle ?? author}`}
+          </span>
+          {shared && (
+            <span className="tt-badge">
+              <IconUsers size={10} /> workspace
+            </span>
+          )}
           {!isUser && model && <span className="tt-model">{model}</span>}
+          {streaming && (
+            <span className="tt-tag live" aria-label="generating">
+              <i />
+              <i />
+              <i />
+              generating
+            </span>
+          )}
           <span className="tt-spacer" />
-          {timeLabel && <span className="tt-time">{timeLabel}</span>}
+          {timeLabel && <span className="tt-time" title={timeTitle}>{timeLabel}</span>}
         </div>
         {via && !isUser && <div className="tt-attr">via {via}</div>}
 
@@ -1188,13 +1225,8 @@ const Bubble = memo(function Bubble({
             row only appears on hover. */}
         <div className="tt-actions">
           {[...counts.entries()].map(([emoji, n]) => (
-            <button
-              key={emoji}
-              onClick={() => onReact?.(messageId!, emoji)}
-              className="rounded-full border px-2 py-0.5 text-xs transition-colors hover:border-[color:var(--hive-accent-cool)]"
-              style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
-            >
-              {emoji} {n}
+            <button key={emoji} onClick={() => onReact?.(messageId!, emoji)} className="react">
+              {emoji} <span>{n}</span>
             </button>
           ))}
           <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">

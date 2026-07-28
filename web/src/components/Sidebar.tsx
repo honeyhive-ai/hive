@@ -9,6 +9,7 @@ import {
   createChatInChannel,
   deleteChat,
   getAppSettings,
+  getGitStatus,
   listAgents,
   listChannels,
   listChats,
@@ -26,6 +27,7 @@ import { SkeletonRows } from "@/components/Skeleton";
 import { Avatar } from "@/components/Avatar";
 import { confirmDialog, promptDialog } from "@/components/Dialog";
 import { confirmThen } from "@/lib/confirm";
+import { relTime } from "@/lib/time";
 import {
   NavRow,
   ChatRow,
@@ -61,24 +63,6 @@ function folderBasename(path: string): string {
 }
 
 /// Compact relative time for chat rows ("now", "5m", "3h", "2d", "4w").
-function relTime(iso: string): string {
-  const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return "";
-  const s = Math.floor((Date.now() - t) / 1000);
-  if (s < 60) return "now";
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${h}h`;
-  const d = Math.floor(h / 24);
-  if (d < 7) return `${d}d`;
-  const w = Math.floor(d / 7);
-  if (w < 5) return `${w}w`;
-  const mo = Math.floor(d / 30);
-  if (mo < 12) return `${mo}mo`;
-  return `${Math.floor(d / 365)}y`;
-}
-
 type ChatFilter = "all" | "recent";
 
 export function Sidebar({
@@ -139,6 +123,17 @@ export function Sidebar({
     queryFn: () => listSkills(sessionId ?? ""),
     enabled: Boolean(sessionId),
   });
+
+  // Git branch for the workspace header line 2 (F14) — otherwise it just
+  // repeats the folder name. Keyed on the path so switching workspaces refetches;
+  // shelling out to git is why it's lazy, not baked into app settings.
+  const git = useQuery({
+    queryKey: ["git-status", workspacePath],
+    queryFn: () => getGitStatus(),
+    enabled: workspacePath.trim().length > 0,
+    staleTime: 15_000,
+  });
+  const gitBranch = git.data?.branch ?? null;
 
   const [showArchived, setShowArchived] = useState(false);
   // `null` = no cross-channel View active → the channel tree is shown. A View
@@ -295,7 +290,15 @@ export function Sidebar({
 
   async function handleNew() {
     try {
-      const created = await createChat("");
+      // File the new chat into the current channel so it isn't stranded in the
+      // Unfiled bucket (F11): the open chat's channel, else the first (default,
+      // #general) channel. Only truly channel-less workspaces make it unfiled.
+      const currentChannelId = all.find((c) => c.id === selectedId)?.channelId?.trim();
+      const targetChannelId = currentChannelId || openChannels[0]?.id || "";
+      const created = targetChannelId
+        ? await createChatInChannel(targetChannelId, "")
+        : await createChat("");
+      if (targetChannelId) setChannelCollapsed(targetChannelId, false);
       await qc.invalidateQueries({ queryKey: ["chats"] });
       onSelect(created.id);
     } catch (e) {
@@ -424,7 +427,14 @@ export function Sidebar({
               className="block truncate font-mono text-[11px]"
               style={{ color: "var(--hive-sidebar-ink-muted)" }}
             >
-              {workspacePath ? folderBasename(workspacePath) : "No project folder"}
+              {/* Line 2 is the repo state, not a second copy of the name (F14):
+                  "<repo> · <branch>" when on a git repo, else the folder or a
+                  no-folder hint. */}
+              {workspacePath
+                ? gitBranch
+                  ? `${folderBasename(workspacePath)} · ${gitBranch}`
+                  : folderBasename(workspacePath)
+                : "No project folder"}
             </span>
           </span>
           <span style={{ color: "var(--hive-sidebar-ink-muted)" }} aria-hidden>
@@ -490,7 +500,10 @@ export function Sidebar({
           label="All chats"
           active={filter === "all"}
           onClick={() => setFilter((f) => (f === "all" ? null : "all"))}
-          count={all.filter((c) => !c.archived).length}
+          // Count only discrete chat rows — a channel's default chat renders as
+          // the channel header, not a row, so counting it made "3" show beside
+          // two visible chats (F4: a count must equal what clicking it shows).
+          count={all.filter((c) => !c.archived && !c.isChannelDefault).length}
         />
         <NavRow
           icon={<IconActivity size={15} />}
@@ -644,6 +657,10 @@ export function Sidebar({
                             fontWeight: active || hasMention ? 700 : 590,
                             letterSpacing: "-0.01em",
                             color: "var(--hive-ink)",
+                            // Channels read as slugs (the "#" prefix implies it),
+                            // so render lowercase regardless of stored casing —
+                            // "#General" → "#general" (F15).
+                            textTransform: "lowercase",
                           }}
                         >
                           <span style={{ color: "var(--hive-ink-soft)" }}>#</span>
@@ -705,10 +722,12 @@ export function Sidebar({
               <NewChannelRow onClick={handleNewChannel} />
 
               {/* Unfiled chats (empty channelId — the pre-migration norm) live
-                  under a plain "Chats" cap so nothing disappears (§11 rule 2). */}
+                  under an "Unfiled" cap so nothing disappears (§11 rule 2) and
+                  the label reads as a holding area, not a peer of the channels
+                  (F11: name it Unfiled, not "Chats"). */}
               {unfiled.length > 0 && (
                 <div className="mt-2">
-                  <SectionCap>Chats</SectionCap>
+                  <SectionCap>Unfiled</SectionCap>
                   {unfiled.map((c) => (
                     <ChatRow
                       key={c.id}
@@ -733,7 +752,9 @@ export function Sidebar({
         <div className="mt-2">
           <SectionCap>Workspace</SectionCap>
           <NavRow icon={<IconUsers size={15} />} label="People" count={memberCount} active={utilityPane === "people"} onClick={() => onOpenUtilityPane("people")} />
-          <NavRow icon={<IconWrench size={15} />} label="Agents & tools" count={(agents.data ?? []).length} active={utilityPane === "tools"} onClick={() => onOpenUtilityPane("tools")} />
+          {/* +1 for the always-present default agent (@hive) so the count never
+              reads 0 while it's answering — matches the Tools pane roster (F1). */}
+          <NavRow icon={<IconWrench size={15} />} label="Agents & tools" count={(agents.data ?? []).length + 1} active={utilityPane === "tools"} onClick={() => onOpenUtilityPane("tools")} />
           <NavRow icon={<IconInbox size={15} />} label="Review" active={utilityPane === "review"} onClick={() => onOpenUtilityPane("review")} />
           <NavRow icon={<IconActivity size={15} />} label="Context" active={utilityPane === "context"} onClick={() => onOpenUtilityPane("context")} />
           <NavRow icon={<IconSparkle size={15} />} label="Skills" count={(skills.data ?? []).length} active={utilityPane === "skills"} onClick={() => onOpenUtilityPane("skills")} />

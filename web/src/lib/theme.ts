@@ -271,6 +271,35 @@ export function applyTheme(p: Palette) {
   root.style.setProperty("--hive-danger", status.danger);
   root.style.setProperty("--hive-warn", status.warn);
   root.style.setProperty("--hive-overlay", status.overlay);
+  // Chat-layer scheme-derived numbers (redesign). Like the status tokens they
+  // depend on light/dark, never on the accent family — so keying them to a
+  // theme name would be wrong. They set the target lightness for turn fills,
+  // rails, tinted author names, and filled controls, plus the on-accent text
+  // colour, so one CSS rule set stays legible in every palette + scheme.
+  const chat =
+    p.scheme === "dark"
+      ? {
+          turnMix: "87%",
+          turnRailL: "70%",
+          turnNameL: "82%",
+          accentInkL: "84%",
+          fillL: "82%",
+          onAccent: "rgb(18,20,24)",
+        }
+      : {
+          turnMix: "91%",
+          turnRailL: "54%",
+          turnNameL: "40%",
+          accentInkL: "42%",
+          fillL: "45%",
+          onAccent: "rgb(255,255,255)",
+        };
+  root.style.setProperty("--hive-turn-mix", chat.turnMix);
+  root.style.setProperty("--hive-turn-rail-l", chat.turnRailL);
+  root.style.setProperty("--hive-turn-name-l", chat.turnNameL);
+  root.style.setProperty("--hive-accent-ink-l", chat.accentInkL);
+  root.style.setProperty("--hive-fill-l", chat.fillL);
+  root.style.setProperty("--hive-on-accent", chat.onAccent);
   root.style.setProperty("--hive-canvas", p.canvas);
   root.style.setProperty("--hive-ink", p.ink);
   root.style.setProperty("--hive-panel", p.panel);

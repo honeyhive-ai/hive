@@ -85,7 +85,9 @@ pub fn parse_mentions(body: &str, session: &ChatSession) -> MentionTargets {
     let lower = body.to_lowercase();
     let mut targets = MentionTargets::default();
 
-    if mentions_phrase(&lower, "primary") {
+    // `@hive` is the default agent's handle; `@primary` is the reserved alias
+    // (a role, not a name). Both summon the workspace's primary runtime.
+    if mentions_phrase(&lower, "primary") || mentions_phrase(&lower, "hive") {
         targets.primary = true;
     }
     if mentions_phrase(&lower, "you") || mentions_phrase(&lower, "all") {
@@ -159,6 +161,14 @@ mod tests {
         let t = parse_mentions("hey @primary can you and @you look?", &s);
         assert!(t.primary);
         assert!(t.human_broadcast);
+    }
+
+    #[test]
+    fn hive_is_an_alias_for_primary() {
+        let s = session_with(vec![], vec![]);
+        assert!(parse_mentions("can you take this @hive?", &s).primary);
+        // Bare "hive" in prose (no @) must not summon the primary.
+        assert!(!parse_mentions("the hive is busy today", &s).primary);
     }
 
     #[test]

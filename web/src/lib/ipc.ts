@@ -609,7 +609,7 @@ export const onChatStream = (
 /// Real connection health for the relay sync loop, updated on every sync
 /// attempt: `live` (last sync ok), `error` (last sync failed — see `lastError`),
 /// or `offline` (not syncing / no relay).
-export type ConnectionState = "live" | "error" | "offline";
+export type ConnectionState = "live" | "error" | "offline" | "needs_key";
 
 export interface SyncStatusDto {
   relayConfigured: boolean;

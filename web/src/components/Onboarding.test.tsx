@@ -97,8 +97,12 @@ describe("Onboarding wizard flow", () => {
       ),
     );
 
-    // Step 4: "Just me" is the default → Finish clears any relay (local-only).
+    // Step 4: "Just me" is the default → Next clears any relay (local-only) and
+    // advances to the appearance step.
     await screen.findByText("Team & sync");
+    await clickByName("Next");
+    // Step 5: pick-a-look → Finish completes onboarding.
+    await screen.findByText("Make it yours");
     await clickByName("Finish");
     await waitFor(() => expect(onComplete).toHaveBeenCalled());
     expect(ipc.updateConnectionSettings).toHaveBeenCalledWith(
@@ -237,13 +241,13 @@ describe("Onboarding wizard flow", () => {
     );
     await clickByName("Test connection");
     await screen.findByText("token rejected");
-    // Finish is disabled — a broken relay can't complete onboarding.
-    expect(screen.getByRole("button", { name: "Finish" })).toBeDisabled();
+    // Next is disabled — a broken relay can't advance past the team step.
+    expect(screen.getByRole("button", { name: "Next" })).toBeDisabled();
 
-    // Paste a token + re-test → connected → Finish enabled.
+    // Paste a token + re-test → connected → Next enabled.
     await userEvent.type(screen.getByPlaceholderText(/access token/i), "good-token");
     await clickByName("Test connection");
     await screen.findByText("✓ Connected");
-    expect(screen.getByRole("button", { name: "Finish" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Next" })).toBeEnabled();
   });
 });

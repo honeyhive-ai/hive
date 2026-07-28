@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addWorkspaceToList,
@@ -540,6 +540,11 @@ export function App() {
       <Onboarding
         onComplete={() => {
           window.localStorage.setItem("hive.onboarded", "1");
+          // Onboarding's appearance step persisted the theme + mode to
+          // localStorage; sync App's state so its own applyTheme effect doesn't
+          // revert to the mount-time default.
+          setPalette(loadTheme());
+          setAppearanceMode(loadMode());
           setOnboarded(true);
           refreshWorkspaceShell();
         }}
@@ -674,6 +679,7 @@ export function App() {
               }
               onOpenContext={() => openUtilityPane("context")}
               syncPill={deriveSyncPill(sync.data)}
+              onFixSync={() => openSettings("team")}
               mode={mode}
               onChangeMode={setMode}
               utilityPaneVisible={showUtilityPane}
@@ -761,6 +767,11 @@ export function App() {
                       pane={utilityPane}
                       activeRuntimeId={activeChat.data?.runtimeId ?? currentRuntime?.id ?? ""}
                       onChangePane={setUtilityPane}
+                      onClose={() => setShowUtilityPane(false)}
+                      // The pane's own icon rail duplicates the sidebar's
+                      // Workspace list (F10) — only show it when the sidebar is
+                      // hidden, so panes stay reachable without doubling nav.
+                      showPaneRail={!sidebarVisible}
                       onEditWorkflow={(def) =>
                         selectedId && setWorkflowDraft({ sessionId: selectedId, def })
                       }
@@ -818,7 +829,7 @@ function PaneResizeHandle({
 /// The header status pill, driven by real connection health (not just "a relay
 /// URL is set"): live → success tint, error → danger tint (with the failure in
 /// the tooltip), offline → a muted neutral state. All color via --hive-* tokens.
-type SyncPill = { label: string; color: string | null; title?: string };
+type SyncPill = { label: string; color: string | null; title?: string; actionable?: boolean };
 
 function deriveSyncPill(s: SyncStatusDto | undefined): SyncPill {
   const state = s?.connectionState ?? "offline";
@@ -834,6 +845,19 @@ function deriveSyncPill(s: SyncStatusDto | undefined): SyncPill {
       label: "Sync error",
       color: "var(--hive-danger)",
       title: s?.lastError ?? "Sync failed — reconnect or check your key / token",
+      actionable: true,
+    };
+  }
+  // Relay configured but no E2EE key yet — setup-incomplete, not a failure.
+  // Calm amber prompt to set a passphrase (Settings → Team), never a red error.
+  if (state === "needs_key") {
+    return {
+      label: "Set a passphrase to sync",
+      color: "var(--hive-warn)",
+      title:
+        s?.lastError ??
+        "A relay is configured but this workspace has no encryption key — set a workspace passphrase in Settings → Team to sync encrypted, or clear the relay URL to work local-only.",
+      actionable: true,
     };
   }
   return {
@@ -843,6 +867,39 @@ function deriveSyncPill(s: SyncStatusDto | undefined): SyncPill {
       ? "A relay is configured but nothing is syncing right now"
       : undefined,
   };
+}
+
+/// The header sync status. A tinted state (live/error/needs-key) reads as a
+/// chip, not amber prose beside the title (F16); actionable states (needs-key,
+/// error) are a button that opens Settings → Team. Neutral offline/local stays
+/// a quiet unboxed label.
+function SyncPillChip({ pill, onFix }: { pill: SyncPill; onFix?: () => void }) {
+  if (!pill.color) {
+    return (
+      <span className="ml-1 hidden shrink-0 text-xs opacity-40 sm:inline" title={pill.title}>
+        {pill.label}
+      </span>
+    );
+  }
+  const chipStyle: CSSProperties = {
+    color: pill.color,
+    borderColor: `color-mix(in srgb, ${pill.color} 40%, transparent)`,
+    background: `color-mix(in srgb, ${pill.color} 12%, transparent)`,
+  };
+  const className =
+    "ml-1 hidden shrink-0 items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium sm:inline-flex";
+  if (pill.actionable && onFix) {
+    return (
+      <button type="button" className={`${className} hover:brightness-110`} style={chipStyle} title={pill.title} onClick={onFix}>
+        {pill.label}
+      </button>
+    );
+  }
+  return (
+    <span className={className} style={chipStyle} title={pill.title}>
+      {pill.label}
+    </span>
+  );
 }
 
 function ChatHeaderBar({
@@ -855,6 +912,7 @@ function ChatHeaderBar({
   onRename,
   contextPct,
   onOpenContext,
+  onFixSync,
 }: {
   title: string;
   syncPill: SyncPill;
@@ -867,6 +925,9 @@ function ChatHeaderBar({
   /// until telemetry loads). Clicking the pill opens the Context pane.
   contextPct: number | null;
   onOpenContext: () => void;
+  /// Opens Settings → Team, so an actionable sync chip (needs-key / error) is a
+  /// button that takes the user to the fix.
+  onFixSync?: () => void;
 }) {
   const tabs: { id: CanvasMode; label: string }[] = [
     { id: "chat", label: "Chat" },
@@ -887,13 +948,7 @@ function ChatHeaderBar({
         >
           <IconPencil size={13} />
         </button>
-        <span
-          className="ml-1 hidden shrink-0 text-xs sm:inline"
-          style={{ color: syncPill.color ?? undefined, opacity: syncPill.color ? 1 : 0.4 }}
-          title={syncPill.title}
-        >
-          {syncPill.label}
-        </span>
+        <SyncPillChip pill={syncPill} onFix={onFixSync} />
       </div>
 
       {contextPct !== null && (
@@ -909,7 +964,7 @@ function ChatHeaderBar({
           }}
         >
           <IconHexagon size={11} />
-          {contextPct}%
+          {contextPct}% context
         </button>
       )}
 

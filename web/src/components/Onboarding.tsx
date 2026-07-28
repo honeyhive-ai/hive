@@ -30,8 +30,27 @@ import {
   type RelayProbeDto,
 } from "@/lib/ipc";
 import { HiveBrandIcon } from "@/components/HiveBrand";
+import {
+  applyTheme,
+  loadMode,
+  loadTheme,
+  resolvePalette,
+  saveMode,
+  savePalette,
+  type AppearanceMode,
+  type ThemeName,
+} from "@/lib/theme";
 
 type RuntimeChoice = "claudeCode" | "openai" | "anthropic" | "ollama";
+
+// Onboarding's appearance step. Order + labels for the accent-family picker.
+const THEME_CHOICES: { name: ThemeName; label: string; blurb: string }[] = [
+  { name: "pollen", label: "Pollen", blurb: "Warm honey — the Hive default" },
+  { name: "midnight", label: "Midnight", blurb: "Cool blue-grey" },
+  { name: "studio", label: "Studio", blurb: "Neutral graphite" },
+  { name: "harbor", label: "Harbor", blurb: "Ocean blue" },
+  { name: "meadow", label: "Meadow", blurb: "Botanical green" },
+];
 
 const inputStyle = { borderColor: "var(--hive-line)", background: "var(--hive-panel)" };
 const field = "w-full rounded-xl border px-3 py-2.5 text-sm outline-none";
@@ -90,6 +109,21 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
   const [claudeModels, setClaudeModels] = useState<ClaudeModelOption[]>([]);
   const [claudeCustom, setClaudeCustom] = useState(false);
   const [letEdit, setLetEdit] = useState(true); // Accept edits by default
+
+  // Step 5 — appearance (accent family + light/dark). Applied live for preview
+  // and persisted to localStorage; App re-reads both on completion.
+  const [theme, setTheme] = useState<ThemeName>(loadTheme);
+  const [appearance, setAppearance] = useState<AppearanceMode>(loadMode);
+  const pickTheme = (name: ThemeName) => {
+    setTheme(name);
+    savePalette(name);
+    applyTheme(resolvePalette(name, appearance));
+  };
+  const pickAppearance = (m: AppearanceMode) => {
+    setAppearance(m);
+    saveMode(m);
+    applyTheme(resolvePalette(theme, m));
+  };
 
   // Step 4 — team / relay connection
   type TeamMode = "local" | "join" | "host";
@@ -229,7 +263,9 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
     (step === 2) ||
     (step === 3 && (choice === "claudeCode" || choice === "ollama" || apiKey.trim().length > 0)) ||
     // Step 4: local is always fine; join/host must have a verified connection.
-    (step === 4 && (teamMode === "local" || connectionOk));
+    (step === 4 && (teamMode === "local" || connectionOk)) ||
+    // Step 5 (appearance) always has a valid selection.
+    (step === 5);
 
   async function next() {
     setError(null);
@@ -246,8 +282,10 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
       } else if (step === 3) {
         await applyRuntime();
         setStep(4);
-      } else {
+      } else if (step === 4) {
         await finishStep4();
+        setStep(5);
+      } else {
         onComplete();
       }
     } catch (e) {
@@ -393,10 +431,10 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
         </div>
         <div className="mb-4 text-sm opacity-60">
           A local-first workspace where you and your AI agents build side by side — bring your own
-          models, keep your code and keys on your machine. Four quick steps:
+          models, keep your code and keys on your machine. A few quick steps:
         </div>
         <div className="mb-5 flex gap-1.5">
-          {[1, 2, 3, 4].map((n) => (
+          {[1, 2, 3, 4, 5].map((n) => (
             <div key={n} className="h-1 flex-1 rounded-full" style={{ background: n <= step ? "var(--hive-accent-cool)" : "var(--hive-line)" }} />
           ))}
         </div>
@@ -665,6 +703,55 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
           </div>
         )}
 
+        {step === 5 && (
+          <div className="space-y-3">
+            <div className="text-sm font-medium">Make it yours</div>
+            <div className="text-xs opacity-50">Pick a look — change it anytime in Settings → Appearance.</div>
+            <div className="grid grid-cols-2 gap-2">
+              {THEME_CHOICES.map((t) => {
+                const p = resolvePalette(t.name, appearance);
+                const active = theme === t.name;
+                return (
+                  <button
+                    key={t.name}
+                    type="button"
+                    onClick={() => pickTheme(t.name)}
+                    className="flex items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left"
+                    style={{ borderColor: active ? "var(--hive-accent-cool)" : "var(--hive-line)", background: active ? "var(--hive-mist)" : "transparent" }}
+                  >
+                    <span
+                      className="relative h-8 w-8 shrink-0 overflow-hidden rounded-lg border"
+                      style={{ borderColor: "var(--hive-line)", background: p.canvas }}
+                      aria-hidden
+                    >
+                      <span className="absolute bottom-1 left-1 h-3 w-3 rounded-full" style={{ background: p.accentWarm }} />
+                      <span className="absolute right-1 top-1 h-3 w-3 rounded-full" style={{ background: p.accentCool }} />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate text-sm font-medium">{t.label}</span>
+                      <span className="block truncate text-[11px] opacity-50">{t.blurb}</span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex gap-1.5">
+              {(["auto", "light", "dark"] as AppearanceMode[]).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => pickAppearance(m)}
+                  className="flex-1 rounded-lg border px-3 py-1.5 text-xs font-medium capitalize"
+                  style={{ borderColor: appearance === m ? "var(--hive-accent-cool)" : "var(--hive-line)", background: appearance === m ? "var(--hive-mist)" : "transparent" }}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+            <div className="text-xs opacity-40">Auto follows your system light/dark setting.</div>
+          </div>
+        )}
+
         {error && <p className="mt-3 text-xs" style={{ color: "var(--hive-accent-warm)" }}>{error}</p>}
 
         <div className="mt-6 flex items-center justify-between">
@@ -683,7 +770,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
               className="rounded-xl px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
               style={{ background: "var(--hive-accent-cool)" }}
             >
-              {busy ? "…" : step === 4 ? "Finish" : "Next"}
+              {busy ? "…" : step === 5 ? "Finish" : "Next"}
             </button>
           </div>
         </div>

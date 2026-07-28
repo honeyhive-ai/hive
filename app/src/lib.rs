@@ -5979,8 +5979,12 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                         eprintln!("{msg}");
                         last_sync_err = Some(msg.clone());
                     }
+                    // Not a *failure* — the relay is configured but this
+                    // workspace has no key yet. Surface a calm, actionable
+                    // "needs_key" state (not a red error) so the header prompts
+                    // the user to set a passphrase rather than alarming them.
                     *app.state::<AppState>().conn_health.lock().unwrap() = ConnHealth {
-                        state: "error".to_string(),
+                        state: "needs_key".to_string(),
                         last_error: Some(msg.clone()),
                     };
                     let _ = app.emit("workspace://sync-error", msg);

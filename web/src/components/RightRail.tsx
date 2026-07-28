@@ -49,6 +49,7 @@ import {
 import { LogsView } from "@/components/LogsView";
 import { Avatar } from "@/components/Avatar";
 import { fileToAvatarDataUrl } from "@/lib/avatar";
+import { PRIMARY_NAME, PRIMARY_HANDLE } from "@/lib/agent";
 import { toast, errMsg } from "@/components/Toast";
 import { confirmThen } from "@/lib/confirm";
 import {
@@ -96,6 +97,8 @@ export function RightRail({
   pane,
   activeRuntimeId,
   onChangePane,
+  onClose,
+  showPaneRail = true,
   onEditWorkflow,
 }: {
   width: number;
@@ -103,9 +106,29 @@ export function RightRail({
   pane: UtilityPane;
   activeRuntimeId: string;
   onChangePane: (pane: UtilityPane) => void;
+  /// Dismiss the whole utility pane (besides the header Tools toggle).
+  onClose: () => void;
+  /// Show the pane's own icon rail. Hidden when the sidebar is visible, since
+  /// the sidebar's Workspace list already switches panes (F10).
+  showPaneRail?: boolean;
   /// Opens the DAG editor in the main canvas (owned by App).
   onEditWorkflow: (def: import("@/lib/ipc").WorkflowDefinitionDto) => void;
 }) {
+  // Escape closes the pane — a keyboard alternative to the Tools toggle and the
+  // header ✕. Ignored while typing so it never eats a composer/​input Escape.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const el = document.activeElement;
+      const typing =
+        el instanceof HTMLElement &&
+        (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+      if (!typing) onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
   const panes: { id: UtilityPane; label: string; icon: ReactNode }[] = [
     { id: "tools", label: "Tools", icon: <IconWrench size={17} /> },
     { id: "context", label: "Context", icon: <IconHexagon size={17} /> },
@@ -119,31 +142,44 @@ export function RightRail({
 
   return (
     <aside
-      className="flex shrink-0 overflow-hidden border-l"
+      className="relative flex shrink-0 overflow-hidden border-l"
       style={{ width, borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
     >
-      <div
-        className="flex w-10 shrink-0 flex-col items-center gap-2 border-r py-3"
-        style={{ borderColor: "var(--hive-line)", background: "var(--hive-overlay)" }}
+      {showPaneRail && (
+        <div
+          className="flex w-10 shrink-0 flex-col items-center gap-2 border-r py-3"
+          style={{ borderColor: "var(--hive-line)", background: "var(--hive-overlay)" }}
+        >
+          {panes.map((item) => (
+            <button
+              key={item.id}
+              onClick={() => onChangePane(item.id)}
+              className="flex h-10 w-10 items-center justify-center rounded-2xl transition-colors"
+              style={{
+                background: pane === item.id ? "var(--hive-mist)" : "transparent",
+                color: pane === item.id ? "var(--hive-accent-cool)" : "var(--hive-ink)",
+                opacity: pane === item.id ? 1 : 0.72,
+              }}
+              title={item.label}
+              aria-label={`${item.label} pane`}
+              aria-pressed={pane === item.id}
+            >
+              {item.icon}
+            </button>
+          ))}
+        </div>
+      )}
+      {/* Close the pane — a second dismiss affordance besides the header Tools
+          toggle (and Escape). Sits in the pane header's empty right edge. */}
+      <button
+        onClick={onClose}
+        className="absolute right-2 top-2.5 z-10 flex h-7 w-7 items-center justify-center rounded-lg opacity-55 transition-opacity hover:opacity-100"
+        style={{ color: "var(--hive-ink)" }}
+        title="Close panel (Esc)"
+        aria-label="Close panel"
       >
-        {panes.map((item) => (
-          <button
-            key={item.id}
-            onClick={() => onChangePane(item.id)}
-            className="flex h-10 w-10 items-center justify-center rounded-2xl transition-colors"
-            style={{
-              background: pane === item.id ? "var(--hive-mist)" : "transparent",
-              color: pane === item.id ? "var(--hive-accent-cool)" : "var(--hive-ink)",
-              opacity: pane === item.id ? 1 : 0.72,
-            }}
-            title={item.label}
-            aria-label={`${item.label} pane`}
-            aria-pressed={pane === item.id}
-          >
-            {item.icon}
-          </button>
-        ))}
-      </div>
+        <IconX size={15} />
+      </button>
       <div className="min-h-0 min-w-0 flex-1 overflow-hidden">
         {pane === "tools" && <ToolsPane sessionId={sessionId} activeRuntimeId={activeRuntimeId} />}
         {pane === "review" && <ReviewPane sessionId={sessionId} />}
@@ -270,6 +306,7 @@ function ToolsPane({
   };
 
   const runtimeList = runtimes.data ?? [];
+  const activeRuntime = runtimeList.find((r) => r.id === activeRuntimeId);
   const agentList = agents.data ?? [];
   const mcpList = mcp.data ?? [];
   const enabledMcp = mcpList.filter((s) => s.enabled);
@@ -314,27 +351,42 @@ function ToolsPane({
           </Section>
 
           <Section title="Agents available to @mention">
-            {agentList.length === 0 ? (
-              <EmptyHint text="No agents in this workspace yet." />
-            ) : (
-              agentList.map((agent) => (
-                <Card key={agent.id} className="flex items-center gap-2.5 px-3 py-2.5">
-                  <Avatar
-                    name={agent.name}
-                    url={agent.avatarUrl}
-                    colorHex={agent.avatarColorHex}
-                    kind="agent"
-                    size={28}
-                  />
-                  <div className="min-w-0">
-                    <div className="truncate text-[13px] font-medium">@{agent.name}</div>
-                    <div className="truncate text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
-                      {agent.runtimeId} · {agent.role || "agent"}
-                    </div>
+            {/* The default agent (@hive) always exists — it answers untagged
+                messages and is bound to the active runtime — even before the
+                user adds any of their own. Showing it here (and counting it in
+                the sidebar) stops the pane claiming "no agents" while one is
+                mid-reply (F1). It has no roster record, so no edit/remove. */}
+            <Card className="flex items-center gap-2.5 px-3 py-2.5">
+              <Avatar
+                name={PRIMARY_NAME}
+                kind="agent"
+                host={activeRuntime?.location?.trim().toLowerCase() === "remote" ? "remote" : "local"}
+                size={28}
+              />
+              <div className="min-w-0">
+                <div className="truncate text-[13px] font-medium">@{PRIMARY_HANDLE}</div>
+                <div className="truncate text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+                  {activeRuntime ? runtimePickerLabel(activeRuntime) : "default runtime"} · default
+                </div>
+              </div>
+            </Card>
+            {agentList.map((agent) => (
+              <Card key={agent.id} className="flex items-center gap-2.5 px-3 py-2.5">
+                <Avatar
+                  name={agent.name}
+                  url={agent.avatarUrl}
+                  colorHex={agent.avatarColorHex}
+                  kind="agent"
+                  size={28}
+                />
+                <div className="min-w-0">
+                  <div className="truncate text-[13px] font-medium">@{agent.name}</div>
+                  <div className="truncate text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+                    {agent.runtimeId} · {agent.role || "agent"}
                   </div>
-                </Card>
-              ))
-            )}
+                </div>
+              </Card>
+            ))}
           </Section>
 
           <Section title="Tools reachable">
@@ -711,8 +763,9 @@ function RuntimeCard({
           <span
             className="rounded-full px-2 py-1 text-[10px] font-semibold uppercase opacity-70"
             style={{ background: "var(--hive-mist)" }}
+            title="A runtime you configured (vs. an auto-detected local CLI)"
           >
-            Added
+            Configured
           </span>
         )}
         {active && (
@@ -1029,9 +1082,16 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
     refetchInterval: sync.data?.relayConfigured ? 5000 : false,
   });
 
+  // The People list shows *collaborators*, never yourself: you're in the
+  // identity card, and a self row would offer Remove / Remove & revoke on
+  // yourself — a footgun (the last owner can't be removed anyway, and "revoke
+  // myself" would rotate a key you keep). Leaving a workspace is the workspace
+  // rail's job. Matches the sidebar People count, which already excludes self.
+  const collaborators = (members.data ?? []).filter((m) => !m.isSelf);
+
   // Show `#index` only on names that actually collide; matchable as `@Name#N`.
   const nameCounts = new Map<string, number>();
-  for (const m of members.data ?? []) {
+  for (const m of collaborators) {
     nameCounts.set(m.displayName, (nameCounts.get(m.displayName) ?? 0) + 1);
   }
 
@@ -1166,7 +1226,7 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
             {error}
           </div>
         )}
-        {(members.data ?? []).map((member) => {
+        {collaborators.map((member) => {
           const online = onlineActors.has(member.actorId);
           const dup = (nameCounts.get(member.displayName) ?? 0) > 1 && member.index > 0;
           return (
@@ -1234,7 +1294,7 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
             </Card>
           );
         })}
-        {(members.data ?? []).length === 0 && (
+        {collaborators.length === 0 && (
           <EmptyHint text="No extra members have been added yet." />
         )}
 

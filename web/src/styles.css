@@ -25,55 +25,184 @@
   --hive-warn: rgb(170, 116, 24);
   --hive-overlay: rgba(0, 0, 0, 0.05);
 
-  /* Derived chat-layer tokens (redesign / iteration 2). Built from the base
-     --hive-* tokens with color-mix, so they follow every palette automatically
+  /* Derived chat-layer tokens (redesign). Built from the base --hive-* tokens
+     with color-mix / relative-color, so they follow every palette automatically
      when applyTheme() overrides the base vars — no per-theme wiring needed. */
   --hive-ink-soft: color-mix(in srgb, var(--hive-ink) 55%, transparent);
+  --hive-ink-faint: color-mix(in srgb, var(--hive-ink) 42%, transparent);
   --hive-hover: color-mix(in srgb, var(--hive-ink) 6%, transparent);
   --tint-cool: color-mix(in srgb, var(--hive-accent-cool) 14%, transparent);
   --tint-cool-line: color-mix(in srgb, var(--hive-accent-cool) 38%, transparent);
   --tint-warm: color-mix(in srgb, var(--hive-accent-warm) 13%, transparent);
   --tint-warm-line: color-mix(in srgb, var(--hive-accent-warm) 40%, transparent);
+
+  /* Neutral "muted" accent — the shared-workspace / system identity (requested
+     muted token). Derived from ink so it tracks every palette. */
+  --hive-accent-muted: color-mix(in srgb, var(--hive-ink) 34%, var(--hive-panel));
+
+  /* Scheme-derived numbers — light first-paint defaults; applyTheme() overrides
+     these per light/dark scheme (they depend on scheme, never on the accent
+     family). Drive the turn fill/rail/name lightness + filled-control lightness
+     so a single rule set stays legible in every palette. */
+  --hive-turn-mix: 91%;
+  --hive-turn-rail-l: 54%;
+  --hive-turn-name-l: 40%;
+  --hive-accent-ink-l: 42%;
+  --hive-fill-l: 45%;
+  --hive-on-accent: rgb(255, 255, 255);
+
+  /* Text-weight + fill-weight variants of the semantic accents: same hue and
+     chroma, lightness replaced via relative-colour so they follow every palette
+     with no per-theme wiring. *-ink read as text; *-fill back filled controls
+     where --hive-on-accent is guaranteed legible. */
+  --hive-success-ink: oklch(from var(--hive-success) var(--hive-accent-ink-l) c h);
+  --hive-danger-ink: oklch(from var(--hive-danger) var(--hive-accent-ink-l) c h);
+  --hive-warn-ink: oklch(from var(--hive-warn) var(--hive-accent-ink-l) c h);
+  --hive-warm-ink: oklch(from var(--hive-accent-warm) var(--hive-accent-ink-l) c h);
+  --hive-accent-fill: oklch(from var(--hive-accent-cool) var(--hive-fill-l) c h);
+  --hive-warm-fill: oklch(from var(--hive-accent-warm) var(--hive-fill-l) c h);
+
+  --hive-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
 }
 
-/* ================= CHAT LAYER — flat rows + whisper tint =================
-   Flat geometry (tight padding, small radius, no border) so turns never read as
-   bubbles — but a WHISPER of tint carries identity per spec §5.3/D10: 8% warm on
-   human, 8% cool on agent, over the panel. Hover deepens the same tint rather
-   than replacing it, so the identity cue survives. Avatar shape (circle/rounded
-   square) + handle color reinforce it. */
-.tt { display: flex; gap: 10px; padding: 6px 12px; border-radius: 8px; position: relative; }
+/* ================= CHAT LAYER — turns, cards, composer =================
+   Ported from the design team's Chat Layer Guide. ONE turn treatment, tinted
+   per identity by a single custom property, --turn-accent (a colour). Fill,
+   rail and author colour all derive from it in CSS: React only names the
+   accent (warm for humans, cool/agent-hue for agents, muted for shared), and
+   the theme owns fill/rail/name lightness via the scheme-derived numbers. So
+   the same rules stay legible across Studio / Harbor / Midnight, light+dark. */
+.tt {
+  --turn-accent: var(--hive-accent-cool);
+  /* Fill is a *whisper* — ~8% accent (guide §5.3). Mixed in sRGB, not OKLCH:
+     OKLCH preserves chroma, so an 8% amber over a dark panel reads as a
+     saturated 30–40% card. sRGB keeps the tint a hint of identity, never a
+     selected-row highlight. Rail + name stay OKLCH so they hold hue+contrast. */
+  --tf: color-mix(in srgb, var(--hive-panel) 92%, var(--turn-accent));
+  --tr: oklch(from var(--turn-accent) var(--hive-turn-rail-l) c h);
+  --tn: oklch(from var(--turn-accent) var(--hive-turn-name-l) c h);
+  display: flex; gap: 10px; padding: 6px 12px; border-radius: 8px; position: relative;
+  background: var(--tf); border-inline-start: 2px solid var(--tr); outline: none;
+}
 .tt + .tt { margin-top: 2px; }
-.tt.human { background: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-warm)); }
-.tt.agent { background: color-mix(in srgb, var(--hive-panel) 92%, var(--hive-accent-cool)); }
-.tt.shared { background: var(--hive-mist); }
-.tt.human:hover { background: color-mix(in srgb, var(--hive-panel) 87%, var(--hive-accent-warm)); }
-.tt.agent:hover { background: color-mix(in srgb, var(--hive-panel) 87%, var(--hive-accent-cool)); }
+.tt:hover { background: color-mix(in srgb, var(--hive-panel) 88%, var(--turn-accent)); }
+.tt:focus-visible { outline: 2px solid var(--tr); outline-offset: 2px; }
+.tt.human { --turn-accent: var(--hive-accent-warm); }
+.tt.agent { --turn-accent: var(--hive-accent-cool); }
+.tt.shared { --turn-accent: var(--hive-accent-muted); background: var(--hive-mist); border-inline-start-color: transparent; }
 .tt.shared:hover { background: color-mix(in srgb, var(--hive-mist) 90%, var(--hive-ink)); }
+.tt.shared .tt-handle, .tt.shared .tt-name { color: var(--hive-ink-soft); }
+.tt.shared .tt-text { color: var(--hive-ink-soft); }
 .tt.is-stale { opacity: 0.6; }
 .tt-av { padding-top: 2px; flex: none; }
 .tt-body { flex: 1; min-width: 0; }
-.tt-head { display: flex; align-items: baseline; gap: 8px; }
+.tt-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .tt-name { font-weight: 600; font-size: 14px; color: var(--hive-ink); }
-.tt-handle { font-weight: 600; font-size: 14px; color: var(--hive-accent-cool); }
-.tt-model { font-size: 11px; color: var(--hive-ink-soft); font-family: ui-monospace, Menlo, monospace; }
+.tt-handle { font-weight: 600; font-size: 14px; color: var(--tn); }
+.tt-model { font-size: 11px; color: var(--hive-ink-soft); font-family: var(--hive-mono); }
 .tt-spacer { flex: 1; }
 .tt-time { font-size: 12px; color: var(--hive-ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.tt-attr { font-size: 12px; color: var(--hive-ink-soft); margin-top: 0; }
-.tt-text { font-size: 14px; margin-top: 2px; line-height: 1.5; }
-.tt-actions { margin-top: 2px; display: flex; align-items: center; gap: 4px; min-height: 20px; }
+.tt-attr { font-size: 12px; color: var(--hive-ink-soft); margin-top: 1px; }
+.tt-text { font-size: 14px; margin-top: 2px; line-height: 1.5; color: var(--hive-ink); text-wrap: pretty; }
+.tt-actions { margin-top: 2px; display: flex; align-items: center; gap: 4px; min-height: 20px; flex-wrap: wrap; }
 .tt-system { text-align: center; font-size: 12px; color: var(--hive-ink-soft); padding: 8px 0; display: flex; align-items: center; gap: 8px; justify-content: center; }
 .tt-system .ln { height: 1px; background: var(--hive-line); flex: 1; max-width: 120px; }
-/* avatars: human = circle, agent = rounded square */
-.av { flex: none; display: grid; place-items: center; color: #fff; font-weight: 600; position: relative; }
+
+/* Header badge (shared / workspace agent) + live/error state tags. */
+.tt-badge { display: inline-flex; align-items: center; gap: 4px; font-size: 10px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--hive-ink-soft); background: var(--hive-overlay); border: 1px solid var(--hive-line); border-radius: 5px; padding: 1px 6px; }
+.tt-tag { display: inline-flex; align-items: center; gap: 5px; font-family: var(--hive-mono); font-size: 10px; letter-spacing: 0.03em; text-transform: uppercase; color: var(--hive-ink-soft); background: var(--hive-overlay); border: 1px solid var(--hive-line); border-radius: 5px; padding: 2px 6px; }
+.tt-tag.live { color: var(--tn); border-color: color-mix(in srgb, var(--tr) 34%, transparent); }
+.tt-tag.live i { width: 3px; height: 3px; border-radius: 50%; background: currentColor; animation: blip 1.1s infinite; }
+.tt-tag.live i:nth-child(2) { animation-delay: 0.16s; }
+.tt-tag.live i:nth-child(3) { animation-delay: 0.32s; }
+.tt-tag.bad { color: var(--hive-danger-ink); border-color: color-mix(in srgb, var(--hive-danger) 32%, transparent); background: color-mix(in srgb, var(--hive-danger) 8%, transparent); }
+@keyframes blip { 0%, 100% { opacity: 0.25; } 50% { opacity: 1; } }
+.tt-caret { display: inline-block; width: 2px; height: 14px; background: var(--tr); margin-left: 2px; vertical-align: -2px; animation: cblink 1s steps(1) infinite; }
+@keyframes cblink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .tt-caret, .tt-tag.live i { animation: none; } }
+
+/* avatars: human = circle, agent = rounded square (kept from the shared Avatar
+   component; the badge overlay for owned/shared agents rides the turn). */
+.av { flex: none; display: grid; place-items: center; color: var(--hive-on-accent); font-weight: 600; position: relative; }
 .av.human { border-radius: 50%; }
 .av.agent { border-radius: 30%; }
 
+/* Tool-call activity — one dim line at rest, expands to its output. */
+.tcall { margin-top: 8px; border: 1px solid var(--hive-line); border-radius: 8px; background: var(--hive-mist); overflow: hidden; }
+.tcall summary { list-style: none; }
+.tcall summary::-webkit-details-marker { display: none; }
+.tcall-chev { display: inline-flex; transition: transform 0.16s; color: var(--hive-ink-faint); }
+.tcall[open] > .tcall-h .tcall-chev { transform: rotate(90deg); }
+.tcall-h { display: flex; align-items: center; gap: 8px; width: 100%; font: inherit; font-size: 12px; color: var(--hive-ink-soft); background: none; border: 0; padding: 7px 10px; cursor: pointer; text-align: left; }
+.tcall-h:hover { background: var(--hive-hover); }
+.tcall-n { font-family: var(--hive-mono); font-size: 11.5px; color: var(--hive-ink); }
+.tcall-a { font-family: var(--hive-mono); font-size: 11px; color: var(--hive-ink-faint); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tcall-badge { margin-left: auto; font-family: var(--hive-mono); font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.06em; border-radius: 4px; padding: 2px 5px; flex: none; }
+.tcall-badge.ok { color: var(--hive-success-ink); background: color-mix(in srgb, var(--hive-success) 14%, transparent); }
+.tcall-badge.bad { color: var(--hive-danger-ink); background: color-mix(in srgb, var(--hive-danger) 14%, transparent); }
+.tcall-o { margin: 0; padding: 10px 12px; border-top: 1px solid var(--hive-line); font-family: var(--hive-mono); font-size: 11px; line-height: 1.65; color: var(--hive-ink-soft); white-space: pre-wrap; overflow-x: auto; background: var(--hive-panel); }
+.tcall-o.bad { color: var(--hive-danger-ink); background: color-mix(in srgb, var(--hive-danger) 7%, transparent); }
+
+/* Streaming / interrupted note under a turn. */
+.tt-note { display: flex; align-items: center; gap: 9px; font-size: 12px; line-height: 1.45; margin-top: 8px; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--hive-line); background: var(--hive-overlay); color: var(--hive-ink-soft); flex-wrap: wrap; }
+.tt-note.bad { color: var(--hive-danger-ink); border-color: color-mix(in srgb, var(--hive-danger) 28%, transparent); background: color-mix(in srgb, var(--hive-danger) 7%, transparent); }
+.tt-note span { flex: 1; min-width: 120px; }
+
+/* Reactions row. */
+.react { font: inherit; font-size: 12px; display: inline-flex; align-items: center; gap: 5px; background: var(--hive-panel); border: 1px solid var(--hive-line); border-radius: 14px; padding: 3px 9px; cursor: pointer; color: var(--hive-ink-soft); }
+.react:hover { border-color: var(--tint-cool-line); }
+.react.on { border-color: var(--tint-cool-line); background: var(--tint-cool); }
+.react span { font-family: var(--hive-mono); font-size: 10.5px; }
+
+/* ===== Composer — a turn-shaped card; the "next turn" in the transcript. ===== */
+.cmp { display: flex; flex-direction: column; gap: 6px; }
+.cmp-card { border: 1px solid var(--hive-line); border-radius: 12px; background: var(--hive-panel); padding: 9px 10px; transition: border-color 0.14s, box-shadow 0.14s; }
+.cmp.is-focused .cmp-card, .cmp.is-sending .cmp-card { border-color: var(--tint-cool-line); box-shadow: 0 0 0 3px var(--tint-cool); }
+.cmp.is-error .cmp-card { border-color: color-mix(in srgb, var(--hive-danger) 46%, transparent); }
+.cmp-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 4px 0 8px; border-radius: 7px; background: var(--hive-mist); border: 1px solid var(--hive-line); font-size: 11.5px; color: var(--hive-ink-soft); }
+.chip b { color: var(--hive-ink); font-weight: 560; font-size: 11.5px; max-width: 12rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip button { width: 16px; height: 16px; display: grid; place-items: center; border: 0; border-radius: 4px; background: none; color: var(--hive-ink-faint); cursor: pointer; }
+.chip button:hover { background: var(--hive-hover); color: var(--hive-ink); }
+.cmp-in { position: relative; }
+.cmp-in textarea { width: 100%; min-height: 44px; max-height: 220px; border: 0; background: none; resize: none; font: inherit; font-size: 14px; line-height: 1.5; color: var(--hive-ink); outline: none; padding: 4px 2px; }
+.cmp-in textarea::placeholder { color: var(--hive-ink-faint); }
+.cmp-f { display: flex; align-items: center; gap: 5px; margin-top: 6px; }
+.cmp-f .sp { flex: 1; }
+.cmp-err { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin-top: 8px; padding: 9px 11px; border-radius: 9px; font-size: 12px; color: var(--hive-danger-ink); background: color-mix(in srgb, var(--hive-danger) 8%, transparent); border: 1px solid color-mix(in srgb, var(--hive-danger) 26%, transparent); }
+.cmp-err span { flex: 1; min-width: 150px; }
+.cmp-err b { font-weight: 650; }
+
+/* Icon + filled buttons (composer + card actions). */
+.ib { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 8px; border: 0; background: none; color: var(--hive-ink-soft); cursor: pointer; }
+.ib:hover { background: var(--hive-hover); color: var(--hive-ink); }
+.send { width: 30px; height: 30px; border-radius: 9px; border: 0; background: var(--hive-accent-fill); color: var(--hive-on-accent); display: grid; place-items: center; cursor: pointer; }
+.send:disabled { background: var(--hive-mist); color: var(--hive-ink-faint); cursor: default; }
+
 /* Composer footer hint line ("Live — type @ or / …") with keycaps. */
 .hint { font-size: 12px; color: var(--hive-ink-soft); padding: 7px 6px 0; display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
-.kbd { font-family: ui-monospace, Menlo, monospace; font-size: 11px; background: var(--hive-mist); border: 1px solid var(--hive-line); border-bottom-width: 2px; border-radius: 5px; padding: 0 5px; line-height: 1.5; }
-/* Route pill (composer): the default recipient / resolved @route. */
+.kbd { font-family: var(--hive-mono); font-size: 11px; background: var(--hive-mist); border: 1px solid var(--hive-line); border-bottom-width: 2px; border-radius: 5px; padding: 0 5px; line-height: 1.5; }
+
+/* Route pill (composer): the resolved recipient / default @route. */
+.rp-wrap { position: relative; }
+.rp { display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 9px; border-radius: 8px; font: inherit; font-size: 12px; cursor: pointer; color: var(--hive-ink); background: var(--tint-cool); border: 1px solid var(--tint-cool-line); }
+.rp:hover, .rp.on { background: color-mix(in srgb, var(--hive-accent-cool) 20%, transparent); }
+.rp b { font-weight: 620; font-size: 12px; color: var(--hive-accent-fill); }
+.rp-ar { color: var(--hive-accent-fill); font-family: var(--hive-mono); }
+.rp-sep { color: var(--hive-ink-faint); }
+.rp-via { color: var(--hive-ink-soft); }
 .route-glyph { width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center; background: var(--tint-cool); color: var(--hive-accent-cool); flex: none; }
+
+/* Popover (route runtime picker). Anchored above the pill. */
+.pop { position: absolute; bottom: calc(100% + 7px); left: 0; z-index: 50; min-width: 262px; background: var(--hive-panel); border: 1px solid var(--hive-line); border-radius: 11px; box-shadow: 0 16px 40px -14px var(--hive-overlay); padding: 5px; max-height: 340px; overflow: auto; }
+.pop-h { font-family: var(--hive-mono); font-size: 9.5px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--hive-ink-faint); padding: 7px 9px 4px; }
+.pop-i { display: flex; align-items: center; gap: 9px; width: 100%; font: inherit; font-size: 12.5px; color: var(--hive-ink); background: none; border: 0; border-radius: 8px; padding: 6px 9px; cursor: pointer; text-align: left; }
+.pop-i:hover { background: var(--hive-hover); }
+.pop-i.sel { background: var(--tint-cool); }
+.pop-t { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.pop-t b { font-size: 12.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pop-t span { font-family: var(--hive-mono); font-size: 10.5px; color: var(--hive-ink-faint); }
+.pop-n { font-size: 11px; line-height: 1.5; color: var(--hive-ink-faint); padding: 8px 9px 5px; margin-top: 4px; border-top: 1px solid var(--hive-line); }
 
 html,
 body,
