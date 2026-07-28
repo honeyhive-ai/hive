@@ -86,6 +86,36 @@ The directory binding **trusts the relay** to assert "this key belongs to @alice
 
 **Recommended split:** Option **A** for trusted/enterprise relays (reuse the shipped directory), Options **B/C** as the relay-untrusted path for self-hosters who need identity to survive a hostile relay. In all cases **authorization** (who is a member, in what role) stays in Hive events (S2), and **device→account** stays the existing `DeviceCertificate` — GitHub only answers *identity*.
 
+> **Status — Option C implemented in `hive-runtime` (default OFF).** A
+> `HIVE_IDENTITY_MODE` toggle (`relay` = Option A, the default & byte-for-byte
+> current behavior | `github-signing-keys` = Option C) selects the mode
+> ([`identity_verifier::IdentityMode`]). Option C fetches
+> `api.github.com/users/<login>/ssh_signing_keys`, parses each `ssh-ed25519`
+> line to a raw pubkey, and checks the account's registered signing key is among
+> them, caching the per-account verdict with a TTL (`IdentityCache`, default
+> 10 min). The gate ([`identity_verifier::gate_ingest`]) is wired into
+> `sync_engine::apply_fetched`: **Verified → accept; NotListed (GitHub fetched,
+> key absent) → quarantine; Unknown (not fetched yet / 404 / rate-limited /
+> unreachable) → HOLD-and-retry** (the cursor is held before the event exactly
+> like a not-yet-openable body, so it is re-fetched and re-classified once
+> verification completes — never dropped). Because GitHub is a shared authority,
+> two devices at different verification states converge in the limit (tested).
+> **Residuals:** (1) the async GitHub fetch must *populate* the shared
+> `IdentityCache` — the runtime exposes `SyncEngine::identity_cache()` +
+> `identity_verifier::refresh_account`, but the app-side task that resolves each
+> member's `login` (from the GitHub-authenticated directory) and schedules the
+> refresh is a **follow-up in `app/`** (also the UI toggle). Until that ships,
+> Option C holds everything from unverified accounts. (2) While GitHub is
+> unreachable, every event from a not-yet-verified account stays held (liveness
+> cost, by design — availability yields to identity). (3) An account key
+> *removed from GitHub after* an event was already ingested is **not**
+> retroactively quarantined (no re-scan of the store), so a hostile mid-flight
+> GitHub-key removal can leave already-ingested devices ahead of devices that
+> hadn't fetched yet — an inherent limit of gating an append-only log against a
+> mutable external directory; mitigated by keys being first-registration-pinned
+> in the log. (4) The p2p path (`peer.rs`) is still unwired (unchanged from
+> Option A's status).
+
 ### Design
 
 1. **Extend the directory + a `DeviceCertificateAdded { certificate }` event** so peers learn each device's signing key: the directory (Option A) and/or the event log (forward-compat-safe via phase 1). The cert chains device → GitHub-anchored account.

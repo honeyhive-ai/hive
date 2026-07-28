@@ -25,6 +25,11 @@ pub enum QuarantineReason {
     /// The stamped author's account is not the signing device's account — a
     /// member trying to attribute an event to someone else.
     Impersonation,
+    /// Option C (github-signing-keys identity mode): GitHub was fetched and the
+    /// account's registered signing key is **not** among the login's
+    /// `ssh_signing_keys` — a provably-bad identity binding. See
+    /// `identity_verifier` and docs/security-hardening-plan.md S1 Option C.
+    GithubKeyNotListed,
 }
 
 /// Resolves device public keys + revocation status for verification.
@@ -130,12 +135,22 @@ pub fn verify_stream<R: DeviceKeyResolver>(
 pub struct WorkspaceRoster {
     devices: HashMap<Uuid, (Vec<u8>, Uuid)>,
     revoked: HashSet<Uuid>,
+    /// account_id → the account's pinned signing public key, for member accounts
+    /// (first-registration wins, canonical order). Retained so the Option-C
+    /// identity gate can check this exact key against the account's GitHub
+    /// `ssh_signing_keys`. Not used by Option A (relay-trusted) verification.
+    account_keys: HashMap<Uuid, Vec<u8>>,
 }
 
 impl WorkspaceRoster {
     /// The account that owns `device_id`, if trusted.
     pub fn account_of(&self, device_id: Uuid) -> Option<Uuid> {
         self.devices.get(&device_id).map(|(_, a)| *a)
+    }
+    /// The pinned account signing key for a member account, if known. Used by the
+    /// Option-C identity gate to compare against GitHub `ssh_signing_keys`.
+    pub fn account_signing_key(&self, account_id: Uuid) -> Option<&[u8]> {
+        self.account_keys.get(&account_id).map(Vec::as_slice)
     }
     pub fn is_empty(&self) -> bool {
         self.devices.is_empty() && self.revoked.is_empty()
@@ -205,6 +220,14 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
     }
 
     let mut roster = WorkspaceRoster::default();
+    // Retain the pinned account signing keys for accounts that are members — the
+    // Option-C gate checks these against GitHub. (Non-member account keys are
+    // irrelevant; their devices are revoked below.)
+    for (account_id, key) in &account_keys {
+        if members.contains(account_id) {
+            roster.account_keys.insert(*account_id, key.clone());
+        }
+    }
     for cert in &certs {
         let Some(account_key) = account_keys.get(&cert.account_id) else { continue };
         if cert.verify(account_key).is_err() {
