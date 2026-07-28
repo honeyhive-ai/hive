@@ -376,6 +376,48 @@ impl ChatService {
         Ok(())
     }
 
+    /// Startup sweep: clear stale `is_streaming` flags left by a hard quit
+    /// mid-stream.
+    ///
+    /// [`begin_assistant_message`](Self::begin_assistant_message) marks a
+    /// placeholder `is_streaming: true`; only
+    /// [`complete_assistant_message`](Self::complete_assistant_message) clears it.
+    /// If the process dies mid-stream the flag is persisted forever and the message
+    /// renders as a perpetual "typing" ghost on next launch. This sweep — meant to
+    /// run once at startup, *before* any new stream begins — finds every message
+    /// still `is_streaming` and emits a `MessageCompleted` carrying the body
+    /// accumulated so far, flipping the flag off and persisting the fix. Returns the
+    /// number of messages swept.
+    ///
+    /// Convergence-safe: `MessageCompleted` is an ordinary event folded in the
+    /// canonical `(lamport, event_id)` order like any other, so every device reaches
+    /// the same state. It cannot fight a genuinely in-flight stream — this runs at
+    /// startup when no stream is live in *this* process, and were another device
+    /// still streaming the same message its later chunks/completion carry a higher
+    /// lamport and win the fold.
+    pub fn clear_stale_streaming(&mut self) -> Result<usize> {
+        let mut cleared = 0usize;
+        for session_id in self.store.list_session_ids()? {
+            let Some(session) = self.load(session_id)? else { continue };
+            let workspace_id = session.workspace_id;
+            let stale: Vec<(Uuid, String)> = session
+                .messages
+                .iter()
+                .filter(|m| m.is_streaming)
+                .map(|m| (m.id, m.body.clone()))
+                .collect();
+            for (message_id, body) in stale {
+                self.append_signed(
+                    session_id,
+                    workspace_id,
+                    SessionEvent::MessageCompleted { message_id, body },
+                )?;
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    }
+
     /// Remove a message from the transcript (e.g. the last assistant turn, before
     /// regenerating it). Idempotent.
     pub fn remove_message(
@@ -664,6 +706,12 @@ impl ChatService {
     }
 
     /// Rename a channel and/or set its purpose.
+    ///
+    /// `purpose` semantics are a field-level delta (see [`SessionEvent::ChannelRenamed`]):
+    /// `None` = rename only, leaving any existing purpose untouched; `Some(text)` =
+    /// set the purpose; `Some("")` = explicitly clear it. The caller's intent is
+    /// passed through verbatim, so a plain rename can no longer wipe a purpose set
+    /// concurrently (or previously) on the same channel.
     pub fn rename_channel(
         &mut self,
         workspace_id: Uuid,
@@ -678,7 +726,7 @@ impl ChatService {
             SessionEvent::ChannelRenamed {
                 channel_id: channel_id.into(),
                 name: name.into(),
-                purpose: purpose.filter(|p| !p.trim().is_empty()),
+                purpose,
             },
         )?;
         Ok(())
@@ -852,7 +900,11 @@ impl ChatService {
         Ok(())
     }
 
-    /// Install (or replace, by name) a loaded skill, emitting the new set.
+    /// Install (or replace, by id) a loaded skill, emitting the new set.
+    ///
+    /// Identity is the skill's stable `id`, not its display `name` — add, remove,
+    /// and the config-hoist union all key on `id`, so two skills that happen to
+    /// share a name coexist and remove-by-id always targets the record add wrote.
     pub fn add_skill(
         &mut self,
         _session_id: Uuid,
@@ -866,7 +918,7 @@ impl ChatService {
             .load(session_id)?
             .map(|s| s.loaded_skills)
             .unwrap_or_default();
-        if let Some(slot) = skills.iter_mut().find(|s| s.name == skill.name) {
+        if let Some(slot) = skills.iter_mut().find(|s| s.id == skill.id) {
             *slot = skill;
         } else {
             skills.push(skill);
@@ -1251,7 +1303,9 @@ impl ChatService {
                     }
                 }
                 for s in cfg.loaded_skills {
-                    if !session.loaded_skills.iter().any(|x| x.name == s.name) {
+                    // Dedup by stable id (names are display-only) — consistent with
+                    // add_skill/remove_skill's identity key.
+                    if !session.loaded_skills.iter().any(|x| x.id == s.id) {
                         session.loaded_skills.push(s);
                     }
                 }
@@ -1998,24 +2052,55 @@ mod tests {
     }
 
     #[test]
+    fn clear_stale_streaming_sweeps_a_ghost_message() {
+        // Simulate a hard quit mid-stream: a placeholder is begun and chunked but
+        // never completed, so it persists `is_streaming: true` — a perpetual
+        // "typing" ghost. The startup sweep must clear it while preserving the body.
+        let (mut svc, _) = service();
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let (sid, wid) = (chat.id, chat.workspace_id);
+
+        svc.post_user_message(sid, wid, "hi").unwrap();
+        let mid = svc.begin_assistant_message(sid, wid, "Hive", "anthropic").unwrap();
+        svc.append_chunk(sid, wid, mid, "partial reply").unwrap();
+        // No complete_assistant_message — the process "died" here.
+
+        let before = svc.load(sid).unwrap().unwrap();
+        assert!(before.messages.iter().any(|m| m.id == mid && m.is_streaming));
+
+        let swept = svc.clear_stale_streaming().unwrap();
+        assert_eq!(swept, 1, "one ghost message swept");
+
+        let after = svc.load(sid).unwrap().unwrap();
+        let msg = after.messages.iter().find(|m| m.id == mid).unwrap();
+        assert!(!msg.is_streaming, "stale is_streaming cleared on sweep");
+        assert_eq!(msg.body, "partial reply", "accumulated body preserved");
+
+        // Idempotent: a second sweep finds nothing to clear.
+        assert_eq!(svc.clear_stale_streaming().unwrap(), 0);
+    }
+
+    #[test]
     fn skills_install_replace_and_remove_round_trip() {
         // The event → store → projection loop behind Skills: installing emits
-        // SkillsUpdated, re-installing the same name replaces (not duplicates),
-        // and removal by id drops it. `prompt::tests` covers the last hop
-        // (loaded skills → system prompt).
+        // SkillsUpdated, re-installing the SAME id replaces (not duplicates), and
+        // removal by id drops it. Identity is the stable id, not the display name.
+        // `prompt::tests` covers the last hop (loaded skills → system prompt).
         let (mut svc, _) = service();
         let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
         let (sid, wid) = (chat.id, chat.workspace_id);
 
         let skill = hive_core::SkillProfile::new("review", "Always review diffs first.");
+        let skill_id = skill.id;
         svc.add_skill(sid, wid, skill).unwrap();
         let loaded = svc.load(sid).unwrap().unwrap().loaded_skills;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].name, "review");
         assert_eq!(loaded[0].instructions, "Always review diffs first.");
 
-        // Same name → replaced in place, not duplicated.
-        let updated = hive_core::SkillProfile::new("review", "v2 instructions");
+        // Same id → replaced in place, not duplicated.
+        let mut updated = hive_core::SkillProfile::new("review", "v2 instructions");
+        updated.id = skill_id;
         svc.add_skill(sid, wid, updated).unwrap();
         let loaded = svc.load(sid).unwrap().unwrap().loaded_skills;
         assert_eq!(loaded.len(), 1);
@@ -2023,6 +2108,31 @@ mod tests {
 
         svc.remove_skill(sid, wid, loaded[0].id).unwrap();
         assert!(svc.load(sid).unwrap().unwrap().loaded_skills.is_empty());
+    }
+
+    #[test]
+    fn skills_identity_is_id_not_name() {
+        // Two skills sharing a display name but with distinct ids must coexist
+        // (add dedups by id), and remove-by-id must target exactly one — proving
+        // add/remove/union all key on the stable id, not the name.
+        let (mut svc, _) = service();
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let (sid, wid) = (chat.id, chat.workspace_id);
+
+        let a = hive_core::SkillProfile::new("review", "variant A");
+        let b = hive_core::SkillProfile::new("review", "variant B");
+        let (a_id, b_id) = (a.id, b.id);
+        svc.add_skill(sid, wid, a).unwrap();
+        svc.add_skill(sid, wid, b).unwrap();
+
+        let loaded = svc.load(sid).unwrap().unwrap().loaded_skills;
+        assert_eq!(loaded.len(), 2, "same-name distinct-id skills coexist");
+
+        // Remove-by-id drops only the targeted one (the other same-name survives).
+        svc.remove_skill(sid, wid, a_id).unwrap();
+        let loaded = svc.load(sid).unwrap().unwrap().loaded_skills;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, b_id);
     }
 
     #[test]

@@ -127,7 +127,12 @@ pub enum SessionEvent {
     /// Create (or upsert by id) a channel. Rides the workspace-config log
     /// (spec §11); folded into `ChatSession.channels`. Workspace-scoped.
     ChannelCreated { channel: Channel },
-    /// Rename a channel and/or set its one-line purpose (by id).
+    /// Rename a channel and/or set its one-line purpose (by id). `purpose` is a
+    /// field-level delta, not a co-overwrite of the name: `None` means **leave the
+    /// existing purpose unchanged** (a plain rename must not wipe a concurrently or
+    /// previously set purpose), while `Some(s)` overwrites it — including `Some("")`
+    /// as an explicit *clear*. This decouples the two fields so a rename and a
+    /// purpose-set on the same channel no longer clobber each other all-or-nothing.
     ChannelRenamed {
         channel_id: String,
         name: String,
@@ -445,7 +450,12 @@ impl ChatSession {
             SessionEvent::ChannelRenamed { channel_id, name, purpose } => {
                 if let Some(c) = self.channels.iter_mut().find(|c| &c.id == channel_id) {
                     c.name = name.clone();
-                    c.purpose = purpose.clone();
+                    // Field-level delta: `None` leaves the existing purpose intact
+                    // (a rename never wipes a concurrently/previously set purpose);
+                    // `Some(s)` overwrites, with an empty string being a clear.
+                    if let Some(p) = purpose {
+                        c.purpose = if p.is_empty() { None } else { Some(p.clone()) };
+                    }
                 }
             }
             SessionEvent::ChannelReordered { channel_ids } => {
@@ -1096,6 +1106,84 @@ mod tests {
         // And it still converges under every delivery order.
         for seed in 0..200u64 {
             assert_eq!(project(&shuffled(events.clone(), seed | 1)).expect("session"), s, "divergence at seed {seed}");
+        }
+    }
+
+    /// A plain rename (`purpose: None`) must leave an existing purpose intact;
+    /// `Some(text)` overwrites and `Some("")` is an explicit clear.
+    #[test]
+    fn channel_rename_preserves_existing_purpose() {
+        let mut s = base_session();
+        let mut ch = Channel::new("c1", "auth");
+        ch.purpose = Some("login flows".into());
+        s.channels.push(ch);
+
+        // Rename only — purpose must survive.
+        s.apply(&SessionEvent::ChannelRenamed {
+            channel_id: "c1".into(),
+            name: "authentication".into(),
+            purpose: None,
+        });
+        assert_eq!(s.channels[0].name, "authentication");
+        assert_eq!(
+            s.channels[0].purpose.as_deref(),
+            Some("login flows"),
+            "purpose preserved across a plain rename"
+        );
+
+        // Some(text) overwrites.
+        s.apply(&SessionEvent::ChannelRenamed {
+            channel_id: "c1".into(),
+            name: "authn".into(),
+            purpose: Some("SSO + OAuth".into()),
+        });
+        assert_eq!(s.channels[0].purpose.as_deref(), Some("SSO + OAuth"));
+
+        // Some("") is an explicit clear.
+        s.apply(&SessionEvent::ChannelRenamed {
+            channel_id: "c1".into(),
+            name: "authn".into(),
+            purpose: Some(String::new()),
+        });
+        assert_eq!(s.channels[0].purpose, None, "empty string clears the purpose");
+    }
+
+    /// A concurrent purpose-set and rename on the same channel must not clobber
+    /// each other: the rename (purpose `None`) preserves the set purpose, and the
+    /// result converges under every delivery order.
+    #[test]
+    fn concurrent_channel_rename_and_purpose_set_converge() {
+        let base = owned_base();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            by("owner", env(sid, wid, 2, SessionEvent::ChannelCreated { channel: Channel::new("c1", "auth") })),
+            // Set the purpose (carries the current name).
+            by("owner", env(sid, wid, 3, SessionEvent::ChannelRenamed {
+                channel_id: "c1".into(),
+                name: "auth".into(),
+                purpose: Some("login flows".into()),
+            })),
+            // A concurrent rename that only changes the name (purpose None).
+            by("owner", env(sid, wid, 4, SessionEvent::ChannelRenamed {
+                channel_id: "c1".into(),
+                name: "authentication".into(),
+                purpose: None,
+            })),
+        ];
+
+        let expected = project(&events).expect("session");
+        let ch = expected.channels.iter().find(|c| c.id == "c1").unwrap();
+        assert_eq!(ch.name, "authentication", "latest name wins by canonical order");
+        assert_eq!(
+            ch.purpose.as_deref(),
+            Some("login flows"),
+            "rename did not clobber the concurrently-set purpose"
+        );
+
+        for seed in 0..300u64 {
+            let permuted = shuffled(events.clone(), seed | 1);
+            assert_eq!(project(&permuted).expect("session"), expected, "divergence at seed {seed}");
         }
     }
 
