@@ -366,9 +366,15 @@ impl Default for LiveSettings {
     }
 }
 
-/// Deterministic workspace id for a relay room — UUID v5 over the room name, so
+/// Deterministic workspace id for a relay room — UUID v5 over the room string, so
 /// every peer in the same room computes the same id and their chats group
 /// together. Used to scope (and exclude from "My workspace") room chats.
+///
+/// The `room` is now an opaque high-entropy token minted at workspace creation
+/// (see `create_workspace`), not a human name — but this mapping stays a stable,
+/// deterministic function of whatever `room` string is stored, so pre-existing
+/// human-name rooms in older settings keep resolving to the exact same id
+/// (back-compat: we never rewrite an existing `room`).
 fn room_workspace_id(room: &str) -> Uuid {
     // A fixed namespace so the mapping is stable across builds/devices.
     const NS: Uuid = Uuid::from_u128(0x6869_7665_726f_6f6d_776f_726b_7370_6163);
@@ -526,6 +532,84 @@ mod workspace_invite_tests {
         let a = WorkspaceConn { name: "A".into(), relay_url: "x".into(), room: "shared".into(), key: None, icon: None, dm_account: None, founder_actor_id: None };
         let b = WorkspaceConn { name: "B".into(), relay_url: "y".into(), room: "shared".into(), key: Some("k".into()), icon: None, dm_account: None, founder_actor_id: Some("github:1".into()) };
         assert_eq!(a.id(), b.id());
+    }
+
+    /// S5 #2: `create_workspace` mints an opaque, high-entropy room rather than a
+    /// name-derived one. We exercise the exact room-minting expression it uses
+    /// (`random_token(32)`) and assert the security properties: the room is not the
+    /// guessable `UUIDv5(name)`, and two workspaces sharing a display name still get
+    /// distinct rooms (and thus distinct workspace ids).
+    #[test]
+    fn created_room_is_high_entropy_not_name_derived() {
+        let display = "Team Rocket";
+        // Two workspaces, same friendly name — as create_workspace would mint them.
+        let room_a = random_token(32);
+        let room_b = random_token(32);
+        // Opaque: not the old name-slug scheme and not equal to UUIDv5(name).
+        assert_ne!(room_a, room_b, "two creations must not collide");
+        assert!(!room_a.contains("team"), "room must not embed the display name");
+        assert_ne!(room_workspace_id(&room_a), room_workspace_id(display));
+        assert_ne!(room_workspace_id(&room_b), room_workspace_id(display));
+        // Same display label, different rooms ⇒ different workspace ids.
+        assert_ne!(room_workspace_id(&room_a), room_workspace_id(&room_b));
+        // High entropy: a 128-bit v4-uuid-hex token, so 32 hex chars.
+        assert_eq!(room_a.len(), 32);
+        assert!(room_a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// S5 #2: the invite carries the opaque room, so a joiner resolves the same
+    /// workspace id the founder did — joining is a paste, never a typed name.
+    #[test]
+    fn invite_carries_opaque_room_and_joiner_resolves_same_id() {
+        let room = random_token(32);
+        let founder = WorkspaceConn {
+            name: "My Team".into(),
+            relay_url: "wss://r/v1".into(),
+            room: room.clone(),
+            key: Some(random_token(24)),
+            icon: None,
+            dm_account: None,
+            founder_actor_id: Some("github:7".into()),
+        };
+        let invite = encode_workspace_invite(&founder);
+        let joined = decode_workspace_invite(&invite).unwrap();
+        assert_eq!(joined.room, room, "invite round-trips the opaque room");
+        // Both sides map that room to the identical workspace id.
+        assert_eq!(joined.id(), founder.id());
+        assert_eq!(joined.id(), room_workspace_id(&room));
+    }
+
+    /// S5 #2 back-compat: a pre-existing human-name room (written before this change
+    /// and never rewritten) must keep resolving to its exact same stable id. This
+    /// pins the concrete UUIDv5 so a change to the namespace or trimming can't
+    /// silently strand old joined rooms.
+    #[test]
+    fn legacy_human_name_room_id_is_stable() {
+        assert_eq!(
+            room_workspace_id("team-alpha"),
+            Uuid::parse_str("81bd2bd9-b99e-5ec2-bfc7-e37942939e23").unwrap(),
+        );
+        // Trimming still normalizes as before.
+        assert_eq!(room_workspace_id(" team-alpha "), room_workspace_id("team-alpha"));
+    }
+
+    /// S5 #2 friend DMs: both peers derive the identical room regardless of argument
+    /// order, and the room no longer leaks the participants' account ids in cleartext
+    /// (not the old enumerable `dm-<a>-<b>` plaintext).
+    #[test]
+    fn dm_room_is_symmetric_and_opaque() {
+        let a = "github:1001";
+        let b = "github:2002";
+        // Same room whichever side computes it, and whichever order args arrive in.
+        assert_eq!(dm_room_for(a, b), dm_room_for(b, a));
+        assert_eq!(dm_room_for("1001", "github:2002"), dm_room_for(a, b));
+        // Opaque: neither account id appears in the room string.
+        let room = dm_room_for(a, b);
+        assert!(!room.contains("1001") && !room.contains("2002"));
+        assert_ne!(room, "dm-1001-2002", "must not be the guessable plaintext");
+        assert!(room.starts_with("dm-"));
+        // Different pairs ⇒ different rooms.
+        assert_ne!(dm_room_for(a, b), dm_room_for(a, "github:3003"));
     }
 }
 
@@ -6291,16 +6375,6 @@ fn random_token(len: usize) -> String {
     s
 }
 
-fn slugify(name: &str) -> String {
-    let s: String = name
-        .trim()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-        .collect();
-    let s = s.trim_matches('-').to_string();
-    if s.is_empty() { "workspace".to_string() } else { s }
-}
-
 /// Create a new team workspace: generates a unique room + E2EE key, adds it to
 /// the rail, switches to it, and (if a relay is configured) starts syncing it.
 /// Returns the new workspace; use `workspace_invite` to share it.
@@ -6316,7 +6390,12 @@ fn create_workspace(state: State<AppState>, name: String) -> Result<WorkspaceInf
     let founder = state.service.lock().unwrap().author().id.clone();
     let conn = {
         let mut s = state.settings.lock().unwrap();
-        let room = format!("{}-{}", slugify(display), random_token(6));
+        // High-entropy, opaque room id (S5 metadata half): the room/sync id is a
+        // random 128-bit token, NOT derived from the (guessable) display name. On a
+        // shared/open relay this means a known workspace name no longer implies a
+        // guessable room. The friendly name lives only in `name` (display label);
+        // joiners get this opaque room from the `hivews1:` invite, never by typing.
+        let room = random_token(32);
         let conn = WorkspaceConn {
             name: display.to_string(),
             // Inherit the currently-configured relay so the new room syncs
@@ -7367,7 +7446,15 @@ fn dm_room_for(a: &str, b: &str) -> String {
     let na = a.trim().trim_start_matches("github:");
     let nb = b.trim().trim_start_matches("github:");
     let (lo, hi) = if na <= nb { (na, nb) } else { (nb, na) };
-    format!("dm-{lo}-{hi}")
+    // High-entropy DM room (S5 metadata half): instead of the enumerable plaintext
+    // `dm-<accountA>-<accountB>` (which leaks both participants' account ids in the
+    // room name and lets anyone scan a shared relay for who's DMing whom), derive
+    // an opaque token from a UUIDv5 hash of the ordered pair. Still deterministic —
+    // both peers order the accounts the same way and compute the identical room —
+    // but the account ids no longer appear in cleartext on the relay.
+    const DM_NS: Uuid = Uuid::from_u128(0x6869_7665_646d_726f_6f6d_7061_6972_3031);
+    let id = Uuid::new_v5(&DM_NS, format!("{lo}\u{0}{hi}").as_bytes());
+    format!("dm-{}", id.simple())
 }
 
 #[derive(serde::Serialize)]
