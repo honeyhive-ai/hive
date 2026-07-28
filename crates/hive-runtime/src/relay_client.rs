@@ -371,6 +371,72 @@ impl RelayClient {
         Ok(out)
     }
 
+    /// Open the relay's live push stream for a workspace:
+    /// `GET /v1/workspaces/{id}/events` as `text/event-stream`, authed with the
+    /// same bearer + GitHub identity as every other read. The relay sends a
+    /// `data: {"seq":N}` nudge whenever a new envelope is appended; each nudge is
+    /// forwarded over the returned [`SseStream`] so the sync loop can trigger an
+    /// immediate pull instead of waiting for its poll. The stream is a wake-up
+    /// only — event bodies still come through the unchanged fetch/decode path, so
+    /// this transport stays content-blind.
+    ///
+    /// A background task drives `reqwest`'s `bytes_stream()` through an
+    /// [`SseDecoder`] (robust to lines split across chunks) and pushes nudges
+    /// into the channel; it exits (closing the stream → `recv` yields `None`)
+    /// when the body ends or errors, so the caller reconnects with backoff.
+    /// Dropping the [`SseStream`] tears the task and HTTP connection down.
+    ///
+    /// Errors distinguish an older relay without the endpoint (404 →
+    /// [`SseConnectError::Unsupported`], degrade to polling) from auth/transport
+    /// failures, so the caller can degrade gracefully rather than hard-fail.
+    pub async fn open_event_stream(
+        &self,
+        workspace: &str,
+    ) -> Result<crate::sse::SseStream, crate::sse::SseConnectError> {
+        use crate::sse::{SseConnectError, SseDecoder, SseStream};
+        let url = format!("{}/v1/workspaces/{}/events", self.base, workspace);
+        let resp = self
+            .authed(self.http.get(url))
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .send()
+            .await
+            .map_err(|e| SseConnectError::Transport(e.to_string()))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(match status.as_u16() {
+                404 => SseConnectError::Unsupported,
+                401 | 403 => SseConnectError::Unauthorized,
+                c => SseConnectError::Status(c),
+            });
+        }
+        // A small buffer: nudges are cheap and coalesce naturally (any pending
+        // nudge triggers a full pull), so a slow consumer just drops back to one
+        // pull-per-drain rather than growing unboundedly.
+        let (tx, rx) = tokio::sync::mpsc::channel::<u64>(64);
+        tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let mut decoder = SseDecoder::new();
+            let mut body = resp.bytes_stream();
+            while let Some(chunk) = body.next().await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    // A read error ends the stream; the caller reconnects.
+                    Err(_) => break,
+                };
+                for data in decoder.feed(&chunk) {
+                    // Any `data:` frame is a "pull now" nudge; a missing/garbled
+                    // seq still wakes the loop (seq 0 is a valid nudge marker).
+                    let seq = crate::sse::parse_seq(&data).unwrap_or(0);
+                    if tx.send(seq).await.is_err() {
+                        // Receiver (SseStream) dropped → nobody's listening; stop.
+                        return;
+                    }
+                }
+            }
+        });
+        Ok(SseStream::new(rx))
+    }
+
     /// Upsert this device's ephemeral presence (online + typing) for a
     /// workspace. Presence is not part of the event log — it's transient
     /// metadata keyed by `device_id` and overwritten on each ping.

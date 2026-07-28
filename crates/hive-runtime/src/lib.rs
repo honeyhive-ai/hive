@@ -23,6 +23,7 @@ pub mod prompt;
 pub mod provider;
 pub mod relay_client;
 pub mod remote_manifest;
+pub mod sse;
 pub mod sync_engine;
 pub mod tool_loop;
 pub mod vault_fetcher;
@@ -40,6 +41,7 @@ pub use relay_client::{
     RelayProbe, RelayTokenEntry, RelayUserEntry,
 };
 pub use remote_manifest::resolve_manifest_url;
+pub use sse::{next_backoff, parse_seq, SseConnectError, SseDecoder, SseStream};
 pub use sync_engine::{SyncEngine, SyncError};
 pub use provider::dispatch::{self, ResolvedRuntime};
 pub use provider::{AnthropicClient, ChatTurn, OpenAiClient, ProviderError};
