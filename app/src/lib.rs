@@ -53,6 +53,36 @@ const SUMMARY_RESERVE_TOKENS: i64 = 700;
 /// Max chained agent turns from one user message (loop guard for cascades).
 const MAX_CASCADE_DEPTH: usize = 4;
 
+/// Upper bound on remembered "already notified" mention ids (see `AppState::notified`).
+const NOTIFIED_CAP: usize = 1024;
+
+/// Insertion-ordered set of ids with a fixed capacity. Dedups by value (a given
+/// id is "new" only the first time) and evicts the oldest once full, so the
+/// working set stays bounded over an arbitrarily long session.
+#[derive(Default)]
+struct BoundedIdSet {
+    order: std::collections::VecDeque<Uuid>,
+    seen: std::collections::HashSet<Uuid>,
+}
+
+impl BoundedIdSet {
+    /// Insert `id`, evicting the oldest entry if over `cap`. Returns true if the
+    /// id was newly inserted (i.e. this is the first time it's been seen while
+    /// still within the retained window).
+    fn insert(&mut self, id: Uuid, cap: usize) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        self.order.push_back(id);
+        while self.order.len() > cap {
+            if let Some(old) = self.order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        true
+    }
+}
+
 struct AppState {
     service: Mutex<ChatService>,
     identity: IdentityStore<FileKeyVault>,
@@ -72,9 +102,10 @@ struct AppState {
     workspace_root: Mutex<String>,
     /// Per-session incremental summary cache: (covered overflow ids, summary).
     summary_cache: Mutex<HashMap<Uuid, (Vec<Uuid>, String)>>,
-    /// Fetched vault content, keyed by raw URL — one fetch per app run so
-    /// attaching a vault doesn't add a network round-trip to every message.
-    vault_cache: Mutex<HashMap<String, String>>,
+    /// Fetched vault content, keyed by raw URL, with the fetch time so a stale
+    /// entry (older than `VAULT_CACHE_TTL`) is re-fetched instead of served for
+    /// the whole app run. Within the TTL it avoids a per-message round-trip.
+    vault_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
     /// MCP servers from `hive.config.toml`; shell-managed installs live in the
     /// workspace catalog and are merged at read time.
     base_mcp: Mutex<Vec<McpServerSpec>>,
@@ -88,8 +119,9 @@ struct AppState {
     /// against double-dispatching the same incoming message.
     responding: Mutex<std::collections::HashSet<Uuid>>,
     /// Message ids we've already raised a local "you were mentioned"
-    /// notification for, so syncs don't re-notify.
-    notified: Mutex<std::collections::HashSet<Uuid>>,
+    /// notification for, so syncs don't re-notify. Bounded to the most recent
+    /// `NOTIFIED_CAP` ids so a long-running session doesn't leak memory.
+    notified: Mutex<BoundedIdSet>,
     /// Live workflow-run drivers (run id → waker). A vote or cancel pokes the
     /// waker so a gate-suspended driver reacts instantly.
     run_wakers: Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>,
@@ -2997,7 +3029,11 @@ async fn preview_vault(state: State<'_, AppState>, url: String) -> Result<String
     let text = vault_fetcher::fetch_text(&url).await.map_err(map_err)?;
     // Previewing doubles as refresh: replace the cached copy the context
     // injection uses, so an updated upstream doc takes effect without restart.
-    state.vault_cache.lock().unwrap().insert(url, text.clone());
+    state
+        .vault_cache
+        .lock()
+        .unwrap()
+        .insert(url, (std::time::Instant::now(), text.clone()));
     Ok(text.chars().take(2000).collect())
 }
 
@@ -3492,6 +3528,15 @@ fn join_system(base: &str, extra: &str) -> String {
 const VAULT_MAX_SOURCES: usize = 3;
 const VAULT_MAX_CHARS: usize = 6000;
 const VAULT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+/// How long a cached vault fetch stays fresh before it's re-fetched. Bounds how
+/// stale an upstream doc can be while keeping the common case cache-hit-only.
+const VAULT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Whether a vault cache entry fetched `age` ago may still be served. Pulled out
+/// as a pure fn so the staleness boundary is unit-testable without a clock.
+fn vault_entry_fresh(age: std::time::Duration) -> bool {
+    age < VAULT_CACHE_TTL
+}
 
 /// Build the `[Reference vaults]` system-prompt section from the session's
 /// vault sources. Content is fetched once per app run (cached by raw URL);
@@ -3512,10 +3557,33 @@ async fn vault_context_section(
     if applicable.is_empty() {
         return String::new();
     }
+    // The source/char caps silently drop the tail when more than VAULT_MAX_SOURCES
+    // vaults apply — log which made it in vs which were dropped so it's diagnosable.
+    if applicable.len() > VAULT_MAX_SOURCES {
+        let included: Vec<String> =
+            applicable.iter().take(VAULT_MAX_SOURCES).map(|v| v.label()).collect();
+        let dropped: Vec<String> =
+            applicable.iter().skip(VAULT_MAX_SOURCES).map(|v| v.label()).collect();
+        eprintln!(
+            "vault: {} sources apply but only {} fit the cap — included {:?}, dropped {:?}",
+            applicable.len(),
+            VAULT_MAX_SOURCES,
+            included,
+            dropped
+        );
+    }
     let mut entries: Vec<(String, Option<String>)> = Vec::new();
     for source in applicable.into_iter().take(VAULT_MAX_SOURCES) {
         let url = source.raw_url();
-        let cached = state.vault_cache.lock().unwrap().get(&url).cloned();
+        // Serve the cache only while fresh; a stale entry is re-fetched so an
+        // updated upstream doc takes effect without restarting the app.
+        let cached = state
+            .vault_cache
+            .lock()
+            .unwrap()
+            .get(&url)
+            .filter(|(fetched_at, _)| vault_entry_fresh(fetched_at.elapsed()))
+            .map(|(_, text)| text.clone());
         let content = match cached {
             Some(text) => Some(text),
             None => {
@@ -3523,10 +3591,16 @@ async fn vault_context_section(
                     .await
                 {
                     Ok(Ok(text)) => {
-                        state.vault_cache.lock().unwrap().insert(url.clone(), text.clone());
+                        state
+                            .vault_cache
+                            .lock()
+                            .unwrap()
+                            .insert(url.clone(), (std::time::Instant::now(), text.clone()));
                         Some(text)
                     }
-                    _ => None,
+                    // Re-fetch failed: fall back to any (stale) cached copy rather
+                    // than dropping the source entirely.
+                    _ => state.vault_cache.lock().unwrap().get(&url).map(|(_, t)| t.clone()),
                 }
             }
         };
@@ -4395,7 +4469,7 @@ fn notify_mentions(
         }
     };
     if let Some((msg_id, who)) = hit {
-        if state.notified.lock().unwrap().insert(msg_id) {
+        if state.notified.lock().unwrap().insert(msg_id, NOTIFIED_CAP) {
             let _ = app
                 .notification()
                 .builder()
@@ -5443,7 +5517,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         db_path,
         settings,
         responding: Mutex::new(std::collections::HashSet::new()),
-        notified: Mutex::new(std::collections::HashSet::new()),
+        notified: Mutex::new(BoundedIdSet::default()),
         run_wakers: Mutex::new(HashMap::new()),
         gate_runs: Mutex::new(HashMap::new()),
         canceled_runs: Mutex::new(std::collections::HashSet::new()),
@@ -6882,13 +6956,99 @@ async fn workspace_add_member(
         .map_err(|e| e.to_string())
 }
 
-/// Remove a member from the active workspace (`account` = `github:<id>`). Caller
-/// must be `Admin`+. Pair with a key rotation to also revoke read access.
+/// The stable Hive account id (as a string) for a relay membership account key
+/// of the form `github:<numeric-id>`, or `None` if it isn't a github account.
+/// Lets us exclude a relay-removed member from the E2EE rotation recipient set.
+fn hive_account_id_for(account: &str) -> Option<String> {
+    account
+        .strip_prefix("github:")
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|id| hive_runtime::github::account_id_for(id).to_string())
+}
+
+/// Remove a member from the active workspace (`account` = `github:<id>`) AND
+/// rotate the workspace E2EE key so the removed member's retained key can't open
+/// post-removal traffic. Caller must be `Admin`+ (enforced by the relay).
+///
+/// The relay is unaware of E2EE key material (its `MemberEntry` has no device
+/// keys), so recipients for the new key are gathered from the *local* workspace
+/// roster — the union of remaining members' `key_agreement_public` across the
+/// active workspace's sessions, minus the removed account, plus the acting
+/// owner's own device. If no such recipients are obtainable (e.g. the roster
+/// hasn't synced device keys yet) the relay removal still succeeds but the key
+/// is NOT rotated; `rotated: false` in the result is the caller's signal that
+/// read access was not revoked (a warning is also logged).
 #[tauri::command]
-async fn workspace_remove_member(state: State<'_, AppState>, account: String) -> Result<(), String> {
+async fn workspace_remove_member(
+    state: State<'_, AppState>,
+    account: String,
+) -> Result<RevokeResultDto, String> {
     let relay = configured_relay(&state)?;
     let room = state.settings.lock().unwrap().sync_room.clone();
-    state.relay_client(&relay).remove_member(&room, &account).await.map_err(|e| e.to_string())
+    let client = state.relay_client(&relay);
+
+    // 1. Remove server-side membership first (authorization enforced relay-side).
+    client.remove_member(&room, &account).await.map_err(|e| e.to_string())?;
+
+    // 2. Gather the remaining members' device keys from the local roster.
+    let removed_id = hive_account_id_for(&account);
+    let recipients: Vec<(String, Vec<u8>)> = {
+        let svc = state.service.lock().unwrap();
+        let active_ws = state.active_workspace_id();
+        let mut map: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
+        let ids = svc.store().list_session_ids().map_err(map_err)?;
+        for id in ids {
+            let Some(session) = svc.load(id).map_err(map_err)? else { continue };
+            if session.workspace_id != active_ws {
+                continue;
+            }
+            for m in &session.members {
+                let is_removed = removed_id.as_deref() == Some(m.actor.id.as_str())
+                    || m.actor.account_id.map(|a| a.to_string()).as_deref() == removed_id.as_deref();
+                if is_removed {
+                    continue;
+                }
+                if let Some(pk) = &m.actor.key_agreement_public {
+                    map.insert(m.actor.id.clone(), pk.clone());
+                }
+            }
+        }
+        // Always seal to the acting owner's own device so they adopt the new key.
+        let me = svc.author().clone();
+        if let Some(pk) = &me.key_agreement_public {
+            map.insert(me.id.clone(), pk.clone());
+        }
+        map.into_iter().collect()
+    };
+
+    // 3. Publish a fresh workspace key sealed only to those recipients.
+    if recipients.is_empty() {
+        eprintln!(
+            "workspace_remove_member: removed {account} from relay membership but could not \
+             rotate the E2EE key (no roster recipients with device keys) — read access is NOT \
+             revoked; the removed member retains the current key."
+        );
+        return Ok(RevokeResultDto { rotated: false, recipients: 0 });
+    }
+    let next_version = client
+        .fetch_key_rotations(&room)
+        .await
+        .ok()
+        .and_then(|rs| rs.iter().map(|r| r.version).max())
+        .unwrap_or(0)
+        + 1;
+    let new_key = hive_core::e2ee::generate_workspace_key().map_err(|e| format!("{e:?}"))?;
+    let rotation = hive_core::e2ee::WorkspaceKeyRotation::seal_for_devices(
+        next_version,
+        &new_key,
+        &recipients,
+    )
+    .map_err(|e| format!("{e:?}"))?;
+    client
+        .publish_key_rotation(&room, &rotation)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(RevokeResultDto { rotated: true, recipients: recipients.len() as u32 })
 }
 
 // ── Social graph: friends + presence (P5) ──────────────────────────────────
@@ -7873,6 +8033,37 @@ mod title_tests {
 }
 
 #[cfg(test)]
+mod bounded_id_set_tests {
+    use super::BoundedIdSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn dedups_repeated_ids() {
+        let mut set = BoundedIdSet::default();
+        let id = Uuid::new_v4();
+        assert!(set.insert(id, 8), "first insert is new");
+        assert!(!set.insert(id, 8), "second insert is a duplicate");
+    }
+
+    #[test]
+    fn stays_bounded_and_evicts_oldest() {
+        let mut set = BoundedIdSet::default();
+        let cap = 4;
+        let ids: Vec<Uuid> = (0..10).map(|_| Uuid::new_v4()).collect();
+        for id in &ids {
+            assert!(set.insert(*id, cap));
+        }
+        // Never retains more than `cap` entries regardless of how many were seen.
+        assert_eq!(set.order.len(), cap);
+        assert_eq!(set.seen.len(), cap);
+        // The most-recent `cap` are still deduped...
+        assert!(!set.insert(ids[9], cap));
+        // ...but an evicted (oldest) id is treated as new again.
+        assert!(set.insert(ids[0], cap));
+    }
+}
+
+#[cfg(test)]
 mod export_tests {
     use super::{chat_markdown, export_filename};
     use hive_core::{ChatMessage, ChatSession, MessageRole};
@@ -7910,7 +8101,20 @@ mod export_tests {
 
 #[cfg(test)]
 mod vault_context_tests {
-    use super::{vault_section_text, VAULT_MAX_CHARS};
+    use super::{vault_entry_fresh, vault_section_text, VAULT_CACHE_TTL, VAULT_MAX_CHARS};
+    use std::time::Duration;
+
+    #[test]
+    fn fresh_entry_within_ttl_is_served() {
+        assert!(vault_entry_fresh(Duration::ZERO));
+        assert!(vault_entry_fresh(VAULT_CACHE_TTL - Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn stale_entry_at_or_past_ttl_is_refetched() {
+        assert!(!vault_entry_fresh(VAULT_CACHE_TTL));
+        assert!(!vault_entry_fresh(VAULT_CACHE_TTL + Duration::from_secs(60)));
+    }
 
     #[test]
     fn empty_sources_produce_no_section() {
