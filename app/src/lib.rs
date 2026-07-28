@@ -5716,7 +5716,107 @@ async fn fire_schedule(app: &AppHandle, sched: &ScheduledAgentConfig) -> Result<
     Ok(())
 }
 
+/// The local (network-free) sync configuration that, when it changes, forces the
+/// sync loop to rebuild its engine / SSE connection: relay URL, room, workspace
+/// key, and the two auth tokens. Compared cheaply while an SSE stream is live so
+/// a Settings edit (connect / reconnect / go local-only) takes effect promptly
+/// without a per-tick network poll. (Remote *key rotations* are picked up on the
+/// heartbeat re-entry, which re-fetches the keyring.)
+type LocalSyncSig = (Option<String>, String, Option<[u8; 32]>, Option<String>, Option<String>);
+
+fn read_local_sync_sig(settings: &Arc<Mutex<LiveSettings>>) -> LocalSyncSig {
+    let s = settings.lock().unwrap();
+    (
+        s.relay_url.clone(),
+        s.sync_room.clone(),
+        s.workspace_key(),
+        s.relay_access_token.clone(),
+        s.github_token.clone(),
+    )
+}
+
+/// Run one push+fetch+apply cycle against the relay, mirroring the health /
+/// error / recovery bookkeeping the old per-tick loop did. Returns whether the
+/// cycle succeeded. Split so it can be invoked both on an SSE nudge and on the
+/// heartbeat safety-net poll. The fetch/decode/ingest logic in `SyncEngine` is
+/// unchanged — this only calls it.
+async fn sync_pull_once(
+    app: &AppHandle,
+    eng: &mut hive_runtime::SyncEngine,
+    store: &mut EventStore,
+    last_sync_err: &mut Option<String>,
+) -> bool {
+    // Split steps keep the store's borrow out of any `.await`.
+    let outcome: Result<usize, hive_runtime::SyncError> = async {
+        let to_push = eng.take_unpushed(store)?;
+        eng.push_envelopes(&to_push).await?;
+        let fetched = eng.fetch_new().await?;
+        eng.apply_fetched(store, &fetched)
+    }
+    .await;
+    match outcome {
+        Ok(pulled) => {
+            if last_sync_err.take().is_some() {
+                eprintln!("sync: recovered");
+            }
+            // Record health so the UI can trust "Live".
+            *app.state::<AppState>().conn_health.lock().unwrap() =
+                ConnHealth { state: "live".to_string(), last_error: None };
+            if pulled > 0 {
+                let _ = app.emit("workspace://synced", pulled);
+                // Wake every live workflow driver so a stage suspended on a
+                // remote reply (or a remote gate vote) reacts within sync
+                // latency instead of on its safety-net poll.
+                let state = app.state::<AppState>();
+                for w in state.run_wakers.lock().unwrap().values() {
+                    w.notify_waiters();
+                }
+            }
+            true
+        }
+        Err(e) => {
+            // Log a persistent error only once (until it changes or recovers).
+            // Unauthorized gets an actionable line.
+            let msg = match &e {
+                hive_runtime::SyncError::Relay(hive_runtime::RelayError::Unauthorized) => {
+                    "sync paused: the relay rejected this device's access token \
+                     — add yourself in Settings → Team (or clear the relay URL \
+                     to work local-only)"
+                        .to_string()
+                }
+                other => format!("sync error: {other}"),
+            };
+            if last_sync_err.as_deref() != Some(msg.as_str()) {
+                eprintln!("{msg}");
+                *last_sync_err = Some(msg.clone());
+            }
+            // Surface the actionable error to the backend health state and emit
+            // an event the frontend can subscribe to (mirrors the success path).
+            *app.state::<AppState>().conn_health.lock().unwrap() = ConnHealth {
+                state: "error".to_string(),
+                last_error: Some(msg.clone()),
+            };
+            let _ = app.emit("workspace://sync-error", msg);
+            false
+        }
+    }
+}
+
 async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_path: PathBuf) {
+    // Safety-net poll while an SSE stream is live: a full re-entry (re-fetch the
+    // keyring, pull, reopen the stream) that catches any nudge SSE dropped. This
+    // replaces the old 3s busy-poll — SSE carries the fast path.
+    const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(20);
+    // Cheap, network-free check for a local config change while SSE is live, so a
+    // Settings edit isn't stuck behind the 20s heartbeat.
+    const CONFIG_WATCH: std::time::Duration = std::time::Duration::from_secs(3);
+    // Poll cadence when SSE is unavailable (older relay / disconnected / backing
+    // off) — the degraded-but-working fallback.
+    const FALLBACK_POLL: std::time::Duration = std::time::Duration::from_secs(3);
+    // A stream that stayed up at least this long counts as "healthy", so its drop
+    // resets the reconnect backoff; a faster flap keeps escalating it.
+    const STABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
     let mut store = match EventStore::open(&db_path) {
         Ok(s) => s,
         Err(e) => {
@@ -5739,6 +5839,14 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
     // Suppress repeated identical sync errors so a persistent condition (e.g. an
     // unauthorized relay) logs once, not on every tick.
     let mut last_sync_err: Option<String> = None;
+    // SSE reconnect state: `sse_attempt` drives the exponential backoff; we only
+    // retry opening the stream once `now >= next_sse_attempt`, while still polling
+    // at FALLBACK_POLL in between so a down stream never goes dark. `sse_unsupported`
+    // remembers a 404 for a given config so we stop re-attempting the endpoint on
+    // an older relay and settle into polling.
+    let mut sse_attempt: u32 = 0;
+    let mut next_sse_attempt = std::time::Instant::now();
+    let mut sse_unsupported: Option<ConnSig> = None;
     loop {
         let (relay_url, room, passphrase_key, access_token, github_token) = {
             let s = settings.lock().unwrap();
@@ -5792,7 +5900,7 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                         last_error: Some(msg.clone()),
                     };
                     let _ = app.emit("workspace://sync-error", msg);
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    tokio::time::sleep(FALLBACK_POLL).await;
                     continue;
                 }
                 let sig: ConnSig = (url.clone(), room.clone(), keyring.clone());
@@ -5809,72 +5917,142 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                         "sync: relay {url} room {room} (encrypted, {} epoch key(s))",
                         keyring.len()
                     );
-                    engine = Some((e, sig));
+                    engine = Some((e, sig.clone()));
                 }
-                if let Some((eng, _)) = engine.as_mut() {
-                    // Split steps keep the (non-Send) store out of any `.await`.
-                    let outcome: Result<usize, hive_runtime::SyncError> = async {
-                        let to_push = eng.take_unpushed(&store)?;
-                        eng.push_envelopes(&to_push).await?;
-                        let fetched = eng.fetch_new().await?;
-                        eng.apply_fetched(&mut store, &fetched)
+
+                // Fast path: subscribe to the relay's live push stream *first* so
+                // any envelope appended during/after connect produces a queued
+                // nudge — then the immediate pull below closes the connect race
+                // (it sweeps everything up to now; the queued nudge re-pulls). The
+                // attempt is gated by the reconnect backoff (`next_sse_attempt`)
+                // and skipped once a config is known to lack the endpoint.
+                let sse_known_unsupported = sse_unsupported.as_ref() == Some(&sig);
+                let mut stream: Option<hive_runtime::SseStream> = None;
+                if !sse_known_unsupported && std::time::Instant::now() >= next_sse_attempt {
+                    let client = hive_runtime::RelayClient::new(&url)
+                        .with_auth(access_token.clone())
+                        .with_github_token(github_token.clone());
+                    match client.open_event_stream(&room).await {
+                        Ok(s) => {
+                            sse_attempt = 0; // fresh, successful connection
+                            eprintln!("sync: live push stream open (relay {url} room {room})");
+                            stream = Some(s);
+                        }
+                        // Older relay without the endpoint: degrade to polling and
+                        // stop re-attempting the stream for this config (graceful).
+                        Err(hive_runtime::SseConnectError::Unsupported) => {
+                            sse_unsupported = Some(sig.clone());
+                            eprintln!(
+                                "sync: relay has no live push endpoint (404) — using {}s poll",
+                                FALLBACK_POLL.as_secs()
+                            );
+                        }
+                        // Couldn't open (auth / status / transport): back off the
+                        // stream; the pull below still surfaces health and syncs.
+                        Err(e) => {
+                            let delay = hive_runtime::next_backoff(sse_attempt);
+                            next_sse_attempt = std::time::Instant::now() + delay;
+                            sse_attempt = sse_attempt.saturating_add(1);
+                            eprintln!(
+                                "sync: could not open push stream ({e}) — polling, retry in {}s",
+                                delay.as_secs()
+                            );
+                        }
                     }
-                    .await;
-                    match outcome {
-                        Ok(pulled) => {
-                            if last_sync_err.take().is_some() {
-                                eprintln!("sync: recovered");
-                            }
-                            // Record health so the UI can trust "Live".
-                            *app.state::<AppState>().conn_health.lock().unwrap() =
-                                ConnHealth { state: "live".to_string(), last_error: None };
-                            if pulled > 0 {
-                                let _ = app.emit("workspace://synced", pulled);
-                                // Wake every live workflow driver so a stage
-                                // suspended on a remote reply (or a remote gate
-                                // vote) reacts within sync latency instead of on
-                                // its safety-net poll.
-                                let state = app.state::<AppState>();
-                                for w in state.run_wakers.lock().unwrap().values() {
-                                    w.notify_waiters();
+                }
+
+                // Immediate pull on every (re-)entry — startup, a config change, a
+                // heartbeat refresh, a reconnect, or the fallback poll tick. Also
+                // sweeps up any nudge missed while the stream was down, so an SSE
+                // gap never loses events. `sync_pull_once` owns the health /
+                // recovery / `workspace://synced` bookkeeping.
+                if let Some((eng, _)) = engine.as_mut() {
+                    let _ = sync_pull_once(&app, eng, &mut store, &mut last_sync_err).await;
+                }
+
+                // Live loop while the push stream is up: nudge → pull. Breaks to the
+                // outer loop on the safety-net heartbeat (refresh keys + reopen), on
+                // a local-config change, or on a stream drop (reconnect w/ backoff).
+                if let Some(mut stream) = stream {
+                    let connected_at = std::time::Instant::now();
+                    // Snapshot the local config so a Settings edit while the stream
+                    // is live forces a rebuild without a network poll.
+                    let local_sig = read_local_sync_sig(&settings);
+                    let mut dropped = false;
+                    if let Some((eng, _)) = engine.as_mut() {
+                        // The longer safety-net heartbeat replaces the old 3s
+                        // busy-poll; each beat breaks to the outer loop so the
+                        // keyring is re-fetched, a pull runs, and the stream reopens.
+                        let mut heartbeat = tokio::time::interval(HEARTBEAT);
+                        heartbeat.tick().await; // drop the immediate first tick
+                        let mut cfg = tokio::time::interval(CONFIG_WATCH);
+                        cfg.tick().await;
+                        loop {
+                            tokio::select! {
+                                nudge = stream.recv() => match nudge {
+                                    // A nudge ("wake up and pull") → pull now.
+                                    Some(_seq) => {
+                                        let _ = sync_pull_once(
+                                            &app, eng, &mut store, &mut last_sync_err,
+                                        )
+                                        .await;
+                                    }
+                                    // Stream closed/errored → reconnect (backoff).
+                                    None => {
+                                        dropped = true;
+                                        break;
+                                    }
+                                },
+                                // Safety-net heartbeat: refresh at the outer top.
+                                _ = heartbeat.tick() => break,
+                                // Cheap local-config watch: rebuild on a change.
+                                _ = cfg.tick() => {
+                                    if read_local_sync_sig(&settings) != local_sig {
+                                        break;
+                                    }
                                 }
                             }
                         }
-                        Err(e) => {
-                            // Log a persistent error only once (until it changes
-                            // or recovers). Unauthorized gets an actionable line.
-                            let msg = match &e {
-                                hive_runtime::SyncError::Relay(
-                                    hive_runtime::RelayError::Unauthorized,
-                                ) => "sync paused: the relay rejected this device's access token \
-                                      — add yourself in Settings → Team (or clear the relay URL \
-                                      to work local-only)"
-                                    .to_string(),
-                                other => format!("sync error: {other}"),
-                            };
-                            if last_sync_err.as_deref() != Some(msg.as_str()) {
-                                eprintln!("{msg}");
-                                last_sync_err = Some(msg.clone());
-                            }
-                            // Surface the actionable error to the backend health
-                            // state and emit an event the frontend can subscribe to
-                            // (mirrors `workspace://synced` on the success path).
-                            *app.state::<AppState>().conn_health.lock().unwrap() = ConnHealth {
-                                state: "error".to_string(),
-                                last_error: Some(msg.clone()),
-                            };
-                            let _ = app.emit("workspace://sync-error", msg);
+                    }
+                    if dropped {
+                        // A stream that stayed up long enough was healthy — reset
+                        // the backoff; a fast flap keeps escalating it.
+                        if connected_at.elapsed() >= STABLE_AFTER {
+                            sse_attempt = 0;
+                            next_sse_attempt = std::time::Instant::now();
+                        } else {
+                            let delay = hive_runtime::next_backoff(sse_attempt);
+                            next_sse_attempt = std::time::Instant::now() + delay;
+                            sse_attempt = sse_attempt.saturating_add(1);
+                            eprintln!(
+                                "sync: push stream dropped — reconnecting in {}s (polling meanwhile)",
+                                delay.as_secs()
+                            );
                         }
+                        // Fall through to the short fallback poll below.
+                    } else {
+                        // Clean exit (heartbeat / config change): re-enter
+                        // immediately to refresh keys, pull, and reopen — no
+                        // busy-loop, the heartbeat only fires every 20s.
+                        sse_attempt = 0;
+                        next_sse_attempt = std::time::Instant::now();
+                        continue;
                     }
                 }
+                // Degraded / disconnected fallback: keep pulling on the short poll.
+                tokio::time::sleep(FALLBACK_POLL).await;
             }
             // No relay configured: idle (local-only) until the UI sets one.
             _ => {
                 engine = None;
                 *app.state::<AppState>().conn_health.lock().unwrap() = ConnHealth::default();
+                // Reset SSE reconnect state so a later connect starts clean.
+                sse_attempt = 0;
+                next_sse_attempt = std::time::Instant::now();
+                sse_unsupported = None;
+                tokio::time::sleep(FALLBACK_POLL).await;
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }
 
