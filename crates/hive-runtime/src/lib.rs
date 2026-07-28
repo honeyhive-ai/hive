@@ -13,6 +13,7 @@ pub mod event_store;
 pub mod git_attribution;
 pub mod github;
 pub mod identity_store;
+pub mod identity_verifier;
 pub mod mcp;
 pub mod mcp_oauth;
 pub mod mentions;
@@ -48,6 +49,10 @@ pub use provider::{AnthropicClient, ChatTurn, OpenAiClient, ProviderError};
 
 pub use envelope_verifier::{
     verify_stream, DeviceKeyResolver, DeviceRoster, QuarantineReason, VerificationOutcome,
+};
+pub use identity_verifier::{
+    gate_ingest, shared_cache, FetchOutcome, IdentityCache, IdentityMode, IdentityVerdict,
+    IngestAction, SharedIdentityCache,
 };
 pub use event_store::{EventStore, EventStoreError};
 pub use identity_store::{

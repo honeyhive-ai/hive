@@ -9,13 +9,15 @@
 //! (upsert-by-id, idempotent reactions) tolerates.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use hive_core::{open_symmetric, seal_symmetric, SealedEnvelope, SessionEventEnvelope};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::event_store::EventStore;
-use crate::envelope_verifier::{build_roster, verdict_for, Verdict};
+use crate::envelope_verifier::{build_roster, verdict_for};
+use crate::identity_verifier::{gate_ingest, shared_cache, IdentityMode, IngestAction, SharedIdentityCache};
 use crate::relay_client::{RelayClient, RelayError};
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +68,14 @@ pub struct SyncEngine {
     /// readable across rotations. Empty ⇒ no key: relay pushes are **refused**
     /// (E2EE is mandatory on the wire — see [`SyncEngine::encode`]).
     keyring: BTreeMap<u32, [u8; 32]>,
+    /// Identity-verification mode (security plan S1). `Relay` (Option A, the
+    /// default) trusts the roster's account keys as-is — **current behavior**.
+    /// `GithubSigningKeys` (Option C) additionally requires each account key to
+    /// be verified against GitHub `ssh_signing_keys` before its events project.
+    identity_mode: IdentityMode,
+    /// GitHub-identity verdict cache (Option C). Populated out-of-band by an async
+    /// task that hits GitHub; read synchronously on ingest. Unused in `Relay` mode.
+    identity_cache: SharedIdentityCache,
 }
 
 /// Outcome of decoding one fetched relay body. Separating the two failure
@@ -93,7 +103,29 @@ impl SyncEngine {
             loaded: false,
             pending: Vec::new(),
             keyring: BTreeMap::new(),
+            identity_mode: IdentityMode::from_env(),
+            identity_cache: shared_cache(),
         }
+    }
+
+    /// Override the identity-verification mode (default: [`IdentityMode::from_env`]).
+    /// Mainly for tests and explicit opt-in wiring.
+    pub fn with_identity_mode(mut self, mode: IdentityMode) -> Self {
+        self.identity_mode = mode;
+        self
+    }
+
+    /// Share a specific GitHub-identity verdict cache — so the app's async
+    /// GitHub-verification task and this engine read/write the same cache.
+    pub fn with_identity_cache(mut self, cache: SharedIdentityCache) -> Self {
+        self.identity_cache = cache;
+        self
+    }
+
+    /// The shared GitHub-identity verdict cache, for an out-of-band async task to
+    /// populate (Option C). In `Relay` mode it is simply never consulted.
+    pub fn identity_cache(&self) -> SharedIdentityCache {
+        Arc::clone(&self.identity_cache)
     }
 
     /// Enable E2EE with a single base-epoch (0) key — the passphrase-derived path.
@@ -351,27 +383,56 @@ impl SyncEngine {
         // revoked device, impersonation); merely-unverifiable events (unsigned,
         // or from a device whose cert we haven't seen yet) are accepted and
         // re-checked as the roster grows — never dropped.
+        //
+        // Under `IdentityMode::GithubSigningKeys` (Option C) the identity gate
+        // folds in a GitHub `ssh_signing_keys` check: a roster-valid event whose
+        // account isn't GitHub-verified **yet** is *held* exactly like a
+        // not-yet-openable body (the cursor is held before it, so it's re-fetched
+        // and re-classified once verification completes) — never dropped, so two
+        // devices at different verification states can't diverge in applied state.
+        // Only a *provably-bad* identity (GitHub fetched, key not listed) is
+        // quarantined. `Relay` mode (Option A, default) never holds on identity —
+        // it is byte-for-byte the pre-existing policy.
         let mut roster_src = store.roster_envelopes()?;
         roster_src.extend(decoded.iter().map(|(_, e)| e.clone()));
         let roster = build_roster(&roster_src);
+        let identity = self
+            .identity_cache
+            .lock()
+            .expect("identity cache mutex poisoned");
 
         let mut applied = 0;
         for (seq, env) in &decoded {
-            if let Verdict::Quarantine(reason) = verdict_for(&roster, env) {
-                tracing::warn!(?reason, event_id = %env.event_id, "quarantined a fetched event");
-                // Provably bad and stable — advance past it (re-fetching won't help).
-                resolved.push(*seq);
-                continue;
+            let base = verdict_for(&roster, env);
+            let signer_account = env.signer_device_id.and_then(|d| roster.account_of(d));
+            let account_key = signer_account.and_then(|a| roster.account_signing_key(a));
+            match gate_ingest(self.identity_mode, base, signer_account, account_key, &identity) {
+                IngestAction::Quarantine(reason) => {
+                    tracing::warn!(?reason, event_id = %env.event_id, "quarantined a fetched event");
+                    // Provably bad and stable — advance past it (re-fetching won't help).
+                    resolved.push(*seq);
+                }
+                IngestAction::Hold(reason) => {
+                    // Can't verify yet (Option C: GitHub identity pending/unreachable).
+                    // Hold the cursor before it and retry, mirroring NotYetOpenable —
+                    // NEVER drop, so a peer that later verifies converges to the same
+                    // applied state. Not ingested this pass.
+                    tracing::debug!(reason, seq = *seq, event_id = %env.event_id, "holding a fetched event for identity re-verification");
+                    retry_at = Some(retry_at.map_or(*seq, |r| r.min(*seq)));
+                }
+                IngestAction::Accept => {
+                    self.seen.insert(env.event_id);
+                    // This event is now on the relay (we received it from there): queue
+                    // it for the durable `pushed` set so a restart never bounces it back.
+                    self.pending.push(env.event_id);
+                    if store.ingest(env)? {
+                        applied += 1;
+                    }
+                    resolved.push(*seq);
+                }
             }
-            self.seen.insert(env.event_id);
-            // This event is now on the relay (we received it from there): queue
-            // it for the durable `pushed` set so a restart never bounces it back.
-            self.pending.push(env.event_id);
-            if store.ingest(env)? {
-                applied += 1;
-            }
-            resolved.push(*seq);
         }
+        drop(identity);
 
         // Advance the cursor to the highest resolved sequence, but never to or
         // past the lowest not-yet-openable sequence (so it's re-fetched), and
@@ -1037,5 +1098,248 @@ mod tests {
         sync_a.sync_once(&mut store_a).await.unwrap();
         let session_a = store_a.load_session(sid).unwrap().unwrap();
         assert!(session_a.messages.iter().any(|m| m.body == "reply from B"));
+    }
+
+    // --- Option C (github-signing-keys identity mode) ------------------------
+
+    use crate::identity_verifier::{shared_cache, IdentityMode, IdentityVerdict, SharedIdentityCache};
+
+    /// A member principal with its trust events (`MemberAdded`, `AccountKeyRegistered`,
+    /// `DeviceCertificateAdded`) + an account signing key we can mark verified.
+    struct OcPrincipal {
+        account_id: Uuid,
+        account_key: Vec<u8>,
+        device_kp: hive_core::crypto::SigningKeypair,
+        device_id: Uuid,
+        trust: Vec<SessionEventEnvelope>,
+    }
+
+    fn oc_principal() -> OcPrincipal {
+        use hive_core::crypto::{DeviceCertificate, SigningKeypair};
+        use hive_core::identity::{ActorIdentity, ActorKind, WorkspaceMember, WorkspaceRole};
+        use hive_core::Timestamp;
+
+        let account = SigningKeypair::generate().unwrap();
+        let account_id = Uuid::new_v4();
+        let device = SigningKeypair::generate().unwrap();
+        let device_id = Uuid::new_v4();
+        let cert = DeviceCertificate::issue(
+            &account,
+            account_id,
+            device_id,
+            &device.public_key_bytes(),
+            Timestamp::epoch(),
+        );
+        let member = WorkspaceMember {
+            id: account_id.to_string(),
+            actor: ActorIdentity {
+                id: account_id.to_string(),
+                display_name: "A".into(),
+                kind: ActorKind::Human,
+                account_id: Some(account_id),
+                device_id: Some(device_id),
+                git_email: None,
+                key_agreement_public: None,
+                avatar_url: None,
+            },
+            role: WorkspaceRole::Owner,
+            title: String::new(),
+            index: 1,
+            joined_at: Timestamp::epoch(),
+        };
+        // Trust events are signed by the device (as they are in production), so
+        // under Option C they follow the same verified/held path as content.
+        let signed = |lamport: i64, payload: SessionEvent| {
+            let mut e = SessionEventEnvelope::new(Uuid::nil(), Uuid::nil(), lamport, payload);
+            hive_core::sign_envelope(&mut e, device_id, &device);
+            e
+        };
+        let trust = vec![
+            signed(1, SessionEvent::MemberAdded { member }),
+            signed(
+                2,
+                SessionEvent::AccountKeyRegistered {
+                    account_id,
+                    signing_public_key: account.public_key_bytes().to_vec(),
+                },
+            ),
+            signed(3, SessionEvent::DeviceCertificateAdded { certificate: cert }),
+        ];
+        OcPrincipal {
+            account_id,
+            account_key: account.public_key_bytes().to_vec(),
+            device_kp: device,
+            device_id,
+            trust,
+        }
+    }
+
+    fn oc_content(p: &OcPrincipal, lamport: i64) -> SessionEventEnvelope {
+        use hive_core::identity::{ActorIdentity, ActorKind, ActorStamp};
+        use hive_core::Timestamp;
+        let mut e = SessionEventEnvelope::new(
+            Uuid::nil(),
+            Uuid::nil(),
+            lamport,
+            SessionEvent::SessionTitleChanged { title: format!("t{lamport}") },
+        );
+        e.actor_stamp = Some(ActorStamp {
+            actor: ActorIdentity {
+                id: p.account_id.to_string(),
+                display_name: "A".into(),
+                kind: ActorKind::Human,
+                account_id: Some(p.account_id),
+                device_id: Some(p.device_id),
+                git_email: None,
+                key_agreement_public: None,
+                avatar_url: None,
+            },
+            recorded_at: Timestamp::epoch(),
+        });
+        hive_core::sign_envelope(&mut e, p.device_id, &p.device_kp);
+        e
+    }
+
+    fn oc_engine(cache: SharedIdentityCache) -> SyncEngine {
+        SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
+            .with_identity_mode(IdentityMode::GithubSigningKeys)
+            .with_identity_cache(cache)
+    }
+
+    fn oc_batch(p: &OcPrincipal, content: &SessionEventEnvelope) -> Vec<(u64, Value)> {
+        p.trust
+            .iter()
+            .chain(std::iter::once(content))
+            .enumerate()
+            .map(|(i, e)| (i as u64 + 1, serde_json::to_value(e).unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn option_c_unverified_is_held_not_dropped_then_promoted() {
+        let p = oc_principal();
+        let content = oc_content(&p, 100);
+        let batch = oc_batch(&p, &content);
+
+        let cache = shared_cache();
+        let mut eng = oc_engine(Arc::clone(&cache));
+        let mut store = EventStore::open_in_memory().unwrap();
+
+        // GitHub not fetched yet: the roster-valid content event is HELD, not
+        // dropped. Trust events themselves are unsigned → also held under Option C.
+        assert_eq!(eng.apply_fetched(&mut store, &batch).unwrap(), 0);
+        assert!(!store.has_event(content.event_id).unwrap(), "unverified content is held, not applied");
+        assert_eq!(eng.cursor(), 0, "cursor held at the front for retry (nothing resolved)");
+
+        // Deterministic: replaying the same batch changes nothing while unverified.
+        assert_eq!(eng.apply_fetched(&mut store, &batch).unwrap(), 0);
+        assert!(!store.has_event(content.event_id).unwrap());
+
+        // GitHub verification completes → the held event is promoted on re-fetch.
+        cache.lock().unwrap().put(
+            p.account_id,
+            p.account_key.clone(),
+            IdentityVerdict::Verified,
+            std::time::Duration::from_secs(600),
+        );
+        eng.apply_fetched(&mut store, &batch).unwrap();
+        assert!(store.has_event(content.event_id).unwrap(), "promoted once verified");
+    }
+
+    #[test]
+    fn option_c_key_not_listed_is_quarantined() {
+        let p = oc_principal();
+        let content = oc_content(&p, 100);
+        let batch = oc_batch(&p, &content);
+
+        let cache = shared_cache();
+        // GitHub fetched and the account key is NOT among the login's signing keys.
+        cache.lock().unwrap().put(
+            p.account_id,
+            p.account_key.clone(),
+            IdentityVerdict::NotListed,
+            std::time::Duration::from_secs(600),
+        );
+        let mut eng = oc_engine(Arc::clone(&cache));
+        let mut store = EventStore::open_in_memory().unwrap();
+
+        eng.apply_fetched(&mut store, &batch).unwrap();
+        assert!(!store.has_event(content.event_id).unwrap(), "provably-bad identity is quarantined");
+        // Quarantine is stable → the cursor advances past it (re-fetching won't help).
+        assert_eq!(eng.cursor() as usize, batch.len(), "cursor advances past a quarantined event");
+    }
+
+    #[test]
+    fn option_a_default_ignores_github_state_unchanged() {
+        // Same batch, same (NotListed) cache — but Relay mode (the default) never
+        // consults it: behavior is byte-for-byte the pre-Option-C policy, so the
+        // valid signed content event is ingested.
+        let p = oc_principal();
+        let content = oc_content(&p, 100);
+        let batch = oc_batch(&p, &content);
+
+        let cache = shared_cache();
+        cache.lock().unwrap().put(
+            p.account_id,
+            p.account_key.clone(),
+            IdentityVerdict::NotListed,
+            std::time::Duration::from_secs(600),
+        );
+        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
+            .with_identity_mode(IdentityMode::Relay)
+            .with_identity_cache(cache);
+        let mut store = EventStore::open_in_memory().unwrap();
+
+        eng.apply_fetched(&mut store, &batch).unwrap();
+        assert!(store.has_event(content.event_id).unwrap(), "Option A ingests regardless of GitHub state");
+    }
+
+    #[test]
+    fn option_c_devices_at_different_verification_states_converge() {
+        // The core convergence property: two devices ingest the SAME batch under
+        // Option C but at different GitHub-verification states. The one without
+        // verification yet HOLDS the event (doesn't drop it); once it verifies, it
+        // reaches the identical applied state. No divergence into applied-vs-dropped.
+        let p = oc_principal();
+        let content = oc_content(&p, 100);
+        let batch = oc_batch(&p, &content);
+
+        // Device A: already GitHub-verified.
+        let cache_a = shared_cache();
+        cache_a.lock().unwrap().put(
+            p.account_id,
+            p.account_key.clone(),
+            IdentityVerdict::Verified,
+            std::time::Duration::from_secs(600),
+        );
+        let mut eng_a = oc_engine(Arc::clone(&cache_a));
+        let mut store_a = EventStore::open_in_memory().unwrap();
+        eng_a.apply_fetched(&mut store_a, &batch).unwrap();
+
+        // Device B: no network yet (cache empty) → holds, applies nothing.
+        let cache_b = shared_cache();
+        let mut eng_b = oc_engine(Arc::clone(&cache_b));
+        let mut store_b = EventStore::open_in_memory().unwrap();
+        eng_b.apply_fetched(&mut store_b, &batch).unwrap();
+
+        assert!(store_a.has_event(content.event_id).unwrap(), "A applied (verified)");
+        assert!(!store_b.has_event(content.event_id).unwrap(), "B held (not yet verified) — NOT dropped");
+
+        // B's GitHub verification catches up (shared authority → same verdict) and
+        // it re-fetches the held event → converges to A's applied state.
+        cache_b.lock().unwrap().put(
+            p.account_id,
+            p.account_key.clone(),
+            IdentityVerdict::Verified,
+            std::time::Duration::from_secs(600),
+        );
+        eng_b.apply_fetched(&mut store_b, &batch).unwrap();
+        assert!(store_b.has_event(content.event_id).unwrap(), "B converges once verified");
+
+        // Both devices now hold the identical event.
+        assert_eq!(
+            store_a.has_event(content.event_id).unwrap(),
+            store_b.has_event(content.event_id).unwrap(),
+        );
     }
 }
