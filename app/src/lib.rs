@@ -7803,6 +7803,14 @@ pub fn run() {
                                 Ok(false) => {}
                                 Err(e) => eprintln!("ensure default channel: {e}"),
                             }
+                            // Clear any `is_streaming` messages left mid-flight by a
+                            // prior hard-quit, so they don't render as perpetual
+                            // "typing" ghosts on this launch.
+                            match svc.clear_stale_streaming() {
+                                Ok(n) if n > 0 => eprintln!("swept {n} stale streaming message(s)"),
+                                Ok(_) => {}
+                                Err(e) => eprintln!("clear stale streaming: {e}"),
+                            }
                         }
                         // Re-spawn drivers for runs interrupted by the last
                         // shutdown so they auto-continue instead of stalling.
