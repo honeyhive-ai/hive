@@ -83,6 +83,12 @@ fn workflow_guidance() -> &'static str {
 Rules: stage ids are slugs; "after" edges must form a DAG (stages whose deps are all done run in parallel); {{nodes.<id>.output}} may only reference upstream stages; gates pause for human approval — "onReject" is "halt" or {"retryFrom": "<upstream id>"}."#
 }
 
+fn path_guidance() -> &'static str {
+    "Your replies are shared with teammates whose machines have different file \
+layouts, so never write absolute local filesystem paths (such as your working \
+directory) in a reply — refer to files by their repository-relative path."
+}
+
 fn proposal_guidance() -> &'static str {
     r#"To put a concrete action up for the team to approve, end a reply with a [[propose: {…}]] directive:
 [[propose: {"title": "…", "kind": "fileDiff|command|decision", "body": "…", "requiredApprovals": 1}]]
@@ -93,10 +99,11 @@ This is saved for human review — it is NOT auto-executed. It appears in the Re
 pub fn primary_system_prompt(session: &ChatSession) -> String {
     let base = format!(
         "You are the primary runtime for the Hive workspace \"{title}\". You \
-coordinate the conversation and may take actions or answer directly.\n\n{roster}\n\n{guide}\n\n{wf}\n\n{prop}",
+coordinate the conversation and may take actions or answer directly.\n\n{roster}\n\n{guide}\n\n{paths}\n\n{wf}\n\n{prop}",
         title = session.title,
         roster = workspace_roster(session),
         guide = mention_guidance(),
+        paths = path_guidance(),
         wf = workflow_guidance(),
         prop = proposal_guidance(),
     );
@@ -113,12 +120,13 @@ pub fn agent_system_prompt(session: &ChatSession, agent: &WorkspaceAgent) -> Str
     let base = format!(
         "You are {name}, {role}, collaborating in the Hive workspace \"{title}\". \
 Stay in character as {name}; you are distinct from the primary runtime and the \
-other agents.\n\n{roster}\n\n{guide}\n\n{wf}\n\n{prop}",
+other agents.\n\n{roster}\n\n{guide}\n\n{paths}\n\n{wf}\n\n{prop}",
         name = agent.name,
         role = role,
         title = session.title,
         roster = workspace_roster(session),
         guide = mention_guidance(),
+        paths = path_guidance(),
         wf = workflow_guidance(),
         prop = proposal_guidance(),
     );
@@ -173,6 +181,16 @@ mod tests {
         let p = primary_system_prompt(&session());
         assert!(p.contains("primary runtime"));
         assert!(p.contains("@Scout"));
+    }
+
+    #[test]
+    fn path_guidance_warns_against_absolute_paths_in_both() {
+        let s = session();
+        let agent = s.workspace_agents[0].clone();
+        for p in [primary_system_prompt(&s), agent_system_prompt(&s, &agent)] {
+            assert!(p.contains("repository-relative"));
+            assert!(p.contains("never write absolute local filesystem paths"));
+        }
     }
 
     #[test]

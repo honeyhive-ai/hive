@@ -4048,9 +4048,11 @@ async fn try_tool_loop(
 
     let (phase, text) = match result {
         Ok(text) => {
+            let root = state.workspace_root.lock().unwrap().clone();
             let mut svc = state.service.lock().unwrap();
-            let body =
-                finalize_reply(&mut svc, session_id, workspace_id, message_id, &responder.author, &text)?;
+            let body = finalize_reply(
+                &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &text,
+            )?;
             ("completed".to_string(), body)
         }
         Err(e) => {
@@ -4081,16 +4083,37 @@ async fn try_tool_loop(
 /// directives, complete the message with the cleaned body, seed the directive
 /// emoji as reactions, and save any agent-authored workflow definitions
 /// (authored by the responder). Returns the cleaned body.
+/// Rewrite the absolute workspace root out of a synced reply so it never leaks
+/// the author's local directory layout to teammates (§12.3 / F19). Occurrences
+/// of the root become its repo-relative form (the basename), so
+/// `/Users/x/projects/api/src/main.rs` → `api/src/main.rs`. A backstop behind
+/// the prompt guidance — the model shouldn't emit absolute paths, but if it
+/// does, they don't reach the shared log. No-op when the root isn't present.
+fn redact_workspace_path(body: &str, workspace_root: &str) -> String {
+    let root = workspace_root.trim_end_matches('/');
+    if root.is_empty() || !body.contains(root) {
+        return body.to_string();
+    }
+    let base = std::path::Path::new(root)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(root);
+    body.replace(root, base)
+}
+
 fn finalize_reply(
     svc: &mut ChatService,
     session_id: Uuid,
     workspace_id: Uuid,
     message_id: Uuid,
     author: &str,
+    workspace_root: &str,
     full: &str,
 ) -> Result<String, String> {
     let parsed = hive_runtime::directives::parse_reply_directives(full);
-    svc.complete_assistant_message(session_id, workspace_id, message_id, &parsed.cleaned)
+    let cleaned = redact_workspace_path(&parsed.cleaned, workspace_root);
+    svc.complete_assistant_message(session_id, workspace_id, message_id, &cleaned)
         .map_err(map_err)?;
     if !parsed.emojis.is_empty() {
         let actor = hive_core::ActorIdentity::new(author, author, hive_core::ActorKind::Agent);
@@ -4139,7 +4162,7 @@ fn finalize_reply(
             ),
         );
     }
-    Ok(parsed.cleaned)
+    Ok(cleaned)
 }
 
 /// A finished assistant turn: the transcript message it produced plus the
@@ -4268,8 +4291,11 @@ async fn run_prepared_turn(
     match result {
         Ok(full) => {
             let body = {
+                let root = state.workspace_root.lock().unwrap().clone();
                 let mut svc = state.service.lock().unwrap();
-                finalize_reply(&mut svc, session_id, workspace_id, message_id, &responder.author, &full)?
+                finalize_reply(
+                    &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &full,
+                )?
             };
             let _ = app.emit(
                 ChatStreamEvent::EVENT,
@@ -8446,7 +8472,7 @@ mod finalize_proposal_tests {
         let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude").unwrap();
 
         let body = "Done.\n[[propose: {\"title\": \"Bump timeout\", \"kind\": \"command\", \"body\": \"30s\", \"requiredApprovals\": 2}]]";
-        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", body).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", "/tmp/ws", body).unwrap();
         assert_eq!(cleaned, "Done.");
 
         let session = svc.load(chat.id).unwrap().unwrap();
@@ -8461,6 +8487,28 @@ mod finalize_proposal_tests {
         assert_eq!(p.status, ProposalStatus::Open);
         // The agent's own approval can't satisfy quorum (self-approval guard).
         assert_eq!(p.qualifying_approvals(), 0);
+    }
+
+    #[test]
+    fn redact_workspace_path_rewrites_absolute_root_to_repo_relative() {
+        let root = "/Users/x/projects/api";
+        // Bare root and a sub-path both collapse to the repo-relative form.
+        assert_eq!(
+            super::redact_workspace_path("working in /Users/x/projects/api now", root),
+            "working in api now",
+        );
+        assert_eq!(
+            super::redact_workspace_path("see /Users/x/projects/api/src/main.rs", root),
+            "see api/src/main.rs",
+        );
+        // A trailing slash on the configured root still matches.
+        assert_eq!(
+            super::redact_workspace_path("/Users/x/projects/api/lib", "/Users/x/projects/api/"),
+            "api/lib",
+        );
+        // No root present, or an empty root, is a no-op.
+        assert_eq!(super::redact_workspace_path("no paths here", root), "no paths here");
+        assert_eq!(super::redact_workspace_path("/Users/x/projects/api", ""), "/Users/x/projects/api");
     }
 }
 
