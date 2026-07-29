@@ -4372,16 +4372,16 @@ async fn send_message(
     let local_actor_id = state.local_actor_id();
 
     // Record the user turn, then decide who (if anyone) answers it.
-    let (workspace_id, mut next_target) = {
+    let (workspace_id, trigger_id, mut next_target) = {
         let mut svc = state.service.lock().unwrap();
         let session = svc.load(sid).map_err(map_err)?.ok_or("unknown session")?;
         let workspace_id = session.workspace_id;
-        svc.post_user_message(sid, workspace_id, &body).map_err(map_err)?;
+        let posted = svc.post_user_message(sid, workspace_id, &body).map_err(map_err)?;
         // The session can be deleted mid-turn (normal use). Bail gracefully —
         // never `.unwrap()` under the `service` lock, or a None poisons the
         // global mutex and bricks every future `service.lock()` this process.
         let Some(session) = svc.load(sid).map_err(map_err)? else { return Ok(()) };
-        (workspace_id, dispatch_target(&body, &session))
+        (workspace_id, posted.id, dispatch_target(&body, &session))
     };
 
     // Turn loop: a reply that mentions another (distinct) agent cascades a
@@ -4389,7 +4389,7 @@ async fn send_message(
     // target means the message was human-to-human — no runtime runs.
     let mut visited: Vec<Uuid> = Vec::new();
     let mut first_reply: Option<String> = None;
-    for _ in 0..MAX_CASCADE_DEPTH {
+    for depth in 0..MAX_CASCADE_DEPTH {
         let Some(target) = next_target else { break };
         let session = {
             let svc = state.service.lock().unwrap();
@@ -4411,6 +4411,16 @@ async fn send_message(
         // message (it syncs); the owner's device picks it up via `maybe_respond`.
         if !owns_responder(&local_actor_id, &responder) {
             break;
+        }
+
+        // Claim the initial (user-message) turn so only one of the owner's
+        // devices answers it; back off if another device won. Cascaded turns
+        // (depth > 0) are single-device continuations and aren't claimed.
+        if depth == 0 {
+            let mut svc = state.service.lock().unwrap();
+            if !svc.claim_turn(sid, workspace_id, trigger_id).map_err(map_err)? {
+                break;
+            }
         }
 
         let reply = run_turn(&app, &state, sid, workspace_id, &responder).await?.body;
@@ -4521,7 +4531,7 @@ async fn maybe_respond(
     let local_actor_id = state.local_actor_id();
 
     // Decide whether there's an unanswered user message we own the response to.
-    let plan: Option<(Uuid, Responder)> = {
+    let plan: Option<(Uuid, Responder, Uuid)> = {
         let svc = state.service.lock().unwrap();
         let Some(session) = svc.load(sid).map_err(map_err)? else {
             return Ok(());
@@ -4542,7 +4552,7 @@ async fn maybe_respond(
                     };
                     let responder = responder_for(&state, &session, agent.as_ref());
                     owns_responder(&local_actor_id, &responder)
-                        .then_some((session.workspace_id, responder))
+                        .then_some((session.workspace_id, responder, m.id))
                 }
                 None => None,
             },
@@ -4550,7 +4560,7 @@ async fn maybe_respond(
         }
     };
 
-    let Some((workspace_id, responder)) = plan else {
+    let Some((workspace_id, responder, trigger_id)) = plan else {
         return Ok(());
     };
 
@@ -4563,6 +4573,15 @@ async fn maybe_respond(
         Ok(g) => g,
         Err(_) => return Ok(()),
     };
+    // Cross-device single-answer: ownership is account-scoped, so all of the
+    // owner's online devices would otherwise answer. Claim the turn; if another
+    // device already won the claim, back off.
+    {
+        let mut svc = state.service.lock().unwrap();
+        if !svc.claim_turn(sid, workspace_id, trigger_id).map_err(map_err)? {
+            return Ok(());
+        }
+    }
     let result = run_turn(&app, &state, sid, workspace_id, &responder).await;
     result.map(|_| ())
 }

@@ -60,6 +60,14 @@ pub enum SessionEvent {
     /// Drop a message from the transcript (used by "regenerate" to replace the
     /// last assistant turn). Idempotent — removing an unknown id is a no-op.
     MessageRemoved { message_id: Uuid },
+    /// A device claims the right to answer `trigger_id` (a user message). Because
+    /// ownership is account-scoped, all of a person's online devices otherwise
+    /// self-elect and double-answer. The fold applies events in canonical
+    /// `(lamport, event_id)` order, so the FIRST claim seen per trigger wins
+    /// deterministically on every device (see `ChatSession::turn_claims`); a
+    /// device that has synced another device's winning claim backs off. Benign
+    /// coordination — not projection-gated.
+    TurnClaimed { trigger_id: Uuid, device_id: Uuid },
     MemberAdded { member: WorkspaceMember },
     MemberRemoved { member_id: String },
     MemberRoleChanged { change: MemberRoleChange },
@@ -184,6 +192,7 @@ impl SessionEvent {
             SessionEvent::MessageChunkReceived { .. } => "messageChunkReceived",
             SessionEvent::MessageCompleted { .. } => "messageCompleted",
             SessionEvent::MessageRemoved { .. } => "messageRemoved",
+            SessionEvent::TurnClaimed { .. } => "turnClaimed",
             SessionEvent::MemberAdded { .. } => "memberAdded",
             SessionEvent::MemberRemoved { .. } => "memberRemoved",
             SessionEvent::MemberRoleChanged { .. } => "memberRoleChanged",
@@ -344,6 +353,11 @@ impl ChatSession {
             }
             SessionEvent::MessageRemoved { message_id } => {
                 self.messages.retain(|m| &m.id != message_id);
+            }
+            SessionEvent::TurnClaimed { trigger_id, device_id } => {
+                // First claim in canonical fold order wins; later claims for the
+                // same trigger are ignored. Deterministic across devices.
+                self.turn_claims.entry(*trigger_id).or_insert(*device_id);
             }
             SessionEvent::MemberAdded { member } => {
                 if let Some(idx) = self.members.iter().position(|m| m.id == member.id) {
@@ -1107,6 +1121,24 @@ mod tests {
         for seed in 0..200u64 {
             assert_eq!(project(&shuffled(events.clone(), seed | 1)).expect("session"), s, "divergence at seed {seed}");
         }
+    }
+
+    /// The fold applies envelopes in canonical `(lamport, event_id)` order, so
+    /// the first `TurnClaimed` per trigger wins on every device (later claims are
+    /// ignored). This is what stops an account's two devices double-answering.
+    #[test]
+    fn turn_claim_first_in_fold_order_wins_and_is_idempotent() {
+        let mut s = base_session();
+        let trigger = Uuid::new_v4();
+        let device_a = Uuid::new_v4();
+        let device_b = Uuid::new_v4();
+        s.apply(&SessionEvent::TurnClaimed { trigger_id: trigger, device_id: device_a });
+        s.apply(&SessionEvent::TurnClaimed { trigger_id: trigger, device_id: device_b });
+        assert_eq!(s.turn_claims.get(&trigger), Some(&device_a), "first claim wins");
+        // A different trigger claims independently.
+        let t2 = Uuid::new_v4();
+        s.apply(&SessionEvent::TurnClaimed { trigger_id: t2, device_id: device_b });
+        assert_eq!(s.turn_claims.get(&t2), Some(&device_b));
     }
 
     /// A plain rename (`purpose: None`) must leave an existing purpose intact;

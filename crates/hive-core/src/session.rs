@@ -5,6 +5,7 @@
 //! them. The event log + projector are the source of truth.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::agent::WorkspaceAgent;
@@ -63,6 +64,12 @@ pub struct ChatSession {
     /// answers un-`@mentioned` messages. Empty on legacy sessions (→ local).
     #[serde(default)]
     pub creator_actor_id: String,
+    /// Turn-answer claims: `trigger user-message id → winning device id`. The
+    /// first `TurnClaimed` in canonical fold order wins, so every device agrees
+    /// which one answers a given turn — preventing account-scoped double-answers.
+    /// Ephemeral coordination state; empty on legacy sessions.
+    #[serde(default)]
+    pub turn_claims: BTreeMap<Uuid, Uuid>,
     /// Channels defined on the workspace. Only populated when this session IS
     /// the workspace-config log (§11); empty on ordinary chats.
     #[serde(default)]
@@ -115,6 +122,7 @@ impl ChatSession {
             workflow_runs: Vec::new(),
             archived: false,
             creator_actor_id: String::new(),
+            turn_claims: BTreeMap::new(),
             channels: Vec::new(),
             channel_id: String::new(),
             workspace_runtimes: Vec::new(),

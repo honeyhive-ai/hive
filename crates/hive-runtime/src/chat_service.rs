@@ -597,6 +597,37 @@ impl ChatService {
         Ok(added)
     }
 
+    /// Claim the right to answer `trigger_id` (a user message), returning whether
+    /// THIS device won. Ownership is account-scoped, so without this every online
+    /// device of the responder's owner self-elects and double-answers. The first
+    /// `TurnClaimed` in canonical fold order wins deterministically, so a device
+    /// that has already synced a competing claim backs off (`Ok(false)`). It only
+    /// resolves once claims sync, so it *reduces* rather than fully eliminates the
+    /// concurrent-within-one-round-trip race — the streaming placeholder stays the
+    /// second-line guard. A vanished/legacy session (no claim state) → proceed.
+    pub fn claim_turn(
+        &mut self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        trigger_id: Uuid,
+    ) -> Result<bool> {
+        if let Some(session) = self.load(session_id)? {
+            if let Some(winner) = session.turn_claims.get(&trigger_id) {
+                return Ok(*winner == self.device_id);
+            }
+        }
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::TurnClaimed { trigger_id, device_id: self.device_id },
+        )?;
+        Ok(self
+            .load(session_id)?
+            .and_then(|s| s.turn_claims.get(&trigger_id).copied())
+            .map(|w| w == self.device_id)
+            .unwrap_or(true))
+    }
+
     /// Rename the session (manual, or auto-generated from the first exchange).
     pub fn set_title(
         &mut self,
