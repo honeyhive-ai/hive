@@ -6290,7 +6290,7 @@ fn list_workspaces(state: State<AppState>) -> Vec<WorkspaceInfoDto> {
     let s = state.settings.lock().unwrap();
     let mut out = vec![WorkspaceInfoDto {
         id: state.local_workspace_id.to_string(),
-        name: "My workspace".to_string(),
+        name: "Home".to_string(),
         kind: "local".to_string(),
         active: active == state.local_workspace_id,
         icon_url: s.local_workspace_icon.clone(),
