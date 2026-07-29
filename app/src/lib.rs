@@ -3601,7 +3601,7 @@ async fn windowed_context(
 ) -> (String, Vec<ChatTurn>) {
     let snapshot = context_snapshot(state, session_id, session, responder);
     let plan = snapshot.plan;
-    let turns = turns_from(&plan.kept, &responder.author);
+    let turns = turns_from(&plan.kept, responder.agent_id, &responder.author);
     // Reference vaults ride in the system prompt (capped; cached per app run).
     // Like the summary below, this is appended after the window plan — the
     // caps keep the skew small and the output/summary reserves absorb it.
@@ -3876,7 +3876,7 @@ async fn summarize_chat(state: State<'_, AppState>, session_id: String) -> Resul
     let body = format!("**Conversation summary**\n\n{summary}");
     let mut svc = state.service.lock().unwrap();
     let id = svc
-        .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id)
+        .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id, None)
         .map_err(map_err)?;
     svc.complete_assistant_message(sid, workspace_id, id, body).map_err(map_err)?;
     Ok(())
@@ -3910,7 +3910,7 @@ async fn compact_chat(state: State<'_, AppState>, session_id: String) -> Result<
         svc.remove_message(sid, workspace_id, id).map_err(map_err)?;
     }
     let id = svc
-        .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id)
+        .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id, None)
         .map_err(map_err)?;
     svc.complete_assistant_message(sid, workspace_id, id, body).map_err(map_err)?;
     // In-memory overflow summary cache is now stale (messages changed).
@@ -4077,7 +4077,7 @@ async fn try_tool_loop(
 
     let message_id = {
         let mut svc = state.service.lock().unwrap();
-        svc.begin_assistant_message(session_id, workspace_id, &responder.author, &responder.runtime_id)
+        svc.begin_assistant_message(session_id, workspace_id, &responder.author, &responder.runtime_id, responder.agent_id)
             .map_err(map_err)?
     };
 
@@ -4294,7 +4294,7 @@ async fn run_prepared_turn(
 
     let message_id = {
         let mut svc = state.service.lock().unwrap();
-        svc.begin_assistant_message(session_id, workspace_id, &responder.author, &responder.runtime_id)
+        svc.begin_assistant_message(session_id, workspace_id, &responder.author, &responder.runtime_id, responder.agent_id)
             .map_err(map_err)?
     };
 
@@ -8581,7 +8581,7 @@ mod finalize_proposal_tests {
         let wid = Uuid::new_v4();
         let chat = svc.create_chat("A", wid, "anthropic").unwrap();
         svc.add_agent(chat.id, wid, WorkspaceAgent::new("Scout", "ws-claude")).unwrap();
-        let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude").unwrap();
+        let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude", None).unwrap();
 
         let body = "Done.\n[[propose: {\"title\": \"Bump timeout\", \"kind\": \"command\", \"body\": \"30s\", \"requiredApprovals\": 2}]]";
         let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", "/tmp/ws", body).unwrap();

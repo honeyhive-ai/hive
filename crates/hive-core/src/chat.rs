@@ -100,6 +100,16 @@ pub struct ChatMessage {
     pub runtime_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_persona_id: Option<String>,
+    /// The responding agent's stable id (None = the primary runtime or a human).
+    /// "Own vs other" turn attribution keys on this, not the display name, so a
+    /// rename or a duplicate name can't mis-label a turn as the responder's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responder_id: Option<Uuid>,
+    /// The device that authored a streaming assistant message. The startup
+    /// stale-stream sweep only completes messages from THIS device, so it can't
+    /// truncate a peer's in-flight stream. None on human/legacy messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_device_id: Option<Uuid>,
     #[serde(default)]
     pub tool_calls: Vec<ChatToolCall>,
     #[serde(default)]
@@ -127,6 +137,8 @@ impl ChatMessage {
             runtime_id: None,
             runtime_label: None,
             agent_persona_id: None,
+            responder_id: None,
+            origin_device_id: None,
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
             reactions: Vec::new(),

@@ -324,10 +324,15 @@ impl ChatService {
         workspace_id: Uuid,
         author: impl Into<String>,
         runtime_id: impl Into<String>,
+        responder_id: Option<Uuid>,
     ) -> Result<Uuid> {
         let mut message = ChatMessage::new(MessageRole::Assistant, author, "");
         message.is_streaming = true;
         message.runtime_id = Some(runtime_id.into());
+        // Stamp the responder's stable id (for own-turn attribution) and this
+        // device (so the stale-stream sweep never truncates a peer's stream).
+        message.responder_id = responder_id;
+        message.origin_device_id = Some(self.device_id);
         let id = message.id;
         self.append_signed(
             session_id,
@@ -403,7 +408,13 @@ impl ChatService {
             let stale: Vec<(Uuid, String)> = session
                 .messages
                 .iter()
-                .filter(|m| m.is_streaming)
+                // Only complete OUR own orphaned streams (or legacy ones with no
+                // device stamp). A message still streaming on a peer's device
+                // must not be swept here — that would truncate their live reply.
+                .filter(|m| {
+                    m.is_streaming
+                        && m.origin_device_id.map(|d| d == self.device_id).unwrap_or(true)
+                })
                 .map(|m| (m.id, m.body.clone()))
                 .collect();
             for (message_id, body) in stale {
@@ -1422,8 +1433,8 @@ pub fn resolve_workspace_credential(cred: &WorkspaceCredential) -> Option<String
 
 /// Map a session's transcript into provider wire turns, attributed for the
 /// responder named `own_author` (see [`turns_from`]).
-pub fn turns_for(session: &ChatSession, own_author: &str) -> Vec<ChatTurn> {
-    turns_from(&session.messages, own_author)
+pub fn turns_for(session: &ChatSession, own_id: Option<Uuid>, own_author: &str) -> Vec<ChatTurn> {
+    turns_from(&session.messages, own_id, own_author)
 }
 
 /// Map a message slice into provider wire turns: user→user,
@@ -1438,7 +1449,7 @@ pub fn turns_for(session: &ChatSession, own_author: &str) -> Vec<ChatTurn> {
 /// stay unprefixed: they are genuinely "your" earlier outputs, so the model has
 /// a clean template and never learns to prefix its own name. Pass an empty
 /// `own_author` to attribute every turn (no self to exclude).
-pub fn turns_from(messages: &[ChatMessage], own_author: &str) -> Vec<ChatTurn> {
+pub fn turns_from(messages: &[ChatMessage], own_id: Option<Uuid>, own_author: &str) -> Vec<ChatTurn> {
     let turns: Vec<ChatTurn> = messages
         .iter()
         .filter(|m| !m.body.is_empty() && !m.is_streaming)
@@ -1454,7 +1465,19 @@ pub fn turns_from(messages: &[ChatMessage], own_author: &str) -> Vec<ChatTurn> {
             match m.role {
                 MessageRole::User => Some(ChatTurn::user(attributed())),
                 MessageRole::Assistant | MessageRole::Agent => {
-                    if !own_author.is_empty() && m.author == own_author {
+                    // "Own" turns stay unprefixed. Key on the responder's stable
+                    // id when responding as an agent (robust to rename/duplicate
+                    // name); for the primary (no agent id) fall back to a
+                    // primary-authored turn matched by name.
+                    let is_own = match own_id {
+                        Some(oid) => m.responder_id == Some(oid),
+                        None => {
+                            m.responder_id.is_none()
+                                && !own_author.is_empty()
+                                && m.author == own_author
+                        }
+                    };
+                    if is_own {
                         Some(ChatTurn::assistant(m.body.clone()))
                     } else {
                         Some(ChatTurn::assistant(attributed()))
@@ -1527,7 +1550,7 @@ mod tests {
         assert_eq!(pend[0].agent_name, "reviewer");
 
         // The agent replies → no longer pending.
-        let mid = svc.begin_assistant_message(chat.id, wid, "reviewer", "ws-claude").unwrap();
+        let mid = svc.begin_assistant_message(chat.id, wid, "reviewer", "ws-claude", None).unwrap();
         svc.complete_assistant_message(chat.id, wid, mid, "done").unwrap();
         let s = svc.load(chat.id).unwrap().unwrap();
         assert!(pending_mentions(&s).is_empty(), "answered mention should not be pending");
@@ -2113,7 +2136,7 @@ mod tests {
 
         svc.post_user_message(sid, wid, "Say hello").unwrap();
         let mid = svc
-            .begin_assistant_message(sid, wid, "Hive", "anthropic")
+            .begin_assistant_message(sid, wid, "Hive", "anthropic", None)
             .unwrap();
         for piece in ["Hel", "lo, ", "world"] {
             svc.append_chunk(sid, wid, mid, piece).unwrap();
@@ -2129,7 +2152,7 @@ mod tests {
 
         // provider turns include both, in wire shape, attributed for "Hive":
         // the human turn is name-prefixed; Hive's own turn stays unprefixed.
-        let turns = turns_for(&session, "Hive");
+        let turns = turns_for(&session, None, "Hive");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "Mara: Say hello");
@@ -2145,9 +2168,9 @@ mod tests {
         let sid = chat.id;
         svc.post_user_message(sid, wid, "kick off").unwrap();
         // Two agents reply into the same thread.
-        let m1 = svc.begin_assistant_message(sid, wid, "Scout", "ws-claude").unwrap();
+        let m1 = svc.begin_assistant_message(sid, wid, "Scout", "ws-claude", None).unwrap();
         svc.complete_assistant_message(sid, wid, m1, "found the bug").unwrap();
-        let m2 = svc.begin_assistant_message(sid, wid, "Nova", "ws-claude").unwrap();
+        let m2 = svc.begin_assistant_message(sid, wid, "Nova", "ws-claude", None).unwrap();
         svc.complete_assistant_message(sid, wid, m2, "drafting the fix").unwrap();
 
         // From Scout's perspective: its own turn is clean; Nova + the human are
@@ -2155,11 +2178,34 @@ mod tests {
         // consecutive assistant turns coalesce (alternation repair), preserving
         // the attribution prefixes.
         let session = svc.load(sid).unwrap().unwrap();
-        let turns = turns_for(&session, "Scout");
+        let turns = turns_for(&session, None, "Scout");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "Mara: kick off");
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "found the bug\n\nNova: drafting the fix");
+    }
+
+    #[test]
+    fn attribution_keys_on_responder_id_not_name() {
+        // Two agents share the display name "Nova" but have distinct ids. When
+        // Nova-A responds (own_id = its id), only its own id-matched turn is
+        // unprefixed; Nova-B's same-named turn is attributed, not mistaken as A's.
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let sid = svc.create_chat("dup", wid, "anthropic").unwrap().id;
+        svc.post_user_message(sid, wid, "go").unwrap();
+        let nova_a = Uuid::new_v4();
+        let nova_b = Uuid::new_v4();
+        let a = svc.begin_assistant_message(sid, wid, "Nova", "rt", Some(nova_a)).unwrap();
+        svc.complete_assistant_message(sid, wid, a, "A analysis").unwrap();
+        let b = svc.begin_assistant_message(sid, wid, "Nova", "rt", Some(nova_b)).unwrap();
+        svc.complete_assistant_message(sid, wid, b, "B take").unwrap();
+
+        let session = svc.load(sid).unwrap().unwrap();
+        let turns = turns_for(&session, Some(nova_a), "Nova");
+        // A's turn (id-matched) unprefixed; B's (same name, different id) named.
+        // The two consecutive assistant turns coalesce.
+        assert_eq!(turns.last().unwrap().content, "A analysis\n\nNova: B take");
     }
 
     #[test]
@@ -2186,7 +2232,7 @@ mod tests {
         let (sid, wid) = (chat.id, chat.workspace_id);
 
         svc.post_user_message(sid, wid, "hi").unwrap();
-        let mid = svc.begin_assistant_message(sid, wid, "Hive", "anthropic").unwrap();
+        let mid = svc.begin_assistant_message(sid, wid, "Hive", "anthropic", None).unwrap();
         svc.append_chunk(sid, wid, mid, "partial reply").unwrap();
         // No complete_assistant_message — the process "died" here.
 
