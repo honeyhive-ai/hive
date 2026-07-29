@@ -253,6 +253,12 @@ async fn drive_run_inner(
         // stages in parallel.
         let outputs = collect_outputs(&run, &session);
         let mut agent_nodes = Vec::new();
+        // Serialize stages targeting the SAME agent: two concurrent prompts to
+        // one (remote) agent can't be correlated to its reply — both stages would
+        // match the single synced answer, silently dropping one prompt's result.
+        // Claim one stage per agent this iteration; the rest stay ready and run
+        // next round (once the first completes).
+        let mut claimed_agents: std::collections::HashSet<Option<Uuid>> = std::collections::HashSet::new();
         for node in &ready {
             match &node.kind {
                 WorkflowNodeKind::Gate {
@@ -280,7 +286,11 @@ async fn drive_run_inner(
                     s.proposal_id = Some(pid);
                     state.gate_runs.lock().unwrap().insert(pid, run_id);
                 }
-                WorkflowNodeKind::Agent { .. } => {
+                WorkflowNodeKind::Agent { agent_id, .. } => {
+                    // Defer a same-agent sibling to a later iteration (see above).
+                    if !claimed_agents.insert(*agent_id) {
+                        continue;
+                    }
                     run.node_state_mut(&node.id).expect("node state exists").status =
                         NodeRunStatus::Running;
                     agent_nodes.push(node.clone());

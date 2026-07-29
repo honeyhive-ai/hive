@@ -194,9 +194,18 @@ export function ChatView({
         }
         qc.invalidateQueries({ queryKey: ["chat", sessionRef.current] });
         qc.invalidateQueries({ queryKey: ["chats"] });
-        setStreams((prev) => retireStream(prev, e.messageId));
-        setOptimisticUser(null);
-        setSending(false);
+        setStreams((prev) => {
+          const next = retireStream(prev, e.messageId);
+          // Clear the shared "sending"/optimistic state only when the LAST live
+          // stream retires — a sibling parallel workflow-stage stream may still
+          // be generating, so clearing on the first completion read as "done"
+          // while others were mid-flight.
+          if (next.size === 0) {
+            setSending(false);
+            setOptimisticUser(null);
+          }
+          return next;
+        });
       }
     });
     return () => {
