@@ -1408,7 +1408,7 @@ pub fn turns_for(session: &ChatSession, own_author: &str) -> Vec<ChatTurn> {
 /// a clean template and never learns to prefix its own name. Pass an empty
 /// `own_author` to attribute every turn (no self to exclude).
 pub fn turns_from(messages: &[ChatMessage], own_author: &str) -> Vec<ChatTurn> {
-    messages
+    let turns: Vec<ChatTurn> = messages
         .iter()
         .filter(|m| !m.body.is_empty() && !m.is_streaming)
         .filter_map(|m| {
@@ -1432,7 +1432,34 @@ pub fn turns_from(messages: &[ChatMessage], own_author: &str) -> Vec<ChatTurn> {
                 MessageRole::System => None,
             }
         })
-        .collect()
+        .collect();
+    repair_alternation(turns)
+}
+
+/// Make a turn list provider-safe: coalesce consecutive same-role turns and
+/// guarantee the first turn is `user`. Anthropic rejects a leading assistant
+/// message and (per its docs) consecutive same-role messages with a 400 — which
+/// a multi-agent thread produces routinely (two agents reply in a row) and which
+/// `/compact` produces every time (it posts a lone assistant "Summary" as the
+/// new head). OpenAI-style providers are lenient, so this only ever normalizes.
+/// Coalescing joins bodies with a blank line, preserving the `Name:` attribution
+/// prefixes; a leading assistant turn gets a minimal synthetic user turn ahead of
+/// it rather than being dropped (which would lose that context).
+fn repair_alternation(turns: Vec<ChatTurn>) -> Vec<ChatTurn> {
+    let mut merged: Vec<ChatTurn> = Vec::with_capacity(turns.len());
+    for t in turns {
+        match merged.last_mut() {
+            Some(last) if last.role == t.role => {
+                last.content.push_str("\n\n");
+                last.content.push_str(&t.content);
+            }
+            _ => merged.push(t),
+        }
+    }
+    if merged.first().map(|t| t.role == "assistant").unwrap_or(false) {
+        merged.insert(0, ChatTurn::user("(Continuing the earlier conversation.)".to_string()));
+    }
+    merged
 }
 
 #[cfg(test)]
@@ -2093,12 +2120,29 @@ mod tests {
         svc.complete_assistant_message(sid, wid, m2, "drafting the fix").unwrap();
 
         // From Scout's perspective: its own turn is clean; Nova + the human are
-        // attributed so Scout can tell the contributions apart.
+        // attributed so Scout can tell the contributions apart. Scout's and Nova's
+        // consecutive assistant turns coalesce (alternation repair), preserving
+        // the attribution prefixes.
         let session = svc.load(sid).unwrap().unwrap();
         let turns = turns_for(&session, "Scout");
+        assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].content, "Mara: kick off");
-        assert_eq!(turns[1].content, "found the bug"); // Scout's own → unprefixed
-        assert_eq!(turns[2].content, "Nova: drafting the fix"); // other agent → named
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "found the bug\n\nNova: drafting the fix");
+    }
+
+    #[test]
+    fn alternation_repair_prepends_user_before_a_leading_assistant() {
+        // A window boundary / `/compact` can leave an assistant turn at the head;
+        // Anthropic requires the first message to be `user`.
+        let turns = repair_alternation(vec![
+            ChatTurn::assistant("Summary of earlier work".to_string()),
+            ChatTurn::user("now what?".to_string()),
+        ]);
+        assert_eq!(turns[0].role, "user"); // synthetic user prepended
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "Summary of earlier work"); // not dropped
+        assert_eq!(turns[2].content, "now what?");
     }
 
     #[test]

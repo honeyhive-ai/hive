@@ -64,6 +64,14 @@ fn mentions_phrase_opts(body_lower: &str, needle: &str, allow_hash_after: bool) 
     while let Some(idx) = body_lower[from..].find(&pat) {
         let start = from + idx;
         let after = start + pat.len();
+        // The char BEFORE the `@` must be a boundary too, or an email address /
+        // inline handle (`me@hive.io`, `ping@scout`) would count as a mention and
+        // wrongly summon the primary/an agent to answer an ordinary message.
+        let ok_before = body_lower[..start]
+            .chars()
+            .next_back()
+            .map(|c| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(true);
         // the char following the match must not continue an identifier
         let ok_after = body_lower[after..]
             .chars()
@@ -72,7 +80,7 @@ fn mentions_phrase_opts(body_lower: &str, needle: &str, allow_hash_after: bool) 
                 !c.is_alphanumeric() && c != '_' && c != '-' && (allow_hash_after || c != '#')
             })
             .unwrap_or(true);
-        if ok_after {
+        if ok_before && ok_after {
             return true;
         }
         from = after;
@@ -169,6 +177,19 @@ mod tests {
         assert!(parse_mentions("can you take this @hive?", &s).primary);
         // Bare "hive" in prose (no @) must not summon the primary.
         assert!(!parse_mentions("the hive is busy today", &s).primary);
+    }
+
+    #[test]
+    fn at_needs_a_left_boundary_so_emails_arent_mentions() {
+        let scout = WorkspaceAgent::new("scout", "r1");
+        let s = session_with(vec![scout], vec![]);
+        // Email / inline-handle forms must NOT summon the primary or an agent.
+        assert!(!parse_mentions("reach me at me@hive.io", &s).primary);
+        assert!(!parse_mentions("email support@primary please", &s).primary);
+        assert!(parse_mentions("ping user@scout for that", &s).agents.is_empty());
+        // A real mention (boundary before @) still resolves.
+        assert!(parse_mentions("hey @hive can you look?", &s).primary);
+        assert!(parse_mentions("(@scout) take a look", &s).agents.len() == 1);
     }
 
     #[test]

@@ -2078,6 +2078,30 @@ fn add_agent(
     role: String,
 ) -> Result<(), String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("Agent name can't be empty.".to_string());
+    }
+    // Reserved mention words would hijack routing (an agent named "primary"
+    // shadows the primary runtime; "you"/"all" shadow broadcast).
+    const RESERVED: &[&str] =
+        &["primary", "hive", "you", "all", "everyone", "owners", "admins", "contributors", "viewers"];
+    if RESERVED.contains(&name.to_lowercase().as_str()) {
+        return Err(format!("\u{201c}{name}\u{201d} is a reserved mention name — pick another."));
+    }
+    let mut svc = state.service.lock().unwrap();
+    // Agents have no `#index` disambiguation (unlike humans), so a duplicate name
+    // would be unaddressable and could be double-answered by the worker path.
+    // Reject a collision with an existing agent or member up front.
+    if let Some(session) = svc.load(id).map_err(map_err)? {
+        let taken = session.workspace_agents.iter().any(|a| a.name.eq_ignore_ascii_case(&name))
+            || session.members.iter().any(|m| m.actor.display_name.eq_ignore_ascii_case(&name));
+        if taken {
+            return Err(format!(
+                "\u{201c}{name}\u{201d} is already taken by another agent or member — pick a distinct name."
+            ));
+        }
+    }
     let mut agent = WorkspaceAgent::new(
         name,
         if runtime_id.is_empty() {
@@ -2087,7 +2111,6 @@ fn add_agent(
         },
     );
     agent.role = role;
-    let mut svc = state.service.lock().unwrap();
     // Stamp ownership so only the creator can later edit the agent's avatar.
     agent.owner_actor_id = svc.author().id.clone();
     svc.add_agent(id, state.active_workspace_id(), agent).map_err(map_err)
