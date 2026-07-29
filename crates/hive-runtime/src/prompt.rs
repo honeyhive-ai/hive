@@ -11,7 +11,7 @@ use uuid::Uuid;
 pub fn workspace_roster(session: &ChatSession) -> String {
     let mut lines = vec!["Workspace participants:".to_string()];
 
-    lines.push("- @primary — the primary runtime (coordinator).".to_string());
+    lines.push("- @hive (alias @primary) — the primary runtime (coordinator).".to_string());
 
     for member in &session.members {
         let title = if member.title.is_empty() {

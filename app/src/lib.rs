@@ -3788,6 +3788,11 @@ async fn summarize(
         body.push_str("\n\nNew messages to fold in:\n");
     }
     for m in messages {
+        // Skip system notes ("🧩 X added a workflow…") and empty/streaming
+        // placeholders so they don't get summarized as if a participant said them.
+        if m.role == MessageRole::System || m.is_streaming || m.body.trim().is_empty() {
+            continue;
+        }
         body.push_str(&format!("{}: {}\n", m.author, m.body));
     }
     let turns = vec![ChatTurn::user(body)];
@@ -4422,7 +4427,15 @@ async fn send_message(
             reloaded
         };
         let reply_mentions = parse_mentions(&reply, &reloaded);
-        if reply_mentions.human_broadcast || !reply_mentions.humans.is_empty() {
+        // Only notify when THIS device's user is actually the mentioned human —
+        // not any human (which pinged the wrong user), and don't double up with
+        // the sync-side `notify_mentions` that fires on other devices.
+        let my_role = reloaded
+            .members
+            .iter()
+            .find(|m| m.id == local_actor_id)
+            .map(|m| m.role);
+        if message_mentions_me(&reply, &reloaded, &local_actor_id, my_role) {
             let _ = app
                 .notification()
                 .builder()
