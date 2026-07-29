@@ -6,6 +6,7 @@ import {
   directoryRegister,
   ensureSelfMember,
   getAppSettings,
+  listWorkspaces,
   getChat,
   getContextTelemetry,
   listAgents,
@@ -167,6 +168,9 @@ export function App() {
   const qc = useQueryClient();
 
   const settings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
+  // The active workspace's name (the team/room identity) — the sidebar header
+  // labels the space by name, not by its project-folder basename.
+  const workspaceList = useQuery({ queryKey: ["workspaces"], queryFn: listWorkspaces });
   const runtimes = useQuery({ queryKey: ["runtimes"], queryFn: listRuntimes });
   const [onboarded, setOnboarded] = useState(
     () => typeof window !== "undefined" && window.localStorage.getItem("hive.onboarded") === "1",
@@ -396,12 +400,16 @@ export function App() {
   }, [contextTelemetry.data?.overflowMessageCount]);
 
   const workspaceRoot = settings.data?.workspaceRoot ?? "";
+  const activeWorkspaceName = workspaceList.data?.find((w) => w.active)?.name?.trim();
   const workspaceLabel = useMemo(() => {
+    // Prefer the workspace's own name (what you named the team/room); fall back
+    // to the project-folder basename only when it has none.
+    if (activeWorkspaceName) return activeWorkspaceName;
     const trimmed = workspaceRoot.replace(/[\\/]+$/, "");
     if (!trimmed) return "Hive Workspace";
     const parts = trimmed.split(/[\\/]/);
     return parts[parts.length - 1] || "Hive Workspace";
-  }, [workspaceRoot]);
+  }, [activeWorkspaceName, workspaceRoot]);
 
   const runtimeItems = runtimes.data ?? [];
   const currentRuntime =
