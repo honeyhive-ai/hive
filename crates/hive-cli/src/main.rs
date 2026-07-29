@@ -390,7 +390,7 @@ async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Re
             }
             // Non-Send store is held across .await — cmd_agent runs on a
             // current-thread runtime (see run()), so this is allowed.
-            let turns = turns_for(&s);
+            let turns = turns_for(&s, &name);
             print!("↳ @{name} replying in {} … ", s.id);
             // H1 gate: only execute MCP tools when the triggering author holds
             // ≥ HIVE_MCP_MIN_ROLE (default Contributor). Unresolved author →
@@ -576,7 +576,7 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
                         continue;
                     }
                 };
-                let turns = turns_for(&s);
+                let turns = turns_for(&s, &agent.name);
                 let system = format!(
                     "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.",
                     agent.name

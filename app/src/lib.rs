@@ -3560,7 +3560,7 @@ async fn windowed_context(
 ) -> (String, Vec<ChatTurn>) {
     let snapshot = context_snapshot(state, session_id, session, responder);
     let plan = snapshot.plan;
-    let turns = turns_from(&plan.kept);
+    let turns = turns_from(&plan.kept, &responder.author);
     // Reference vaults ride in the system prompt (capped; cached per app run).
     // Like the summary below, this is appended after the window plan — the
     // caps keep the skew small and the output/summary reserves absorb it.

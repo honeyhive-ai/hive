@@ -83,6 +83,13 @@ fn workflow_guidance() -> &'static str {
 Rules: stage ids are slugs; "after" edges must form a DAG (stages whose deps are all done run in parallel); {{nodes.<id>.output}} may only reference upstream stages; gates pause for human approval — "onReject" is "halt" or {"retryFrom": "<upstream id>"}."#
 }
 
+fn transcript_guidance() -> &'static str {
+    "In the conversation, each turn from another participant is prefixed with \
+their name (\"Name: message\") so you can tell who said what; your own earlier \
+turns appear without a prefix. Write your reply as yourself — do not add a name \
+prefix to it."
+}
+
 fn path_guidance() -> &'static str {
     "Your replies are shared with teammates whose machines have different file \
 layouts, so never write absolute local filesystem paths (such as your working \
@@ -99,10 +106,11 @@ This is saved for human review — it is NOT auto-executed. It appears in the Re
 pub fn primary_system_prompt(session: &ChatSession) -> String {
     let base = format!(
         "You are the primary runtime for the Hive workspace \"{title}\". You \
-coordinate the conversation and may take actions or answer directly.\n\n{roster}\n\n{guide}\n\n{paths}\n\n{wf}\n\n{prop}",
+coordinate the conversation and may take actions or answer directly.\n\n{roster}\n\n{guide}\n\n{transcript}\n\n{paths}\n\n{wf}\n\n{prop}",
         title = session.title,
         roster = workspace_roster(session),
         guide = mention_guidance(),
+        transcript = transcript_guidance(),
         paths = path_guidance(),
         wf = workflow_guidance(),
         prop = proposal_guidance(),
@@ -120,12 +128,13 @@ pub fn agent_system_prompt(session: &ChatSession, agent: &WorkspaceAgent) -> Str
     let base = format!(
         "You are {name}, {role}, collaborating in the Hive workspace \"{title}\". \
 Stay in character as {name}; you are distinct from the primary runtime and the \
-other agents.\n\n{roster}\n\n{guide}\n\n{paths}\n\n{wf}\n\n{prop}",
+other agents.\n\n{roster}\n\n{guide}\n\n{transcript}\n\n{paths}\n\n{wf}\n\n{prop}",
         name = agent.name,
         role = role,
         title = session.title,
         roster = workspace_roster(session),
         guide = mention_guidance(),
+        transcript = transcript_guidance(),
         paths = path_guidance(),
         wf = workflow_guidance(),
         prop = proposal_guidance(),
@@ -190,6 +199,9 @@ mod tests {
         for p in [primary_system_prompt(&s), agent_system_prompt(&s, &agent)] {
             assert!(p.contains("repository-relative"));
             assert!(p.contains("never write absolute local filesystem paths"));
+            // Transcript attribution guidance rides alongside (multi-agent).
+            assert!(p.contains("prefixed with their name"));
+            assert!(p.contains("do not add a name prefix"));
         }
     }
 

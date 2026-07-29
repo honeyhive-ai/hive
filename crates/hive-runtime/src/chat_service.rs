@@ -1389,23 +1389,48 @@ pub fn resolve_workspace_credential(cred: &WorkspaceCredential) -> Option<String
     }
 }
 
-/// Map a session's transcript into provider wire turns.
-pub fn turns_for(session: &ChatSession) -> Vec<ChatTurn> {
-    turns_from(&session.messages)
+/// Map a session's transcript into provider wire turns, attributed for the
+/// responder named `own_author` (see [`turns_from`]).
+pub fn turns_for(session: &ChatSession, own_author: &str) -> Vec<ChatTurn> {
+    turns_from(&session.messages, own_author)
 }
 
 /// Map a message slice into provider wire turns: user→user,
 /// assistant/agent→assistant. System and empty/streaming placeholders are
 /// skipped (system is passed separately as the `system` param). Used with the
 /// compacted (windowed) history.
-pub fn turns_from(messages: &[ChatMessage]) -> Vec<ChatTurn> {
+///
+/// Each turn is prefixed with its speaker (`"Name: …"`) so a responder can tell
+/// participants apart in a multi-agent thread — the roster names everyone, but
+/// without this the transcript collapses every agent + human into anonymous
+/// assistant/user turns. The responder's OWN prior turns (author == `own_author`)
+/// stay unprefixed: they are genuinely "your" earlier outputs, so the model has
+/// a clean template and never learns to prefix its own name. Pass an empty
+/// `own_author` to attribute every turn (no self to exclude).
+pub fn turns_from(messages: &[ChatMessage], own_author: &str) -> Vec<ChatTurn> {
     messages
         .iter()
         .filter(|m| !m.body.is_empty() && !m.is_streaming)
-        .filter_map(|m| match m.role {
-            MessageRole::User => Some(ChatTurn::user(m.body.clone())),
-            MessageRole::Assistant | MessageRole::Agent => Some(ChatTurn::assistant(m.body.clone())),
-            MessageRole::System => None,
+        .filter_map(|m| {
+            let attributed = || {
+                let who = m.author.trim();
+                if who.is_empty() {
+                    m.body.clone()
+                } else {
+                    format!("{who}: {}", m.body)
+                }
+            };
+            match m.role {
+                MessageRole::User => Some(ChatTurn::user(attributed())),
+                MessageRole::Assistant | MessageRole::Agent => {
+                    if !own_author.is_empty() && m.author == own_author {
+                        Some(ChatTurn::assistant(m.body.clone()))
+                    } else {
+                        Some(ChatTurn::assistant(attributed()))
+                    }
+                }
+                MessageRole::System => None,
+            }
         })
         .collect()
 }
@@ -2044,11 +2069,36 @@ mod tests {
         assert_eq!(session.messages[1].body, "Hello, world");
         assert!(!session.messages[1].is_streaming);
 
-        // provider turns include both, in wire shape
-        let turns = turns_for(&session);
+        // provider turns include both, in wire shape, attributed for "Hive":
+        // the human turn is name-prefixed; Hive's own turn stays unprefixed.
+        let turns = turns_for(&session, "Hive");
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "Mara: Say hello");
         assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "Hello, world");
+    }
+
+    #[test]
+    fn turns_attribute_other_agents_but_not_the_responder() {
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("Multi", wid, "anthropic").unwrap();
+        let sid = chat.id;
+        svc.post_user_message(sid, wid, "kick off").unwrap();
+        // Two agents reply into the same thread.
+        let m1 = svc.begin_assistant_message(sid, wid, "Scout", "ws-claude").unwrap();
+        svc.complete_assistant_message(sid, wid, m1, "found the bug").unwrap();
+        let m2 = svc.begin_assistant_message(sid, wid, "Nova", "ws-claude").unwrap();
+        svc.complete_assistant_message(sid, wid, m2, "drafting the fix").unwrap();
+
+        // From Scout's perspective: its own turn is clean; Nova + the human are
+        // attributed so Scout can tell the contributions apart.
+        let session = svc.load(sid).unwrap().unwrap();
+        let turns = turns_for(&session, "Scout");
+        assert_eq!(turns[0].content, "Mara: kick off");
+        assert_eq!(turns[1].content, "found the bug"); // Scout's own → unprefixed
+        assert_eq!(turns[2].content, "Nova: drafting the fix"); // other agent → named
     }
 
     #[test]
