@@ -3572,6 +3572,24 @@ fn dispatch_target(body: &str, session: &ChatSession) -> Option<DispatchTarget> 
     (human_member_count(session) <= 1).then_some(DispatchTarget::Primary)
 }
 
+/// How many consecutive agent/assistant replies trail the transcript back to the
+/// last human turn — the cross-device cascade depth. The inline `visited` set
+/// bounds a cascade *within* one device; this bounds it *across* devices (A on
+/// one device @mentions B on another, B @mentions A, …), since the transcript is
+/// synced and every device counts the same. A reply is only dispatched when this
+/// is below `MAX_CASCADE_DEPTH`.
+fn cascade_depth(session: &ChatSession) -> usize {
+    let mut n = 0;
+    for m in session.messages.iter().rev() {
+        match m.role {
+            MessageRole::System => continue,
+            MessageRole::Assistant | MessageRole::Agent => n += 1,
+            MessageRole::User => break,
+        }
+    }
+    n
+}
+
 /// Window the history to the model budget and, if anything overflows,
 /// summarize it (cached incrementally per session) and prepend the summary to
 /// the system prompt. Returns (system, turns).
@@ -4556,6 +4574,27 @@ async fn maybe_respond(
                 }
                 None => None,
             },
+            // #4: the trailing message is an agent reply that may @mention an
+            // agent THIS device owns (a cross-device cascade the inline loop on
+            // the replying device couldn't run). Bound the chain depth so an
+            // A↔B cascade across devices can't loop forever, and never re-answer
+            // as the replier itself.
+            Some(m) if matches!(m.role, MessageRole::Assistant | MessageRole::Agent) => {
+                if cascade_depth(&session) >= MAX_CASCADE_DEPTH {
+                    None
+                } else {
+                    parse_mentions(&m.body, &session)
+                        .agents
+                        .iter()
+                        .filter_map(|aid| session.workspace_agents.iter().find(|a| &a.id == aid))
+                        .filter(|a| a.name != m.author)
+                        .find_map(|a| {
+                            let responder = responder_for(&state, &session, Some(a));
+                            owns_responder(&local_actor_id, &responder)
+                                .then_some((session.workspace_id, responder, m.id))
+                        })
+                }
+            }
             _ => None,
         }
     };
@@ -8423,9 +8462,27 @@ mod bounded_id_set_tests {
 
 #[cfg(test)]
 mod export_tests {
-    use super::{chat_markdown, export_filename};
+    use super::{cascade_depth, chat_markdown, export_filename};
     use hive_core::{ChatMessage, ChatSession, MessageRole};
     use uuid::Uuid;
+
+    #[test]
+    fn cascade_depth_counts_agent_replies_since_last_human() {
+        let mut s = ChatSession::new("t", Uuid::nil(), "");
+        let push = |s: &mut ChatSession, role, who: &str| {
+            s.messages.push(ChatMessage::new(role, who, "x"));
+        };
+        assert_eq!(cascade_depth(&s), 0);
+        push(&mut s, MessageRole::User, "Mara");
+        assert_eq!(cascade_depth(&s), 0);
+        push(&mut s, MessageRole::Assistant, "Scout");
+        assert_eq!(cascade_depth(&s), 1);
+        push(&mut s, MessageRole::System, "sys"); // system notes don't count
+        push(&mut s, MessageRole::Agent, "Nova");
+        assert_eq!(cascade_depth(&s), 2, "two agent replies since the human turn");
+        push(&mut s, MessageRole::User, "Mara"); // a new human turn resets depth
+        assert_eq!(cascade_depth(&s), 0);
+    }
 
     #[test]
     fn filename_is_slugified() {
