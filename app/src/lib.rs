@@ -5394,11 +5394,32 @@ async fn check_for_app_update() -> Option<UpdateInfo> {
         .json()
         .await
         .ok()?;
-    if info.tag.trim().is_empty() || info.tag == current {
-        None
-    } else {
-        Some(info)
+    // Only offer an update when the manifest is a *strictly newer* release than
+    // this build. Comparing tags for mere inequality (the old behavior) would
+    // prompt a "downgrade" whenever the manifest lagged the installed build —
+    // e.g. a 1.0.0 app seeing a stale 0.2.0 manifest. If either tag can't be
+    // parsed as a version, stay quiet rather than risk a bogus prompt.
+    match (parse_release_version(&info.tag), parse_release_version(current)) {
+        (Some(remote), Some(cur)) if remote > cur => Some(info),
+        _ => None,
     }
+}
+
+/// Parse a `vMAJOR.MINOR.PATCH` (or bare `MAJOR.MINOR.PATCH`) release tag into a
+/// comparable tuple, dropping any leading `v` and any pre-release/build suffix
+/// (`-rc1`, `+build`). Returns `None` for anything that doesn't look like a
+/// release version, so callers fail quiet instead of guessing.
+fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
+    let core = tag
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .split(['-', '+'])
+        .next()?;
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some((major, minor, patch))
 }
 
 /// Check the update feed. Returns `Some(version)` when a newer signed build is
@@ -8412,6 +8433,42 @@ mod title_tests {
     fn caps_overlong_titles_to_eight_words() {
         let out = sanitize_title("one two three four five six seven eight nine ten");
         assert_eq!(out.split_whitespace().count(), 8);
+    }
+}
+
+#[cfg(test)]
+mod update_version_tests {
+    use super::parse_release_version;
+
+    #[test]
+    fn parses_tags_with_and_without_v_prefix() {
+        assert_eq!(parse_release_version("v1.0.0"), Some((1, 0, 0)));
+        assert_eq!(parse_release_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_release_version(" V0.2.0 "), Some((0, 2, 0)));
+        assert_eq!(parse_release_version("v1.4"), Some((1, 4, 0)));
+    }
+
+    #[test]
+    fn drops_prerelease_and_build_metadata() {
+        assert_eq!(parse_release_version("v1.0.0-rc1"), Some((1, 0, 0)));
+        assert_eq!(parse_release_version("1.0.0+build.5"), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn rejects_non_versions() {
+        assert_eq!(parse_release_version(""), None);
+        assert_eq!(parse_release_version("dev"), None);
+        assert_eq!(parse_release_version("vX.Y.Z"), None);
+    }
+
+    #[test]
+    fn ordering_only_flags_strictly_newer() {
+        let cur = parse_release_version("v1.0.0").unwrap();
+        // The bug: a stale 0.2.0 manifest must NOT look newer than a 1.0.0 build.
+        assert!(parse_release_version("v0.2.0").unwrap() < cur);
+        assert!(!(parse_release_version("v1.0.0").unwrap() > cur)); // equal ≠ newer
+        assert!(parse_release_version("v1.0.1").unwrap() > cur);
+        assert!(parse_release_version("v2.0.0").unwrap() > cur);
     }
 }
 

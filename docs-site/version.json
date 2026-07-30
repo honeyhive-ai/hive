@@ -1,6 +1,6 @@
 {
-  "tag": "v0.2.0",
-  "name": "Hive 0.2.0",
+  "tag": "v1.0.0",
+  "name": "Hive 1.0.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Agentic workflows (DAG editor + gates), durable relay user management, in-app team management, docs overhaul."
+  "notes": "Production 1.0: mandatory end-to-end encryption with hardened relay authorization, CLI/daemon multi-agent parity, longer autonomous agent cascades, one-line CLI install, and a Postgres-backed relay for durable HA."
 }
