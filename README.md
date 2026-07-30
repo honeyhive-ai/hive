@@ -227,7 +227,7 @@ The full model is documented in
 
 ### Install
 
-Grab the installer for your platform from the
+**Desktop app** — grab the installer for your platform from the
 [**latest release**](https://github.com/honeyhive-ai/hive/releases/latest):
 
 | Platform | Download |
@@ -236,8 +236,24 @@ Grab the installer for your platform from the
 | **Linux** | `Hive_*_amd64.AppImage`, `.deb`, or `.rpm` |
 | **Windows** | `Hive_*_x64-setup.exe` or `.msi` |
 
-On first launch, a four-step onboarding sets up your identity, project folder,
-agent/runtime, and (optionally) a team relay — no config files required.
+On first launch, a five-step onboarding sets up your identity, project folder,
+agent/runtime, team relay (optional), and appearance — no config files required.
+
+**CLI &amp; headless worker** (`hive`) — a one-line install for the terminal /
+server side (macOS + Linux, Apple Silicon and x86_64):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/honeyhive-ai/hive/main/install.sh | sh
+```
+
+It fetches the prebuilt `hive` binary for your platform from the latest release.
+Override the target dir with `HIVE_INSTALL_DIR` or pin a tag with `HIVE_VERSION`.
+Or build from source: `cargo install --path crates/hive-cli`.
+
+Use `hive worker` to run a **headless daemon** that answers `@mentions` for the
+agents it hosts — the production way to keep agents responsive when no desktop is
+open. It runs on **workspace-owned** credentials (never a personal key, §12.5);
+see [Configure a worker](#run-a-headless-worker) below.
 
 > **Status.** Hive is under active development and current releases are tagged as
 > previews (`0.2.x`). Installers are unsigned for now, so macOS/Windows may warn
@@ -272,6 +288,40 @@ Full user and self-hosting docs live at
 - [Multi-agent](https://docs.apiaryhq.ai/features/multi-agent/) ·
   [Workflows](https://docs.apiaryhq.ai/features/workflows/) ·
   [Collaboration](https://docs.apiaryhq.ai/features/collaboration/)
+
+## Run a headless worker
+
+`hive worker` is the production daemon: it registers the box as a workspace host
+and answers `@mentions` for the agents assigned to it, so agents stay responsive
+with no desktop open. It's configured entirely by environment variables:
+
+| Var | Purpose |
+| --- | --- |
+| `HIVE_DATA_DIR` | Local event-store directory. |
+| `HIVE_RELAY_URL` | Relay base URL (sync). |
+| `HIVE_RELAY_ACCESS_TOKEN` | Relay access token. |
+| `HIVE_WORKSPACE` | Workspace room id to serve. |
+| `HIVE_WORKSPACE_KEY` | The workspace E2EE key (so it can read/write the log). |
+| `HIVE_WS_SECRET_<ref>` | Secret for a workspace-owned runtime credential (§12.5). |
+| `HIVE_MCP_CONFIG` | Optional MCP server config for tool use. |
+
+```sh
+HIVE_RELAY_URL=… HIVE_RELAY_ACCESS_TOKEN=… HIVE_WORKSPACE=… HIVE_WORKSPACE_KEY=… \
+  hive worker
+```
+
+Assign agents to the worker from the desktop (or `hive set-agent-host`). The
+worker uses **workspace-owned** runtime credentials — never a personal key — and
+gates MCP tool use on the triggering author's role (`HIVE_MCP_MIN_ROLE`, default
+contributor). It claims each turn before answering, so a worker and a desktop
+that both own an agent never double-reply, and it recovers from transient relay
+outages with backoff. Multiple agents can carry on a conversation across worker
+and desktop without a human in the loop, up to a generous per-turn cascade
+ceiling (a loop backstop, not a conversation limit).
+
+> `hive agent` is a **local-dev-only** foreground responder that runs on a
+> personal credential; it refuses to start unless `HIVE_ALLOW_PERSONAL_AGENT=1`
+> is set. For anything unattended or shared, use `hive worker`.
 
 ## Self-hosting the relay
 

@@ -13,7 +13,7 @@ you (or another participant) mention.
 | Mention | Who answers |
 |---|---|
 | `@agent-name` | that workspace agent (runs on its owner's device/runtime) |
-| `@primary` | the chat's Primary Runtime |
+| `@hive` (alias `@primary`) | the chat's default agent / Primary Runtime |
 | `@you` / `@all` | broadcast to all humans in the workspace (notification only) |
 | `@alice` (a member's name/handle) | that specific person |
 | `@owners`, `@admins`, `@contributors`, `@viewers` | a governance-role group |
@@ -36,9 +36,19 @@ and agent→human. So a sub-agent that gets blocked can escalate:
 ```
 
 `@admins` gets a turn routed to that role group; **you** get a
-notification. Agent fan-out is depth-capped (`MAX_CASCADE_DEPTH = 4`) to
-prevent runaway loops, and the human broadcast just notifies — it never
-auto-runs a turn.
+notification (the human broadcast never auto-runs a turn).
+
+**Autonomous multi-agent threads.** Two or more agents can carry on a
+conversation without a human in the loop: as long as each reply `@mentions`
+another agent, Hive keeps routing turns between them — and the chain continues
+even when the agents live on **different devices** or a headless
+[`hive worker`](../../crates/hive-cli/README.md) (each device claims a turn
+before answering, so no two ever double-reply the same mention). A cascade ends
+naturally the moment an agent *stops* mentioning another. A generous per-turn
+depth ceiling (`MAX_CASCADE_DEPTH`, currently 24 replies since the last human
+turn) is only a runaway/loop backstop — not a conversation limit — so genuine
+multi-agent discussions run their course, while an infinite `A ↔ B` loop is still
+bounded.
 
 ### Identity
 

@@ -27,7 +27,7 @@ Because builds are unsigned, first launch needs a nudge:
 
 ## Wizard steps
 
-The onboarding is **four quick steps** (the progress dots at the top count
+The onboarding is **five quick steps** (the progress dots at the top count
 them off):
 
 1. **Identity** — enter a display name, **or sign in with GitHub** (see
@@ -49,6 +49,9 @@ them off):
 4. **Team** — optional. If you have a relay endpoint, paste it here
    (and optionally name a team) so cross-network peers can sync. Skip
    to stay solo/local; you can add a relay later from Settings.
+5. **Appearance** — pick a theme (Pollen, Midnight, Studio, Harbor, or
+   Meadow) and light / dark / auto. It applies live as you choose, and
+   you can change it anytime from **Settings → Appearance**.
 
 ![Onboarding runtime step](../images/onboarding-runtime.png){ width="720" }
 

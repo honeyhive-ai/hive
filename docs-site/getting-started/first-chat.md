@@ -12,8 +12,9 @@ The composer is at the bottom. A few affordances worth knowing:
 - **Primary runtime select (above the input).** Shows which runtime
   answers this chat, and lists every configured runtime so you can
   switch per chat. To address a specific agent or teammate instead,
-  type `@` to bring up the mention popover — candidates are `@primary`,
-  `@all`, your **agents**, and **members** of the chat. (There are no
+  type `@` to bring up the mention popover — candidates are `@hive`
+  (the default agent; `@primary` still works as an alias), `@all`, your
+  **agents**, and **members** of the chat. (There are no
   `@file` mentions; attach files with the picker below.)
 - **Slash commands.** Type `/` to bring up commands. Selecting one runs
   it instead of sending text: **Summarize conversation**, **Compact

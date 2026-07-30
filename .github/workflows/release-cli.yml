@@ -1,0 +1,59 @@
+# Builds the `hive` CLI/daemon binary for macOS + Linux and attaches it to the
+# GitHub Release for the tag, named `hive-<target>` so install.sh can fetch the
+# right one. The desktop app is built separately by release.yml.
+name: release-cli
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.1)"
+        required: true
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+          - runner: macos-13
+            target: x86_64-apple-darwin
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust target
+        run: rustup update stable && rustup target add ${{ matrix.target }}
+
+      - name: Install musl toolchain (Linux)
+        if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build hive CLI
+        run: cargo build --release --locked -p hive-cli --target ${{ matrix.target }}
+
+      - name: Stage asset
+        run: |
+          install -m 0755 "target/${{ matrix.target }}/release/hive" "hive-${{ matrix.target }}"
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: hive-${{ matrix.target }}
+          fail_on_unmatched_files: true

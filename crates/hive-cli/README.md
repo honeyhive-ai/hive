@@ -66,18 +66,44 @@ workspace the app created).
 > four topologies (shared data dir · local relay · remote worker · team) and how
 > to pick one.
 
-## Using this as an agent
+## Production daemon: `hive worker`
 
-`hive agent [name]` is the built-in loop: after each sync it replies — as the
-workspace's **primary responder** — to any new user turn that is un-mentioned
-or `@primary`, generating the reply with your configured provider and posting
-it back as signed events. It seeds on the existing backlog so it never answers
-history, and idles between polls.
+**`hive worker` is the production way to run agents headless.** It registers the
+box as a workspace host, drains queued `@mentions` for the agents assigned to it,
+and runs them on **workspace-owned** runtime credentials (§12.5) — never a
+personal key. It:
+
+- **claims each turn** before answering, so a worker and a desktop (or another
+  worker) that both own an agent never double-reply the same mention;
+- **survives transient failures** — a store/relay error is logged and retried
+  (with exponential backoff on sync), not fatal to the daemon;
+- **continues agent→agent cascades** across devices, up to a generous per-turn
+  ceiling (a runaway/loop backstop, not a conversation limit), so 2+ agents can
+  hold a real multi-turn thread with no human in the loop;
+- **gates MCP tools** on the triggering author's role (`HIVE_MCP_MIN_ROLE`).
+
+```sh
+export HIVE_DATA_DIR=/var/lib/hive HIVE_RELAY_URL=https://relay.example \
+       HIVE_RELAY_ACCESS_TOKEN=hrt1… HIVE_WORKSPACE=acme HIVE_WORKSPACE_KEY=…
+hive register-worker --label prod-box     # once
+hive set-agent-host acme-bot <host-id>     # assign agents (or from the desktop)
+hive worker --label prod-box               # run the daemon
+```
+
+## `hive agent` — local dev only
+
+`hive agent [name]` is a foreground loop that replies — as the workspace's
+**primary responder** — to any new un-mentioned or `@primary` user turn, using a
+**personal** provider credential. Because a personal key is *not* workspace-owned
+(§12.5), it is a **local-dev convenience only** and refuses to start unless you
+opt in with `HIVE_ALLOW_PERSONAL_AGENT=1`. For anything unattended or shared, use
+`hive worker` above.
 
 ```sh
 export HIVE_DATA_DIR=/var/lib/hive HIVE_RELAY_URL=https://relay.example \
        HIVE_RELAY_ACCESS_TOKEN=hrt1… HIVE_WORKSPACE=acme HIVE_WORKSPACE_KEY=… \
-       HIVE_PROVIDER=anthropic HIVE_MODEL=claude-sonnet-4-5 ANTHROPIC_API_KEY=sk-…
+       HIVE_PROVIDER=anthropic HIVE_MODEL=claude-sonnet-4-5 ANTHROPIC_API_KEY=sk-… \
+       HIVE_ALLOW_PERSONAL_AGENT=1
 hive agent acme-bot
 ```
 
