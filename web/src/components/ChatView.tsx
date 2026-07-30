@@ -487,6 +487,18 @@ export function ChatView({
   }
 
   const messages: ChatMessageDto[] = chat.data?.messages ?? [];
+  // Retire the optimistic echo the moment the persisted user message lands in
+  // the transcript — don't wait for the agent's stream to retire. Waiting made
+  // the sent message double-render (persisted copy + optimistic bubble) for the
+  // whole turn, and never de-dupe at all when the turn stalled (agent stuck on
+  // "thinking"). The just-sent message is the newest, so match on the tail.
+  useEffect(() => {
+    if (!optimisticUser) return;
+    const last = messages[messages.length - 1];
+    if (last && last.role === "user" && last.body === optimisticUser) {
+      setOptimisticUser(null);
+    }
+  }, [messages, optimisticUser]);
   // The only real provenance we have today is the chat's runtime (there's no
   // per-message model/provider on ChatMessageDto). Derive a single "via
   // provider/model" attribution line for agent turns from it.

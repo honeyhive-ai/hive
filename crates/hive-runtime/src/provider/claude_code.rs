@@ -120,6 +120,18 @@ pub async fn stream_reply(
         .stdout
         .take()
         .ok_or_else(|| ProviderError::Subprocess("no stdout".into()))?;
+    // Drain stderr concurrently. Otherwise a chatty CLI — `--verbose` can emit a
+    // lot — fills the OS stderr pipe buffer (~64KB), which blocks the child's
+    // next stderr write, which stops it writing stdout, which hangs our read
+    // loop forever: the UI sits on "thinking" with no error and no output. We
+    // read it in parallel and use the captured text for the failure path below.
+    let stderr_task = child.stderr.take().map(|mut e| {
+        tokio::spawn(async move {
+            let mut buf = String::new();
+            let _ = e.read_to_string(&mut buf).await;
+            buf
+        })
+    });
     let mut reader = BufReader::new(stdout).lines();
 
     let mut assembled = String::new();
@@ -141,11 +153,11 @@ pub async fn stream_reply(
         .wait()
         .await
         .map_err(|e| ProviderError::Subprocess(format!("wait: {e}")))?;
+    let stderr = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
     if !status.success() {
-        let mut stderr = String::new();
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut stderr).await;
-        }
         return Err(ProviderError::Subprocess(format!(
             "{program} exited with {status}: {}",
             stderr.trim()
