@@ -130,6 +130,10 @@ struct AppState {
     gate_runs: Mutex<HashMap<Uuid, Uuid>>,
     /// Runs asked to cancel; their drivers check between transitions.
     canceled_runs: Mutex<std::collections::HashSet<Uuid>>,
+    /// Per-session stop signal for an in-flight chat turn. The composer's Stop
+    /// button fires it; `send_message` races the turn against it and breaks,
+    /// dropping the turn future — which kills any CLI subprocess (kill_on_drop).
+    turn_stops: Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>,
     /// Live relay connection health, updated by the background sync loop's
     /// error/success arms so the UI can distinguish "Live" from a dead relay /
     /// expired token / wrong key instead of showing "Live" forever.
@@ -4365,6 +4369,20 @@ async fn run_prepared_turn(
     }
 }
 
+/// Stop an in-flight turn for a session — the composer's Stop button. Fires the
+/// session's stop signal, which unblocks the `select!` in `send_message` (and
+/// any device running the turn via `maybe_respond`'s equivalent path), aborting
+/// generation. Whatever streamed so far is discarded; the chat is free to accept
+/// a new message immediately. No-op if nothing is generating.
+#[tauri::command]
+fn stop_turn(state: State<AppState>, session_id: String) -> Result<(), String> {
+    let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    if let Some(signal) = state.turn_stops.lock().unwrap().get(&sid) {
+        signal.notify_waiters();
+    }
+    Ok(())
+}
+
 #[tauri::command]
 async fn send_message(
     app: AppHandle,
@@ -4374,6 +4392,9 @@ async fn send_message(
 ) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
     let local_actor_id = state.local_actor_id();
+    // Stop signal for this session's turn(s): the Stop button fires it, breaking
+    // the cascade loop and aborting the in-flight generation below.
+    let stop = state.turn_stops.lock().unwrap().entry(sid).or_default().clone();
 
     // Record the user turn, then decide who (if anyone) answers it.
     let (workspace_id, trigger_id, mut next_target) = {
@@ -4427,7 +4448,14 @@ async fn send_message(
             }
         }
 
-        let reply = run_turn(&app, &state, sid, workspace_id, &responder).await?.body;
+        // Race the turn against the Stop signal. On stop we break out of the
+        // cascade loop; dropping the `run_turn` future aborts generation and
+        // (via kill_on_drop) kills any CLI subprocess mid-flight.
+        let reply = tokio::select! {
+            biased;
+            _ = stop.notified() => break,
+            r = run_turn(&app, &state, sid, workspace_id, &responder) => r?.body,
+        };
         if first_reply.is_none() {
             first_reply = Some(reply.clone());
         }
@@ -5732,6 +5760,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         run_wakers: Mutex::new(HashMap::new()),
         gate_runs: Mutex::new(HashMap::new()),
         canceled_runs: Mutex::new(std::collections::HashSet::new()),
+        turn_stops: Mutex::new(HashMap::new()),
         conn_health: Mutex::new(ConnHealth::default()),
     })
 }
@@ -8304,6 +8333,7 @@ pub fn run() {
             remove_vault,
             preview_vault,
             send_message,
+            stop_turn,
             get_workspace_diffs,
             get_app_settings,
             get_git_status,

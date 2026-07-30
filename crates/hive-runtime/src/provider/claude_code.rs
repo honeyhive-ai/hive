@@ -94,7 +94,11 @@ pub async fn stream_reply(
     cmd.args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Kill the CLI if this future is dropped (e.g. the user hits Stop and the
+        // caller's `select!` aborts the turn) — otherwise the subprocess would
+        // keep generating, orphaned, after we stopped reading it.
+        .kill_on_drop(true);
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }

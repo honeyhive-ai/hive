@@ -80,7 +80,9 @@ pub async fn run_with(
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Kill the agent if this future is dropped (Stop button aborts the turn).
+        .kill_on_drop(true);
     for (k, v) in envs {
         cmd.env(k, v);
     }

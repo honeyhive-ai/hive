@@ -81,6 +81,11 @@ export const getContextTelemetry = (sessionId: string) =>
 export const sendMessage = (sessionId: string, body: string) =>
   invoke<void>("send_message", { sessionId, body });
 
+/// Stop the in-flight turn for a session (the composer's Stop button). Aborts
+/// generation and kills any CLI subprocess; safe no-op if nothing is running.
+export const stopTurn = (sessionId: string) =>
+  invoke<void>("stop_turn", { sessionId });
+
 /// Replace the last assistant/agent turn with a fresh generation.
 export const regenerate = (sessionId: string) =>
   invoke<void>("regenerate", { sessionId });

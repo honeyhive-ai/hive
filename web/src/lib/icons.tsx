@@ -57,6 +57,13 @@ export const IconSend = ({ size = 18 }: P) => (
     <path d="m5 12 7-7 7 7" />
   </Icon>
 );
+// Stop generating: a filled rounded square (reads as "stop", distinct from the
+// send arrow). Filled so it stands out as an interrupt affordance.
+export const IconStop = ({ size = 18 }: P) => (
+  <Icon size={size}>
+    <rect x="6.5" y="6.5" width="11" height="11" rx="2.5" fill="currentColor" stroke="none" />
+  </Icon>
+);
 export const IconPaperclip = ({ size }: P) => (
   <Icon size={size}>
     <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />

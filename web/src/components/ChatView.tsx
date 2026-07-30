@@ -12,6 +12,7 @@ import {
   saveAttachment,
   readWorkspaceFile,
   sendMessage,
+  stopTurn,
   regenerate,
   summarizeChat,
   compactChat,
@@ -31,6 +32,7 @@ import {
   IconRegenerate,
   IconSmile,
   IconSend,
+  IconStop,
   IconPaperclip,
   IconFile,
   IconImage,
@@ -485,6 +487,25 @@ export function ChatView({
       qc.invalidateQueries({ queryKey: ["chats"] });
     }
   }
+
+  // Stop the in-flight turn and free the composer immediately. The backend
+  // aborts generation (killing any CLI subprocess); locally we drop the live
+  // streams, the "thinking"/sending state, and the optimistic echo so the user
+  // can send a new message right away rather than waiting for a stuck turn.
+  async function handleStop() {
+    try {
+      await stopTurn(sessionId);
+    } catch (e) {
+      toast.error(`Couldn't stop: ${errMsg(e)}`);
+    } finally {
+      setStreams(new Map());
+      setSending(false);
+      setOptimisticUser(null);
+      qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+    }
+  }
+  // A turn is in flight whenever we're sending or a stream is live.
+  const busy = sending || streams.size > 0;
 
   const messages: ChatMessageDto[] = chat.data?.messages ?? [];
   // Retire the optimistic echo the moment the persisted user message lands in
@@ -942,15 +963,27 @@ export function ChatView({
                 >
                   @file
                 </button>
-                <button
-                  onClick={handleSend}
-                  disabled={sending || (!input.trim() && attachments.length === 0)}
-                  className="send"
-                  aria-label="Send message"
-                  title="Send (Enter)"
-                >
-                  <IconSend size={15} />
-                </button>
+                {busy ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleStop()}
+                    className="send"
+                    aria-label="Stop generating"
+                    title="Stop generating"
+                  >
+                    <IconStop size={15} />
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleSend}
+                    disabled={!input.trim() && attachments.length === 0}
+                    className="send"
+                    aria-label="Send message"
+                    title="Send (Enter)"
+                  >
+                    <IconSend size={15} />
+                  </button>
+                )}
               </div>
             </div>
 
