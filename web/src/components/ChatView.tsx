@@ -194,20 +194,31 @@ export function ChatView({
         if (e.phase === "error") {
           setStreamError(e.text?.trim() || "Generation failed or was interrupted.");
         }
-        qc.invalidateQueries({ queryKey: ["chat", sessionRef.current] });
-        qc.invalidateQueries({ queryKey: ["chats"] });
-        setStreams((prev) => {
-          const next = retireStream(prev, e.messageId);
-          // Clear the shared "sending"/optimistic state only when the LAST live
-          // stream retires — a sibling parallel workflow-stage stream may still
-          // be generating, so clearing on the first completion read as "done"
-          // while others were mid-flight.
-          if (next.size === 0) {
-            setSending(false);
-            setOptimisticUser(null);
-          }
-          return next;
-        });
+        // Land the persisted turn in the transcript BEFORE retiring its live
+        // stream bubble. If we retire first, the streamed text vanishes for a
+        // frame (stream gone, refetch not back yet) and the bottom-anchor spacer
+        // recomputes — so the whole thread visibly jumps up then drops. Refetch,
+        // then retire, so the persisted copy replaces the bubble seamlessly.
+        const mid = e.messageId;
+        const retire = () =>
+          setStreams((prev) => {
+            const next = retireStream(prev, mid);
+            // Clear the shared "sending"/optimistic state only when the LAST live
+            // stream retires — a sibling parallel workflow-stage stream may still
+            // be generating, so clearing on the first completion read as "done"
+            // while others were mid-flight.
+            if (next.size === 0) {
+              setSending(false);
+              setOptimisticUser(null);
+            }
+            return next;
+          });
+        void qc
+          .invalidateQueries({ queryKey: ["chat", sessionRef.current] })
+          .finally(() => {
+            void qc.invalidateQueries({ queryKey: ["chats"] });
+            retire();
+          });
       }
     });
     return () => {
@@ -657,11 +668,12 @@ export function ChatView({
               turns exist, so the empty-state card keeps its top placement. */}
           {messages.length > 0 && <div className="flex-1" aria-hidden />}
           {messages
-            // A message that's mid-stream is rendered by the live `streams`
-            // bubble below; skip its (partially-flushed) transcript copy so it
-            // doesn't render twice — happens whenever the chat query refetches
-            // mid-stream (reactions, parallel workflow stages).
-            .filter((m) => !(m.isStreaming && streams.has(m.id)))
+            // Hide a message's persisted copy while its live `streams` bubble is
+            // still shown — not just mid-stream but through the completion
+            // handoff (we keep the bubble until the refetch lands, above). The
+            // stream bubble is the single source until it retires, so this never
+            // renders the turn twice, and the swap is seamless (no anchor jump).
+            .filter((m) => !streams.has(m.id))
             .map((m) => {
               const rosterAgent = m.role === "user" || m.role === "system" ? undefined : agentByName.get(m.author);
               // A workspace-owned agent (empty ownerActorId) is a "shared" turn
