@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "Hive"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.22.1",
  "dunce",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "hive-core",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "hive-core"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek 2.2.0",
@@ -2438,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "hive-proto"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "ts-rs",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "hive-relay"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2463,7 +2463,7 @@ dependencies = [
 
 [[package]]
 name = "hive-runtime"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",

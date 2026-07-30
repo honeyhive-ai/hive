@@ -255,10 +255,9 @@ agents it hosts — the production way to keep agents responsive when no desktop
 open. It runs on **workspace-owned** credentials (never a personal key, §12.5);
 see [Configure a worker](#run-a-headless-worker) below.
 
-> **Status.** Hive is under active development and current releases are tagged as
-> previews (`0.2.x`). Installers are unsigned for now, so macOS/Windows may warn
-> on first open. A Homebrew cask is being prepared under
-> [`deploy/homebrew`](deploy/homebrew).
+> **Status.** Hive is at its first stable release (`1.0.0`). Installers are
+> unsigned for now, so macOS/Windows may warn on first open. A Homebrew cask is
+> being prepared under [`deploy/homebrew`](deploy/homebrew).
 
 ### A first workspace
 
