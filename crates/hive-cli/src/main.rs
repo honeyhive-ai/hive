@@ -573,7 +573,40 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
         if cfg.relay_url.is_some() {
             let _ = sync_once(cfg).await;
         }
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Sleep until the next tick, but wake immediately on a shutdown signal so
+        // a redeploy/stop (SIGTERM) or Ctrl-C exits cleanly between ticks rather
+        // than being SIGKILLed mid-poll.
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+            _ = shutdown_signal() => {
+                println!("worker: shutdown signal received — stopping.");
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Resolves when the process receives SIGTERM (orchestrator stop/redeploy) or
+/// SIGINT (Ctrl-C), so the worker loop can exit gracefully.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -611,6 +644,12 @@ async fn drain_worker_tick(
         };
         if id == workspace_config_session_id(s.workspace_id) {
             continue;
+        }
+        // Bound the hard-failed set over a long uptime — past a generous cap,
+        // drop it so transiently-failed mentions get another chance and memory
+        // can't creep unbounded.
+        if failed.len() >= 8192 {
+            failed.clear();
         }
         for pm in pending_mentions(&s) {
             if !hosted.contains(&pm.agent_id) || failed.contains(&pm.message_id) {
