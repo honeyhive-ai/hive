@@ -40,6 +40,9 @@ export function AddWorkspaceModal({ open, onClose }: { open: boolean; onClose: (
   async function refresh() {
     await qc.invalidateQueries({ queryKey: ["workspaces"] });
     await qc.invalidateQueries({ queryKey: ["chats"] });
+    // Channels are workspace-scoped too — refresh them or the new workspace can
+    // briefly show the previous one's channels until another refetch lands.
+    await qc.invalidateQueries({ queryKey: ["channels"] });
     await qc.invalidateQueries({ queryKey: ["sync-status"] });
   }
 

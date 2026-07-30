@@ -99,8 +99,14 @@ export function Sidebar({
   utilityPane: UtilityPane;
 }) {
   const qc = useQueryClient();
-  const chats = useQuery({ queryKey: ["chats"], queryFn: listChats });
-  const channels = useQuery({ queryKey: ["channels"], queryFn: listChannels });
+  // Scope chats + channels by the active workspace (its path). listChats /
+  // listChannels return the *active* workspace's data, so a global key let one
+  // workspace's cache bleed into another after a create/switch that didn't
+  // invalidate it — e.g. a fresh workspace briefly showing the previous
+  // workspace's channels. Keying on the path makes the switch refetch fresh
+  // (invalidateQueries(["chats"]) still prefix-matches these).
+  const chats = useQuery({ queryKey: ["chats", workspacePath], queryFn: listChats });
+  const channels = useQuery({ queryKey: ["channels", workspacePath], queryFn: listChannels });
   const mentionStates = useQuery({ queryKey: ["mention-states"], queryFn: listMentionStates });
   const settings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
   const members = useQuery({
