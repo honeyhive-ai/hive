@@ -205,22 +205,19 @@ with one agent.
 
 ---
 
-## 9. `right-rail-files.png` — used by `features/right-rail.md`
+## 9. `right-rail.png` — used by `features/right-rail.md`
 
-> ⚠️ **Verify against the live UI — the "Files" pane was removed.** The current
-> right-rail panes are **Tools · Context · Review · People · Vaults · Skills ·
-> Workflows · Activity**; there is no standalone "Files" pane. The
-> "read what the agent is reading" surface now lives under **Tools** (file
-> access) / **Context**. Before shooting: decide whether to (a) retarget this
-> shot to the current file/context surface and keep the name, or (b) rename it
-> and update `features/right-rail.md`, which still describes a "Files" pane.
+*(Renamed from `right-rail-files.png` — the standalone "Files" pane no longer
+exists. The page + gallery now reference `right-rail.png`.)*
 
-**State.** The right-rail pane that shows workspace files / what the agent reads.
+**State.** The right rail with the **Tools** pane active, so the shot conveys the
+pane switcher plus a populated pane.
 
-**Recipe.** Open that pane, select a file (e.g. a `README.md` in the workspace),
-and capture the tree + preview.
+**Recipe.** Open the right rail and select **Tools** (🛠). Have at least one
+workspace agent + the active runtime showing so the pane isn't empty.
 
-**Must be visible.** The right-rail pane icons + the file tree and a file preview.
+**Must be visible.** The vertical **icon strip** (Tools · Context · Review ·
+People · Vaults · Skills · Workflows · Activity) and the populated Tools pane.
 
 ---
 
@@ -360,7 +357,7 @@ claimed turns (or `hive --help`). This is a **terminal** shot, not the app.
 - **`providers-add.png`** — Settings → **Models & runtimes** with the **"Add a
   provider…"** selector open (OpenAI, OpenRouter, Azure, Ollama, …).
 - **`settings-appearance.png`** — Settings → **Appearance**: palette swatches
-  (Studio/Harbor/Meadow/Midnight) + light/dark toggle.
+  (Pollen/Studio/Harbor/Meadow/Midnight) + light/dark toggle.
 
 > `rendezvous-flow.png` (in the gallery) is a **diagram**, not a UI screenshot —
 > it's out of scope for this capture pass.
@@ -378,7 +375,7 @@ cd docs-site/images && ls -1 *.png
 # Referenced by docs pages (11 total; ✅ = already captured):
 #   agents-pane.png            collaborators.png        first-chat-empty.png
 #   invite-pane.png            onboarding-identity.png ✅ onboarding-runtime.png
-#   onboarding-welcome.png ✅   right-rail-files.png     settings-general.png
+#   onboarding-welcome.png ✅   right-rail.png           settings-general.png
 #   settings-runtimes.png      settings-team-members.png
 #
 # Gallery-only / optional (not required by the build):

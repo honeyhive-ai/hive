@@ -2,13 +2,14 @@
 
 Hive's Settings view is organized into **tabs**, so the page isn't one
 overwhelming scroll — only the active tab mounts. The tabs are
-**Account**, **Models**, **Tools**, **Schedules**, **Team**,
-**Workspace**, and **Appearance**. Workspace-scoped config (runtimes,
-MCP servers) is written back to `hive.config.toml`; connection settings
-persist to a `settings.json` in the app data dir; the theme is stored
-locally per device.
+**Account**, **Appearance**, **Folder & Git**, **Team sync**,
+**Schedules**, **Models & runtimes**, **Tools & MCP**, **Permissions**,
+**Updates & data**, and **Danger zone**. Workspace-scoped config
+(runtimes, MCP servers) is written back to `hive.config.toml`; connection
+settings persist to a `settings.json` in the app data dir; the theme is
+stored locally per device.
 
-![Settings — Models tab](../images/settings-general.png){ width="900" }
+![Settings — Account tab](../images/settings-general.png){ width="900" }
 
 ## Account
 
@@ -22,62 +23,23 @@ locally per device.
   to **one member, two devices**. See
   [Identity & devices](../concepts/identity.md). Official builds ship
   with the OAuth App client id baked in; forks can paste their own.
-- **Check for updates** — the auto-updater is scaffolded and activates
-  at public launch (for signed builds); on current unsigned dists it's
-  inert.
 
-### Danger zone — Reset local data
+## Appearance
 
-The bottom of the Account tab has a **Danger zone** with **"Reset local
-data"**: it wipes this device's chats, identity, keys, settings, and
-workspaces, then relaunches Hive fresh. It's the supported way to start
-over — uninstalling leaves data behind. See
-[Reset local data](../getting-started/first-launch.md#reset-local-data)
-for the per-OS data directories.
+- **Mode** — `Auto` (follows your OS light/dark setting, any platform),
+  `Light`, or `Dark`.
+- **Theme** — the accent family: **pollen** (the honey-gold default),
+  **studio** (neutral graphite), **harbor** (ocean blue), **meadow**
+  (green), or **midnight** (deep indigo). Each has a light and a dark
+  variant; the mode picks which.
 
-## Models
+## Folder & Git
 
-LLM access is organized as a hierarchy:
+The workspace **root path** (drives the Diff canvas + git integration),
+a one-line git status (current **branch** + **changed-file count**), and
+an **Open in editor** shortcut. See [Git integration](git.md).
 
-- **Providers** — `anthropic`, `openAI`, `openRouter`, `ollama`,
-  `azure` (Azure OpenAI), `custom`, plus the `claude` CLI (**Claude
-  Code**) and the subprocess agents `pi` / `aider`. Each provider holds
-  its **own API key** and optional base URL (so multiple providers can
-  have distinct keys, including any generic OpenAI-compatible endpoint).
-- **Models (runtimes)** — a model on a provider (id + capability flags).
-  The add form includes an optional **Context window in tokens** — set
-  it for Ollama/custom models whose window Hive can't infer from the
-  name; the [context planner](voice-and-slash.md) budgets against it.
-- **Agents** — reusable personas (name + model/runtime + role +
-  instructions) you can attach to any chat.
-
-The default runtime is the **`claude` CLI** — no API key needed, it uses
-your Claude subscription. See
-[Configuring a runtime](../getting-started/configuring-a-runtime.md).
-
-### Context commands
-
-The instructions behind `/summarize` and `/compact` are editable here —
-blank uses the built-in default (shown as the placeholder). The
-`/summarize` instruction also guides the automatic summarization of
-overflowed history. See
-[Managing context](voice-and-slash.md#customizing-the-instructions).
-
-## Tools
-
-Install / enable / remove **Model Context Protocol (MCP) servers**. An
-installed server stays **inert until you enable it** — enabling is what
-launches the command or opens the connection, and only enabled servers
-expose their tools to agents. Two transports: `stdio` (Hive spawns the
-binary) and `http`. See [MCP servers](../addons/mcp.md).
-
-## Schedules
-
-Define **scheduled agents** — recurring runs that kick off a chat turn
-on a cron-like schedule without you present. See
-[Scheduled agents](scheduling.md) for the full walkthrough.
-
-## Team
+## Team sync
 
 Everything needed to share a workspace, editable at runtime (applied
 within a few seconds, no restart). Teams are normally created/joined
@@ -109,9 +71,9 @@ See [Self-hosting a relay](../networking/self-host.md), the
 
 ![Team members panel](../images/settings-team-members.png){ width="800" }
 
-On a relay that supports it, the Team tab also has a **Team members**
-panel for managing who may sync — durable, with no redeploy and instant
-revocation:
+On a relay that supports it, the Team sync tab also has a **Team
+members** panel for managing who may sync — durable, with no redeploy and
+instant revocation:
 
 - **Add member** — give a name (and optionally their GitHub login); Hive
   creates the user on the relay and shows a **one-time access token**.
@@ -132,11 +94,52 @@ instead. Managing members needs you signed in to GitHub
 (Settings → Account). See
 [Managing relay access](../networking/self-host.md#managing-relay-access).
 
-### Agent file access
+## Schedules
 
-Also on the Team tab: how agents are allowed to touch files — and this
-differs **per agent type** (Claude Code is not the only agent that edits
-files):
+Define **scheduled agents** — recurring runs that kick off a chat turn
+on a cron-like schedule without you present. See
+[Scheduled agents](scheduling.md) for the full walkthrough.
+
+## Models & runtimes
+
+LLM access is organized as a hierarchy:
+
+- **Providers** — `anthropic`, `openAI`, `openRouter`, `ollama`,
+  `azure` (Azure OpenAI), `custom`, plus the `claude` CLI (**Claude
+  Code**) and the subprocess agents `pi` / `aider`. Each provider holds
+  its **own API key** and optional base URL (so multiple providers can
+  have distinct keys, including any generic OpenAI-compatible endpoint).
+- **Models (runtimes)** — a model on a provider (id + capability flags).
+  The add form includes an optional **Context window in tokens** — set
+  it for Ollama/custom models whose window Hive can't infer from the
+  name; the [context planner](voice-and-slash.md) budgets against it.
+- **Agents** — reusable personas (name + model/runtime + role +
+  instructions) you can attach to any chat.
+
+The default runtime is the **`claude` CLI** — no API key needed, it uses
+your Claude subscription. See
+[Configuring a runtime](../getting-started/configuring-a-runtime.md).
+
+### Context commands
+
+The instructions behind `/summarize` and `/compact` are editable here —
+blank uses the built-in default (shown as the placeholder). The
+`/summarize` instruction also guides the automatic summarization of
+overflowed history. See
+[Managing context](voice-and-slash.md#customizing-the-instructions).
+
+## Tools & MCP
+
+Install / enable / remove **Model Context Protocol (MCP) servers**. An
+installed server stays **inert until you enable it** — enabling is what
+launches the command or opens the connection, and only enabled servers
+expose their tools to agents. Two transports: `stdio` (Hive spawns the
+binary) and `http`. See [MCP servers](../addons/mcp.md).
+
+## Permissions
+
+How agents are allowed to touch files — and this differs **per agent
+type** (Claude Code is not the only agent that edits files):
 
 - **`claude` permission mode** — `Read-only` (default; proposes edits
   but blocks writes), `Accept edits` (can write files), or `Bypass all`
@@ -145,22 +148,24 @@ files):
   prompt.
 - **aider / pi** gate via their own flags.
 - **API/MCP-backed agents** can only call the MCP tools you've
-  **enabled** on the Tools tab — an installed-but-disabled server is
-  inert, so nothing runs until you turn it on.
+  **enabled** on the Tools & MCP tab — an installed-but-disabled server
+  is inert, so nothing runs until you turn it on.
 
-## Workspace
+## Updates & data
 
-The workspace **root path** (drives the Diff canvas + git integration),
-a one-line git status (current **branch** + **changed-file count**), and
-an **Open in editor** shortcut. See [Git integration](git.md).
+- **Check for updates** — the auto-updater is scaffolded and activates
+  at public launch (for signed builds); on current unsigned dists it's
+  inert. A lightweight version check still notifies you when a newer
+  release is published.
+- **Export data** — download a copy of this device's local data.
 
-## Appearance
+## Danger zone
 
-- **Mode** — `Auto` (follows your OS light/dark setting, any platform),
-  `Light`, or `Dark`.
-- **Theme** — the accent family: **pollen** (the honey-gold default),
-  **studio** (neutral graphite), **harbor** (ocean blue), or **meadow**
-  (green). Each has a light and a dark variant; the mode picks which.
+**Reset local data** wipes this device's chats, identity, keys,
+settings, and workspaces, then relaunches Hive fresh. It's the supported
+way to start over — uninstalling leaves data behind. See
+[Reset local data](../getting-started/first-launch.md#reset-local-data)
+for the per-OS data directories.
 
 ## Notes
 
@@ -168,7 +173,7 @@ an **Open in editor** shortcut. See [Git integration](git.md).
   chat's primary runtime — no setting required. Rename any chat with the
   ✎ pencil next to its title.
 - **System tray / menu bar** — the tray icon's menu jumps straight to
-  **Friends**, **Team & Relay Sync** (this page's Team tab), and
+  **Friends**, **Team & Relay Sync** (this page's Team sync tab), and
   **Settings**, besides showing/quitting the app.
 - **Focus mode** — collapse the sidebar with **⌘B** (or the panel button
   at the bottom of the workspace rail) and the tools rail with **⌘J** (or

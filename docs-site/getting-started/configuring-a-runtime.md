@@ -7,7 +7,7 @@ session.
 
 Open **Settings → Models** to add or edit.
 
-![Settings → Models tab](../images/settings-runtimes.png){ width="800" }
+![Settings → Models & runtimes tab](../images/settings-runtimes.png){ width="800" }
 
 ## Supported providers
 
