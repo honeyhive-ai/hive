@@ -1411,6 +1411,32 @@ pub fn pending_mentions(session: &ChatSession) -> Vec<PendingMention> {
             }
         }
     }
+    // Cross-device cascade: the trailing message is an agent reply that @mentions
+    // another agent (not itself). It's actionable work for that agent's worker,
+    // which — unlike the desktop's inline loop — otherwise never sees it. Bound by
+    // cascade depth so an A↔B chain across devices/workers can't loop forever.
+    if let Some(last) = session.messages.iter().rev().find(|m| m.role != MessageRole::System) {
+        if matches!(last.role, MessageRole::Assistant | MessageRole::Agent)
+            && session.cascade_depth() < hive_core::MAX_CASCADE_DEPTH
+        {
+            let targets = crate::mentions::parse_mentions(&last.body, session);
+            for aid in &targets.agents {
+                let Some(agent) = session.workspace_agents.iter().find(|a| &a.id == aid) else {
+                    continue;
+                };
+                if agent.name == last.author {
+                    continue; // an agent mentioning itself never re-triggers
+                }
+                out.retain(|p| p.agent_id != *aid);
+                out.push(PendingMention {
+                    session_id: session.id,
+                    message_id: last.id,
+                    agent_id: *aid,
+                    agent_name: agent.name.clone(),
+                });
+            }
+        }
+    }
     out
 }
 
@@ -1559,6 +1585,30 @@ mod tests {
         svc.post_user_message(chat.id, wid, "@reviewer another").unwrap();
         let s = svc.load(chat.id).unwrap().unwrap();
         assert_eq!(pending_mentions(&s).len(), 1, "a new unanswered mention re-queues");
+    }
+
+    #[test]
+    fn pending_mentions_surfaces_trailing_agent_cascade_not_self() {
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let sid = svc.create_chat("c", wid, "anthropic").unwrap().id;
+        let scout = WorkspaceAgent::new("Scout", "r");
+        let nova = WorkspaceAgent::new("Nova", "r");
+        let nova_id = nova.id;
+        svc.add_agent(sid, wid, scout).unwrap();
+        svc.add_agent(sid, wid, nova).unwrap();
+        svc.post_user_message(sid, wid, "kick off").unwrap();
+        // Scout replies, @mentioning Nova AND itself — Nova becomes cross-device
+        // cascade work (a worker can pick it up); Scout's self-mention must not.
+        let m = svc.begin_assistant_message(sid, wid, "Scout", "r", None).unwrap();
+        svc.complete_assistant_message(sid, wid, m, "@Nova your turn — I (@Scout) am done").unwrap();
+        let s = svc.load(sid).unwrap().unwrap();
+        let pend = pending_mentions(&s);
+        assert!(pend.iter().any(|p| p.agent_id == nova_id), "Nova's cascade mention is queued");
+        assert!(
+            !pend.iter().any(|p| p.agent_name == "Scout"),
+            "an agent's self-mention never re-triggers itself"
+        );
     }
 
     #[test]

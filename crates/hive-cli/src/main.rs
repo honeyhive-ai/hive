@@ -344,6 +344,17 @@ fn resolve_agent_runtime(cfg: &Config, runtime_id: Option<&str>) -> Result<(Reso
 /// runtime (a workspace-owned one with `--runtime`, else the personal env), and
 /// post + sync the reply back as signed events.
 async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Result<()> {
+    // §12.5: a detached agent must run on a WORKSPACE-owned credential, never a
+    // personal key. `hive agent` resolves a personal/local runtime, so it is a
+    // local-dev convenience only — the production daemon is `hive worker`, which
+    // requires a workspace-owned runtime. Refuse to run unattended in production
+    // unless explicitly opted in for dev.
+    if std::env::var("HIVE_ALLOW_PERSONAL_AGENT").is_err() {
+        bail!(
+            "`hive agent` runs on a personal credential, which isn't workspace-owned (\u{a7}12.5) — \
+             use `hive worker` for production. For local dev only, set HIVE_ALLOW_PERSONAL_AGENT=1."
+        );
+    }
     // Pull config first so a `--runtime` workspace runtime is available.
     if cfg.relay_url.is_some() {
         let _ = sync_once(cfg).await;
@@ -538,89 +549,148 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
     println!("worker {my_host} online — draining queued mentions for its agents. Ctrl-C to stop.");
     // Mentions whose reply hard-failed, so we don't retry them every tick.
     let mut failed: HashSet<Uuid> = HashSet::new();
+    // Exponential backoff on repeated relay-sync failures, so a relay outage
+    // isn't hammered every 3s. Resets to the base cadence on the first success.
+    let mut sync_fails: u32 = 0;
     loop {
         if cfg.relay_url.is_some() {
-            if let Err(e) = sync_once(cfg).await {
-                eprintln!("sync: {e}");
-            }
-        }
-        let mut svc = open_service(cfg)?;
-        // Heartbeat presence (throttled), so peers see this worker as online.
-        let _ = svc.touch_host(ws, &my_host, 60);
-        let hosted: HashSet<Uuid> = svc
-            .load(workspace_config_session_id(ws))?
-            .map(|s| s.workspace_agents)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|a| a.host_id == my_host)
-            .map(|a| a.id)
-            .collect();
-        let runtimes = svc.list_workspace_runtimes(ws)?;
-        for id in svc.store().list_session_ids()? {
-            let Some(s) = svc.load(id)? else { continue };
-            if id == workspace_config_session_id(s.workspace_id) {
-                continue;
-            }
-            for pm in pending_mentions(&s) {
-                if !hosted.contains(&pm.agent_id) || failed.contains(&pm.message_id) {
+            match sync_once(cfg).await {
+                Ok(_) => sync_fails = 0,
+                Err(e) => {
+                    sync_fails = sync_fails.saturating_add(1);
+                    let secs = (3u64 << sync_fails.min(5)).min(120); // 6,12,24,48,96,120…
+                    eprintln!("sync: {e} — retrying in {secs}s");
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
                     continue;
-                }
-                let Some(agent) = s.workspace_agents.iter().find(|a| a.id == pm.agent_id) else {
-                    continue;
-                };
-                let (rt, rt_label) = match agent_workspace_runtime(&runtimes, agent) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("skip @{}: {e}", agent.name);
-                        failed.insert(pm.message_id);
-                        continue;
-                    }
-                };
-                let turns = turns_for(&s, Some(agent.id), &agent.name);
-                let system = format!(
-                    "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.",
-                    agent.name
-                );
-                print!("↳ @{} replying in {} … ", agent.name, s.id);
-                // H1 gate: resolve the triggering message's author + role and
-                // only execute MCP tools when they clear HIVE_MCP_MIN_ROLE
-                // (default Contributor). Unresolved author → fail closed. An
-                // under-privileged requester still gets a tool-free reply.
-                let author_role = s
-                    .messages
-                    .iter()
-                    .find(|m| m.id == pm.message_id)
-                    .and_then(|m| m.actor_identity.as_ref())
-                    .map(|a| s.role_of(&a.id));
-                let min_role = reply::mcp_min_role();
-                let allow_mcp = reply::mcp_allowed_for(author_role, min_role);
-                if !allow_mcp {
-                    eprintln!(
-                        "withholding MCP tools for message {} — author role {:?} below minimum {:?}",
-                        pm.message_id, author_role, min_role
-                    );
-                }
-                // MCP tools when HIVE_MCP_CONFIG provisions them and the gate
-                // allows, else a plain stream.
-                match reply::generate_reply(&rt, &system, &turns, allow_mcp).await {
-                    Ok(reply) => {
-                        let mid = svc.begin_assistant_message(s.id, s.workspace_id, agent.name.clone(), rt_label.clone(), Some(agent.id))?;
-                        svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
-                        println!("done");
-                    }
-                    Err(e) => {
-                        println!("failed: {e}");
-                        failed.insert(pm.message_id);
-                    }
                 }
             }
         }
-        drop(svc);
+        // A transient store/DB error inside a tick must NOT kill the daemon —
+        // log it and retry on the next tick (bare `?` here used to abort the loop).
+        if let Err(e) = drain_worker_tick(cfg, ws, &my_host, &mut failed).await {
+            eprintln!("worker: tick failed (retrying): {e}");
+        }
         if cfg.relay_url.is_some() {
             let _ = sync_once(cfg).await;
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
+}
+
+/// One drain pass: answer every queued mention for an agent this worker hosts
+/// that another device hasn't already claimed. Returns `Err` only on a
+/// tick-fatal store error (the caller logs and retries) — per-mention failures
+/// are isolated so one bad mention can't abort the whole pass.
+async fn drain_worker_tick(
+    cfg: &Config,
+    ws: Uuid,
+    my_host: &str,
+    failed: &mut HashSet<Uuid>,
+) -> Result<()> {
+    let mut svc = open_service(cfg)?;
+    // Heartbeat presence (throttled), so peers see this worker as online.
+    let _ = svc.touch_host(ws, my_host, 60);
+    let hosted: HashSet<Uuid> = svc
+        .load(workspace_config_session_id(ws))?
+        .map(|s| s.workspace_agents)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.host_id == my_host)
+        .map(|a| a.id)
+        .collect();
+    let runtimes = svc.list_workspace_runtimes(ws)?;
+    for id in svc.store().list_session_ids()? {
+        // Skip a session that fails to load rather than aborting the whole tick.
+        let s = match svc.load(id) {
+            Ok(Some(s)) => s,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("worker: load {id} failed: {e}");
+                continue;
+            }
+        };
+        if id == workspace_config_session_id(s.workspace_id) {
+            continue;
+        }
+        for pm in pending_mentions(&s) {
+            if !hosted.contains(&pm.agent_id) || failed.contains(&pm.message_id) {
+                continue;
+            }
+            let Some(agent) = s.workspace_agents.iter().find(|a| a.id == pm.agent_id) else {
+                continue;
+            };
+            // Claim the turn so a worker and the agent-owner's desktop (or another
+            // worker) don't both answer the same mention. Back off if we lost.
+            match svc.claim_turn(s.id, s.workspace_id, pm.message_id) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(e) => {
+                    eprintln!("worker: claim {} failed: {e}", pm.message_id);
+                    continue;
+                }
+            }
+            let (rt, rt_label) = match agent_workspace_runtime(&runtimes, agent) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("skip @{}: {e}", agent.name);
+                    failed.insert(pm.message_id);
+                    continue;
+                }
+            };
+            let turns = turns_for(&s, Some(agent.id), &agent.name);
+            let system = format!(
+                "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.",
+                agent.name
+            );
+            print!("↳ @{} replying in {} … ", agent.name, s.id);
+            // H1 gate: resolve the triggering message's author + role and only
+            // execute MCP tools when they clear HIVE_MCP_MIN_ROLE (default
+            // Contributor). Unresolved author → fail closed.
+            let author_role = s
+                .messages
+                .iter()
+                .find(|m| m.id == pm.message_id)
+                .and_then(|m| m.actor_identity.as_ref())
+                .map(|a| s.role_of(&a.id));
+            let min_role = reply::mcp_min_role();
+            let allow_mcp = reply::mcp_allowed_for(author_role, min_role);
+            if !allow_mcp {
+                eprintln!(
+                    "withholding MCP tools for message {} — author role {:?} below minimum {:?}",
+                    pm.message_id, author_role, min_role
+                );
+            }
+            match reply::generate_reply(&rt, &system, &turns, allow_mcp).await {
+                Ok(reply) => {
+                    // Persist the reply defensively — a begin/complete failure logs
+                    // and moves on instead of tearing down the daemon.
+                    match svc.begin_assistant_message(
+                        s.id,
+                        s.workspace_id,
+                        agent.name.clone(),
+                        rt_label.clone(),
+                        Some(agent.id),
+                    ) {
+                        Ok(mid) => {
+                            if let Err(e) =
+                                svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)
+                            {
+                                eprintln!("worker: complete failed: {e}");
+                            } else {
+                                println!("done");
+                            }
+                        }
+                        Err(e) => eprintln!("worker: begin failed: {e}"),
+                    }
+                }
+                Err(e) => {
+                    println!("failed: {e}");
+                    failed.insert(pm.message_id);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Show queued work — unanswered agent mentions — and whether each agent's host

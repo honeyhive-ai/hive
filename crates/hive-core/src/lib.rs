@@ -54,7 +54,7 @@ pub use policy::{PermissionPolicy, PermissionScope, Workspace};
 pub use proposals::{ActionProposal, ProposalApproval, ProposalKind, ProposalStatus};
 pub use runtime::{ModelProviderKind, RuntimeCapabilities, RuntimeLocation, RuntimeTarget};
 pub use schedule::ScheduleTrigger;
-pub use session::ChatSession;
+pub use session::{ChatSession, MAX_CASCADE_DEPTH};
 pub use skills::SkillProfile;
 pub use time_util::Timestamp;
 pub use vault::{MountedVault, VaultSource};

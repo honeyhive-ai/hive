@@ -51,7 +51,8 @@ const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 const OUTPUT_RESERVE_TOKENS: i64 = 4096;
 const SUMMARY_RESERVE_TOKENS: i64 = 700;
 /// Max chained agent turns from one user message (loop guard for cascades).
-const MAX_CASCADE_DEPTH: usize = 4;
+/// Shared with the worker via hive-core so the bound holds across devices.
+use hive_core::MAX_CASCADE_DEPTH;
 
 /// Upper bound on remembered "already notified" mention ids (see `AppState::notified`).
 const NOTIFIED_CAP: usize = 1024;
@@ -3572,23 +3573,8 @@ fn dispatch_target(body: &str, session: &ChatSession) -> Option<DispatchTarget> 
     (human_member_count(session) <= 1).then_some(DispatchTarget::Primary)
 }
 
-/// How many consecutive agent/assistant replies trail the transcript back to the
-/// last human turn — the cross-device cascade depth. The inline `visited` set
-/// bounds a cascade *within* one device; this bounds it *across* devices (A on
-/// one device @mentions B on another, B @mentions A, …), since the transcript is
-/// synced and every device counts the same. A reply is only dispatched when this
-/// is below `MAX_CASCADE_DEPTH`.
-fn cascade_depth(session: &ChatSession) -> usize {
-    let mut n = 0;
-    for m in session.messages.iter().rev() {
-        match m.role {
-            MessageRole::System => continue,
-            MessageRole::Assistant | MessageRole::Agent => n += 1,
-            MessageRole::User => break,
-        }
-    }
-    n
-}
+// `cascade_depth` now lives on `hive_core::ChatSession` (shared with the worker
+// so the cross-device bound is identical on every device).
 
 /// Window the history to the model budget and, if anything overflows,
 /// summarize it (cached incrementally per session) and prepend the summary to
@@ -4580,7 +4566,7 @@ async fn maybe_respond(
             // A↔B cascade across devices can't loop forever, and never re-answer
             // as the replier itself.
             Some(m) if matches!(m.role, MessageRole::Assistant | MessageRole::Agent) => {
-                if cascade_depth(&session) >= MAX_CASCADE_DEPTH {
+                if session.cascade_depth() >= MAX_CASCADE_DEPTH {
                     None
                 } else {
                     parse_mentions(&m.body, &session)
@@ -8462,7 +8448,7 @@ mod bounded_id_set_tests {
 
 #[cfg(test)]
 mod export_tests {
-    use super::{cascade_depth, chat_markdown, export_filename};
+    use super::{chat_markdown, export_filename};
     use hive_core::{ChatMessage, ChatSession, MessageRole};
     use uuid::Uuid;
 
@@ -8472,16 +8458,16 @@ mod export_tests {
         let push = |s: &mut ChatSession, role, who: &str| {
             s.messages.push(ChatMessage::new(role, who, "x"));
         };
-        assert_eq!(cascade_depth(&s), 0);
+        assert_eq!(s.cascade_depth(), 0);
         push(&mut s, MessageRole::User, "Mara");
-        assert_eq!(cascade_depth(&s), 0);
+        assert_eq!(s.cascade_depth(), 0);
         push(&mut s, MessageRole::Assistant, "Scout");
-        assert_eq!(cascade_depth(&s), 1);
+        assert_eq!(s.cascade_depth(), 1);
         push(&mut s, MessageRole::System, "sys"); // system notes don't count
         push(&mut s, MessageRole::Agent, "Nova");
-        assert_eq!(cascade_depth(&s), 2, "two agent replies since the human turn");
+        assert_eq!(s.cascade_depth(), 2, "two agent replies since the human turn");
         push(&mut s, MessageRole::User, "Mara"); // a new human turn resets depth
-        assert_eq!(cascade_depth(&s), 0);
+        assert_eq!(s.cascade_depth(), 0);
     }
 
     #[test]

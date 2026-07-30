@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::agent::WorkspaceAgent;
 use crate::channel::Channel;
 use crate::workspace_runtime::WorkspaceRuntime;
-use crate::chat::ChatMessage;
+use crate::chat::{ChatMessage, MessageRole};
 use crate::identity::{WorkspaceMember, WorkspaceRole};
 use crate::proposals::ActionProposal;
 use crate::skills::SkillProfile;
@@ -91,7 +91,33 @@ pub struct ChatSession {
     pub updated_at: Timestamp,
 }
 
+/// Safety ceiling on agent replies since the last human turn — a runaway/loop
+/// backstop, NOT a conversation limiter. A healthy cascade ends on its own when
+/// an agent stops `@mention`-ing another; this only bites when agents keep
+/// addressing each other, so it's set generously enough for 2+ agents to hold a
+/// real multi-turn conversation without a human ping, while still bounding an
+/// infinite A↔B loop and its token cost. Bounds the chain inline on one device
+/// *and* across devices (both read the synced transcript via
+/// [`ChatSession::cascade_depth`]). Could later be a per-workspace setting.
+pub const MAX_CASCADE_DEPTH: usize = 24;
+
 impl ChatSession {
+    /// How many consecutive agent/assistant replies trail the transcript back to
+    /// the last human turn — the cascade depth. Used to bound agent→agent chains
+    /// (the desktop turn loop, cross-device pickup, and the worker queue all read
+    /// the same synced value, so the bound holds across devices).
+    pub fn cascade_depth(&self) -> usize {
+        let mut n = 0;
+        for m in self.messages.iter().rev() {
+            match m.role {
+                MessageRole::System => continue,
+                MessageRole::Assistant | MessageRole::Agent => n += 1,
+                MessageRole::User => break,
+            }
+        }
+        n
+    }
+
     /// The workspace role `actor_id` holds in this session's projected roster,
     /// or the safe floor (`Viewer`) if they're not a member. Mirrors the
     /// authoring-side floor (`ChatService::actor_role`) so ingest/projection
