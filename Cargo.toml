@@ -4,7 +4,6 @@ members = [
     "crates/hive-core",
     "crates/hive-proto",
     "crates/hive-runtime",
-    "crates/hive-relay",
     "crates/hive-cli",
     "app",
 ]

@@ -483,7 +483,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, hive_relay::router()).await.unwrap();
+            axum::serve(listener, crate::test_relay::router()).await.unwrap();
         });
         format!("http://{addr}")
     }

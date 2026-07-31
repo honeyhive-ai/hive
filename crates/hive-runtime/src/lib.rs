@@ -30,6 +30,9 @@ pub mod sync_engine;
 pub mod tool_loop;
 pub mod vault_fetcher;
 
+#[cfg(test)]
+mod test_relay;
+
 pub use chat_service::{
     pending_mentions, resolve_workspace_credential, turns_for, turns_from, ChatService,
     PendingMention,
