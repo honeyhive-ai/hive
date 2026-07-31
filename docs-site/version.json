@@ -1,6 +1,6 @@
 {
-  "tag": "v1.1.1",
-  "name": "Hive 1.1.1",
+  "tag": "v1.2.0",
+  "name": "Hive 1.2.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "In-app auto-update (the app now downloads and installs updates in place on macOS, no more manual reinstall). Plus the Windows CI fix and the 1.1 concurrency work: same-agent tasks stay distinct, file-mutating turns run in isolated git worktrees returned as review-gated diffs, and worker pools drain the backlog in parallel."
+  "notes": "Codex (native) and Hermes (generic CLI) join Claude Code, Pi, and Aider as first-class subprocess agents — bind an @agent to the Codex runtime and it dispatches through codex exec in an isolated worktree, returned as a review-gated diff. Onboarding now detects codex on your PATH and offers it like Claude Code, and you can add it after the fact from Settings -> Models. Plus a published Homebrew tap (brew install --cask honeyhive-ai/hive/hive) and docs for running the headless CLI alongside the app."
 }
