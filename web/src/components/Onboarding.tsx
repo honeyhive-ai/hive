@@ -41,7 +41,7 @@ import {
   type ThemeName,
 } from "@/lib/theme";
 
-type RuntimeChoice = "claudeCode" | "openai" | "anthropic" | "ollama";
+type RuntimeChoice = "claudeCode" | "codex" | "openai" | "anthropic" | "ollama";
 
 // Onboarding's appearance step. Order + labels for the accent-family picker.
 const THEME_CHOICES: { name: ThemeName; label: string; blurb: string }[] = [
@@ -144,7 +144,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
         setEnv(d);
         if (d.gitName) setName((n) => n || d.gitName!);
         // Recommend the best available runtime.
-        setChoice(d.claudeCode ? "claudeCode" : d.openaiEnv ? "openai" : d.ollama ? "ollama" : "anthropic");
+        setChoice(d.claudeCode ? "claudeCode" : d.codex ? "codex" : d.openaiEnv ? "openai" : d.ollama ? "ollama" : "anthropic");
       } catch {
         /* detection is best-effort */
       }
@@ -261,7 +261,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
   const canNext =
     (step === 1 && (gh != null || name.trim().length > 0)) ||
     (step === 2) ||
-    (step === 3 && (choice === "claudeCode" || choice === "ollama" || apiKey.trim().length > 0)) ||
+    (step === 3 && (choice === "claudeCode" || choice === "codex" || choice === "ollama" || apiKey.trim().length > 0)) ||
     // Step 4: local is always fine; join/host must have a verified connection.
     (step === 4 && (teamMode === "local" || connectionOk)) ||
     // Step 5 (appearance) always has a valid selection.
@@ -315,6 +315,10 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
       // header shows and new chats default to — otherwise it stays on the
       // hardcoded Sonnet default and silently overrides the user's pick.
       await setDefaultModel(claudeDefaultModelFor(claudeModel));
+    } else if (choice === "codex") {
+      // Codex is a subprocess runtime — no key (auth is `codex login`). Empty
+      // endpoint = `codex` on PATH; empty model = codex's own default.
+      await addRuntime("codex-cli", "Codex", "codex", "local", "", "", true, false);
     }
     const needsKey = choice === "openai" || choice === "anthropic";
     await updateConnectionSettings({
@@ -592,6 +596,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
                   </>
                 );
               })()}
+              <RuntimeOption v="codex" choice={choice} setChoice={setChoice} label="Codex" note={env?.codex ? "detected · no API key (codex login)" : "not found on PATH — install the codex CLI"} />
               <RuntimeOption v="openai" choice={choice} setChoice={setChoice} label="OpenAI-compatible API" note="OpenAI, OpenRouter, or any local OpenAI-style server" />
               <RuntimeOption v="anthropic" choice={choice} setChoice={setChoice} label="Anthropic API key" note={env?.anthropicEnv ? "ANTHROPIC_API_KEY detected" : "claude.ai API key"} />
               {env?.ollama && <RuntimeOption v="ollama" choice={choice} setChoice={setChoice} label="Ollama (local)" note="detected · local models, no key" />}

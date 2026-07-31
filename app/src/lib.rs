@@ -7900,6 +7900,7 @@ async fn friend_open_dm(
 #[serde(rename_all = "camelCase")]
 struct EnvDetectDto {
     claude_code: bool,
+    codex: bool,
     ollama: bool,
     anthropic_env: bool,
     openai_env: bool,
@@ -8089,6 +8090,7 @@ fn detect_environment() -> EnvDetectDto {
         .unwrap_or(false);
     EnvDetectDto {
         claude_code: on_path("claude"),
+        codex: on_path("codex"),
         ollama,
         anthropic_env: std::env::var("ANTHROPIC_API_KEY").map(|v| !v.is_empty()).unwrap_or(false),
         openai_env: std::env::var("OPENAI_API_KEY").map(|v| !v.is_empty()).unwrap_or(false),

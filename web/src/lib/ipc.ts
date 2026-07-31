@@ -329,6 +329,7 @@ export const githubLogout = () => invoke<void>("github_logout");
 /// What's installed/available on this machine, to drive first-run defaults.
 export interface EnvDetectDto {
   claudeCode: boolean;
+  codex: boolean;
   ollama: boolean;
   anthropicEnv: boolean;
   openaiEnv: boolean;
