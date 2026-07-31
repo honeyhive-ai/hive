@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addAgent,
+  listAgentTemplates,
   addMember,
   importGithubTeams,
   inviteByHandle,
@@ -234,6 +235,7 @@ function ToolsPane({
 }) {
   const qc = useQueryClient();
   const runtimes = useQuery({ queryKey: ["runtimes"], queryFn: listRuntimes });
+  const agentTemplates = useQuery({ queryKey: ["agent-templates"], queryFn: listAgentTemplates });
   const agents = useQuery({ queryKey: ["agents", sessionId], queryFn: () => listAgents(sessionId) });
   const mcp = useQuery({ queryKey: ["mcp"], queryFn: listMcpServers });
   const [scope, setScope] = useState<ToolsScope>("chat");
@@ -423,6 +425,29 @@ function ToolsPane({
               onToggle={() => setShowAddAgent((v) => !v)}
             >
               <Card className="space-y-2 p-3">
+                {(agentTemplates.data ?? []).length > 0 && (
+                  <Field label="Start from a saved agent">
+                    <SelectField
+                      value=""
+                      ariaLabel="Saved agent template"
+                      onChange={(id) => {
+                        const t = (agentTemplates.data ?? []).find((x) => x.id === id);
+                        if (!t) return;
+                        setAgentName(t.name);
+                        setAgentRole(t.role ?? "");
+                        if (t.runtimeId) setAgentRuntimeId(t.runtimeId);
+                      }}
+                    >
+                      <option value="">Saved agents…</option>
+                      {(agentTemplates.data ?? []).map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name}
+                          {t.role ? ` · ${t.role}` : ""}
+                        </option>
+                      ))}
+                    </SelectField>
+                  </Field>
+                )}
                 <input
                   value={agentName}
                   onChange={(event) => setAgentName(event.target.value)}

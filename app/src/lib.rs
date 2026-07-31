@@ -4398,7 +4398,19 @@ async fn run_prepared_turn(
     const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_millis(750);
     let mut pending = String::new();
     let mut last_flush = std::time::Instant::now();
-    let result = dispatch::stream(
+    // Backstop timeout: a subprocess agent can wedge (waiting on auth/input, a
+    // blocked MCP, a hung network call) and stream nothing — which otherwise
+    // leaves the UI on "thinking" forever. Cap the whole turn so a wedged runtime
+    // surfaces as an error and frees the chat. Generous by default (real coding
+    // turns run minutes); override with HIVE_TURN_TIMEOUT_SECS. Dropping the
+    // future on timeout kills any spawned CLI (kill_on_drop).
+    let turn_timeout = std::time::Duration::from_secs(
+        std::env::var("HIVE_TURN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600),
+    );
+    let stream_fut = dispatch::stream(
         &responder.runtime,
         Some(&system),
         &turns,
@@ -4423,8 +4435,14 @@ async fn run_prepared_turn(
                 last_flush = std::time::Instant::now();
             }
         },
-    )
-    .await;
+    );
+    let result = match tokio::time::timeout(turn_timeout, stream_fut).await {
+        Ok(r) => r,
+        Err(_) => Err(ProviderError::Subprocess(format!(
+            "runtime timed out after {}s with no completion — the agent may be waiting on login/auth, input, or a blocked tool. Verify it with Settings \u{2192} Models \u{2192} Test, or raise HIVE_TURN_TIMEOUT_SECS.",
+            turn_timeout.as_secs()
+        ))),
+    };
 
     match result {
         Ok(full) => {
@@ -5145,6 +5163,76 @@ fn set_git_email(state: State<AppState>, email: String) -> Result<(), String> {
         .unwrap()
         .set_author_git_email((!trimmed.is_empty()).then(|| trimmed.to_string()));
     Ok(())
+}
+
+/// Result of a runtime preflight. `ok` means the runtime answered with a
+/// non-empty reply inside the timeout. Surfaced by the Models settings "Test"
+/// button so a user can verify claude/codex/etc. actually work before relying on
+/// them — turning a silent "thinking forever" into an immediate pass/fail.
+#[derive(serde::Serialize)]
+struct RuntimeTestDto {
+    ok: bool,
+    latency_ms: u64,
+    reply: String,
+    error: Option<String>,
+}
+
+/// Preflight a runtime: send a trivial prompt and confirm it answers within a
+/// hard timeout. Runs the *real* dispatch path (same resolution + same
+/// subprocess/HTTP client as a live turn), in the current workspace folder, so a
+/// green result means a real turn will run too. A hung CLI (missing login/auth,
+/// wrong executable path, or a blocked MCP/hook in the project) surfaces as a
+/// timeout error instead of an indefinite stall. Timeout is 45s (override with
+/// HIVE_RUNTIME_TEST_TIMEOUT_SECS).
+#[tauri::command]
+async fn test_runtime(
+    state: State<'_, AppState>,
+    runtime_id: String,
+) -> Result<RuntimeTestDto, String> {
+    let runtime = state.resolve_runtime(&runtime_id);
+    let workspace_root = {
+        let r = state.workspace_root.lock().unwrap().clone();
+        if r.trim().is_empty() { None } else { Some(r) }
+    };
+    let turns = vec![ChatTurn::user("Reply with exactly the token: PINGOK")];
+    let system = "You are a connectivity probe. Reply with exactly PINGOK and nothing else.";
+    let timeout = std::time::Duration::from_secs(
+        std::env::var("HIVE_RUNTIME_TEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(45),
+    );
+    let start = std::time::Instant::now();
+    // Dropping this future on timeout kills any spawned CLI (kill_on_drop).
+    let fut = dispatch::stream(
+        &runtime,
+        Some(system),
+        &turns,
+        workspace_root.as_deref(),
+        &[],
+        32,
+        |_| {},
+    );
+    let outcome = tokio::time::timeout(timeout, fut).await;
+    let latency_ms = start.elapsed().as_millis() as u64;
+    Ok(match outcome {
+        Ok(Ok(reply)) => {
+            let reply = reply.trim().to_string();
+            RuntimeTestDto { ok: !reply.is_empty(), latency_ms, reply, error: None }
+        }
+        Ok(Err(e)) => {
+            RuntimeTestDto { ok: false, latency_ms, reply: String::new(), error: Some(e.to_string()) }
+        }
+        Err(_) => RuntimeTestDto {
+            ok: false,
+            latency_ms,
+            reply: String::new(),
+            error: Some(format!(
+                "No response within {}s — the runtime spawned but never answered. Likely a missing login/auth (run the CLI's login once), a wrong executable path, or the CLI blocking on project config (e.g. an MCP server or hook) in the workspace folder.",
+                timeout.as_secs()
+            )),
+        },
+    })
 }
 
 #[tauri::command]
@@ -8512,6 +8600,7 @@ pub fn run() {
             get_app_settings,
             get_git_status,
             list_runtimes,
+            test_runtime,
             add_runtime,
             remove_runtime,
             set_chat_runtime,

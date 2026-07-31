@@ -10,6 +10,8 @@ import {
   setDefaultModel,
   listRuntimes,
   removeRuntime,
+  testRuntime,
+  type RuntimeTestResult,
   setDefaultRuntime,
   listProviders,
   listProviderPresets,
@@ -308,6 +310,23 @@ function RuntimesSection() {
   const formRef = useRef<HTMLDivElement>(null);
   const presets = useQuery({ queryKey: ["provider-presets"], queryFn: listProviderPresets });
 
+  // Per-runtime preflight state: { pending } while testing, { result } after.
+  const [tests, setTests] = useState<
+    Record<string, { pending?: boolean; result?: RuntimeTestResult }>
+  >({});
+  const runTest = async (id: string) => {
+    setTests((t) => ({ ...t, [id]: { pending: true } }));
+    try {
+      const result = await testRuntime(id);
+      setTests((t) => ({ ...t, [id]: { result } }));
+    } catch (e) {
+      setTests((t) => ({
+        ...t,
+        [id]: { result: { ok: false, latency_ms: 0, reply: "", error: errMsg(e) } },
+      }));
+    }
+  };
+
   function resetRuntimeForm() {
     setEditingId(null);
     setRuntimeId("");
@@ -392,6 +411,14 @@ function RuntimesSection() {
                 {runtime.provider === "claude-code" && !runtime.isManaged && <ClaudeCodeRowModel />}
               </div>
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => runTest(runtime.id)}
+                  disabled={tests[runtime.id]?.pending}
+                  className="text-xs hover:opacity-80 disabled:opacity-50"
+                  title="Send a trivial prompt and verify this runtime answers"
+                >
+                  {tests[runtime.id]?.pending ? "Testing…" : "Test"}
+                </button>
                 {runtime.isManaged && (
                   <button onClick={() => startEdit(runtime)} className="text-xs hover:opacity-80">
                     Edit
@@ -422,6 +449,22 @@ function RuntimesSection() {
                 )}
               </div>
             </div>
+            {tests[runtime.id]?.result && (
+              <div className="mt-2 rounded-xl px-3 py-2 text-xs" style={fieldStyle}>
+                {tests[runtime.id]!.result!.ok ? (
+                  <span style={{ color: "var(--hive-success, #3fb950)" }}>
+                    ✓ Responded in {tests[runtime.id]!.result!.latency_ms} ms
+                    {tests[runtime.id]!.result!.reply
+                      ? ` — "${tests[runtime.id]!.result!.reply.slice(0, 60)}"`
+                      : ""}
+                  </span>
+                ) : (
+                  <span style={{ color: "var(--hive-danger)" }}>
+                    ✕ {tests[runtime.id]!.result!.error ?? "No response"}
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         ))}
       </div>

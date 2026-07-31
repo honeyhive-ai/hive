@@ -157,6 +157,19 @@ export const setContextCommands = (summarizePrompt: string, compactPrompt: strin
 export const removeRuntime = (runtimeId: string) =>
   invoke<void>("remove_runtime", { runtimeId });
 
+export type RuntimeTestResult = {
+  ok: boolean;
+  latency_ms: number;
+  reply: string;
+  error: string | null;
+};
+
+/// Preflight a runtime: sends a trivial prompt through the real dispatch path
+/// and reports pass/fail + latency, so a CLI that hangs or isn't logged in shows
+/// up here instead of as a silent "thinking forever" in chat.
+export const testRuntime = (runtimeId: string) =>
+  invoke<RuntimeTestResult>("test_runtime", { runtimeId });
+
 export const setChatRuntime = (sessionId: string, runtimeId: string) =>
   invoke<void>("set_chat_runtime", { sessionId, runtimeId });
 

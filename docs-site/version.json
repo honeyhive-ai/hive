@@ -1,6 +1,6 @@
 {
-  "tag": "v1.2.0",
-  "name": "Hive 1.2.0",
+  "tag": "v1.2.1",
+  "name": "Hive 1.2.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Codex (native) and Hermes (generic CLI) join Claude Code, Pi, and Aider as first-class subprocess agents — bind an @agent to the Codex runtime and it dispatches through codex exec in an isolated worktree, returned as a review-gated diff. Onboarding now detects codex on your PATH and offers it like Claude Code, and you can add it after the fact from Settings -> Models. Plus a published Homebrew tap (brew install --cask honeyhive-ai/hive/hive) and docs for running the headless CLI alongside the app."
+  "notes": "Runtime reliability: a per-runtime Test button (Settings -> Models) sends a trivial prompt through the real dispatch path and reports pass/fail + latency, so a CLI that isn't logged in or hangs shows up immediately instead of as a silent stall. Turns now have a backstop timeout (a wedged agent surfaces an error and frees the chat instead of thinking forever; override with HIVE_TURN_TIMEOUT_SECS). And saved agents (Settings -> Agents) can now be attached to a chat from the Tools pane's Add-an-agent picker, so a template you define once is usable in any workspace."
 }
