@@ -106,10 +106,13 @@ on a cron-like schedule without you present. See
 LLM access is organized as a hierarchy:
 
 - **Providers** — `anthropic`, `openAI`, `openRouter`, `ollama`,
-  `azure` (Azure OpenAI), `custom`, plus the `claude` CLI (**Claude
-  Code**) and the subprocess agents `pi` / `aider`. Each provider holds
-  its **own API key** and optional base URL (so multiple providers can
-  have distinct keys, including any generic OpenAI-compatible endpoint).
+  `azure` (Azure OpenAI), `custom`, plus the CLI coding agents: `claude`
+  (**Claude Code**), `pi`, `aider`, **Codex** (OpenAI's `codex exec`), and
+  **Hermes** (any stdin-driven CLI — set the executable + flags on the
+  runtime). API providers hold their **own API key** and optional base URL
+  (so multiple providers can have distinct keys, including any generic
+  OpenAI-compatible endpoint); the CLI agents use their own login and need
+  no key.
 - **Models (runtimes)** — a model on a provider (id + capability flags).
   The add form includes an optional **Context window in tokens** — set
   it for Ollama/custom models whose window Hive can't infer from the

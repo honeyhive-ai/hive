@@ -292,7 +292,7 @@ function RuntimesSection() {
   // `location` doesn't drive any behavior (dispatch routes by provider +
   // endpoint); we derive it from the endpoint just for the list label.
   const deriveLocation = () => {
-    if (["claude-code", "pi", "aider"].includes(runtimeProvider)) return "local";
+    if (["claude-code", "pi", "aider", "codex", "hermes"].includes(runtimeProvider)) return "local";
     const ep = `${runtimeEndpoint} ${runtimeBaseUrl}`.toLowerCase();
     return /localhost|127\.0\.0\.1|0\.0\.0\.0|::1/.test(ep) ? "local" : "remote";
   };
@@ -488,13 +488,15 @@ function RuntimesSection() {
             <option value="claude-code">Claude Code</option>
             <option value="pi">Pi</option>
             <option value="aider">Aider</option>
+            <option value="codex">Codex</option>
+            <option value="hermes">Hermes (generic CLI)</option>
           </select>
         </div>
         <input
           value={runtimeEndpoint}
           onChange={(e) => setRuntimeEndpoint(e.target.value)}
           placeholder={
-            runtimeProvider === "pi" || runtimeProvider === "aider"
+            ["pi", "aider", "codex", "hermes"].includes(runtimeProvider)
               ? "Executable path (blank = found on PATH)"
               : "Endpoint URL"
           }

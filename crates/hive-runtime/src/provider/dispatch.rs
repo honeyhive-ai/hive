@@ -157,6 +157,50 @@ pub async fn stream(
             )
             .await
         }
+        ModelProviderKind::Codex => {
+            // OpenAI Codex CLI, headless: `codex exec [flags] <prompt>` runs one
+            // task non-interactively and streams its work to stdout. Prompt is a
+            // positional arg (like `pi -p`). Default flags run it fully automatic
+            // in a workspace-write sandbox so it can actually edit files (Hive
+            // already isolates the turn in a worktree + gates the result); a
+            // model is passed with `-m` when set. Any of this is overridable via
+            // the runtime's `args`.
+            let prompt = subprocess::render_prompt(system, turns);
+            let program = if rt.endpoint.is_empty() { "codex" } else { &rt.endpoint };
+            let mut args: Vec<String> = vec!["exec".into(), "--full-auto".into()];
+            if !rt.model.is_empty() {
+                args.push("-m".into());
+                args.push(rt.model.clone());
+            }
+            args.extend(rt.args.iter().cloned());
+            args.push(prompt);
+            subprocess::run_with(
+                program,
+                &args,
+                working_dir,
+                extra_env,
+                subprocess::PromptInput::InArgs,
+                on_delta,
+            )
+            .await
+        }
+        ModelProviderKind::Hermes => {
+            // Generic stdin-driven CLI agent: feed the rendered prompt on stdin
+            // and stream stdout, with the binary (`endpoint`, default "hermes")
+            // and any flags (`args`) configured on the runtime. This is the same
+            // shape as aider, so any prompt-on-stdin agent works with no new code.
+            let input = subprocess::render_prompt(system, turns);
+            let program = if rt.endpoint.is_empty() { "hermes" } else { &rt.endpoint };
+            subprocess::run_with(
+                program,
+                &rt.args,
+                working_dir,
+                extra_env,
+                subprocess::PromptInput::Stdin(&input),
+                on_delta,
+            )
+            .await
+        }
     }
 }
 

@@ -82,8 +82,9 @@ box Hive drives:
 - **The `claude` CLI** — no API key required, uses your existing Claude auth.
 - **Anthropic**, **OpenAI**, **OpenRouter**, **Ollama** (local), and **any
   OpenAI-compatible endpoint**.
-- **Subprocess agents** — tools like **aider** and **pi** run as child
-  processes and participate as first-class agents.
+- **Subprocess agents** — CLI coding agents run as child processes and
+  participate as first-class agents: **aider**, **pi**, **Codex** (OpenAI's
+  `codex exec`), and any stdin-driven CLI via the generic **Hermes** runtime.
 
 Each agent carries its own identity, role, and runtime, so a BYOA model knows
 exactly who it is and who else is in the room.

@@ -21,6 +21,12 @@ pub enum ModelProviderKind {
     Aider,
     Pi,
     ClaudeCode,
+    /// OpenAI's `codex` CLI coding agent (`codex exec …`), driven headless.
+    Codex,
+    /// A generic stdin-driven CLI agent (e.g. `hermes`): the prompt goes in on
+    /// stdin, the reply comes back on stdout. Binary + flags are configured on
+    /// the runtime, so any such agent can be wired without new code.
+    Hermes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

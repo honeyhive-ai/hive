@@ -733,7 +733,7 @@ async fn drain_worker_tick(
                     .args
                     .iter()
                     .any(|a| a == "acceptEdits" || a == "bypassPermissions"),
-                ModelProviderKind::Pi | ModelProviderKind::Aider => true,
+                ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes => true,
                 _ => false,
             };
             let isolate = write_capable

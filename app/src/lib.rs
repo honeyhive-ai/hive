@@ -1114,6 +1114,8 @@ fn provider_name(kind: ModelProviderKind) -> &'static str {
         ModelProviderKind::Aider => "aider",
         ModelProviderKind::Pi => "pi",
         ModelProviderKind::ClaudeCode => "claude-code",
+        ModelProviderKind::Codex => "codex",
+        ModelProviderKind::Hermes => "hermes",
     }
 }
 
@@ -1129,6 +1131,8 @@ fn parse_provider_kind(input: &str) -> Result<ModelProviderKind, String> {
         "aider" => Ok(ModelProviderKind::Aider),
         "pi" => Ok(ModelProviderKind::Pi),
         "claudecode" => Ok(ModelProviderKind::ClaudeCode),
+        "codex" => Ok(ModelProviderKind::Codex),
+        "hermes" => Ok(ModelProviderKind::Hermes),
         other => Err(format!("unknown provider {other}")),
     }
 }
@@ -1173,6 +1177,8 @@ fn provider_config_name(kind: ModelProviderKind) -> &'static str {
         ModelProviderKind::Aider => "aider",
         ModelProviderKind::Pi => "pi",
         ModelProviderKind::ClaudeCode => "claude-code",
+        ModelProviderKind::Codex => "codex",
+        ModelProviderKind::Hermes => "hermes",
     }
 }
 
@@ -1667,7 +1673,7 @@ impl AppState {
             let provider = rt.provider_kind;
             let endpoint = if matches!(
                 provider,
-                ModelProviderKind::Aider | ModelProviderKind::Pi | ModelProviderKind::ClaudeCode
+                ModelProviderKind::Aider | ModelProviderKind::Pi | ModelProviderKind::ClaudeCode | ModelProviderKind::Codex | ModelProviderKind::Hermes
             ) {
                 // subprocess: endpoint is the program (config endpoint or the
                 // provider name as the command)
@@ -4317,7 +4323,7 @@ async fn run_prepared_turn(
     // subprocess agent makes on this host aren't credited to the host owner.
     let git_subprocess = matches!(
         responder.runtime.provider,
-        ModelProviderKind::ClaudeCode | ModelProviderKind::Pi | ModelProviderKind::Aider
+        ModelProviderKind::ClaudeCode | ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes
     );
     let humans: Vec<hive_core::ActorIdentity> = if git_subprocess {
         session
@@ -4360,7 +4366,7 @@ async fn run_prepared_turn(
         ModelProviderKind::ClaudeCode => {
             state.settings.lock().unwrap().claude_permission_mode != "default"
         }
-        ModelProviderKind::Pi | ModelProviderKind::Aider => true,
+        ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes => true,
         _ => false,
     };
     let worktree = if git_subprocess
@@ -7954,6 +7960,8 @@ fn provider_catalog() -> Vec<(ModelProviderKind, &'static str, bool, bool, &'sta
         (ClaudeCode, "Claude Code (CLI)", false, false, "Local `claude` CLI — uses its own login"),
         (Pi, "pi (CLI)", false, false, "Local `pi` agent"),
         (Aider, "aider (CLI)", false, false, "Local `aider` agent"),
+        (Codex, "Codex (CLI)", false, false, "OpenAI `codex` CLI — headless `codex exec`, uses its own login"),
+        (Hermes, "Hermes (generic CLI)", false, false, "Any stdin-driven CLI agent; set the executable + flags on the runtime"),
     ]
 }
 
