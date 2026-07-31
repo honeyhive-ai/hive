@@ -10,14 +10,14 @@ A tap is just a GitHub repo named `homebrew-<tap>`:
 
 1. Create `github.com/honeyhive-ai/homebrew-hive`.
 2. Copy this cask into it at `Casks/hive.rb`.
-3. Cut a GitHub Release tagged `v<version>` with the two macOS DMGs attached:
-   `Hive_<version>_aarch64.dmg` and `Hive_<version>_x64.dmg`.
-4. Fill in the `sha256` values and bump `version`:
+3. Cut a GitHub Release tagged `v<version>` with the macOS DMG attached
+   (`Hive_<version>_aarch64.dmg`). The app is **Apple-Silicon-only**, so the cask
+   is arm-only (`depends_on arch: :arm64`); add an Intel slice only if/when an
+   `x64` DMG is built.
+4. Bump `version` and set the `sha256` from the released DMG:
    ```bash
-   shasum -a 256 Hive_0.1.0_aarch64.dmg   # → arm
-   shasum -a 256 Hive_0.1.0_x64.dmg       # → intel
+   shasum -a 256 Hive_1.1.1_aarch64.dmg   # → sha256 in the cask
    ```
-5. Replace the `honeyhive-ai/hive` placeholders with the real repo.
 
 Users then install with:
 
@@ -29,19 +29,13 @@ brew install --cask hive
 `brew upgrade --cask hive` picks up new releases (the `livecheck` block watches
 GitHub releases).
 
-## Unsigned builds caveat
+## Signing
 
-Until the DMGs are **signed + notarized** (Developer ID — see
-`docs/packaging.md`), Gatekeeper will block first launch even when installed
-via Homebrew. Document the one-time workaround for users, or notarize:
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/Hive.app"
-```
-
-Notarization is also a hard requirement for the **official** `homebrew/cask`
-repo (`brew install --cask hive` with no tap). Use a personal tap until the app
-is notarized and the project meets homebrew-cask's notability criteria.
+The macOS DMGs are **signed + notarized** (Developer ID) in CI, so Gatekeeper
+opens them normally — no `xattr` workaround needed. Notarization also satisfies
+the signing prerequisite for the **official** `homebrew/cask` repo; a personal
+tap (above) is still the pragmatic path until the project meets homebrew-cask's
+notability criteria.
 
 ## Automating sha256 + version
 

@@ -1,18 +1,15 @@
 cask "hive" do
-  arch arm: "aarch64", intel: "x64"
+  # Apple Silicon only — the desktop app ships an aarch64 DMG (no Intel build).
+  version "1.1.1"
+  sha256 "8884d03176c25e84b6635d416a147f537bdfcba1509ce8300fccef50ebadb2a8"
 
-  version "0.1.0"
-  # Fill these from the released DMGs before publishing:
-  #   shasum -a 256 Hive_#{version}_aarch64.dmg   # → arm
-  #   shasum -a 256 Hive_#{version}_x64.dmg        # → intel
-  sha256 arm:   "0000000000000000000000000000000000000000000000000000000000000000",
-         intel: "0000000000000000000000000000000000000000000000000000000000000000"
-
-  url "https://github.com/honeyhive-ai/hive/releases/download/v#{version}/Hive_#{version}_#{arch}.dmg",
+  url "https://github.com/honeyhive-ai/hive/releases/download/v#{version}/Hive_#{version}_aarch64.dmg",
       verified: "github.com/honeyhive-ai/hive/"
   name "Hive"
   desc "Shared LLM workspace for developers — bring your own runtime"
   homepage "https://github.com/honeyhive-ai/hive"
+
+  depends_on arch: :arm64
 
   livecheck do
     url :url
