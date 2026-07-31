@@ -9,6 +9,8 @@ are three ways to bring someone in.
 
 ## Create / join a team (the ＋ button)
 
+![Creating a team â the invite code is redacted here](../images/team-invite.png){ width="760" }
+
 The common path is the **workspace rail's ＋ button**, which opens
 the **Add workspace** modal with two tabs:
 

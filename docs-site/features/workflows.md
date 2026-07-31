@@ -11,6 +11,8 @@ pane — and the workflow definitions and run records sync **end-to-end
 encrypted** with the workspace, so teammates watch a run progress live and
 can vote its gates from their own devices.
 
+![The workflow builder — a multi-stage DAG with an approval gate](../images/workflow-builder.png){ width="900" }
+
 ## Presets
 
 Open the **Workflows** pane in the right rail and add either preset — both

@@ -16,6 +16,8 @@ whenever your display name is still unset (or the placeholder `You`)
 
 ![Onboarding identity step](../images/onboarding-identity.png){ width="700" }
 
+![Onboarding step 4 — Team & sync](../images/onboarding-team.png){ width="700" }
+
 There is no separate Welcome, Permissions, or Finish/Review screen —
 identity is the first thing you see, and the last step's **Finish**
 button saves everything. The runtime picker offers Claude Code,

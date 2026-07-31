@@ -11,6 +11,8 @@ Use MCP when you want to:
 - Share a tool set across many agents and workspaces.
 - Run a long-lived tool process separately from Hive.
 
+![Settings — Tools & MCP](../images/settings-tools-mcp.png){ width="820" }
+
 Don't use MCP when:
 
 - You want a *whole agent* (wire a CLI-agent runtime instead —

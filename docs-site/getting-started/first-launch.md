@@ -55,6 +55,8 @@ them off):
 
 ![Onboarding runtime step](../images/onboarding-runtime.png){ width="720" }
 
+![Onboarding step 5 — pick a theme](../images/onboarding-appearance.png){ width="720" }
+
 There's no separate Welcome, Permissions, or Finish/Review screen —
 identity is the first thing you see, and the last step's **Finish**
 button saves everything.

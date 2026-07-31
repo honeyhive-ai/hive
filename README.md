@@ -56,7 +56,7 @@ without handing their source to a SaaS; and anyone who wants an always-on agent
 that keeps working while their laptop is closed — on infrastructure they control.
 
 <div align="center">
-<img src="docs-site/images/onboarding-welcome.png" alt="Hive onboarding" width="640">
+<img src="docs-site/images/overview.png" alt="Hive — a shared LLM workspace" width="820">
 </div>
 
 ## Features

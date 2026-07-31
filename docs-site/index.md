@@ -5,6 +5,8 @@
 collaborate with peers on real work — code, commits, reviews — and
 keep your data local-first.
 
+![The Hive workspace](images/overview.png){ width="900" }
+
 ---
 
 ## Why Hive

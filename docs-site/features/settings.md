@@ -26,6 +26,7 @@ stored locally per device.
 
 ## Appearance
 
+
 - **Mode** — `Auto` (follows your OS light/dark setting, any platform),
   `Light`, or `Dark`.
 - **Theme** — the accent family: **pollen** (the honey-gold default),
