@@ -11,6 +11,7 @@ pub mod directives;
 pub mod envelope_verifier;
 pub mod event_store;
 pub mod git_attribution;
+pub mod git_worktree;
 pub mod github;
 pub mod identity_store;
 pub mod identity_verifier;
