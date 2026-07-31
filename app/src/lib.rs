@@ -5595,6 +5595,41 @@ async fn check_for_update(app: AppHandle) -> Result<Option<String>, String> {
     }
 }
 
+/// Download + install the latest signed update **in place**, then relaunch — the
+/// self-update path (VSCode-style). Streams `update://progress` events so the UI
+/// can show a bar. Errors (updater not configured / no signed `latest.json` /
+/// nothing newer) let the caller fall back to opening the release page.
+#[tauri::command]
+async fn install_update(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app
+        .updater()
+        .map_err(|e| format!("auto-update isn't configured yet ({e})"))?;
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("couldn't check for updates: {e}"))?
+        .ok_or_else(|| "already up to date".to_string())?;
+    let mut downloaded: usize = 0;
+    update
+        .download_and_install(
+            |chunk, total| {
+                downloaded += chunk;
+                let _ = app.emit(
+                    "update://progress",
+                    serde_json::json!({ "downloaded": downloaded, "total": total }),
+                );
+            },
+            || {
+                let _ = app.emit("update://progress", serde_json::json!({ "done": true }));
+            },
+        )
+        .await
+        .map_err(|e| format!("update failed to install: {e}"))?;
+    // Relaunch into the freshly-installed version. `restart` diverges.
+    app.restart();
+}
+
 /// Tint the native title bar to match the app background. The frontend calls
 /// this with the live `--hive-canvas` color (and whether the active theme is
 /// dark) on launch and on every theme change, so the OS chrome tracks the UI.
@@ -8486,6 +8521,7 @@ pub fn run() {
             set_titlebar_color,
             reset_local_data,
             check_for_update,
+            install_update,
             check_for_app_update,
             list_schedules,
             add_schedule,

@@ -32,14 +32,15 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {
       "endpoints": [
         "https://github.com/honeyhive-ai/hive/releases/latest/download/latest.json"
       ],
-      "pubkey": ""
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDhFQjA3RDUyRjVBRUM3QjQKUldTMHg2NzFVbjJ3anI3elhQQTlLcGUrWnJSdEtyY0tHejRZdGpoNnZQQzB4ZXlEQ2g1QkR6QTkK"
     }
   }
 }

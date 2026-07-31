@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { checkForAppUpdate, openExternal, type AppUpdateInfo } from "@/lib/ipc";
+import {
+  checkForAppUpdate,
+  installUpdate,
+  onUpdateProgress,
+  openExternal,
+  type AppUpdateInfo,
+} from "@/lib/ipc";
 import { IconSparkle, IconX } from "@/lib/icons";
 
 const DISMISS_KEY = "hive.updateDismissed";
@@ -10,6 +16,8 @@ const DISMISS_KEY = "hive.updateDismissed";
 /// for that specific version. Failures are silent — it never nags on its own.
 export function UpdateBanner() {
   const [info, setInfo] = useState<AppUpdateInfo | null>(null);
+  // Install state: null = idle, else a 0–100 percent (or -1 while starting).
+  const [pct, setPct] = useState<number | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -25,12 +33,41 @@ export function UpdateBanner() {
     };
   }, []);
 
+  useEffect(() => {
+    const un = onUpdateProgress((p) => {
+      if (p.done) setPct(100);
+      else if (p.total && p.downloaded != null) setPct(Math.round((p.downloaded / p.total) * 100));
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+  }, []);
+
   if (!info) return null;
 
   function dismiss() {
     if (info) window.localStorage.setItem(DISMISS_KEY, info.tag);
     setInfo(null);
   }
+
+  // Try the in-place updater (download → verify → install → relaunch). If it
+  // isn't available yet (no signed release / unconfigured), fall back to the
+  // release page so the button always does *something*.
+  async function handleInstall() {
+    setPct(-1);
+    try {
+      await installUpdate(); // relaunches on success; never returns
+    } catch {
+      setPct(null);
+      void openExternal(info?.url || "https://github.com/honeyhive-ai/hive/releases/latest").catch(
+        () => {},
+      );
+    }
+  }
+
+  const installing = pct !== null;
+  const label =
+    pct === null ? "Download" : pct < 0 ? "Starting…" : pct >= 100 ? "Restarting…" : `Installing… ${pct}%`;
 
   return (
     // bottom-20 (not bottom-4): the ToastHost owns the bottom-right corner —
@@ -49,17 +86,18 @@ export function UpdateBanner() {
           {info.notes && <div className="mt-1 text-xs opacity-55">{info.notes}</div>}
           <div className="mt-3 flex items-center gap-2">
             <button
-              onClick={() => {
-                void openExternal(info.url || "https://github.com/honeyhive-ai/hive/releases/latest").catch(() => {});
-              }}
-              className="rounded-lg px-3 py-1.5 text-sm font-medium text-white hover:brightness-110"
+              onClick={() => void handleInstall()}
+              disabled={installing}
+              className="rounded-lg px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:opacity-70"
               style={{ background: "var(--hive-accent-cool)" }}
             >
-              Download
+              {label}
             </button>
-            <button onClick={dismiss} className="rounded-lg px-3 py-1.5 text-sm opacity-60 hover:opacity-100">
-              Later
-            </button>
+            {!installing && (
+              <button onClick={dismiss} className="rounded-lg px-3 py-1.5 text-sm opacity-60 hover:opacity-100">
+                Later
+              </button>
+            )}
           </div>
         </div>
         <button onClick={dismiss} aria-label="Dismiss" className="shrink-0 opacity-40 hover:opacity-80">

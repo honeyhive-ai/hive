@@ -791,6 +791,21 @@ export const implementProposal = (sessionId: string, proposalId: string) =>
 /// configured yet (#144).
 export const checkForUpdate = () => invoke<string | null>("check_for_update");
 
+/// Download + install the latest signed update in place and relaunch (VSCode
+/// style). Resolves by relaunching on success; rejects if the updater isn't
+/// configured / no signed release yet — so the caller can fall back to the
+/// release page.
+export const installUpdate = () => invoke<void>("install_update");
+
+/// Download progress for `installUpdate`, streamed from the updater.
+export interface UpdateProgress {
+  downloaded?: number;
+  total?: number | null;
+  done?: boolean;
+}
+export const onUpdateProgress = (cb: (p: UpdateProgress) => void): Promise<UnlistenFn> =>
+  listen<UpdateProgress>("update://progress", (e) => cb(e.payload));
+
 /// Enterprise (#143): import a GitHub org's Teams as workspace members + roles.
 /// Returns the count added. Needs a signed-in GitHub token with read:org.
 export const importGithubTeams = (sessionId: string, org: string) =>
