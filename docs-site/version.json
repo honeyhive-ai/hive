@@ -1,6 +1,6 @@
 {
-  "tag": "v1.1.0",
-  "name": "Hive 1.1.0",
+  "tag": "v1.1.1",
+  "name": "Hive 1.1.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Concurrent multi-agent work: tasks to the same agent stay distinct, file-mutating turns run in isolated git worktrees and come back as review-gated diffs you approve and apply, and worker pools drain the backlog in parallel. Plus a Stop button to interrupt a turn, and fixes for duplicated messages, agent stalls, and channel/scroll glitches."
+  "notes": "In-app auto-update (the app now downloads and installs updates in place on macOS, no more manual reinstall). Plus the Windows CI fix and the 1.1 concurrency work: same-agent tasks stay distinct, file-mutating turns run in isolated git worktrees returned as review-gated diffs, and worker pools drain the backlog in parallel."
 }

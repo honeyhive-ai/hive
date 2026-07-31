@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "Hive"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "base64 0.22.1",
  "dunce",
@@ -2406,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cli"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "hive-core",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "hive-core"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek 2.2.0",
@@ -2438,7 +2438,7 @@ dependencies = [
 
 [[package]]
 name = "hive-proto"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "serde",
  "ts-rs",
@@ -2446,7 +2446,7 @@ dependencies = [
 
 [[package]]
 name = "hive-runtime"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "anyhow",
  "axum",
