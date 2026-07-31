@@ -418,8 +418,8 @@ async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Re
             }
             // MCP tools when HIVE_MCP_CONFIG provisions them and the gate allows,
             // else a plain stream.
-            let reply = reply::generate_reply(&rt, &system, &turns, allow_mcp).await?;
-            let mid = svc.begin_assistant_message(s.id, s.workspace_id, name.clone(), rt_label.clone(), None)?;
+            let reply = reply::generate_reply(&rt, &system, &turns, allow_mcp, None).await?;
+            let mid = svc.begin_assistant_message(s.id, s.workspace_id, name.clone(), rt_label.clone(), None, Some(last.id))?;
             svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
             seen.insert(mid);
             println!("done");
@@ -699,7 +699,34 @@ async fn drain_worker_tick(
                     pm.message_id, author_role, min_role
                 );
             }
-            match reply::generate_reply(&rt, &system, &turns, allow_mcp).await {
+            // Isolate a file-mutating subprocess turn in its own git worktree
+            // (like the desktop), so a pool of workers draining the same checkout
+            // can't clobber each other's tree, and the edits return as a
+            // review-gated proposal instead of landing silently. API turns and
+            // non-git roots run in place.
+            let repo = std::env::current_dir().ok();
+            let isolate = matches!(
+                rt.provider,
+                ModelProviderKind::ClaudeCode | ModelProviderKind::Pi | ModelProviderKind::Aider
+            ) && repo
+                .as_deref()
+                .map(hive_runtime::git_worktree::is_git_repo)
+                .unwrap_or(false);
+            let worktree = match (isolate, repo.as_deref()) {
+                (true, Some(root)) => {
+                    match hive_runtime::git_worktree::Worktree::create(root, &pm.message_id.to_string()) {
+                        Ok(wt) => Some(wt),
+                        Err(e) => {
+                            eprintln!("worker: worktree unavailable, running in place: {e}");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+            let work_dir = worktree.as_ref().map(|w| w.path.to_string_lossy().into_owned());
+
+            match reply::generate_reply(&rt, &system, &turns, allow_mcp, work_dir.as_deref()).await {
                 Ok(reply) => {
                     // Persist the reply defensively — a begin/complete failure logs
                     // and moves on instead of tearing down the daemon.
@@ -709,6 +736,10 @@ async fn drain_worker_tick(
                         agent.name.clone(),
                         rt_label.clone(),
                         Some(agent.id),
+                        // Stamp the mention this reply answers, so pending_mentions
+                        // correlates it precisely (Phase 1) even when several
+                        // concurrent tasks target the same agent.
+                        Some(pm.message_id),
                     ) {
                         Ok(mid) => {
                             if let Err(e) =
@@ -721,8 +752,32 @@ async fn drain_worker_tick(
                         }
                         Err(e) => eprintln!("worker: begin failed: {e}"),
                     }
+                    // Surface the isolated worktree's changes as a review-gated
+                    // proposal, then remove the worktree.
+                    if let Some(wt) = worktree {
+                        if let Ok(diff) = wt.diff() {
+                            if !diff.trim().is_empty() {
+                                let files = wt.changed_files().unwrap_or_default();
+                                let n = files.len();
+                                let title = format!(
+                                    "@{} proposed changes to {} file{}",
+                                    agent.name,
+                                    n,
+                                    if n == 1 { "" } else { "s" }
+                                );
+                                let prop = hive_core::ActionProposal::file_diff(title, "", diff, files);
+                                if let Err(e) = svc.upsert_proposal(s.id, s.workspace_id, prop) {
+                                    eprintln!("worker: proposal failed: {e}");
+                                }
+                            }
+                        }
+                        let _ = wt.remove();
+                    }
                 }
                 Err(e) => {
+                    if let Some(wt) = worktree {
+                        let _ = wt.remove();
+                    }
                     println!("failed: {e}");
                     failed.insert(pm.message_id);
                 }

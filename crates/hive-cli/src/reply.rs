@@ -70,13 +70,16 @@ pub async fn generate_reply(
     system: &str,
     turns: &[ChatTurn],
     allow_mcp_tools: bool,
+    working_dir: Option<&str>,
 ) -> Result<String> {
     if allow_mcp_tools {
         if let Some(text) = try_tool_loop(rt, system, turns).await? {
             return Ok(text);
         }
     }
-    dispatch::stream(rt, Some(system), turns, None, &[], MAX_TOKENS, |_| {})
+    // working_dir is the subprocess agent's cwd — an isolated worktree when the
+    // worker is isolating this turn, else the plain workspace root.
+    dispatch::stream(rt, Some(system), turns, working_dir, &[], MAX_TOKENS, |_| {})
         .await
         .map_err(|e| anyhow!("provider: {e}"))
 }

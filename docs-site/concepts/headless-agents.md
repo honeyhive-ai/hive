@@ -147,6 +147,34 @@ HIVE_WS_SECRET_acme=sk-…  hive agent bot --runtime ws-claude
 - `--secret <value>` carries the key **E2EE on the log** (zero worker
   provisioning; use only for trusted workspaces).
 
+## Concurrency: worker pools + isolated edits
+
+Several people can drive the **same** shared agents from different channels at
+once, and the work stays correct:
+
+- **Per-request correlation.** Each reply is tagged with the exact mention it
+  answers, so two concurrent tasks to one agent never collapse onto a single
+  reply — one task showing "answered" while its work never ran.
+- **Isolated, review-gated edits.** A file-mutating agent turn (Claude Code with
+  write access / aider / pi) runs in its **own git worktree** cut from `HEAD`, so
+  concurrent turns can't clobber each other's uncommitted work. On completion its
+  diff is captured as a **FileDiff proposal** in the Review pane — approve it and
+  **Implement** applies the patch to the workspace. Nothing lands silently.
+  (Isolated turns start from the last commit, not the main tree's uncommitted
+  WIP.)
+- **Worker pool for throughput.** Run **several `hive worker` processes** to
+  drain the backlog in parallel — `claim_turn` de-dups so no two answer the same
+  mention, and per-turn worktrees keep their file edits from colliding even on a
+  shared checkout:
+
+  ```bash
+  hive worker --label prod-1 &
+  hive worker --label prod-2 &
+  # each claims distinct mentions; each turn isolates its own worktree
+  ```
+
+  A single worker drains serially, so add processes to scale throughput.
+
 ## Coming updates you see on reconnect
 
 Whatever a headless agent does while you're offline — reply in a chat, create a
