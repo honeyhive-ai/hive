@@ -1076,6 +1076,8 @@ fn proposal_dto(p: &ActionProposal) -> ProposalDto {
                 approved: a.approved,
             })
             .collect(),
+        diff: p.diff.clone(),
+        changed_files: p.changed_files.clone(),
     }
 }
 
@@ -3233,11 +3235,41 @@ fn vote_proposal(
     Ok(updated.as_ref().map(proposal_dto))
 }
 
+/// Apply a unified diff to `workspace_root` with `git apply` (patch on stdin).
+/// Fails cleanly (no partial apply) if the tree drifted from the patch's base.
+fn apply_patch(workspace_root: &str, diff: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("git")
+        .arg("-C")
+        .arg(workspace_root)
+        .args(["apply", "--whitespace=nowarn"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("git apply: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("git apply: no stdin")?
+        .write_all(diff.as_bytes())
+        .map_err(|e| format!("write patch: {e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("git apply: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "couldn't apply the change — the workspace may have moved since it was proposed ({})",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Agreement-gated execution: carry out an **approved** proposal. The gate is
 /// that this only runs once quorum is met (status Approved) *and* a human
-/// explicitly invokes it — agents never auto-execute. The proposal is dispatched
-/// to the responding agent as an instruction (so it runs through the normal turn
-/// + per-tool consent), then marked Applied.
+/// explicitly invokes it — agents never auto-execute. A fileDiff proposal's
+/// captured patch is applied directly (`git apply`); command/decision proposals
+/// are dispatched to the responding agent as an instruction. Then marked Applied.
 #[tauri::command]
 async fn implement_proposal(
     app: AppHandle,
@@ -3266,6 +3298,25 @@ async fn implement_proposal(
     }
     if !proposal.is_quorum_met() {
         return Err("not approved yet — it needs quorum before it can be implemented".into());
+    }
+
+    // A file-diff proposal carries the patch an agent produced in its isolated
+    // worktree — apply it straight to the workspace root (no re-dispatch). If the
+    // tree has drifted from the base the patch was cut against, git apply fails
+    // and we surface that rather than half-applying.
+    if proposal.kind == ProposalKind::FileDiff {
+        if let Some(diff) = proposal.diff.clone() {
+            let root = state.workspace_root.lock().unwrap().clone();
+            apply_patch(&root, &diff)?;
+            {
+                let mut svc = state.service.lock().unwrap();
+                let mut applied = proposal;
+                applied.status = ProposalStatus::Applied;
+                svc.upsert_proposal(sid, workspace_id, applied).map_err(map_err)?;
+            }
+            let _ = app.emit("workspace://synced", 1);
+            return Ok(());
+        }
     }
 
     // Dispatch the proposal to the responder as an instruction, so the agent
@@ -4297,6 +4348,43 @@ async fn run_prepared_turn(
     };
 
     let workspace_root = state.workspace_root.lock().unwrap().clone();
+
+    // Per-turn isolation (concurrency): a *file-mutating* subprocess agent runs
+    // in its own git worktree cut from HEAD, so parallel turns can't clobber each
+    // other's uncommitted work in the shared tree. Its diff is captured on
+    // completion and surfaced as a review-gated FileDiff proposal, then the
+    // worktree is removed. Read-only claude turns, API/MCP turns, and non-git
+    // roots run in place (no worktree). Isolating from HEAD means an isolated
+    // turn starts from the last commit, not the main tree's uncommitted WIP.
+    let write_capable = match responder.runtime.provider {
+        ModelProviderKind::ClaudeCode => {
+            state.settings.lock().unwrap().claude_permission_mode != "default"
+        }
+        ModelProviderKind::Pi | ModelProviderKind::Aider => true,
+        _ => false,
+    };
+    let worktree = if git_subprocess
+        && write_capable
+        && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root))
+    {
+        match hive_runtime::git_worktree::Worktree::create(
+            std::path::Path::new(&workspace_root),
+            &session_id.to_string(),
+        ) {
+            Ok(wt) => Some(wt),
+            Err(e) => {
+                eprintln!("hive: worktree isolation unavailable, running in place: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let effective_root = worktree
+        .as_ref()
+        .map(|w| w.path.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace_root.clone());
+
     // Stream deltas to the UI in-memory on every token, but persist to SQLite
     // only as a throttled checkpoint (~1×/750ms) for crash-recovery — not per
     // token (#1). The final body is written once by finalize_reply, so any
@@ -4308,7 +4396,7 @@ async fn run_prepared_turn(
         &responder.runtime,
         Some(&system),
         &turns,
-        Some(&workspace_root),
+        Some(&effective_root),
         &git_env,
         1024,
         |text| {
@@ -4341,6 +4429,34 @@ async fn run_prepared_turn(
                     &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &full,
                 )?
             };
+            // Capture the isolated worktree's changes as a review-gated proposal,
+            // then remove the worktree — the stored diff is the portable artifact
+            // (any reviewer sees it; Implement applies it to the workspace root).
+            if let Some(wt) = worktree {
+                if let Ok(diff) = wt.diff() {
+                    if !diff.trim().is_empty() {
+                        let files = wt.changed_files().unwrap_or_default();
+                        let n = files.len();
+                        let title = format!(
+                            "{} proposed changes to {} file{}",
+                            responder.author,
+                            n,
+                            if n == 1 { "" } else { "s" }
+                        );
+                        // Authorless: the human reviewing can approve it (the
+                        // self-approval guard excludes no one), so a solo user
+                        // can review + implement their agent's work.
+                        let prop = hive_core::ActionProposal::file_diff(title, "", diff, files);
+                        {
+                            let mut svc = state.service.lock().unwrap();
+                            let _ = svc.upsert_proposal(session_id, workspace_id, prop);
+                        }
+                        // Nudge the Review pane to refetch so the change surfaces.
+                        let _ = app.emit("workspace://synced", 1);
+                    }
+                }
+                let _ = wt.remove();
+            }
             let _ = app.emit(
                 ChatStreamEvent::EVENT,
                 ChatStreamEvent {
@@ -4353,6 +4469,11 @@ async fn run_prepared_turn(
             Ok(TurnOutcome { message_id, body })
         }
         Err(e) => {
+            // Discard the isolated worktree — a failed/aborted turn's partial
+            // edits are not surfaced (no proposal), and the worktree is pruned.
+            if let Some(wt) = worktree {
+                let _ = wt.remove();
+            }
             let msg = e.to_string();
             {
                 let mut svc = state.service.lock().unwrap();

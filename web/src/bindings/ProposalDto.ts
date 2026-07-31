@@ -17,4 +17,14 @@ kind: string,
 /**
  * "open" | "approved" | "rejected" | "applied"
  */
-status: string, requiredApprovals: number, qualifyingApprovals: number, quorumMet: boolean, approvals: Array<ApprovalDto>, };
+status: string, requiredApprovals: number, qualifyingApprovals: number, quorumMet: boolean, approvals: Array<ApprovalDto>, 
+/**
+ * For a fileDiff proposal: the unified diff the agent produced in its
+ * isolated worktree (rendered in the Diff canvas; applied on Implement).
+ * None for command/decision proposals.
+ */
+diff?: string | null, 
+/**
+ * Paths the diff touches, for a compact summary in the Review pane.
+ */
+changedFiles?: Array<string>, };

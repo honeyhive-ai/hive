@@ -194,6 +194,33 @@ mod tests {
     }
 
     #[test]
+    fn captured_diff_applies_to_the_base_tree() {
+        // The whole review-gated flow: an isolated worktree's diff must apply
+        // cleanly back to the base with `git apply` (what Implement does).
+        use std::io::Write;
+        use std::process::Stdio;
+        let repo = temp_repo();
+        let wt = Worktree::create(&repo, "apply-test").unwrap();
+        std::fs::write(wt.path.join("a.txt"), "hello\nworld\n").unwrap();
+        std::fs::write(wt.path.join("b.txt"), "new\n").unwrap();
+        let diff = wt.diff().unwrap();
+        wt.remove().unwrap();
+
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["apply", "--whitespace=nowarn"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(diff.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success(), "captured diff applies to base tree");
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "hello\nworld\n");
+        assert_eq!(std::fs::read_to_string(repo.join("b.txt")).unwrap(), "new\n");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
     fn create_is_idempotent_after_a_stale_worktree() {
         let repo = temp_repo();
         let _first = Worktree::create(&repo, "dupe-id").unwrap();

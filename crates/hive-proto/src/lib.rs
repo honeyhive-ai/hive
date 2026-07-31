@@ -117,6 +117,14 @@ pub struct ProposalDto {
     pub qualifying_approvals: u32,
     pub quorum_met: bool,
     pub approvals: Vec<ApprovalDto>,
+    /// For a fileDiff proposal: the unified diff the agent produced in its
+    /// isolated worktree (rendered in the Diff canvas; applied on Implement).
+    /// None for command/decision proposals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    /// Paths the diff touches, for a compact summary in the Review pane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
 }
 
 /// A chat as listed in the sidebar.

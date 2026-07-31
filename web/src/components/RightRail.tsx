@@ -984,6 +984,40 @@ function ReviewPane({ sessionId }: { sessionId: string }) {
               <div className="text-xs uppercase tracking-[0.16em] opacity-55">{proposal.status}</div>
             </div>
             {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
+            {/* A fileDiff proposal (from an agent's isolated worktree) carries a
+                unified diff — render it here so it's reviewable in place, then
+                Implement applies it to the workspace. */}
+            {proposal.diff && (
+              <div className="mt-3">
+                {proposal.changedFiles && proposal.changedFiles.length > 0 && (
+                  <div className="mb-1.5 text-xs opacity-60">
+                    {proposal.changedFiles.length} file
+                    {proposal.changedFiles.length === 1 ? "" : "s"}:{" "}
+                    {proposal.changedFiles.join(", ")}
+                  </div>
+                )}
+                <div
+                  className="max-h-72 overflow-auto rounded-lg border p-2 font-mono text-[11px] leading-[1.5]"
+                  style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+                >
+                  {proposal.diff.split("\n").map((line, i) => {
+                    const color =
+                      line.startsWith("+") && !line.startsWith("+++")
+                        ? "var(--hive-success)"
+                        : line.startsWith("-") && !line.startsWith("---")
+                          ? "var(--hive-danger)"
+                          : line.startsWith("@@")
+                            ? "var(--hive-accent-cool)"
+                            : "var(--hive-ink-soft)";
+                    return (
+                      <div key={i} style={{ color, whiteSpace: "pre" }}>
+                        {line || " "}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
             <div className="mt-3 text-xs opacity-60">
               {proposal.qualifyingApprovals}/{proposal.requiredApprovals} approvals
             </div>

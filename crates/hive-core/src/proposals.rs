@@ -63,6 +63,16 @@ pub struct ActionProposal {
     pub approvals: Vec<ProposalApproval>,
     #[serde(default)]
     pub created_at: Timestamp,
+    /// For a [`ProposalKind::FileDiff`]: the unified diff the agent produced in
+    /// its isolated worktree, applied to the workspace root with `git apply` on
+    /// Implement. Stored on the proposal (not a branch ref) so it's portable —
+    /// every reviewer sees it, and any device whose tree matches the base can
+    /// apply it, not just the one that ran the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    /// Paths the diff touches — a compact summary without parsing the patch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed_files: Vec<String>,
 }
 
 fn default_floor() -> WorkspaceRole {
@@ -86,6 +96,23 @@ impl ActionProposal {
             approval_role_floor: WorkspaceRole::Viewer,
             approvals: Vec::new(),
             created_at: Timestamp::now(),
+            diff: None,
+            changed_files: Vec::new(),
+        }
+    }
+
+    /// A file-diff proposal carrying the patch an agent produced in an isolated
+    /// worktree. `Implement` applies it to the workspace root.
+    pub fn file_diff(
+        title: impl Into<String>,
+        author_actor_id: impl Into<String>,
+        diff: String,
+        changed_files: Vec<String>,
+    ) -> Self {
+        Self {
+            diff: Some(diff),
+            changed_files,
+            ..Self::new(title, ProposalKind::FileDiff, author_actor_id)
         }
     }
 
