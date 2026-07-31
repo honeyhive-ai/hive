@@ -1,6 +1,6 @@
 {
-  "tag": "v1.0.0",
-  "name": "Hive 1.0.0",
+  "tag": "v1.1.0",
+  "name": "Hive 1.1.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Production 1.0: mandatory end-to-end encryption with hardened relay authorization, CLI/daemon multi-agent parity, longer autonomous agent cascades, one-line CLI install, and a Postgres-backed relay for durable HA."
+  "notes": "Concurrent multi-agent work: tasks to the same agent stay distinct, file-mutating turns run in isolated git worktrees and come back as review-gated diffs you approve and apply, and worker pools drain the backlog in parallel. Plus a Stop button to interrupt a turn, and fixes for duplicated messages, agent stalls, and channel/scroll glitches."
 }
