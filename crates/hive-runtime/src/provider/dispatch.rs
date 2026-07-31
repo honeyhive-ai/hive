@@ -158,28 +158,19 @@ pub async fn stream(
             .await
         }
         ModelProviderKind::Codex => {
-            // OpenAI Codex CLI, headless: `codex exec [flags] <prompt>` runs one
-            // task non-interactively and streams its work to stdout. Prompt is a
-            // positional arg (like `pi -p`). Default flags run it fully automatic
-            // in a workspace-write sandbox so it can actually edit files (Hive
-            // already isolates the turn in a worktree + gates the result); a
-            // model is passed with `-m` when set. Any of this is overridable via
-            // the runtime's `args`.
-            let prompt = subprocess::render_prompt(system, turns);
-            let program = if rt.endpoint.is_empty() { "codex" } else { &rt.endpoint };
-            let mut args: Vec<String> = vec!["exec".into(), "--full-auto".into()];
-            if !rt.model.is_empty() {
-                args.push("-m".into());
-                args.push(rt.model.clone());
-            }
-            args.extend(rt.args.iter().cloned());
-            args.push(prompt);
-            subprocess::run_with(
-                program,
-                &args,
+            // OpenAI Codex CLI, headless: `codex exec --json … <prompt>` in a
+            // workspace-write sandbox (it edits files in the working dir, which
+            // is an isolated worktree upstream). The bridge parses codex's JSON
+            // events and surfaces the agent's reply. endpoint = the binary
+            // (default "codex"); model → -m; runtime args are appended.
+            super::codex::stream_reply(
+                &rt.endpoint,
+                &rt.model,
+                &rt.args,
                 working_dir,
                 extra_env,
-                subprocess::PromptInput::InArgs,
+                system,
+                turns,
                 on_delta,
             )
             .await
