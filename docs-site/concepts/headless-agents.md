@@ -9,6 +9,24 @@ covers the ways to wire that up and which one fits your situation.
 > This page is about **topology** — where the agent runs and how it reaches your
 > workspace.
 
+## Install the CLI
+
+One line — macOS + Linux, Apple Silicon and x86_64:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/honeyhive-ai/hive/main/install.sh | sh
+```
+
+It drops the prebuilt `hive` binary from the latest release onto your `PATH`
+(override the dir with `HIVE_INSTALL_DIR`, pin a tag with `HIVE_VERSION`). Or
+build from source: `cargo install --path crates/hive-cli`.
+
+The CLI is the **same runtime as the desktop app, without the window** — so it
+can host agents, drive chats, and sync from a terminal or a background service.
+Even if you live in the GUI, installing it locally is worth it when you want
+agents to keep working while the app is closed, or to script Hive from cron / a
+git hook / CI (setup 1 below).
+
 ## The one rule that decides your setup
 
 Hive state is a **per-device, end-to-end-encrypted event log** — a local
@@ -23,24 +41,38 @@ Everything below follows from that.
 
 ### 1 — Personal agent, one machine, no relay
 
-Point the CLI at the app's own data dir so both read/write the same `hive.db`.
-Simplest possible; zero infrastructure.
+The most common local case: you already run the desktop app and want your agents
+to **keep answering `@mentions` even when the app is closed** — with zero
+infrastructure. Point the CLI at the app's own data dir so both read/write the
+same `hive.db`:
 
 ```sh
-# macOS app data dir shown; adjust per-OS
+# macOS app data dir shown; adjust per-OS. `hive agent` is a local, personal
+# responder — gated so it never runs unattended by accident.
+HIVE_ALLOW_PERSONAL_AGENT=1 \
 HIVE_DATA_DIR="$HOME/Library/Application Support/com.hive.desktop" \
   hive agent bot
 ```
 
+Run it as a **background service** — launchd on macOS, systemd on Linux — and the
+agent stays responsive after you quit the app or shut the lid.
+
+The same data-dir trick lets you **script Hive** from a terminal, cron, a git
+hook, or CI without the GUI: `hive send @agent "…"`, `hive new`, `hive tail`,
+`hive queue`, `hive sync`.
+
 Trade-offs: the agent **signs as you** (shared identity, not a distinct agent
 account); the app refreshes on window focus rather than instantly; and it's a
-single-writer-ish SQLite file (fine for one agent, don't pile on writers).
+single-writer-ish SQLite file (fine for one agent, don't pile on writers). For a
+distinct agent identity, instant updates, and multiple concurrent writers, add a
+relay (setup 2+).
 
 ### 2 — Personal agent, local relay
 
-Run the `hive-relay` binary on `localhost` and point **both** the app and the CLI
-at it. Now the agent has its **own identity** (a distinct member), you get live
-updates, and concurrency is clean. Cost: one extra process to run. See
+Run the relay (the standalone Go service — `docker run -p 8443:8443 …`) on
+`localhost` and point **both** the app and the CLI at it. Now the agent has its
+**own identity** (a distinct member), you get live updates, and concurrency is
+clean. Cost: one extra process to run. See
 [Self-hosting a relay](../networking/self-host.md).
 
 ### 3 — Remote agent / always-on worker
