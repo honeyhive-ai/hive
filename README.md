@@ -70,7 +70,9 @@ handle, or a governance-role group like `@admins` — and agents can mention eac
 other, so a blocked sub-agent can escalate to a human or another model
 (fan-out is depth-capped to prevent runaway loops). **Channels** organize the
 work, and long threads are automatically condensed to fit the model's context
-window.
+window. You can **Stop** a streaming turn and send a new message at any time, and
+concurrent tasks to the *same* agent — from different channels or teammates —
+stay distinct, so several people can drive the shared agents at once.
 
 ### Bring your own agents & runtimes
 
@@ -93,10 +95,13 @@ shell command — becomes a **proposal** that lands in the **Review** pane.
 Approval uses **quorum voting**: a proposal can require more than one approval
 and an optional **role floor** (only up-votes from members at or above a given
 role count), and **self-approval is disallowed**. Reaching quorum still doesn't
-auto-run anything — a human clicks **Implement** for the responsible agent to
-carry it out, keeping a person at the last mile. Agents can now **author**
-proposals for human approval, but they get planning authority, never execution
-authority.
+auto-run anything — a human clicks **Implement** at the last mile.
+
+A file-mutating agent turn runs in its **own isolated git worktree** (branched
+from `HEAD`), so concurrent turns never clobber each other's uncommitted work.
+Its diff is captured as a review-gated proposal — you see the exact patch in the
+Review pane, and **Implement** applies it to your tree (`git apply`). Agents get
+planning authority and can **author** proposals, never execution authority.
 
 ### Agentic workflows
 
@@ -120,7 +125,9 @@ registers a machine as a host and runs every agent bound to it on a
 **drains a queue**: an `@mention` addressed to an agent while its host was offline
 waits, and the worker answers the whole backlog when it comes up. The desktop app
 surfaces the same queue and offers a **Run on worker** handoff for an offline
-agent. See [Headless agents & setups](https://docs.apiaryhq.ai/concepts/headless-agents/)
+agent. Run **several workers** to drain the backlog in parallel — each claims
+distinct turns, and per-turn worktrees keep their file edits from colliding. See
+[Headless agents & setups](https://docs.apiaryhq.ai/concepts/headless-agents/)
 for the four topologies.
 
 ### Skills & vaults
@@ -179,7 +186,6 @@ everything after their cursor; it never sees plaintext and never holds a key.
 | [`crates/hive-runtime`](crates/hive-runtime/README.md) | Orchestration over the core: SQLite event store, `ChatService`, sync engine + relay client, provider adapters, MCP, the tool loop, prompt building, vault fetcher. |
 | [`crates/hive-proto`](crates/hive-proto/README.md) | The `ts-rs` DTOs shared with the frontend; a test regenerates `web/src/bindings/` so the TS contract can't drift. |
 | [`crates/hive-cli`](crates/hive-cli/README.md) | The headless `hive` client and worker daemon — the same runtime, no Tauri. |
-| [`crates/hive-relay`](crates/hive-relay/README.md) | The Rust reference relay, now retained mainly as a test fixture. **Production relay is the separate Go repo** below. |
 | [`app/`](app/README.md) | The Tauri v2 desktop shell: IPC commands, `AppState`, and streaming events; bundles the web UI. |
 | [`web/`](web/README.md) | The React 18 + TypeScript frontend (Vite, TanStack Query, Tauri IPC). |
 | `addons/` | Optional agent shims (e.g. `aider-mcp`). |
@@ -359,8 +365,11 @@ and the [`tauri-cli`](https://tauri.app/reference/cli/) (`cargo install tauri-cl
 cargo test --workspace                   # Rust crates + the Tauri app
 cd web && bun install && bun run build    # frontend: typecheck (tsc) + build
 cargo tauri dev                          # run the app (frontend + backend)
-cargo run -p hive-relay                  # optional: a local reference relay on :8443
 ```
+
+> To exercise sync locally, run a relay from the standalone Go service —
+> [github.com/honeyhive-ai/relay](https://github.com/honeyhive-ai/relay) (see
+> [Self-hosting the relay](#self-hosting-the-relay) for the one-liner).
 
 Packaged installers are produced by [`scripts/build.sh`](scripts/build.sh) (e.g.
 `./scripts/build.sh mac`). See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full
@@ -382,11 +391,12 @@ fit together.
 
 ## Editions
 
-The desktop app and the reference relay are open source (this repo), and the
-production Go relay is open source in its own repo. A managed / enterprise tier
-adds server-side membership & RBAC, hosted relays, and org (GHEC) integration —
-those paid controls live outside this repo and attach via a small `WriteGuard`
-extension seam, so self-hosters keep a fully functional, content-blind relay. See
+The desktop app (this repo) and the production relay (the standalone
+[Go service](https://github.com/honeyhive-ai/relay)) are both open source and
+self-hostable. A managed / enterprise tier adds server-side membership & RBAC,
+hosted relays, and org (GHEC) integration — those paid controls live outside this
+repo and attach via a small `WriteGuard` extension seam, so self-hosters keep a
+fully functional, content-blind relay. See
 [the tiering model](docs-site/ops/tiering.md).
 
 ## Contributing & security
