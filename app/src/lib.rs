@@ -3866,7 +3866,7 @@ async fn summarize_chat(state: State<'_, AppState>, session_id: String) -> Resul
     let body = format!("**Conversation summary**\n\n{summary}");
     let mut svc = state.service.lock().unwrap();
     let id = svc
-        .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id, None)
+        .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id, None, None)
         .map_err(map_err)?;
     svc.complete_assistant_message(sid, workspace_id, id, body).map_err(map_err)?;
     Ok(())
@@ -3900,7 +3900,7 @@ async fn compact_chat(state: State<'_, AppState>, session_id: String) -> Result<
         svc.remove_message(sid, workspace_id, id).map_err(map_err)?;
     }
     let id = svc
-        .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id, None)
+        .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id, None, None)
         .map_err(map_err)?;
     svc.complete_assistant_message(sid, workspace_id, id, body).map_err(map_err)?;
     // In-memory overflow summary cache is now stale (messages changed).
@@ -4036,6 +4036,7 @@ async fn try_tool_loop(
     responder: &Responder,
     system: &str,
     turns: &[ChatTurn],
+    reply_to: Option<Uuid>,
 ) -> Result<Option<TurnOutcome>, String> {
     let Some(api_key) = responder.runtime.api_key.clone() else {
         return Ok(None);
@@ -4067,7 +4068,7 @@ async fn try_tool_loop(
 
     let message_id = {
         let mut svc = state.service.lock().unwrap();
-        svc.begin_assistant_message(session_id, workspace_id, &responder.author, &responder.runtime_id, responder.agent_id)
+        svc.begin_assistant_message(session_id, workspace_id, &responder.author, &responder.runtime_id, responder.agent_id, reply_to)
             .map_err(map_err)?
     };
 
@@ -4242,12 +4243,19 @@ async fn run_prepared_turn(
     system: String,
     turns: Vec<ChatTurn>,
 ) -> Result<TurnOutcome, String> {
+    // The message this turn answers: the last real (non-streaming) message before
+    // our reply is appended. Stamped on the reply as the per-request correlation
+    // key so two concurrent tasks to the SAME agent don't collapse onto one reply
+    // (see ChatMessage::reply_to_message_id / pending_mentions).
+    let reply_to = session.messages.iter().rev().find(|m| !m.is_streaming).map(|m| m.id);
+
     // If MCP tools are enabled and the responder runs on Anthropic, take the
     // (non-streaming) agentic tool loop instead of plain streaming. On any MCP
     // failure we fall through to streaming.
     if responder.runtime.provider == ModelProviderKind::Anthropic {
         if let Some(outcome) =
-            try_tool_loop(app, state, session_id, workspace_id, responder, &system, &turns).await?
+            try_tool_loop(app, state, session_id, workspace_id, responder, &system, &turns, reply_to)
+                .await?
         {
             return Ok(outcome);
         }
@@ -4284,7 +4292,7 @@ async fn run_prepared_turn(
 
     let message_id = {
         let mut svc = state.service.lock().unwrap();
-        svc.begin_assistant_message(session_id, workspace_id, &responder.author, &responder.runtime_id, responder.agent_id)
+        svc.begin_assistant_message(session_id, workspace_id, &responder.author, &responder.runtime_id, responder.agent_id, reply_to)
             .map_err(map_err)?
     };
 
@@ -8654,7 +8662,7 @@ mod finalize_proposal_tests {
         let wid = Uuid::new_v4();
         let chat = svc.create_chat("A", wid, "anthropic").unwrap();
         svc.add_agent(chat.id, wid, WorkspaceAgent::new("Scout", "ws-claude")).unwrap();
-        let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude", None).unwrap();
+        let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude", None, None).unwrap();
 
         let body = "Done.\n[[propose: {\"title\": \"Bump timeout\", \"kind\": \"command\", \"body\": \"30s\", \"requiredApprovals\": 2}]]";
         let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", "/tmp/ws", body).unwrap();

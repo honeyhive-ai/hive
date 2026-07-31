@@ -325,6 +325,7 @@ impl ChatService {
         author: impl Into<String>,
         runtime_id: impl Into<String>,
         responder_id: Option<Uuid>,
+        reply_to_message_id: Option<Uuid>,
     ) -> Result<Uuid> {
         let mut message = ChatMessage::new(MessageRole::Assistant, author, "");
         message.is_streaming = true;
@@ -332,6 +333,9 @@ impl ChatService {
         // Stamp the responder's stable id (for own-turn attribution) and this
         // device (so the stale-stream sweep never truncates a peer's stream).
         message.responder_id = responder_id;
+        // The request this turn answers — the per-agent correlation key that lets
+        // two concurrent tasks to the same agent be told apart (see pending_mentions).
+        message.reply_to_message_id = reply_to_message_id;
         message.origin_device_id = Some(self.device_id);
         let id = message.id;
         self.append_signed(
@@ -1397,9 +1401,22 @@ pub fn pending_mentions(session: &ChatSession) -> Vec<PendingMention> {
             let Some(agent) = session.workspace_agents.iter().find(|a| &a.id == aid) else {
                 continue;
             };
-            let answered = session.messages[i + 1..]
-                .iter()
-                .any(|later| later.role == MessageRole::Assistant && later.author == agent.name);
+            let answered = session.messages[i + 1..].iter().any(|later| {
+                if later.role != MessageRole::Assistant {
+                    return false;
+                }
+                match later.reply_to_message_id {
+                    // Precise per-request match: this reply answers exactly this
+                    // mention. Two concurrent tasks to the same agent no longer
+                    // collapse — a reply to the *other* task won't clear this one.
+                    Some(answers) => answers == m.id,
+                    // Legacy reply with no request id (pre-dates the field): fall
+                    // back to the old author-name heuristic so existing
+                    // transcripts still resolve. This is the only remaining path
+                    // that can collapse concurrent same-agent mentions.
+                    None => later.author == agent.name,
+                }
+            });
             if !answered {
                 out.retain(|p| p.agent_id != *aid);
                 out.push(PendingMention {
@@ -1576,7 +1593,7 @@ mod tests {
         assert_eq!(pend[0].agent_name, "reviewer");
 
         // The agent replies → no longer pending.
-        let mid = svc.begin_assistant_message(chat.id, wid, "reviewer", "ws-claude", None).unwrap();
+        let mid = svc.begin_assistant_message(chat.id, wid, "reviewer", "ws-claude", None, None).unwrap();
         svc.complete_assistant_message(chat.id, wid, mid, "done").unwrap();
         let s = svc.load(chat.id).unwrap().unwrap();
         assert!(pending_mentions(&s).is_empty(), "answered mention should not be pending");
@@ -1585,6 +1602,34 @@ mod tests {
         svc.post_user_message(chat.id, wid, "@reviewer another").unwrap();
         let s = svc.load(chat.id).unwrap().unwrap();
         assert_eq!(pending_mentions(&s).len(), 1, "a new unanswered mention re-queues");
+    }
+
+    #[test]
+    fn concurrent_same_agent_mentions_do_not_collapse() {
+        // Two near-simultaneous tasks to the SAME agent (e.g. two channels / two
+        // people). A reply to one must not mark the other answered — the bug the
+        // per-request reply_to_message_id correlation fixes.
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+        let agent = WorkspaceAgent::new("reviewer", "ws-claude");
+        svc.add_agent(chat.id, wid, agent).unwrap();
+
+        let m1 = svc.post_user_message(chat.id, wid, "@reviewer task one").unwrap().id;
+        let m2 = svc.post_user_message(chat.id, wid, "@reviewer task two").unwrap().id;
+
+        // The agent answers task ONE — reply stamped with m1 as its request id.
+        let mid = svc
+            .begin_assistant_message(chat.id, wid, "reviewer", "ws-claude", None, Some(m1))
+            .unwrap();
+        svc.complete_assistant_message(chat.id, wid, mid, "done with one").unwrap();
+
+        // Task two must STILL be pending. Under the old author-name match this
+        // reply cleared BOTH tasks; with reply_to it only clears task one.
+        let s = svc.load(chat.id).unwrap().unwrap();
+        let pend = pending_mentions(&s);
+        assert_eq!(pend.len(), 1, "reply to task one must not answer task two");
+        assert_eq!(pend[0].message_id, m2, "the still-pending mention is task two");
     }
 
     #[test]
@@ -1600,7 +1645,7 @@ mod tests {
         svc.post_user_message(sid, wid, "kick off").unwrap();
         // Scout replies, @mentioning Nova AND itself — Nova becomes cross-device
         // cascade work (a worker can pick it up); Scout's self-mention must not.
-        let m = svc.begin_assistant_message(sid, wid, "Scout", "r", None).unwrap();
+        let m = svc.begin_assistant_message(sid, wid, "Scout", "r", None, None).unwrap();
         svc.complete_assistant_message(sid, wid, m, "@Nova your turn — I (@Scout) am done").unwrap();
         let s = svc.load(sid).unwrap().unwrap();
         let pend = pending_mentions(&s);
@@ -2186,7 +2231,7 @@ mod tests {
 
         svc.post_user_message(sid, wid, "Say hello").unwrap();
         let mid = svc
-            .begin_assistant_message(sid, wid, "Hive", "anthropic", None)
+            .begin_assistant_message(sid, wid, "Hive", "anthropic", None, None)
             .unwrap();
         for piece in ["Hel", "lo, ", "world"] {
             svc.append_chunk(sid, wid, mid, piece).unwrap();
@@ -2218,9 +2263,9 @@ mod tests {
         let sid = chat.id;
         svc.post_user_message(sid, wid, "kick off").unwrap();
         // Two agents reply into the same thread.
-        let m1 = svc.begin_assistant_message(sid, wid, "Scout", "ws-claude", None).unwrap();
+        let m1 = svc.begin_assistant_message(sid, wid, "Scout", "ws-claude", None, None).unwrap();
         svc.complete_assistant_message(sid, wid, m1, "found the bug").unwrap();
-        let m2 = svc.begin_assistant_message(sid, wid, "Nova", "ws-claude", None).unwrap();
+        let m2 = svc.begin_assistant_message(sid, wid, "Nova", "ws-claude", None, None).unwrap();
         svc.complete_assistant_message(sid, wid, m2, "drafting the fix").unwrap();
 
         // From Scout's perspective: its own turn is clean; Nova + the human are
@@ -2246,9 +2291,9 @@ mod tests {
         svc.post_user_message(sid, wid, "go").unwrap();
         let nova_a = Uuid::new_v4();
         let nova_b = Uuid::new_v4();
-        let a = svc.begin_assistant_message(sid, wid, "Nova", "rt", Some(nova_a)).unwrap();
+        let a = svc.begin_assistant_message(sid, wid, "Nova", "rt", Some(nova_a), None).unwrap();
         svc.complete_assistant_message(sid, wid, a, "A analysis").unwrap();
-        let b = svc.begin_assistant_message(sid, wid, "Nova", "rt", Some(nova_b)).unwrap();
+        let b = svc.begin_assistant_message(sid, wid, "Nova", "rt", Some(nova_b), None).unwrap();
         svc.complete_assistant_message(sid, wid, b, "B take").unwrap();
 
         let session = svc.load(sid).unwrap().unwrap();
@@ -2282,7 +2327,7 @@ mod tests {
         let (sid, wid) = (chat.id, chat.workspace_id);
 
         svc.post_user_message(sid, wid, "hi").unwrap();
-        let mid = svc.begin_assistant_message(sid, wid, "Hive", "anthropic", None).unwrap();
+        let mid = svc.begin_assistant_message(sid, wid, "Hive", "anthropic", None, None).unwrap();
         svc.append_chunk(sid, wid, mid, "partial reply").unwrap();
         // No complete_assistant_message — the process "died" here.
 

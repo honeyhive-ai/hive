@@ -105,6 +105,13 @@ pub struct ChatMessage {
     /// rename or a duplicate name can't mis-label a turn as the responder's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responder_id: Option<Uuid>,
+    /// The message this turn is answering — the id of the user/agent message that
+    /// triggered it. This is the per-request correlation key: without it, replies
+    /// are matched to requests by author name, so two concurrent tasks to the
+    /// SAME agent collapse onto one reply. None on human messages and on legacy
+    /// turns from before this field (correlation falls back to author name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<Uuid>,
     /// The device that authored a streaming assistant message. The startup
     /// stale-stream sweep only completes messages from THIS device, so it can't
     /// truncate a peer's in-flight stream. None on human/legacy messages.
@@ -138,6 +145,7 @@ impl ChatMessage {
             runtime_label: None,
             agent_persona_id: None,
             responder_id: None,
+            reply_to_message_id: None,
             origin_device_id: None,
             tool_calls: Vec::new(),
             tool_results: Vec::new(),

@@ -578,9 +578,17 @@ fn match_stage_reply(
         .iter()
         .find(|m| {
             matches!(m.role, MessageRole::Assistant | MessageRole::Agent)
-                && m.author == agent_author
                 && !m.is_streaming
                 && !m.body.is_empty()
+                // Precise per-request match: this reply answers exactly this
+                // stage's prompt. Falls back to author-name only for legacy
+                // replies without a request id — which is what previously let two
+                // concurrently-ready stages on the *same* agent collapse onto one
+                // reply (the documented deferred gap).
+                && match m.reply_to_message_id {
+                    Some(answers) => answers == after_id,
+                    None => m.author == agent_author,
+                }
         })
         .map(|m| (m.id, m.body.clone()))
 }
