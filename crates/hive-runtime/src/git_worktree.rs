@@ -146,6 +146,10 @@ mod tests {
         run(&dir, "git", &["init", "-q"]);
         run(&dir, "git", &["config", "user.email", "t@t"]);
         run(&dir, "git", &["config", "user.name", "t"]);
+        // Deterministic line endings across platforms — without this, git on
+        // Windows (autocrlf=true by default) rewrites LF↔CRLF on checkout/apply,
+        // so a round-tripped file wouldn't byte-match the LF we wrote.
+        run(&dir, "git", &["config", "core.autocrlf", "false"]);
         std::fs::write(dir.join("a.txt"), "hello\n").unwrap();
         run(&dir, "git", &["add", "-A"]);
         run(&dir, "git", &["commit", "-qm", "init"]);
