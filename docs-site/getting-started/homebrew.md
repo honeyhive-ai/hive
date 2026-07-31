@@ -14,19 +14,13 @@ Upgrade later with:
 brew upgrade --cask hive
 ```
 
-This downloads the right build for your Mac automatically (Apple Silicon or
-Intel) and installs `Hive.app` into `/Applications`.
+This installs `Hive.app` into `/Applications`. The desktop app is **Apple
+Silicon only** — the cask is arm-only, so `brew install` on an Intel Mac reports
+no available build.
 
-## First launch (unsigned builds)
-
-Until notarized builds are published, macOS Gatekeeper blocks the first launch
-of an unsigned app even when installed via Homebrew. Clear it once:
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/Hive.app"
-```
-
-…or right-click **Hive.app → Open** the first time.
+The DMGs are **signed + notarized** (Developer ID), so Gatekeeper opens the app
+normally — no `xattr` workaround needed — and it **updates itself in place** from
+then on.
 
 ## Uninstall
 
