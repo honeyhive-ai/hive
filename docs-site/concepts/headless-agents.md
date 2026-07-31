@@ -168,12 +168,22 @@ once, and the work stays correct:
   shared checkout:
 
   ```bash
-  hive worker --label prod-1 &
-  hive worker --label prod-2 &
-  # each claims distinct mentions; each turn isolates its own worktree
+  # run workers from inside the repo checkout they should edit
+  HIVE_WORKER_PERMISSION_MODE=acceptEdits hive worker --label prod-1 &
+  HIVE_WORKER_PERMISSION_MODE=acceptEdits hive worker --label prod-2 &
+  # each claims distinct mentions; each write turn isolates its own worktree
   ```
 
   A single worker drains serially, so add processes to scale throughput.
+
+  **Write access is opt-in.** A worker's claude agents are **read-only by
+  default** (they answer but don't edit). Set
+  `HIVE_WORKER_PERMISSION_MODE=acceptEdits` (write files) or `bypassPermissions`
+  (also run shell commands) to let them edit — only then does a worker turn
+  isolate a worktree and produce a review-gated proposal. Run the worker from
+  within the repo checkout it should work on (its cwd is the base for the
+  worktree). A headless worker with `bypassPermissions` is powerful — grant it
+  only on trusted boxes.
 
 ## Coming updates you see on reconnect
 

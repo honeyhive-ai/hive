@@ -510,6 +510,20 @@ fn cmd_set_agent_host(cfg: &Config, agent_name: &str, host_id: &str) -> Result<(
 /// agent MUST use a workspace runtime (§12.5) — this returns an error if the
 /// agent's runtime isn't a workspace-owned one, so a worker never runs on a
 /// personal key.
+/// Claude Code permission args for a headless worker. **Read-only by default** —
+/// a worker that can write files (and, with bypass, run shell commands) is
+/// powerful, so write access is opt-in via
+/// `HIVE_WORKER_PERMISSION_MODE=acceptEdits|bypassPermissions`. Only then does a
+/// worker's claude turn actually edit files (and get worktree-isolated + turned
+/// into a review-gated proposal).
+fn worker_claude_args() -> Vec<String> {
+    match std::env::var("HIVE_WORKER_PERMISSION_MODE").as_deref() {
+        Ok("acceptEdits") => vec!["--permission-mode".into(), "acceptEdits".into()],
+        Ok("bypassPermissions") => vec!["--permission-mode".into(), "bypassPermissions".into()],
+        _ => Vec::new(),
+    }
+}
+
 fn agent_workspace_runtime(
     runtimes: &[WorkspaceRuntime],
     agent: &WorkspaceAgent,
@@ -522,12 +536,18 @@ fn agent_workspace_runtime(
     if api_key.is_none() && wr.provider != ModelProviderKind::Ollama {
         bail!("workspace runtime '{}' has no secret on this box (provision HIVE_WS_SECRET_…)", wr.name);
     }
+    // claude-code honors --permission-mode; other providers ignore args here.
+    let args = if wr.provider == ModelProviderKind::ClaudeCode {
+        worker_claude_args()
+    } else {
+        Vec::new()
+    };
     let rt = ResolvedRuntime {
         provider: wr.provider,
         model: wr.model.clone(),
         endpoint: wr.endpoint.clone(),
         api_key,
-        args: Vec::new(),
+        args,
         model_provider_id: None,
         model_base_url: None,
     };
@@ -705,13 +725,22 @@ async fn drain_worker_tick(
             // review-gated proposal instead of landing silently. API turns and
             // non-git roots run in place.
             let repo = std::env::current_dir().ok();
-            let isolate = matches!(
-                rt.provider,
-                ModelProviderKind::ClaudeCode | ModelProviderKind::Pi | ModelProviderKind::Aider
-            ) && repo
-                .as_deref()
-                .map(hive_runtime::git_worktree::is_git_repo)
-                .unwrap_or(false);
+            // Only isolate turns that can actually write: a write-mode claude
+            // (per HIVE_WORKER_PERMISSION_MODE) or aider/pi. A read-only claude
+            // turn produces no diff, so a worktree would just be overhead.
+            let write_capable = match rt.provider {
+                ModelProviderKind::ClaudeCode => rt
+                    .args
+                    .iter()
+                    .any(|a| a == "acceptEdits" || a == "bypassPermissions"),
+                ModelProviderKind::Pi | ModelProviderKind::Aider => true,
+                _ => false,
+            };
+            let isolate = write_capable
+                && repo
+                    .as_deref()
+                    .map(hive_runtime::git_worktree::is_git_repo)
+                    .unwrap_or(false);
             let worktree = match (isolate, repo.as_deref()) {
                 (true, Some(root)) => {
                     match hive_runtime::git_worktree::Worktree::create(root, &pm.message_id.to_string()) {
