@@ -226,6 +226,12 @@ export const exportChat = (sessionId: string) =>
 export const saveAttachment = (name: string, dataBase64: string) =>
   invoke<string>("save_attachment", { name, dataBase64 });
 
+/// Read a local image attachment as a data: URL for inline preview. Rejects when
+/// the file isn't present on this device (e.g. an attachment synced from another
+/// device) so the UI can fall back to a filename chip.
+export const readImageDataUrl = (path: string) =>
+  invoke<string>("read_image_data_url", { path });
+
 export const removeWorkspaceFromList = (path: string) =>
   invoke<string[]>("remove_workspace_from_list", { path });
 

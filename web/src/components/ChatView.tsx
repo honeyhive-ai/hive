@@ -10,6 +10,7 @@ import {
   presenceList,
   presencePing,
   saveAttachment,
+  readImageDataUrl,
   readWorkspaceFile,
   sendMessage,
   stopTurn,
@@ -49,6 +50,7 @@ import {
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonBubbles } from "@/components/Skeleton";
 import { EmojiPicker } from "@/components/EmojiPicker";
+import { loadEmojiIndex, searchEmoji, exactEmoji, type EmojiEntry } from "@/lib/emoji";
 import { Avatar } from "@/components/Avatar";
 import { Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui";
 import { Markdown } from "@/components/Markdown";
@@ -111,6 +113,12 @@ export function ChatView({
   const [slashActive, setSlashActive] = useState(0);
   // Pending composer attachments (saved to disk; referenced by path on send).
   const [attachments, setAttachments] = useState<{ name: string; path: string; image: boolean }[]>([]);
+  // Composer emoji: the picker-panel toggle + the inline `:shortcode` menu.
+  const [showEmoji, setShowEmoji] = useState(false);
+  const [emojiIndex, setEmojiIndex] = useState<EmojiEntry[]>([]);
+  const [emojiSc, setEmojiSc] = useState<{ start: number; query: string } | null>(null);
+  const [emojiScActive, setEmojiScActive] = useState(0);
+  const emojiPanelRef = useRef<HTMLDivElement>(null);
   // Composer route pill: the "default recipient when no @mention" popover.
   const [routeOpen, setRouteOpen] = useState(false);
   // Composer focus ring (the turn-shaped card lights its accent border).
@@ -300,6 +308,69 @@ export function ChatView({
         toast.error(`Couldn't attach ${file.name}: ${errMsg(e)}`);
       }
     }
+  }
+
+  // --- emoji (`:shortcode` autocomplete + picker) -----------------------
+  // Load the emoji index once (lazy chunk); shared with the reaction picker.
+  useEffect(() => {
+    let alive = true;
+    void loadEmojiIndex().then((idx) => {
+      if (alive) setEmojiIndex(idx);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+  const emojiMatches = useMemo(
+    () => (emojiSc ? searchEmoji(emojiIndex, emojiSc.query) : []),
+    [emojiSc, emojiIndex],
+  );
+  // Close the picker panel on outside click / Escape.
+  useEffect(() => {
+    if (!showEmoji) return;
+    const onDown = (ev: MouseEvent) => {
+      if (!emojiPanelRef.current?.contains(ev.target as Node)) setShowEmoji(false);
+    };
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setShowEmoji(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [showEmoji]);
+  // Insert an emoji at the caret (from the picker panel).
+  function insertEmoji(emoji: string) {
+    const ta = taRef.current;
+    const start = ta?.selectionStart ?? input.length;
+    const end = ta?.selectionEnd ?? input.length;
+    const next = input.slice(0, start) + emoji + input.slice(end);
+    setInput(next);
+    requestAnimationFrame(() => {
+      if (!ta) return;
+      ta.focus();
+      const pos = start + emoji.length;
+      ta.setSelectionRange(pos, pos);
+      autoGrow();
+    });
+  }
+  // Replace the active `:shortcode` with the chosen emoji.
+  function acceptEmojiShortcode(emoji: string) {
+    if (!emojiSc) return;
+    const sc = emojiSc;
+    const end = sc.start + 1 + sc.query.length;
+    setInput((cur) => cur.slice(0, sc.start) + emoji + cur.slice(end));
+    setEmojiSc(null);
+    requestAnimationFrame(() => {
+      const ta = taRef.current;
+      if (!ta) return;
+      ta.focus();
+      const pos = sc.start + emoji.length;
+      ta.setSelectionRange(pos, pos);
+      autoGrow();
+    });
   }
 
   // --- @-mention autocomplete -------------------------------------------
@@ -827,6 +898,24 @@ export function ChatView({
                     ))}
                   </Popover>
                 )}
+                {emojiSc && emojiMatches.length > 0 && (
+                  <Popover anchorRef={taRef} backdrop={false} minWidth={220} onDismiss={() => setEmojiSc(null)}>
+                    {emojiMatches.map((c, i) => (
+                      <PopoverItem
+                        key={c.slug}
+                        label={
+                          <span>
+                            <span className="mr-2 text-lg leading-none">{c.emoji}</span>
+                            <span className="opacity-70">:{c.slug}:</span>
+                          </span>
+                        }
+                        active={i === emojiScActive}
+                        onHover={() => setEmojiScActive(i)}
+                        onSelect={() => acceptEmojiShortcode(c.emoji)}
+                      />
+                    ))}
+                  </Popover>
+                )}
                 <textarea
                   ref={taRef}
                   value={input}
@@ -841,6 +930,27 @@ export function ChatView({
                   onChange={(e) => {
                     const v = e.target.value;
                     const caret = e.target.selectionStart ?? v.length;
+                    // `:shortcode:` → emoji on the closing colon (e.g. `:fire:` → 🔥).
+                    const closing = /(?:^|[\s(]):([a-z0-9_+-]{2,}):$/.exec(v.slice(0, caret));
+                    if (closing) {
+                      const em = exactEmoji(emojiIndex, closing[1]);
+                      if (em) {
+                        const scStart = caret - closing[1].length - 2;
+                        const next = v.slice(0, scStart) + em + v.slice(caret);
+                        setInput(next);
+                        autoGrow();
+                        setEmojiSc(null);
+                        setSlash(null);
+                        setMention(null);
+                        requestAnimationFrame(() => {
+                          const ta = taRef.current;
+                          if (!ta) return;
+                          const pos = scStart + em.length;
+                          ta.setSelectionRange(pos, pos);
+                        });
+                        return;
+                      }
+                    }
                     setInput(v);
                     autoGrow();
                     const sl = detectSlash(v, caret);
@@ -848,6 +958,10 @@ export function ChatView({
                     setSlashActive(0);
                     setMention(sl ? null : detectMention(v, caret));
                     setMentionActive(0);
+                    // `:word` (2+ chars, at a word boundary) opens the emoji menu.
+                    const scm = /(?:^|[\s(]):([a-z0-9_+-]{2,})$/.exec(v.slice(0, caret));
+                    setEmojiSc(sl || !scm ? null : { start: caret - scm[1].length - 1, query: scm[1] });
+                    setEmojiScActive(0);
                     if (v.trim()) pingTyping();
                     else clearTyping();
                   }}
@@ -858,10 +972,23 @@ export function ChatView({
                     // item preventDefaults its mousedown, so it never blurs here.
                     setSlash(null);
                     setMention(null);
+                    setEmojiSc(null);
                   }}
                   onKeyDown={(e) => {
-                    // One shared reducer (↑↓ move · ↩/⇥ accept · esc dismiss) for both
+                    // One shared reducer (↑↓ move · ↩/⇥ accept · esc dismiss) for the
                     // composer menus (R5).
+                    if (
+                      emojiSc &&
+                      emojiMatches.length > 0 &&
+                      candidateKey(e, {
+                        count: emojiMatches.length,
+                        active: emojiScActive,
+                        setActive: setEmojiScActive,
+                        onAccept: (i) => acceptEmojiShortcode(emojiMatches[i].emoji),
+                        onDismiss: () => setEmojiSc(null),
+                      })
+                    )
+                      return;
                     if (
                       slash &&
                       slashItems.length > 0 &&
@@ -954,6 +1081,26 @@ export function ChatView({
                   )}
                 </div>
                 <span className="sp" />
+                <div className="relative" ref={emojiPanelRef}>
+                  <button
+                    type="button"
+                    className="ib"
+                    title="Emoji"
+                    aria-label="Insert emoji"
+                    onClick={() => setShowEmoji((v) => !v)}
+                  >
+                    <IconSmile size={15} />
+                  </button>
+                  {showEmoji && (
+                    <EmojiPicker
+                      align="right"
+                      onPick={(emoji) => {
+                        insertEmoji(emoji);
+                        setShowEmoji(false);
+                      }}
+                    />
+                  )}
+                </div>
                 <label className="ib" title="Attach files" aria-label="Attach files">
                   <IconPaperclip size={15} />
                   <input
@@ -1035,7 +1182,10 @@ function TypingDots({ label }: { label: string }) {
   );
 }
 
-/// Renders a message: markdown text plus chips for any `[Attached: …]` paths.
+/// Renders a message: markdown text plus previews/chips for any `[Attached: …]`
+/// paths. Image attachments show an inline thumbnail (loaded from the local
+/// file as a data URL); non-images — and images whose bytes aren't on this
+/// device — show a filename chip.
 function MessageBody({ body }: { body: string }) {
   const { text, paths } = splitAttachments(body);
   return (
@@ -1043,22 +1193,63 @@ function MessageBody({ body }: { body: string }) {
       {text && <Markdown content={text} />}
       {paths.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-2">
-          {paths.map((p, i) => (
-            <span
-              key={`${p}-${i}`}
-              className="inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
-              style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
-              title={p}
-            >
-              <span aria-hidden className="opacity-60">
-                {isImagePath(p) ? <IconImage size={13} /> : <IconFile size={13} />}
-              </span>
-              <span className="max-w-[14rem] truncate">{fileBaseName(p)}</span>
-            </span>
-          ))}
+          {paths.map((p, i) =>
+            isImagePath(p) ? (
+              <ImageAttachment key={`${p}-${i}`} path={p} />
+            ) : (
+              <AttachmentChip key={`${p}-${i}`} path={p} />
+            ),
+          )}
         </div>
       )}
     </>
+  );
+}
+
+/// A filename chip for a non-image attachment (or an image not available locally).
+function AttachmentChip({ path, image }: { path: string; image?: boolean }) {
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
+      style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+      title={path}
+    >
+      <span aria-hidden className="opacity-60">
+        {image ?? isImagePath(path) ? <IconImage size={13} /> : <IconFile size={13} />}
+      </span>
+      <span className="max-w-[14rem] truncate">{fileBaseName(path)}</span>
+    </span>
+  );
+}
+
+/// Inline image thumbnail. Loads the local file as a data URL; falls back to a
+/// chip if the bytes aren't on this device (e.g. synced from another peer).
+function ImageAttachment({ path }: { path: string }) {
+  const img = useQuery({
+    queryKey: ["image-attachment", path],
+    queryFn: () => readImageDataUrl(path),
+    staleTime: Infinity,
+    retry: false,
+  });
+  if (img.isError) return <AttachmentChip path={path} image />;
+  if (!img.data) {
+    return (
+      <div
+        className="h-32 w-32 animate-pulse rounded-lg border"
+        style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+        title={fileBaseName(path)}
+      />
+    );
+  }
+  return (
+    <a href={img.data} target="_blank" rel="noreferrer" title={fileBaseName(path)}>
+      <img
+        src={img.data}
+        alt={fileBaseName(path)}
+        className="max-h-64 max-w-[min(20rem,100%)] rounded-lg border object-contain"
+        style={{ borderColor: "var(--hive-line)" }}
+      />
+    </a>
   );
 }
 

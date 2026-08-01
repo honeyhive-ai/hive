@@ -1,6 +1,6 @@
 {
-  "tag": "v1.2.3",
-  "name": "Hive 1.2.3",
+  "tag": "v1.3.0",
+  "name": "Hive 1.3.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes a runtime-switching regression: once you added a second runtime (e.g. Codex), switching a chat back to Claude Code failed with 'unknown runtime id claude-code'. Claude Code is the built-in bring-your-own CLI runtime (surfaced by the runtime list but not a saved config entry), so the per-chat switch now accepts it the same way the default-runtime setter already did. Also carries 1.2.2's macOS file-access helper and 1.2.1's runtime Test button + turn timeout."
+  "notes": "Collaboration fix + composer features. Inviting teammates by GitHub handle now works reliably: signing in with GitHub (or configuring the relay afterward) registers you in the relay directory immediately, instead of only on the next app launch — so a friend who just signed in can be invited right away. Composer: image attachments now show an inline preview in the chat (not just a filename chip), and emoji are easy to add — a picker button plus inline :shortcode: autocomplete (type :fire: to get the emoji). Note: invite people by GitHub handle (it seals the workspace key and registers server-side membership); invite codes are for pairing your own devices."
 }

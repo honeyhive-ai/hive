@@ -1880,6 +1880,38 @@ fn save_attachment(state: State<AppState>, name: String, data_base64: String) ->
     Ok(path.to_string_lossy().to_string())
 }
 
+/// Read a local image attachment as a `data:` URL so the chat can preview it
+/// inline. Bounded so a huge image can't bloat the webview. Errors when the file
+/// isn't present (e.g. an attachment whose path synced from another device but
+/// whose bytes are local-only) so the UI falls back to a filename chip.
+#[tauri::command]
+fn read_image_data_url(path: String) -> Result<String, String> {
+    const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
+    let p = std::path::PathBuf::from(path.trim());
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        _ => return Err("unsupported image type".to_string()),
+    };
+    let meta = std::fs::metadata(&p).map_err(|_| "image not available on this device".to_string())?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err("image too large to preview".to_string());
+    }
+    let bytes = std::fs::read(&p).map_err(map_err)?;
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(format!("data:{mime};base64,{b64}"))
+}
+
 #[tauri::command]
 fn create_chat(state: State<AppState>, title: String) -> Result<ChatSessionDto, String> {
     let title = if title.trim().is_empty() {
@@ -7003,15 +7035,15 @@ fn get_connection_settings(state: State<AppState>) -> ConnectionSettings {
 /// secrets back). The sync loop picks up relay/room/key changes within ~3s.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-fn update_connection_settings(
-    state: State<AppState>,
+async fn update_connection_settings(
+    state: State<'_, AppState>,
     relay_url: String,
     room: String,
     workspace_key: Option<String>,
     api_key: Option<String>,
     relay_access_token: Option<String>,
     permission_mode: String,
-) -> ConnectionSettings {
+) -> Result<ConnectionSettings, String> {
     {
         let mut s = state.settings.lock().unwrap();
         let trimmed = relay_url.trim();
@@ -7046,7 +7078,12 @@ fn update_connection_settings(
         }
         save_settings(&state.data_dir, &s);
     }
-    get_connection_settings(state)
+    // Configuring (or changing) the relay after sign-in should make this account
+    // discoverable immediately — otherwise "sign in first, add relay later"
+    // leaves the user invisible until the next app launch. Self-gates on relay +
+    // github token, so it's a no-op until both exist.
+    let _ = register_directory(&state).await;
+    Ok(get_connection_settings(state))
 }
 
 /// Set the model for the Primary Runtime (the default when no runtime is
@@ -7496,6 +7533,10 @@ async fn github_login_poll(
             state.service.lock().unwrap().set_author_display_name(gh_name.trim());
         }
     }
+    // Register in the relay directory now that a token exists, so teammates can
+    // invite this account by handle immediately — without waiting for a restart
+    // (the mount-time directory_register no-ops before sign-in). Best-effort.
+    let _ = register_directory(&state).await;
     Ok(GithubPollDto { status: "success".into(), account: Some(account) })
 }
 
@@ -7514,17 +7555,19 @@ fn this_device_ka(state: &AppState) -> Option<(String, String)> {
 
 /// Register this device in the relay directory under the signed-in GitHub
 /// account, so teammates can invite this account by handle and seal keys to it.
-/// Best-effort: no-op (Ok) if not signed in or no relay.
-#[tauri::command]
-async fn directory_register(state: State<'_, AppState>) -> Result<(), String> {
-    let relay = match configured_relay(&state) {
+/// Best-effort: no-op (Ok) if not signed in or no relay. Callable directly with
+/// `&AppState` so sign-in can register immediately (not only the mount-time
+/// command) — otherwise a user who signs in *after* app launch never lands in
+/// the directory and can't be invited ("isn't on Hive yet").
+async fn register_directory(state: &AppState) -> Result<(), String> {
+    let relay = match configured_relay(state) {
         Ok(r) => r,
         Err(_) => return Ok(()),
     };
     if state.github_token().is_none() {
         return Ok(());
     }
-    let Some((device_id, ka_hex)) = this_device_ka(&state) else {
+    let Some((device_id, ka_hex)) = this_device_ka(state) else {
         return Ok(());
     };
     let client = state.relay_client(&relay);
@@ -7537,6 +7580,11 @@ async fn directory_register(state: State<'_, AppState>) -> Result<(), String> {
     let label = hostname_label();
     let _ = client.account_register(&device_id, None, label.as_deref()).await;
     Ok(())
+}
+
+#[tauri::command]
+async fn directory_register(state: State<'_, AppState>) -> Result<(), String> {
+    register_directory(&state).await
 }
 
 /// A friendly device label for the account registry (the machine's hostname).
@@ -8714,6 +8762,7 @@ pub fn run() {
             probe_relay_at,
             export_chat,
             save_attachment,
+            read_image_data_url,
             set_git_email,
             p2p_my_code,
             p2p_list_contacts,
