@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "Hive"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "base64 0.22.1",
  "dunce",
@@ -22,6 +22,9 @@ dependencies = [
  "tauri-plugin-updater",
  "tokio",
  "toml 0.8.2",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
  "uuid",
  "windows-sys 0.59.0",
 ]
@@ -1200,7 +1203,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2406,7 +2409,7 @@ dependencies = [
 
 [[package]]
 name = "hive-cli"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "hive-core",
@@ -2420,7 +2423,7 @@ dependencies = [
 
 [[package]]
 name = "hive-core"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek 2.2.0",
@@ -2438,7 +2441,7 @@ dependencies = [
 
 [[package]]
 name = "hive-proto"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "serde",
  "ts-rs",
@@ -2446,7 +2449,7 @@ dependencies = [
 
 [[package]]
 name = "hive-runtime"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5713,13 +5716,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
 dependencies = [
  "proc-macro2",
- "quote",
  "unicode-ident",
 ]
 
@@ -6569,6 +6577,19 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.19",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]

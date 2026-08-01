@@ -22,6 +22,7 @@ import { ModelsSection } from "@/components/settings/ModelsSection";
 import { ToolsSection } from "@/components/settings/ToolsSection";
 import { PermissionsSection } from "@/components/settings/PermissionsSection";
 import { UpdatesSection } from "@/components/settings/UpdatesSection";
+import { DiagnosticsSection } from "@/components/settings/DiagnosticsSection";
 import { DangerZoneSection } from "@/components/settings/DangerZoneSection";
 
 // ── Grouped nav (§6.5) ──────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ export type SettingsTab =
   | "tools"
   | "permissions"
   | "updates"
+  | "diagnostics"
   | "danger";
 
 type NavItem = { id: SettingsTab; label: string; icon: React.ReactNode };
@@ -69,6 +71,7 @@ const NAV_GROUPS: NavGroup[] = [
     cap: "Advanced",
     items: [
       { id: "updates", label: "Updates & data", icon: <IconArrowDown size={16} /> },
+      { id: "diagnostics", label: "Diagnostics", icon: <IconActivity size={16} /> },
       { id: "danger", label: "Danger zone", icon: <IconAlertTriangle size={16} /> },
     ],
   },
@@ -219,6 +222,7 @@ export function SettingsView({
           {tab === "tools" && <ToolsSection />}
           {tab === "permissions" && <PermissionsSection />}
           {tab === "updates" && <UpdatesSection />}
+          {tab === "diagnostics" && <DiagnosticsSection />}
           {tab === "danger" && <DangerZoneSection />}
         </div>
       </div>

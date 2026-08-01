@@ -1,6 +1,6 @@
 {
-  "tag": "v1.3.1",
-  "name": "Hive 1.3.1",
+  "tag": "v1.4.0",
+  "name": "Hive 1.4.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Multiplayer polish. Windows: agent CLIs (Claude Code, Codex, etc.) no longer flash a console window when they run. Members pane simplified to one correct way to add people — invite by GitHub handle (it seals the workspace key and registers membership); the confusing manual placeholder 'Add member' is gone. When two teammates both have a default agent named 'hive', replies now show whose hive answered (the responder's name + avatar). And you're now notified if an owner/admin removes you from a workspace, instead of silently losing access."
+  "notes": "Diagnostics, audit, and timestamps. Internal errors are now logged to a rolling file (and surfaced in Settings -> Diagnostics), so background failures in sync, agents, scheduling, and workflows — plus panics — are visible after the fact instead of vanishing to a stderr no one sees; set HIVE_LOG=debug for more. The People pane gains a Membership history audit projected from the signed config log (who joined or was removed, by whom, and when), and join times are now stamped correctly. Messages show a proper wall-clock timestamp with day separators in the transcript (full date + relative age on hover)."
 }

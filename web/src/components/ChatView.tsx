@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   exportChat,
@@ -26,7 +26,7 @@ import {
   type WorkspaceAgentDto,
 } from "@/lib/ipc";
 import { attachmentMarker, splitAttachments, fileBaseName, isImagePath } from "@/lib/attachments";
-import { relTime, absTime } from "@/lib/time";
+import { relTime, absTime, clockTime, dayKey, dayLabel } from "@/lib/time";
 import { PRIMARY_NAME, PRIMARY_HANDLE } from "@/lib/agent";
 import {
   IconCopy,
@@ -745,7 +745,11 @@ export function ChatView({
             // stream bubble is the single source until it retires, so this never
             // renders the turn twice, and the swap is seamless (no anchor jump).
             .filter((m) => !streams.has(m.id))
-            .map((m) => {
+            .map((m, idx, arr) => {
+              // Day separator when the calendar day changes from the prior turn.
+              const showDay =
+                Boolean(m.createdAt) &&
+                (idx === 0 || dayKey(m.createdAt) !== dayKey(arr[idx - 1]?.createdAt ?? ""));
               const rosterAgent = m.role === "user" || m.role === "system" ? undefined : agentByName.get(m.author);
               // A workspace-owned agent (empty ownerActorId) is a "shared" turn
               // (neutral tint); a personal agent keeps the cool agent tint and
@@ -759,8 +763,9 @@ export function ChatView({
                   ? undefined
                   : rosterAgent?.name ?? (m.author === PRIMARY_NAME ? PRIMARY_HANDLE : m.author);
               return (
-                <Bubble
-                  key={m.id}
+                <Fragment key={m.id}>
+                  {showDay && <DaySeparator label={dayLabel(m.createdAt)} />}
+                  <Bubble
                   messageId={m.id}
                   role={m.role}
                   author={m.author}
@@ -790,7 +795,8 @@ export function ChatView({
                   toolResults={m.toolResults}
                   onReact={handleReact}
                   onRegenerate={m.id === lastAssistantId && !sending && streams.size === 0 ? handleRegenerate : undefined}
-                />
+                  />
+                </Fragment>
               );
             })}
           {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} avatarUrl={selfAvatarUrl} />}
@@ -1183,6 +1189,18 @@ function TypingDots({ label }: { label: string }) {
   );
 }
 
+/// A centered date divider between turns on different calendar days.
+function DaySeparator({ label }: { label: string }) {
+  if (!label) return null;
+  return (
+    <div className="my-2 flex items-center gap-3 px-1 opacity-60" aria-label={label}>
+      <div className="h-px flex-1" style={{ background: "var(--hive-line)" }} />
+      <span className="text-[11px] font-medium uppercase tracking-wide">{label}</span>
+      <div className="h-px flex-1" style={{ background: "var(--hive-line)" }} />
+    </div>
+  );
+}
+
 /// Renders a message: markdown text plus previews/chips for any `[Attached: …]`
 /// paths. Image attachments show an inline thumbnail (loaded from the local
 /// file as a data URL); non-images — and images whose bytes aren't on this
@@ -1375,8 +1393,10 @@ const Bubble = memo(function Bubble({
   // time on hover. `relTime`/`absTime` normalize a designator-less timestamp to
   // UTC first, so a stray naive `createdAt` can never render in the wrong zone
   // (which made a reply look ~8h earlier than the message it answered).
-  const timeLabel = createdAt ? relTime(createdAt) : "";
-  const timeTitle = createdAt ? absTime(createdAt) : undefined;
+  // Show the wall-clock time (e.g. "3:42 PM") as the always-visible timestamp;
+  // the full date + relative age are on hover.
+  const timeLabel = createdAt ? clockTime(createdAt) : "";
+  const timeTitle = createdAt ? `${absTime(createdAt)} (${relTime(createdAt)} ago)` : undefined;
   const isUser = role === "user";
   const isSystem = role === "system";
   const counts = new Map<string, number>();

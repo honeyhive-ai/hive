@@ -23,6 +23,12 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+# Structured logging → a rolling daily file in the OS log dir (+ stderr), so
+# background errors (sync/scheduler/workflow) are diagnosable after the fact
+# instead of vanishing to a stderr no one sees in a GUI launch.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender = "0.2"
 # join_all for parallel workflow stages (already in the graph via tauri).
 futures = "0.3"
 # `devtools` enables the web inspector in release builds too (right-click →

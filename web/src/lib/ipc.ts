@@ -232,6 +232,27 @@ export const saveAttachment = (name: string, dataBase64: string) =>
 export const readImageDataUrl = (path: string) =>
   invoke<string>("read_image_data_url", { path });
 
+/// Tail of today's app log (internal errors/warnings/panics) for the Diagnostics
+/// view.
+export const readRecentLogs = (maxLines?: number) =>
+  invoke<string>("read_recent_logs", { maxLines: maxLines ?? null });
+
+/// Absolute path of the log directory (for "where are my logs" when sharing).
+export const logDirPath = () => invoke<string | null>("log_dir_path");
+
+export type MembershipAuditEntry = {
+  action: "added" | "removed";
+  member: string;
+  role: string | null;
+  by: string;
+  at: string;
+};
+
+/// Workspace-join audit: who added/removed whom and when, from the signed config
+/// log (newest first).
+export const listMembershipAudit = () =>
+  invoke<MembershipAuditEntry[]>("list_membership_audit");
+
 export const removeWorkspaceFromList = (path: string) =>
   invoke<string[]>("remove_workspace_from_list", { path });
 

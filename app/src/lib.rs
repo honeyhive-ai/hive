@@ -1927,6 +1927,26 @@ fn read_image_data_url(path: String) -> Result<String, String> {
     Ok(format!("data:{mime};base64,{b64}"))
 }
 
+/// Read the tail of today's app log for the in-app Diagnostics view — the
+/// internal errors/warnings/panics that otherwise only reach stderr (invisible
+/// in a GUI launch). Returns the last `max_lines` lines (default 500).
+#[tauri::command]
+fn read_recent_logs(max_lines: Option<usize>) -> Result<String, String> {
+    let path = current_log_file().ok_or_else(|| "no log file yet".to_string())?;
+    let text = std::fs::read_to_string(&path).map_err(map_err)?;
+    let n = max_lines.unwrap_or(500).min(5000);
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    Ok(lines[start..].join("\n"))
+}
+
+/// The absolute path of the log directory, so the UI can offer "reveal in
+/// Finder" for sharing logs when debugging.
+#[tauri::command]
+fn log_dir_path() -> Option<String> {
+    LOG_DIR.get().map(|p| p.to_string_lossy().into_owned())
+}
+
 #[tauri::command]
 fn create_chat(state: State<AppState>, title: String) -> Result<ChatSessionDto, String> {
     let title = if title.trim().is_empty() {
@@ -2419,6 +2439,64 @@ fn list_members(state: State<AppState>, session_id: String) -> Result<Vec<Worksp
         .unwrap_or_default())
 }
 
+/// One membership-history entry projected from the signed config log.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MembershipAuditDto {
+    /// "added" | "removed".
+    action: String,
+    /// The affected member's display name (or their id if never seen added).
+    member: String,
+    /// The role granted on an "added" entry.
+    role: Option<String>,
+    /// Who authored the change.
+    by: String,
+    /// RFC 3339 time the event was authored.
+    at: String,
+}
+
+/// Workspace-join audit: who added/removed whom, and when — projected from the
+/// tamper-evident config event log (each event carries its author + timestamp).
+/// Newest first. Answers "who joined this workspace and how".
+#[tauri::command]
+fn list_membership_audit(state: State<AppState>) -> Result<Vec<MembershipAuditDto>, String> {
+    let active = state.active_workspace_id();
+    let config_id = hive_core::workspace_config_session_id(active);
+    let svc = state.service.lock().unwrap();
+    let envs = svc.store().list(config_id).map_err(map_err)?;
+    // Resolve MemberRemoved's id → name from the adds seen earlier in the log.
+    let mut names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut out: Vec<MembershipAuditDto> = Vec::new();
+    for env in envs {
+        let by = env
+            .actor_stamp
+            .as_ref()
+            .map(|a| a.actor.display_name.clone())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
+        let at = rfc3339(env.timestamp);
+        match &env.payload {
+            hive_core::SessionEvent::MemberAdded { member } => {
+                names.insert(member.id.clone(), member.actor.display_name.clone());
+                out.push(MembershipAuditDto {
+                    action: "added".into(),
+                    member: member.actor.display_name.clone(),
+                    role: Some(role_name(member.role).to_string()),
+                    by,
+                    at,
+                });
+            }
+            hive_core::SessionEvent::MemberRemoved { member_id } => {
+                let member = names.get(member_id).cloned().unwrap_or_else(|| member_id.clone());
+                out.push(MembershipAuditDto { action: "removed".into(), member, role: None, by, at });
+            }
+            _ => {}
+        }
+    }
+    out.reverse();
+    Ok(out)
+}
+
 #[tauri::command]
 fn add_member(
     state: State<AppState>,
@@ -2441,7 +2519,7 @@ fn add_member(
         role: parse_role(&role),
         title,
         index: next_index,
-        joined_at: Default::default(),
+        joined_at: hive_core::Timestamp::now(),
     };
     svc.add_member(id, state.active_workspace_id(), member).map_err(map_err)
 }
@@ -2484,7 +2562,7 @@ async fn import_github_teams(
             role: om.role,
             title: String::new(),
             index: next_index,
-            joined_at: Default::default(),
+            joined_at: hive_core::Timestamp::now(),
         };
         svc.add_member(sid, ws, member).map_err(map_err)?;
         added += 1;
@@ -4426,7 +4504,7 @@ async fn run_prepared_turn(
         ) {
             Ok(wt) => Some(wt),
             Err(e) => {
-                eprintln!("hive: worktree isolation unavailable, running in place: {e}");
+                tracing::warn!(target: "worktree", "isolation unavailable, running in place: {e}");
                 None
             }
         }
@@ -6288,7 +6366,7 @@ async fn run_scheduler_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, 
         };
         for sched in due {
             if let Err(e) = fire_schedule(&app, &sched).await {
-                eprintln!("scheduler: schedule '{}' failed: {e}", sched.label);
+                tracing::error!(target: "scheduler", "schedule {} failed: {e}", sched.label);
             }
             // Stamp last_run even on failure, so a broken schedule doesn't
             // hot-loop every tick.
@@ -6429,7 +6507,7 @@ async fn sync_pull_once(
                 other => format!("sync error: {other}"),
             };
             if last_sync_err.as_deref() != Some(msg.as_str()) {
-                eprintln!("{msg}");
+                tracing::error!(target: "sync", "{msg}");
                 *last_sync_err = Some(msg.clone());
             }
             // Surface the actionable error to the backend health state and emit
@@ -6462,7 +6540,7 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
     let mut store = match EventStore::open(&db_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("sync: failed to open store: {e}");
+            tracing::error!(target: "sync", "failed to open store: {e}");
             return;
         }
     };
@@ -6881,7 +6959,7 @@ fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<
             if let Err(e) =
                 svc.ensure_self_member(hive_core::workspace_config_session_id(id), id)
             {
-                eprintln!("workspace: ensure_self_member on activate failed: {e}");
+                tracing::error!(target: "workspace", "ensure_self_member on activate failed: {e}");
             }
         }
     } else {
@@ -7700,7 +7778,7 @@ async fn invite_by_handle(
             role: WorkspaceRole::Contributor,
             title: String::new(),
             index: next_index,
-            joined_at: Default::default(),
+            joined_at: hive_core::Timestamp::now(),
         };
         svc.add_member(sid, state.active_workspace_id(), member).map_err(map_err)?;
     }
@@ -8471,7 +8549,7 @@ async fn run_peer_sync_session(app: AppHandle, data_dir: PathBuf, db_path: PathB
     let node = match IrohNode::bind(secret_from_bytes(secret)).await {
         Ok(n) => std::sync::Arc::new(n),
         Err(e) => {
-            eprintln!("p2p: failed to bind endpoint: {e}");
+            tracing::error!(target: "p2p", "failed to bind endpoint: {e}");
             return;
         }
     };
@@ -8480,7 +8558,7 @@ async fn run_peer_sync_session(app: AppHandle, data_dir: PathBuf, db_path: PathB
     let mut store = match EventStore::open(&db_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("p2p: failed to open store: {e}");
+            tracing::error!(target: "p2p", "failed to open store: {e}");
             return;
         }
     };
@@ -8598,6 +8676,64 @@ fn login_shell_path() -> Option<std::ffi::OsString> {
     }
 }
 
+/// The active log directory (set once at startup), so `read_recent_logs` can
+/// find today's file.
+static LOG_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Today's rolling log file path (matches tracing_appender's `daily` naming:
+/// `hive.log.YYYY-MM-DD`), or the base path if the dated one isn't present yet.
+fn current_log_file() -> Option<PathBuf> {
+    let dir = LOG_DIR.get()?;
+    // Pick the most recently modified hive.log* so we always tail the live file.
+    std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with("hive.log"))
+        .max_by_key(|e| e.metadata().and_then(|m| m.modified()).ok())
+        .map(|e| e.path())
+}
+
+/// Set up structured logging: a daily rolling file in the OS log dir plus stderr.
+/// Background errors (sync/scheduler/workflow) and panics land here instead of
+/// vanishing to a stderr no one reads in a GUI launch. Level via `HIVE_LOG`
+/// (default `info`).
+fn init_logging(app: &tauri::App) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .unwrap_or_else(|_| std::env::temp_dir().join("hive-logs"));
+    let _ = std::fs::create_dir_all(&log_dir);
+    let file = tracing_appender::rolling::daily(&log_dir, "hive.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file);
+    // Keep the flush guard alive for the whole process.
+    Box::leak(Box::new(guard));
+
+    let filter = tracing_subscriber::EnvFilter::try_from_env("HIVE_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(non_blocking),
+        )
+        .try_init();
+    let _ = LOG_DIR.set(log_dir);
+
+    // Log panics (including background tasks) — otherwise a panicked sync/driver
+    // task dies silently. Chain the default hook so the usual output still prints.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!(target: "panic", "{info}");
+        default_hook(info);
+    }));
+    tracing::info!("Hive {} starting", env!("CARGO_PKG_VERSION"));
+}
+
 /// Build and run the Tauri application.
 pub fn run() {
     tauri::Builder::default()
@@ -8607,6 +8743,8 @@ pub fn run() {
         // surfaces a friendly "not configured yet" until then.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
+            // Structured logging first, so everything below is captured.
+            init_logging(app);
             // Before anything spawns a subprocess: repair the minimal PATH that
             // Finder/Dock/DMG launches inherit, so `claude`/`aider`/`pi`/`git`
             // installed in the user's shell PATH are actually found.
@@ -8745,6 +8883,7 @@ pub fn run() {
             implement_proposal,
             toggle_reaction,
             list_members,
+            list_membership_audit,
             add_member,
             import_github_teams,
             remove_member,
@@ -8802,6 +8941,8 @@ pub fn run() {
             export_chat,
             save_attachment,
             read_image_data_url,
+            read_recent_logs,
+            log_dir_path,
             set_git_email,
             p2p_my_code,
             p2p_list_contacts,

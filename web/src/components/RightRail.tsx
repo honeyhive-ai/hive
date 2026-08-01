@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addAgent,
   listAgentTemplates,
+  listMembershipAudit,
   importGithubTeams,
   inviteByHandle,
   removeMember,
@@ -1229,6 +1230,8 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
     queryFn: workspaceMembers,
     enabled: relayOn,
   });
+  const audit = useQuery({ queryKey: ["membership-audit", sessionId], queryFn: listMembershipAudit });
+  const [showAudit, setShowAudit] = useState(false);
   const [srvHandle, setSrvHandle] = useState("");
   const [srvRole, setSrvRole] = useState("contributor");
   const refreshSrv = () => qc.invalidateQueries({ queryKey: ["server-members"] });
@@ -1379,6 +1382,32 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
             <Button variant="primary" disabled={!org.trim() || importTeams.isPending} onClick={() => importTeams.mutate()}>
               {importTeams.isPending ? "Importing…" : "Import"}
             </Button>
+          </Card>
+        </FormDisclosure>
+
+        <FormDisclosure label="Membership history" open={showAudit} onToggle={() => setShowAudit((v) => !v)}>
+          <Card className="space-y-1.5 p-3">
+            <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
+              A tamper-evident audit from the signed config log — who joined or was removed, by whom,
+              and when.
+            </p>
+            {(audit.data ?? []).length === 0 ? (
+              <EmptyHint text="No membership changes recorded yet." />
+            ) : (
+              (audit.data ?? []).map((e, i) => (
+                <div key={i} className="flex items-baseline justify-between gap-2 text-xs">
+                  <span className="min-w-0 truncate">
+                    <span style={{ color: e.action === "removed" ? "var(--hive-danger)" : "var(--hive-accent-warm)" }}>
+                      {e.action === "removed" ? "removed" : `added${e.role ? ` (${e.role})` : ""}`}
+                    </span>{" "}
+                    <b>{e.member}</b> <span className="opacity-50">by {e.by}</span>
+                  </span>
+                  <span className="shrink-0 opacity-40" title={e.at}>
+                    {new Date(e.at).toLocaleDateString()}
+                  </span>
+                </div>
+              ))
+            )}
           </Card>
         </FormDisclosure>
       </Section>

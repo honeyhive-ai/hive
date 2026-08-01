@@ -44,3 +44,28 @@ export function absTime(iso: string): string {
   const d = parseTimestamp(iso);
   return d ? d.toLocaleString() : "";
 }
+
+/// Local wall-clock time (e.g. "3:42 PM") — the always-visible message timestamp.
+export function clockTime(iso: string): string {
+  const d = parseTimestamp(iso);
+  return d ? d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+}
+
+/// A stable per-calendar-day key (local) for grouping messages under day
+/// separators.
+export function dayKey(iso: string): string {
+  const d = parseTimestamp(iso);
+  return d ? d.toDateString() : "";
+}
+
+/// A friendly day-separator label: "Today", "Yesterday", else the full date.
+export function dayLabel(iso: string): string {
+  const d = parseTimestamp(iso);
+  if (!d) return "";
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return "Today";
+  if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
+  return d.toLocaleDateString([], { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+}
