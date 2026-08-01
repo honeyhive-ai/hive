@@ -765,6 +765,7 @@ export function ChatView({
                   role={m.role}
                   author={m.author}
                   handle={handle}
+                  responderName={m.role === "assistant" ? m.responderName ?? undefined : undefined}
                   body={m.body}
                   createdAt={m.createdAt}
                   streaming={m.isStreaming}
@@ -1328,6 +1329,7 @@ const Bubble = memo(function Bubble({
   role,
   author,
   handle,
+  responderName,
   body,
   createdAt,
   streaming = false,
@@ -1350,6 +1352,9 @@ const Bubble = memo(function Bubble({
   /// The mentionable handle for an agent turn (rendered "@handle"); the human
   /// name (`author`) is shown as-is. Falls back to `author` when absent.
   handle?: string;
+  /// For a primary-@hive turn: whose hive answered (shown as "· Alice"), so two
+  /// same-named default agents are distinguishable.
+  responderName?: string;
   body: string;
   createdAt?: string;
   streaming?: boolean;
@@ -1452,6 +1457,11 @@ const Bubble = memo(function Bubble({
           <span className={isUser ? "tt-name" : "tt-handle"}>
             {isUser ? author : `@${handle ?? author}`}
           </span>
+          {responderName && (
+            <span className="tt-badge" title={`Answered by ${responderName}'s hive`}>
+              {responderName}
+            </span>
+          )}
           {shared && (
             <span className="tt-badge">
               <IconUsers size={10} /> workspace

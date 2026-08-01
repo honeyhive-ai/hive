@@ -762,6 +762,11 @@ export const onWorkspaceSynced = (cb: () => void): Promise<UnlistenFn> =>
 export const onSyncError = (cb: (message: string) => void): Promise<UnlistenFn> =>
   listen<string>("workspace://sync-error", (evt) => cb(evt.payload));
 
+/// Fires once when this device syncs a removal of the local user from the active
+/// workspace (an owner/admin removed them). Payload is the workspace id.
+export const onWorkspaceRemoved = (cb: (workspaceId: string) => void): Promise<UnlistenFn> =>
+  listen<string>("workspace://removed", (evt) => cb(evt.payload));
+
 /// Fires when a system-tray menu item asks the UI to navigate. The payload is a
 /// route string: `"friends"`, `"settings"`, or `"settings:<Tab>"`.
 export const onTrayNavigate = (cb: (route: string) => void): Promise<UnlistenFn> =>

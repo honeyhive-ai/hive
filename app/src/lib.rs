@@ -138,6 +138,12 @@ struct AppState {
     /// error/success arms so the UI can distinguish "Live" from a dead relay /
     /// expired token / wrong key instead of showing "Live" forever.
     conn_health: Mutex<ConnHealth>,
+    /// Last observed membership of the local actor in the active workspace,
+    /// `(workspace_id, is_member)`. Drives a one-shot "you were removed"
+    /// notification when it transitions member→non-member (an owner/admin
+    /// removed you). Keyed by workspace so switching workspaces re-baselines
+    /// instead of false-firing.
+    active_membership: Mutex<Option<(Uuid, bool)>>,
 }
 
 /// Coarse connection health for the active relay, surfaced via `sync_status`.
@@ -994,16 +1000,24 @@ fn role_name(role: WorkspaceRole) -> &'static str {
 }
 
 fn message_dto(m: &ChatMessage, agents: &[WorkspaceAgent]) -> ChatMessageDto {
-    // Resolve the author's avatar. Humans carry it on their stamped, synced
-    // actor identity, so a teammate's picture rides in with their message. Agent
-    // turns have no personal identity stamp, so resolve from the roster by name.
-    let (author_avatar_url, author_color_hex) = match m.actor_identity.as_ref().and_then(|a| a.avatar_url.clone()) {
-        Some(url) => (Some(url), None),
-        None => agents
-            .iter()
-            .find(|ag| ag.name == m.author)
-            .map(|ag| (ag.avatar_url.clone(), ag.avatar_color_hex.clone()))
-            .unwrap_or((None, None)),
+    // Resolve the author's avatar. A named agent (in the roster) uses its roster
+    // avatar/color. Otherwise — a human, or the primary "hive" (not a roster
+    // entry) — use the stamped actor identity's avatar (the generating user's).
+    let roster_agent = agents.iter().find(|ag| ag.name == m.author);
+    let (author_avatar_url, author_color_hex) = match roster_agent {
+        Some(ag) => (ag.avatar_url.clone(), ag.avatar_color_hex.clone()),
+        None => (m.actor_identity.as_ref().and_then(|a| a.avatar_url.clone()), None),
+    };
+    // For a primary-@hive turn (assistant role, not a named roster agent), surface
+    // the responding user's name so the UI can show whose hive answered. Skip it
+    // for human turns and named agents.
+    let responder_name = if m.role == MessageRole::Assistant && roster_agent.is_none() {
+        m.actor_identity
+            .as_ref()
+            .map(|a| a.display_name.clone())
+            .filter(|n| !n.trim().is_empty())
+    } else {
+        None
     };
     ChatMessageDto {
         id: m.id.to_string(),
@@ -1042,6 +1056,7 @@ fn message_dto(m: &ChatMessage, agents: &[WorkspaceAgent]) -> ChatMessageDto {
             .collect(),
         author_avatar_url,
         author_color_hex,
+        responder_name,
     }
 }
 
@@ -6125,6 +6140,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         canceled_runs: Mutex::new(std::collections::HashSet::new()),
         turn_stops: Mutex::new(HashMap::new()),
         conn_health: Mutex::new(ConnHealth::default()),
+        active_membership: Mutex::new(None),
     })
 }
 
@@ -6373,6 +6389,29 @@ async fn sync_pull_once(
                 let state = app.state::<AppState>();
                 for w in state.run_wakers.lock().unwrap().values() {
                     w.notify_waiters();
+                }
+                // Detect being removed from the active workspace (an owner/admin
+                // authored MemberRemoved of us) and notify once. Only fires on a
+                // member→non-member transition within the same workspace, so
+                // initial load and workspace switches don't false-fire.
+                let active = state.active_workspace_id();
+                let config_id = hive_core::workspace_config_session_id(active);
+                let me = state.local_actor_id();
+                let current = state
+                    .service
+                    .lock()
+                    .unwrap()
+                    .load(config_id)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.members.iter().any(|m| m.actor.id == me));
+                if let Some(is_member) = current {
+                    let mut prev = state.active_membership.lock().unwrap();
+                    let was_member_here = matches!(*prev, Some((w, true)) if w == active);
+                    if was_member_here && !is_member {
+                        let _ = app.emit("workspace://removed", active.to_string());
+                    }
+                    *prev = Some((active, is_member));
                 }
             }
             true

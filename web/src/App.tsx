@@ -20,6 +20,7 @@ import {
   onTrayNavigate,
   onWorkspaceSynced,
   onSyncError,
+  onWorkspaceRemoved,
   removeWorkspaceFromList,
   renameChat,
   setActiveWorkspace,
@@ -342,6 +343,21 @@ export function App() {
   // moment the relay/key/token goes bad (mirrors onWorkspaceSynced above).
   useEffect(() => {
     const unlisten = onSyncError(() => {
+      qc.invalidateQueries({ queryKey: ["sync-status"] });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [qc]);
+
+  // Removed from the active workspace by an owner/admin: tell the user (removals
+  // were previously silent), and refresh the roster/chats so their view reflects
+  // the loss of access.
+  useEffect(() => {
+    const unlisten = onWorkspaceRemoved(() => {
+      toast.error("You've been removed from this workspace.");
+      qc.invalidateQueries({ queryKey: ["members"] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
       qc.invalidateQueries({ queryKey: ["sync-status"] });
     });
     return () => {

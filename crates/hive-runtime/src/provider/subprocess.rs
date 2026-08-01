@@ -14,6 +14,18 @@ use tokio::process::Command;
 
 use super::anthropic::{ChatTurn, ProviderError};
 
+/// Suppress the console window Windows would otherwise flash when a GUI app
+/// spawns a CLI agent (the user reported a `claude` shell popping up). No-op off
+/// Windows. `0x08000000` = `CREATE_NO_WINDOW`.
+pub(crate) fn suppress_console_window(cmd: &mut Command) {
+    // tokio::process::Command exposes `creation_flags` as an inherent method on
+    // Windows (no CommandExt import needed — that trait is for std's Command).
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000);
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
 /// Default wall-clock budget for a single subprocess agent turn. Overridable
 /// via `HIVE_AGENT_TIMEOUT_SECS` (a slow local model may want more; a flaky
 /// backend may want less).
@@ -89,6 +101,7 @@ pub async fn run_with(
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
+    suppress_console_window(&mut cmd);
 
     let mut child = cmd
         .spawn()

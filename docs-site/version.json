@@ -1,6 +1,6 @@
 {
-  "tag": "v1.3.0",
-  "name": "Hive 1.3.0",
+  "tag": "v1.3.1",
+  "name": "Hive 1.3.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Collaboration fix + composer features. Inviting teammates by GitHub handle now works reliably: signing in with GitHub (or configuring the relay afterward) registers you in the relay directory immediately, instead of only on the next app launch — so a friend who just signed in can be invited right away. Composer: image attachments now show an inline preview in the chat (not just a filename chip), and emoji are easy to add — a picker button plus inline :shortcode: autocomplete (type :fire: to get the emoji). Note: invite people by GitHub handle (it seals the workspace key and registers server-side membership); invite codes are for pairing your own devices."
+  "notes": "Multiplayer polish. Windows: agent CLIs (Claude Code, Codex, etc.) no longer flash a console window when they run. Members pane simplified to one correct way to add people — invite by GitHub handle (it seals the workspace key and registers membership); the confusing manual placeholder 'Add member' is gone. When two teammates both have a default agent named 'hive', replies now show whose hive answered (the responder's name + avatar). And you're now notified if an owner/admin removes you from a workspace, instead of silently losing access."
 }

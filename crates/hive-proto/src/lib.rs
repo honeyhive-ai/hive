@@ -61,6 +61,12 @@ pub struct ChatMessageDto {
     /// The author's avatar accent color (`#rrggbb`), when set. None = derived.
     #[serde(default)]
     pub author_color_hex: Option<String>,
+    /// For a primary-`@hive` turn: the display name of the user whose device
+    /// answered (every user's default agent is named "hive", so this
+    /// disambiguates "Alice's hive" from "Bob's hive"). None for human turns and
+    /// named agents (whose own name is the label).
+    #[serde(default)]
+    pub responder_name: Option<String>,
 }
 
 /// A tool invocation an assistant turn made (MCP or built-in).

@@ -337,6 +337,11 @@ impl ChatService {
         // two concurrent tasks to the same agent be told apart (see pending_mentions).
         message.reply_to_message_id = reply_to_message_id;
         message.origin_device_id = Some(self.device_id);
+        // Stamp the generating user's identity so a reader can tell whose "hive"
+        // answered (every user's default agent is named "hive"). Rides synced like
+        // a human's identity; message_dto surfaces it only for the primary agent
+        // (named agents keep their roster avatar/name).
+        message.actor_identity = Some(self.author.clone());
         let id = message.id;
         self.append_signed(
             session_id,

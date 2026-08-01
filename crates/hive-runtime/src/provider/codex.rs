@@ -82,6 +82,7 @@ pub async fn stream_reply(
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
+    super::subprocess::suppress_console_window(&mut cmd);
 
     let mut child = cmd
         .spawn()

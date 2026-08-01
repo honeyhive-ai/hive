@@ -4,7 +4,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addAgent,
   listAgentTemplates,
-  addMember,
   importGithubTeams,
   inviteByHandle,
   removeMember,
@@ -1154,13 +1153,11 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
     nameCounts.set(m.displayName, (nameCounts.get(m.displayName) ?? 0) + 1);
   }
 
-  const [name, setName] = useState("");
-  const [role, setRole] = useState("contributor");
-  const [title, setTitle] = useState("");
   const [handle, setHandle] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [showInvite, setShowInvite] = useState(false);
-  const [showAdd, setShowAdd] = useState(false);
+  // Invite-by-handle is the one correct way to add a person (seals the key +
+  // registers server-side membership), so it's the primary, open-by-default path.
+  const [showInvite, setShowInvite] = useState(true);
   const [showImport, setShowImport] = useState(false);
   const [showSrvAdd, setShowSrvAdd] = useState(false);
   const refresh = () => qc.invalidateQueries({ queryKey: ["members", sessionId] });
@@ -1210,17 +1207,6 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
       );
     },
     onError: (e) => toast.error(`Couldn't invite: ${errMsg(e)}`),
-  });
-  const addMutation = useMutation({
-    mutationFn: () => addMember(sessionId, name.trim(), role, title.trim()),
-    onSuccess: () => {
-      setName("");
-      setTitle("");
-      setError(null);
-      setShowAdd(false);
-      refresh();
-    },
-    onError: (e) => setError(String(e)),
   });
   const [org, setOrg] = useState("");
   const importTeams = useMutation({
@@ -1373,38 +1359,6 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
             />
             <Button variant="primary" disabled={!handle.trim() || inviteMutation.isPending} onClick={() => inviteMutation.mutate()}>
               {inviteMutation.isPending ? "…" : "Invite"}
-            </Button>
-          </Card>
-        </FormDisclosure>
-
-        <FormDisclosure label="Add member" open={showAdd} onToggle={() => setShowAdd((v) => !v)}>
-          <Card className="space-y-2 p-3">
-            <p className="text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
-              Roles gate actions: owner &gt; admin &gt; contributor &gt; viewer. The last owner is protected.
-            </p>
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="Display name"
-              className="w-full rounded-xl border px-3 py-2 text-sm"
-              style={fieldStyle}
-            />
-            <input
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder="Title (optional)"
-              className="w-full rounded-xl border px-3 py-2 text-sm"
-              style={fieldStyle}
-            />
-            <SubtleSelectField label="Role" value={role} onChange={setRole}>
-              {MEMBER_ROLES.map((r) => (
-                <option key={r} value={r}>
-                  {r}
-                </option>
-              ))}
-            </SubtleSelectField>
-            <Button variant="primary" disabled={!name.trim() || addMutation.isPending} onClick={() => addMutation.mutate()}>
-              Add
             </Button>
           </Card>
         </FormDisclosure>
