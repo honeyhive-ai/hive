@@ -416,7 +416,9 @@ export function App() {
   }, [contextTelemetry.data?.overflowMessageCount]);
 
   const workspaceRoot = settings.data?.workspaceRoot ?? "";
-  const activeWorkspaceName = workspaceList.data?.find((w) => w.active)?.name?.trim();
+  const activeWorkspace = workspaceList.data?.find((w) => w.active);
+  const activeWorkspaceId = activeWorkspace?.id ?? "";
+  const activeWorkspaceName = activeWorkspace?.name?.trim();
   const workspaceLabel = useMemo(() => {
     // Prefer the workspace's own name (what you named the team/room); fall back
     // to the project-folder basename only when it has none.
@@ -630,6 +632,7 @@ export function App() {
         view={view}
         workspaceLabel={workspaceLabel}
         workspacePath={workspaceRoot}
+        activeWorkspaceId={activeWorkspaceId}
         knownWorkspaces={settings.data?.knownWorkspaces ?? []}
         displayName={settings.data?.displayName ?? "You"}
         utilityPane={utilityPane}

@@ -1,6 +1,6 @@
 {
-  "tag": "v1.4.3",
-  "name": "Hive 1.4.3",
+  "tag": "v1.4.4",
+  "name": "Hive 1.4.4",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "The app now shows its version — Settings -> Updates displays the current build (e.g. 'You're on Hive v1.4.3'), which was previously not surfaced anywhere in the UI."
+  "notes": "Switching workspaces now correctly re-scopes the chats/channels view — the sidebar keyed by the folder path, which doesn't change for folderless team/room workspaces, so the previous workspace's view lingered. And every workspace (Home and any created/joined) now gets a default #general channel on activation, not just the one active at startup."
 }

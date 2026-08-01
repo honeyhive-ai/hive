@@ -6927,12 +6927,17 @@ fn list_workspaces(state: State<AppState>) -> Vec<WorkspaceInfoDto> {
 #[tauri::command]
 fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<(), String> {
     let id = Uuid::parse_str(&workspace_id).map_err(map_err)?;
+    let default_rt = state.current_default_runtime_id();
     if id == state.local_workspace_id {
         // The local workspace has no out-of-band invite/founder; clear any pin
         // carried over from a previously-active team workspace so its projection
         // uses the in-band self-consistency rule.
-        state.service.lock().unwrap().set_trusted_founder(None);
+        let mut svc = state.service.lock().unwrap();
+        svc.set_trusted_founder(None);
         *state.active_workspace.lock().unwrap() = state.local_workspace_id;
+        // Every workspace gets a #general so the channel tree is never empty
+        // (idempotent — no-op once any channel exists).
+        let _ = svc.ensure_default_channel(state.local_workspace_id, &default_rt);
         return Ok(());
     }
     // Selecting a team workspace points the live sync fields (relay/room/key) at
@@ -6960,6 +6965,12 @@ fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<
                 svc.ensure_self_member(hive_core::workspace_config_session_id(id), id)
             {
                 tracing::error!(target: "workspace", "ensure_self_member on activate failed: {e}");
+            }
+            // Give the workspace a #general so its channel tree is never empty
+            // (idempotent — no-op once any channel exists, incl. a founder's that
+            // synced in).
+            if let Err(e) = svc.ensure_default_channel(id, &default_rt) {
+                tracing::error!(target: "workspace", "ensure_default_channel on activate failed: {e}");
             }
         }
     } else {

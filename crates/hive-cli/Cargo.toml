@@ -1,6 +1,6 @@
 [package]
 name = "hive-cli"
-version = "1.4.3"
+version = "1.4.4"
 edition.workspace = true
 
 # A headless Hive client — connect to a relay, sync a workspace's E2EE event

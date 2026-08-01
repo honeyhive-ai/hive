@@ -78,6 +78,7 @@ export function Sidebar({
   onOpenUtilityPane,
   workspaceLabel,
   workspacePath,
+  activeWorkspaceId,
   knownWorkspaces,
   displayName,
   utilityPane,
@@ -94,19 +95,20 @@ export function Sidebar({
   onOpenUtilityPane: (pane: UtilityPane) => void;
   workspaceLabel: string;
   workspacePath: string;
+  activeWorkspaceId: string;
   knownWorkspaces: string[];
   displayName: string;
   utilityPane: UtilityPane;
 }) {
   const qc = useQueryClient();
-  // Scope chats + channels by the active workspace (its path). listChats /
-  // listChannels return the *active* workspace's data, so a global key let one
-  // workspace's cache bleed into another after a create/switch that didn't
-  // invalidate it — e.g. a fresh workspace briefly showing the previous
-  // workspace's channels. Keying on the path makes the switch refetch fresh
-  // (invalidateQueries(["chats"]) still prefix-matches these).
-  const chats = useQuery({ queryKey: ["chats", workspacePath], queryFn: listChats });
-  const channels = useQuery({ queryKey: ["channels", workspacePath], queryFn: listChannels });
+  // Scope chats + channels by the *active workspace id*. listChats/listChannels
+  // return the active workspace's data, so keying globally let one workspace's
+  // cache bleed into another. Keying on the id (not the folder path — a team/room
+  // workspace has no folder, so the path wouldn't change on switch and the view
+  // would stay stale) makes each workspace its own cache entry, so a switch shows
+  // the right data. invalidateQueries(["chats"]) still prefix-matches these.
+  const chats = useQuery({ queryKey: ["chats", activeWorkspaceId], queryFn: listChats });
+  const channels = useQuery({ queryKey: ["channels", activeWorkspaceId], queryFn: listChannels });
   const mentionStates = useQuery({ queryKey: ["mention-states"], queryFn: listMentionStates });
   const settings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
   const members = useQuery({
