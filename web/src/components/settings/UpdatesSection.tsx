@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { useMutation } from "@tanstack/react-query";
-import { checkForUpdate, installUpdate, onUpdateProgress, openExternal } from "@/lib/ipc";
+import { useMutation, useQuery } from "@tanstack/react-query";
+import { checkForUpdate, installUpdate, onUpdateProgress, openExternal, getAppInfo } from "@/lib/ipc";
 import { Button, Section, fieldStyle } from "@/components/ui";
 import { toast, errMsg } from "@/components/Toast";
 
@@ -21,6 +21,8 @@ export function UpdatesSection() {
       void un.then((f) => f());
     };
   }, []);
+
+  const info = useQuery({ queryKey: ["app-info"], queryFn: getAppInfo });
 
   const check = useMutation({
     mutationFn: checkForUpdate,
@@ -54,6 +56,10 @@ export function UpdatesSection() {
 
   return (
     <Section title="Updates">
+      <div className="text-sm">
+        You're on <b>Hive v{info.data?.coreVersion ?? "…"}</b>
+        {info.data?.buildProfile === "debug" && <span className="opacity-50"> · debug build</span>}
+      </div>
       <div className="flex items-center justify-between gap-3">
         <p className="text-sm opacity-60">Check whether a newer signed build is available, and install it.</p>
         <Button
