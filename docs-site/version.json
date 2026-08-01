@@ -1,6 +1,6 @@
 {
-  "tag": "v1.4.1",
-  "name": "Hive 1.4.1",
+  "tag": "v1.4.2",
+  "name": "Hive 1.4.2",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "The Activity pane now seeds with recent runtime activity (agents, sync, errors) from the log instead of only showing the live chat stream — so it's no longer blank when nothing is generating. Plus frontend test coverage for the emoji shortcode and timestamp helpers."
+  "notes": "Settings -> Updates now downloads and installs an update in place when it finds one, instead of only reporting that a new version exists (which required restarting the app to get the corner banner's Download button). Same signed in-place updater the launch banner uses, with progress."
 }
