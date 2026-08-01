@@ -309,6 +309,21 @@ export const openPathInEditor = (editorId: string, path: string) =>
 export const openExternal = (url: string) =>
   invoke<void>("open_external", { url });
 
+export type LaunchHealth = {
+  macos: boolean;
+  translocated: boolean;
+  quarantined: boolean;
+};
+
+/// macOS signals that predict silent agent stalls (a quarantined/translocated
+/// bundle can't persist the file-access grant Hive's spawned CLIs need).
+export const launchHealth = () => invoke<LaunchHealth>("launch_health");
+
+/// Open the macOS Full Disk Access pane so the user can grant Hive persistent
+/// file access.
+export const openFileAccessSettings = () =>
+  invoke<void>("open_file_access_settings");
+
 /// GitHub sign-in (device flow). The GitHub user is the Hive account; the same
 /// account works across all your devices.
 export interface GithubAccountDto {

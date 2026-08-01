@@ -5597,6 +5597,73 @@ fn open_url_in_browser(url: &str) -> std::io::Result<()> {
     std::process::Command::new(program).args(&args).spawn().map(|_| ())
 }
 
+/// macOS launch-health signals that predict silent agent stalls. Hive spawns
+/// local CLIs (Claude Code, Codex) that read the workspace folder; macOS
+/// attributes that file access to Hive and can put up a consent modal the turn
+/// blocks on. A quarantined or App-Translocated bundle can't durably persist
+/// that grant, so the modal re-appears every turn. The UI uses this to steer the
+/// user to Full Disk Access (and out of a translocated copy) before it bites.
+#[derive(serde::Serialize, Default)]
+struct LaunchHealthDto {
+    /// True on macOS — the whole concept is macOS-only; the UI hides the card
+    /// elsewhere.
+    macos: bool,
+    /// Running from a randomized read-only AppTranslocation path (Gatekeeper ran
+    /// a quarantined app in place). Grants never persist here — the app must be
+    /// moved to /Applications and reopened.
+    translocated: bool,
+    /// The bundle still carries `com.apple.quarantine` — the trigger for
+    /// translocation and non-persisting grants.
+    quarantined: bool,
+}
+
+#[tauri::command]
+fn launch_health() -> LaunchHealthDto {
+    #[cfg(target_os = "macos")]
+    {
+        let exe = std::env::current_exe().unwrap_or_default();
+        let translocated = exe.to_string_lossy().contains("/AppTranslocation/");
+        // exe = <bundle>.app/Contents/MacOS/<bin> → up three parents = the bundle.
+        let quarantined = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+            .map(|bundle| {
+                std::process::Command::new("xattr")
+                    .args(["-p", "com.apple.quarantine"])
+                    .arg(bundle)
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
+        LaunchHealthDto { macos: true, translocated, quarantined }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        LaunchHealthDto::default()
+    }
+}
+
+/// Open the macOS Full Disk Access pane so the user can grant Hive persistent
+/// file access — the fix for agent turns silently blocking on a folder-consent
+/// modal. No-op off macOS.
+#[tauri::command]
+fn open_file_access_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+            .spawn()
+            .map(|_| ())
+            .map_err(map_err)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
 /// Public version manifest — a small JSON the docs site serves, holding the
 /// latest published release. Fetched in Rust (no webview CORS); maintained
 /// alongside each release.
@@ -8617,6 +8684,8 @@ pub fn run() {
             detect_editors,
             open_path_in_editor,
             open_external,
+            launch_health,
+            open_file_access_settings,
             set_titlebar_color,
             reset_local_data,
             check_for_update,

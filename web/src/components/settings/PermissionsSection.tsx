@@ -2,9 +2,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getConnectionSettings,
   updateConnectionSettings,
+  launchHealth,
+  openFileAccessSettings,
   type ClaudePermissionMode,
 } from "@/lib/ipc";
-import { Section, SelectField } from "@/components/ui";
+import { Button, Section, SelectField } from "@/components/ui";
 import { toast, errMsg } from "@/components/Toast";
 
 /// Permissions — the one page to audit what agents may reach. Today only the
@@ -32,8 +34,44 @@ export function PermissionsSection() {
     onError: (e) => toast.error(`Couldn't set permission mode: ${errMsg(e)}`),
   });
 
+  const health = useQuery({ queryKey: ["launch-health"], queryFn: launchHealth });
+  const openFileAccess = useMutation({
+    mutationFn: () => openFileAccessSettings(),
+    onError: (e) => toast.error(`Couldn't open settings: ${errMsg(e)}`),
+  });
+
   return (
     <Section title="Permissions">
+      {health.data?.macos && (
+        <div
+          className="space-y-2 rounded-2xl border p-3"
+          style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+        >
+          <div className="text-sm font-medium">macOS file access</div>
+          <p className="text-xs opacity-60">
+            Agents run local CLIs (Claude Code, Codex) that read your workspace files. macOS
+            attributes that access to Hive and may put up a folder-permission modal a turn silently
+            waits on. Grant Hive <strong>Full Disk Access</strong> so agent turns don't stall on a
+            hidden prompt.
+          </p>
+          {health.data?.translocated && (
+            <p className="text-xs" style={{ color: "var(--hive-danger)" }}>
+              Hive is running from a temporary location (App Translocation), so permission grants
+              won't stick. Move Hive to <code>/Applications</code> and reopen it — or install via{" "}
+              <code>brew install --cask honeyhive-ai/hive/hive</code>.
+            </p>
+          )}
+          {health.data?.quarantined && !health.data?.translocated && (
+            <p className="text-xs" style={{ color: "var(--hive-accent-warm)" }}>
+              This copy still carries the “downloaded from the internet” quarantine flag, which can
+              keep permissions from persisting. Installing via Homebrew avoids it.
+            </p>
+          )}
+          <Button size="sm" onClick={() => openFileAccess.mutate()}>
+            Open Full Disk Access settings
+          </Button>
+        </div>
+      )}
       <p className="text-xs opacity-50">
         The setting below controls the <code>claude</code> CLI's permission mode (it runs headless,
         so it can't show an approval prompt). Other agents gate file access their own way: aider/pi

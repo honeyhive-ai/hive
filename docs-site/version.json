@@ -1,6 +1,6 @@
 {
-  "tag": "v1.2.1",
-  "name": "Hive 1.2.1",
+  "tag": "v1.2.2",
+  "name": "Hive 1.2.2",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Runtime reliability: a per-runtime Test button (Settings -> Models) sends a trivial prompt through the real dispatch path and reports pass/fail + latency, so a CLI that isn't logged in or hangs shows up immediately instead of as a silent stall. Turns now have a backstop timeout (a wedged agent surfaces an error and frees the chat instead of thinking forever; override with HIVE_TURN_TIMEOUT_SECS). And saved agents (Settings -> Agents) can now be attached to a chat from the Tools pane's Add-an-agent picker, so a template you define once is usable in any workspace."
+  "notes": "macOS file-access fix: agent turns spawn local CLIs (Claude Code, Codex) that read your workspace, and macOS can silently block a turn on a hidden folder-permission modal. Settings -> Permissions now has a File access card that opens Full Disk Access directly, and warns when Hive is running quarantined or App-Translocated (which stops permission grants from persisting). Cleanest install is the Homebrew tap (brew install --cask honeyhive-ai/hive/hive), which avoids the quarantine flag entirely. Builds on 1.2.1's runtime Test button and turn timeout."
 }
