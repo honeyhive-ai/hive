@@ -5439,7 +5439,13 @@ fn set_chat_runtime(
 ) -> Result<(), String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let runtimes = state.combined_runtimes();
-    if !runtimes.is_empty() && !runtimes.iter().any(|rt| rt.id == runtime_id) {
+    // "claude-code" is the built-in BYO Claude CLI runtime — surfaced by
+    // list_runtimes (when `claude` is on PATH) but not a config [[runtimes]]
+    // entry, so it isn't in combined_runtimes. Accept it explicitly (it maps to
+    // the CLI fallback in resolve_runtime, mirroring set_default_runtime), else a
+    // chat can't switch back to Claude Code once any other runtime is configured.
+    let known = runtime_id == "claude-code" || runtimes.iter().any(|rt| rt.id == runtime_id);
+    if !known {
         return Err(format!("unknown runtime id {runtime_id}"));
     }
     let mut svc = state.service.lock().unwrap();

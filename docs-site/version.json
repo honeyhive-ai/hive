@@ -1,6 +1,6 @@
 {
-  "tag": "v1.2.2",
-  "name": "Hive 1.2.2",
+  "tag": "v1.2.3",
+  "name": "Hive 1.2.3",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "macOS file-access fix: agent turns spawn local CLIs (Claude Code, Codex) that read your workspace, and macOS can silently block a turn on a hidden folder-permission modal. Settings -> Permissions now has a File access card that opens Full Disk Access directly, and warns when Hive is running quarantined or App-Translocated (which stops permission grants from persisting). Cleanest install is the Homebrew tap (brew install --cask honeyhive-ai/hive/hive), which avoids the quarantine flag entirely. Builds on 1.2.1's runtime Test button and turn timeout."
+  "notes": "Fixes a runtime-switching regression: once you added a second runtime (e.g. Codex), switching a chat back to Claude Code failed with 'unknown runtime id claude-code'. Claude Code is the built-in bring-your-own CLI runtime (surfaced by the runtime list but not a saved config entry), so the per-chat switch now accepts it the same way the default-runtime setter already did. Also carries 1.2.2's macOS file-access helper and 1.2.1's runtime Test button + turn timeout."
 }
