@@ -142,3 +142,51 @@ jobs:
           releaseBody: "Installers attached below."
           releaseDraft: true
           prerelease: true
+
+  # Auto-bump the Homebrew cask on the tap once the DMG is built + uploaded, so
+  # `brew upgrade --cask hive` tracks releases with no manual edits. Runs in the
+  # tag's context (no cross-workflow tag ambiguity) after `build` uploads assets.
+  # Needs HOMEBREW_TAP_TOKEN — a fine-grained PAT with Contents:write on
+  # honeyhive-ai/homebrew-hive (the default GITHUB_TOKEN can't push cross-repo).
+  # Skips cleanly when the secret is absent. NOTE: kept here rather than in a
+  # `release: published` workflow because releases created by GITHUB_TOKEN do not
+  # fire the `release` event (GitHub's recursion guard), so that trigger never ran.
+  cask:
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: macos-latest
+    steps:
+      - name: Bump the tap cask
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set — skipping cask update."
+            exit 0
+          fi
+          VERSION="${TAG#v}"
+          DMG="Hive_${VERSION}_aarch64.dmg"
+          echo "Downloading $DMG from release $TAG…"
+          for i in 1 2 3 4 5; do
+            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$DMG" --output hive.dmg --clobber; then
+              break
+            fi
+            echo "asset not ready yet (attempt $i) — retrying…"; sleep 15
+          done
+          SHA=$(shasum -a 256 hive.dmg | awk '{print $1}')
+          echo "sha256=$SHA"
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/honeyhive-ai/homebrew-hive.git" tap
+          cd tap
+          sed -i '' -E "s/version \"[^\"]*\"/version \"${VERSION}\"/" Casks/hive.rb
+          sed -i '' -E "s/sha256 \"[^\"]*\"/sha256 \"${SHA}\"/" Casks/hive.rb
+          git config user.name "hive-release-bot"
+          git config user.email "release@apiaryhq.ai"
+          if git commit -am "hive ${VERSION}"; then
+            git push origin HEAD
+            echo "Cask bumped to ${VERSION}."
+          else
+            echo "Cask already at ${VERSION} — nothing to do."
+          fi
