@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { onChatStream } from "@/lib/ipc";
+import { onChatStream, readRecentLogs } from "@/lib/ipc";
 import { useColorScheme } from "@/lib/theme";
 
 // xterm needs concrete colors (no CSS custom properties). One readable pair
@@ -33,10 +33,22 @@ export function LogsView() {
     term.loadAddon(fit);
     term.open(host);
     fit.fit();
-    term.writeln("\x1b[2mhive runtime log — streaming chat activity\x1b[0m");
+    term.writeln("\x1b[2mhive runtime log — recent activity + live chat stream\x1b[0m");
 
     const ro = new ResizeObserver(() => fit.fit());
     ro.observe(host);
+
+    // Seed with the persisted runtime log (sync/agents/scheduling/errors) so the
+    // pane reflects real activity even when nothing is streaming right now.
+    let alive = true;
+    void readRecentLogs(200)
+      .then((text) => {
+        if (!alive || !text.trim()) return;
+        term.writeln("\x1b[2m─── recent ───\x1b[0m");
+        for (const line of text.split("\n")) term.writeln(`\x1b[2m${line}\x1b[0m`);
+        term.writeln("\x1b[2m─── live ───\x1b[0m");
+      })
+      .catch(() => {});
 
     const unlisten = onChatStream((e) => {
       const ts = new Date().toLocaleTimeString();
@@ -50,6 +62,7 @@ export function LogsView() {
     });
 
     return () => {
+      alive = false;
       unlisten.then((fn) => fn());
       ro.disconnect();
       term.dispose();

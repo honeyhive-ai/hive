@@ -1803,7 +1803,7 @@ function SkillsPane({ sessionId }: { sessionId: string }) {
 
 function ActivityPane() {
   return (
-    <RailFrame title="Activity" subtitle="Streaming runtime activity for the current workspace.">
+    <RailFrame title="Activity" subtitle="Recent runtime activity (agents, sync, errors) + the live chat stream.">
       <div className="h-[calc(100vh-12rem)] min-h-[18rem] rounded-2xl border p-1.5" style={panelStyle}>
         <div className="h-full overflow-hidden rounded-xl">
           <LogsView />

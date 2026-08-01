@@ -1,6 +1,6 @@
 {
-  "tag": "v1.4.0",
-  "name": "Hive 1.4.0",
+  "tag": "v1.4.1",
+  "name": "Hive 1.4.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Diagnostics, audit, and timestamps. Internal errors are now logged to a rolling file (and surfaced in Settings -> Diagnostics), so background failures in sync, agents, scheduling, and workflows — plus panics — are visible after the fact instead of vanishing to a stderr no one sees; set HIVE_LOG=debug for more. The People pane gains a Membership history audit projected from the signed config log (who joined or was removed, by whom, and when), and join times are now stamped correctly. Messages show a proper wall-clock timestamp with day separators in the transcript (full date + relative age on hover)."
+  "notes": "The Activity pane now seeds with recent runtime activity (agents, sync, errors) from the log instead of only showing the live chat stream — so it's no longer blank when nothing is generating. Plus frontend test coverage for the emoji shortcode and timestamp helpers."
 }

@@ -50,7 +50,14 @@ import {
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonBubbles } from "@/components/Skeleton";
 import { EmojiPicker } from "@/components/EmojiPicker";
-import { loadEmojiIndex, searchEmoji, exactEmoji, type EmojiEntry } from "@/lib/emoji";
+import {
+  loadEmojiIndex,
+  searchEmoji,
+  exactEmoji,
+  detectShortcode,
+  closingShortcodeWord,
+  type EmojiEntry,
+} from "@/lib/emoji";
 import { Avatar } from "@/components/Avatar";
 import { Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui";
 import { Markdown } from "@/components/Markdown";
@@ -938,11 +945,11 @@ export function ChatView({
                     const v = e.target.value;
                     const caret = e.target.selectionStart ?? v.length;
                     // `:shortcode:` → emoji on the closing colon (e.g. `:fire:` → 🔥).
-                    const closing = /(?:^|[\s(]):([a-z0-9_+-]{2,}):$/.exec(v.slice(0, caret));
-                    if (closing) {
-                      const em = exactEmoji(emojiIndex, closing[1]);
+                    const closingWord = closingShortcodeWord(v.slice(0, caret));
+                    if (closingWord) {
+                      const em = exactEmoji(emojiIndex, closingWord);
                       if (em) {
-                        const scStart = caret - closing[1].length - 2;
+                        const scStart = caret - closingWord.length - 2;
                         const next = v.slice(0, scStart) + em + v.slice(caret);
                         setInput(next);
                         autoGrow();
@@ -966,8 +973,7 @@ export function ChatView({
                     setMention(sl ? null : detectMention(v, caret));
                     setMentionActive(0);
                     // `:word` (2+ chars, at a word boundary) opens the emoji menu.
-                    const scm = /(?:^|[\s(]):([a-z0-9_+-]{2,})$/.exec(v.slice(0, caret));
-                    setEmojiSc(sl || !scm ? null : { start: caret - scm[1].length - 1, query: scm[1] });
+                    setEmojiSc(sl ? null : detectShortcode(v.slice(0, caret)));
                     setEmojiScActive(0);
                     if (v.trim()) pingTyping();
                     else clearTyping();

@@ -48,3 +48,19 @@ export function exactEmoji(index: EmojiEntry[], word: string): string | null {
   const byName = index.find((e) => e.name === q);
   return byName ? byName.emoji : null;
 }
+
+/// Detect an in-progress `:shortcode` at the end of the text before the caret
+/// (`text.slice(0, caret)`). The `:` must be at a word boundary and be followed
+/// by 2+ shortcode chars. Returns the `:`'s index and the typed query, or null.
+export function detectShortcode(before: string): { start: number; query: string } | null {
+  const m = /(?:^|[\s(]):([a-z0-9_+-]{2,})$/.exec(before);
+  if (!m) return null;
+  return { start: before.length - m[1].length - 1, query: m[1] };
+}
+
+/// Detect a *completed* `:word:` at the caret (the user just typed the closing
+/// colon). Returns the inner word (to look up via `exactEmoji`), or null.
+export function closingShortcodeWord(before: string): string | null {
+  const m = /(?:^|[\s(]):([a-z0-9_+-]{2,}):$/.exec(before);
+  return m ? m[1] : null;
+}
