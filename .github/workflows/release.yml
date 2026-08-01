@@ -169,12 +169,12 @@ jobs:
           fi
           VERSION="${TAG#v}"
           DMG="Hive_${VERSION}_aarch64.dmg"
-          echo "Downloading $DMG from release $TAG…"
+          echo "Downloading ${DMG} from release ${TAG}"
           for i in 1 2 3 4 5; do
-            if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$DMG" --output hive.dmg --clobber; then
+            if gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --pattern "${DMG}" --output hive.dmg --clobber; then
               break
             fi
-            echo "asset not ready yet (attempt $i) — retrying…"; sleep 15
+            echo "asset not ready yet (attempt ${i}) - retrying"; sleep 15
           done
           SHA=$(shasum -a 256 hive.dmg | awk '{print $1}')
           echo "sha256=$SHA"
