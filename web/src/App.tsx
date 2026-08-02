@@ -41,6 +41,7 @@ import { RightRail } from "@/components/RightRail";
 import { Onboarding } from "@/components/Onboarding";
 import { ToastHost, toast, errMsg } from "@/components/Toast";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { PendingInvitesBanner } from "@/components/PendingInvitesBanner";
 import { DialogHost, promptDialog } from "@/components/Dialog";
 import { IconPencil, IconHexagon } from "@/lib/icons";
 import { CommandPalette } from "@/components/CommandPalette";
@@ -586,6 +587,7 @@ export function App() {
       <ToastHost />
       <DialogHost />
       <UpdateBanner />
+      <PendingInvitesBanner />
       <CommandPalette
         open={paletteOpen}
         onClose={() => setPaletteOpen(false)}

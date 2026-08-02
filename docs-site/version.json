@@ -1,6 +1,6 @@
 {
-  "tag": "v1.4.5",
-  "name": "Hive 1.4.5",
+  "tag": "v1.5.0",
+  "name": "Hive 1.5.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Sync resilience: the relay client now uses TCP keepalive + a short idle-pool timeout so a connection that dies during sleep or a network blip is dropped and the next request opens a fresh one — sync self-heals instead of erroring until you restart. People pane: your own membership now shows as a 'You' row (a solo/owned workspace no longer reads as '0 people'), and a clear note appears when you aren't in a workspace's roster."
+  "notes": "In-app workspace invites. Inviting a teammate by GitHub handle now also delivers a Pending invite to their account inbox — the invite code (with the key) is sealed to their device's key-agreement key, so the relay stays content-blind. The invitee sees a 'Workspace invite' banner and Accepts to join, no code to copy/paste. (Requires the relay's new invite endpoint; until it's deployed, invites still seal the key as before.)"
 }

@@ -715,6 +715,21 @@ impl RelayClient {
         Ok(resp.json().await?)
     }
 
+    /// Deliver a client-sealed workspace invite to `to_login`'s account inbox.
+    /// `invite` is opaque to the relay (the `hivews1:` code sealed to the
+    /// recipient's key-agreement key), so the workspace key never reaches the
+    /// relay — it only routes the envelope, like a friend request.
+    pub async fn post_workspace_invite(
+        &self,
+        to_login: &str,
+        invite: &serde_json::Value,
+    ) -> Result<(), RelayError> {
+        let url = format!("{}/v1/account/invites", self.base);
+        let body = serde_json::json!({ "toLogin": to_login, "invite": invite });
+        self.authed(self.http.post(url)).json(&body).send().await?;
+        Ok(())
+    }
+
     /// List this account's registered devices (presence + P2P bootstrap).
     pub async fn account_devices(&self) -> Result<Vec<AccountDevice>, RelayError> {
         let url = format!("{}/v1/account/devices", self.base);

@@ -250,6 +250,10 @@ struct LiveSettings {
     /// this list on load.
     #[serde(default)]
     workspaces: Vec<WorkspaceConn>,
+    /// Inbox seqs of workspace invites the user dismissed, so they stay hidden
+    /// from the Pending-invites list.
+    #[serde(default)]
+    dismissed_invites: Vec<u64>,
     /// Reusable agent definitions (a persona = name + model/runtime + role +
     /// instructions) the user can attach to any chat.
     #[serde(default)]
@@ -369,6 +373,7 @@ impl Default for LiveSettings {
             provider_keys: std::collections::HashMap::new(),
             provider_base_urls: std::collections::HashMap::new(),
             workspaces: Vec::new(),
+            dismissed_invites: Vec::new(),
             agent_templates: Vec::new(),
             local_workspace_icon: None,
             schedules: Vec::new(),
@@ -6104,6 +6109,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         provider_keys: std::collections::HashMap::new(),
         provider_base_urls: std::collections::HashMap::new(),
         workspaces: Vec::new(),
+        dismissed_invites: Vec::new(),
         agent_templates: Vec::new(),
         local_workspace_icon: None,
         schedules: Vec::new(),
@@ -7829,7 +7835,139 @@ async fn invite_by_handle(
             .await;
     }
 
+    // Deliver an in-app invite: seal the workspace invite code (which carries the
+    // key) to each of the invitee's devices' key-agreement keys and post it to
+    // their account inbox, so the workspace surfaces as a "Pending invite" — no
+    // code to copy/paste. Opaque to the relay (sealed per device). Best-effort.
+    {
+        let conn = state
+            .settings
+            .lock()
+            .unwrap()
+            .workspaces
+            .iter()
+            .find(|w| w.id() == state.active_workspace_id())
+            .cloned();
+        if let Some(conn) = conn {
+            let code = encode_workspace_invite(&conn);
+            let mut sealed_map = serde_json::Map::new();
+            for (device_id, ka_pub) in &recipients {
+                if let Ok(blob) = hive_core::e2ee::seal(ka_pub, code.as_bytes()) {
+                    if let Ok(v) = serde_json::to_value(&blob) {
+                        sealed_map.insert(device_id.clone(), v);
+                    }
+                }
+            }
+            if !sealed_map.is_empty() {
+                let invite = serde_json::json!({ "sealed": sealed_map });
+                let _ = client.post_workspace_invite(&entry.login, &invite).await;
+            }
+        }
+    }
+
     Ok(InviteResultDto { login: entry.login, devices: recipients.len() as u32, sealed })
+}
+
+/// A workspace invite waiting in this account's inbox (decrypted locally).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingInviteDto {
+    seq: u64,
+    from_login: String,
+    workspace_name: String,
+    room: String,
+    /// The decoded `hivews1:` code — passed back to accept (join).
+    code: String,
+}
+
+/// Pending workspace invites for this account — sealed to this device's
+/// key-agreement key and delivered via the relay inbox. Excludes workspaces
+/// already joined and invites the user dismissed.
+#[tauri::command]
+async fn list_pending_invites(state: State<'_, AppState>) -> Result<Vec<PendingInviteDto>, String> {
+    let relay = match configured_relay(&state) {
+        Ok(r) => r,
+        Err(_) => return Ok(vec![]),
+    };
+    if state.github_token().is_none() {
+        return Ok(vec![]);
+    }
+    let ka = {
+        let s = state.settings.lock().unwrap();
+        s.ka_secret
+            .as_deref()
+            .and_then(parse_hex32)
+            .and_then(|seed| hive_core::e2ee::KeyAgreementKeypair::from_seed(&seed).ok())
+    };
+    let Some(ka) = ka else { return Ok(vec![]) };
+    let events = state
+        .relay_client(&relay)
+        .account_inbox(0)
+        .await
+        .map_err(|e| e.to_string())?;
+    let (joined_rooms, dismissed): (Vec<String>, Vec<u64>) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.workspaces.iter().map(|w| w.room.clone()).collect(),
+            s.dismissed_invites.clone(),
+        )
+    };
+    let mut out = Vec::new();
+    for ev in events {
+        if ev.body.get("kind").and_then(|k| k.as_str()) != Some("workspaceInvite") {
+            continue;
+        }
+        if dismissed.contains(&ev.seq) {
+            continue;
+        }
+        let from_login = ev.body.get("fromLogin").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let Some(sealed) = ev.body.get("invite").and_then(|i| i.get("sealed")).and_then(|s| s.as_object())
+        else {
+            continue;
+        };
+        // Unseal the code with this device's KA key (try each per-device blob).
+        let mut code: Option<String> = None;
+        for blob_v in sealed.values() {
+            if let Ok(blob) = serde_json::from_value::<hive_core::e2ee::SealedBlob>(blob_v.clone()) {
+                if let Ok(bytes) = hive_core::e2ee::open(&ka, &blob) {
+                    if let Ok(s) = String::from_utf8(bytes) {
+                        code = Some(s);
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(code) = code else { continue };
+        let Ok(conn) = decode_workspace_invite(&code) else { continue };
+        if joined_rooms.contains(&conn.room) {
+            continue; // already joined
+        }
+        out.push(PendingInviteDto {
+            seq: ev.seq,
+            from_login,
+            workspace_name: conn.display_name(),
+            room: conn.room.clone(),
+            code,
+        });
+    }
+    Ok(out)
+}
+
+/// Accept a pending invite: join the workspace from its code.
+#[tauri::command]
+async fn accept_invite(state: State<'_, AppState>, code: String) -> Result<WorkspaceInfoDto, String> {
+    join_workspace(state, code)
+}
+
+/// Dismiss a pending invite by its inbox seq (persisted so it stays hidden).
+#[tauri::command]
+fn dismiss_invite(state: State<AppState>, seq: u64) -> Result<(), String> {
+    let mut s = state.settings.lock().unwrap();
+    if !s.dismissed_invites.contains(&seq) {
+        s.dismissed_invites.push(seq);
+    }
+    save_settings(&state.data_dir, &s);
+    Ok(())
 }
 
 /// Claim the active team workspace's room on a membership-enforcing relay, making
@@ -8970,6 +9108,9 @@ pub fn run() {
             github_logout,
             directory_register,
             invite_by_handle,
+            list_pending_invites,
+            accept_invite,
+            dismiss_invite,
             workspace_claim_membership,
             workspace_members,
             workspace_add_member,

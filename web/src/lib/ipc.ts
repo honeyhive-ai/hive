@@ -739,6 +739,25 @@ export const joinWorkspace = (invite: string) =>
 export const workspaceInvite = (workspaceId: string) =>
   invoke<string>("workspace_invite", { workspaceId });
 
+export type PendingInvite = {
+  seq: number;
+  fromLogin: string;
+  workspaceName: string;
+  room: string;
+  code: string;
+};
+
+/// Pending workspace invites delivered to this account's inbox (sealed to this
+/// device, decrypted locally). Excludes already-joined and dismissed ones.
+export const listPendingInvites = () => invoke<PendingInvite[]>("list_pending_invites");
+
+/// Accept a pending invite — joins the workspace from its code.
+export const acceptInvite = (code: string) =>
+  invoke<WorkspaceInfoDto>("accept_invite", { code });
+
+/// Dismiss a pending invite by its inbox seq (stays hidden).
+export const dismissInvite = (seq: number) => invoke<void>("dismiss_invite", { seq });
+
 /// Leave a team workspace (removes it from the rail).
 export const removeWorkspace = (workspaceId: string) =>
   invoke<void>("remove_workspace", { workspaceId });
