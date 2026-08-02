@@ -129,11 +129,15 @@ pub fn verify_stream<R: DeviceKeyResolver>(
 // order). See docs/security-hardening-plan.md S1.
 // ---------------------------------------------------------------------------
 
-/// device_id → (signing public key, owning account) for trusted, non-revoked
-/// devices, plus the set of devices whose owning account was removed.
+/// device_id → (signing public key, the set of accounts that have cert-verified
+/// this device) for trusted, non-revoked devices, plus the set of devices whose
+/// owning account was removed. A device can be certified to more than one
+/// account — e.g. a local identity that later signs into GitHub is the same
+/// person, and each cert is signed by its own account key — so an event is
+/// authentic if its stamp matches ANY of the device's certified accounts.
 #[derive(Debug, Default, Clone)]
 pub struct WorkspaceRoster {
-    devices: HashMap<Uuid, (Vec<u8>, Uuid)>,
+    devices: HashMap<Uuid, (Vec<u8>, HashSet<Uuid>)>,
     revoked: HashSet<Uuid>,
     /// account_id → the account's pinned signing public key, for member accounts
     /// (first-registration wins, canonical order). Retained so the Option-C
@@ -143,9 +147,20 @@ pub struct WorkspaceRoster {
 }
 
 impl WorkspaceRoster {
-    /// The account that owns `device_id`, if trusted.
+    /// Whether `device_id` is cert-verified to sign as `account` (any of its
+    /// certified accounts). False for an unknown device.
+    pub fn device_signs_for(&self, device_id: Uuid, account: Uuid) -> bool {
+        self.devices.get(&device_id).is_some_and(|(_, accts)| accts.contains(&account))
+    }
+    /// Whether `device_id` is a trusted (cert-verified, non-revoked) device.
+    pub fn is_certified(&self, device_id: Uuid) -> bool {
+        self.devices.contains_key(&device_id)
+    }
+    /// One account this device is certified to (deterministic: smallest by id),
+    /// for callers needing a single account when an event carries no stamp. Use
+    /// `device_signs_for` for authorization — a device may hold several.
     pub fn account_of(&self, device_id: Uuid) -> Option<Uuid> {
-        self.devices.get(&device_id).map(|(_, a)| *a)
+        self.devices.get(&device_id).and_then(|(_, accts)| accts.iter().min().copied())
     }
     /// The pinned account signing key for a member account, if known. Used by the
     /// Option-C identity gate to compare against GitHub `ssh_signing_keys`.
@@ -161,6 +176,7 @@ impl DeviceKeyResolver for WorkspaceRoster {
     fn public_key(&self, device_id: Uuid) -> Option<&[u8]> {
         self.devices.get(&device_id).map(|(k, _)| k.as_slice())
     }
+    // (see below for is_revoked)
     fn is_revoked(&self, device_id: Uuid) -> bool {
         self.revoked.contains(&device_id)
     }
@@ -234,12 +250,26 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
             continue; // cert must chain to its account's key
         }
         if members.contains(&cert.account_id) {
-            roster
+            // Accumulate every member account this device is certified to (a
+            // device may transition identities — e.g. local → GitHub sign-in — and
+            // hold a valid cert under each). Any of them is a valid signing account.
+            let entry = roster
                 .devices
-                .insert(cert.device_id, (cert.device_public_key.clone(), cert.account_id));
-        } else {
-            // The account was removed — its devices are revoked.
-            roster.revoked.insert(cert.device_id);
+                .entry(cert.device_id)
+                .or_insert_with(|| (cert.device_public_key.clone(), HashSet::new()));
+            entry.1.insert(cert.account_id);
+        }
+    }
+    // A device whose *only* verified certs are to removed accounts is revoked —
+    // but a device that also holds a current member cert (above) stays trusted.
+    for cert in &certs {
+        if roster.devices.contains_key(&cert.device_id) {
+            continue;
+        }
+        if let Some(account_key) = account_keys.get(&cert.account_id) {
+            if cert.verify(account_key).is_ok() && !members.contains(&cert.account_id) {
+                roster.revoked.insert(cert.device_id);
+            }
         }
     }
     roster
@@ -273,10 +303,15 @@ pub fn verdict_for(roster: &WorkspaceRoster, env: &SessionEventEnvelope) -> Verd
     if verify_envelope(env, signing_key).is_err() {
         return Verdict::Quarantine(QuarantineReason::BadSignature);
     }
-    // Impersonation: the stamped author's account must be the signing device's.
-    if let (Some(stamp), Some(owner)) = (&env.actor_stamp, roster.account_of(device_id)) {
+    // Impersonation: the stamped author's account must be one the signing device
+    // is cert-verified to. A device legitimately certified to more than one
+    // account (an identity transition) may sign as any of them — each cert is
+    // signed by that account's own key, so this can't be forged. The device is
+    // known here (public_key resolved above), so a stamp matching none of its
+    // certified accounts is provably an impersonation.
+    if let Some(stamp) = &env.actor_stamp {
         if let Some(claimed) = stamp.actor.account_id {
-            if claimed != owner {
+            if !roster.device_signs_for(device_id, claimed) {
                 return Verdict::Quarantine(QuarantineReason::Impersonation);
             }
         }
@@ -488,6 +523,70 @@ mod tests {
         let spoof = authored(alice.device_id, &alice.device_kp, Uuid::new_v4(), 101);
         assert_eq!(
             verdict_for(&roster, &spoof),
+            Verdict::Quarantine(QuarantineReason::Impersonation)
+        );
+    }
+
+    #[test]
+    fn device_certified_to_multiple_accounts_may_sign_as_any() {
+        // Identity transition: the SAME device is certified to an old account and
+        // a new one (e.g. a local id, then a GitHub sign-in). Each cert is signed
+        // by its own account key, so events stamped with EITHER account are
+        // authentic — but a third, uncertified account is still impersonation.
+        let p = principal();
+        let old_account = p.account_id;
+        let new_account = Uuid::new_v4();
+        let new_account_kp = SigningKeypair::generate().unwrap();
+
+        let old_cert = DeviceCertificate::issue(
+            &p.account_kp, old_account, p.device_id, &p.device_kp.public_key_bytes(), Timestamp::epoch(),
+        );
+        let new_cert = DeviceCertificate::issue(
+            &new_account_kp, new_account, p.device_id, &p.device_kp.public_key_bytes(), Timestamp::epoch(),
+        );
+        let mk_member = |acct: Uuid| WorkspaceMember {
+            id: acct.to_string(),
+            actor: ActorIdentity {
+                id: acct.to_string(),
+                display_name: "P".into(),
+                kind: ActorKind::Human,
+                account_id: Some(acct),
+                device_id: Some(p.device_id),
+                git_email: None,
+                key_agreement_public: None,
+                avatar_url: None,
+            },
+            role: WorkspaceRole::Contributor,
+            title: String::new(),
+            index: 1,
+            joined_at: Timestamp::epoch(),
+        };
+        let events = vec![
+            env(1, SessionEvent::MemberAdded { member: mk_member(old_account) }),
+            env(2, SessionEvent::MemberAdded { member: mk_member(new_account) }),
+            env(3, SessionEvent::AccountKeyRegistered {
+                account_id: old_account,
+                signing_public_key: p.account_kp.public_key_bytes().to_vec(),
+            }),
+            env(4, SessionEvent::AccountKeyRegistered {
+                account_id: new_account,
+                signing_public_key: new_account_kp.public_key_bytes().to_vec(),
+            }),
+            env(5, SessionEvent::DeviceCertificateAdded { certificate: old_cert }),
+            env(6, SessionEvent::DeviceCertificateAdded { certificate: new_cert }),
+        ];
+        let roster = build_roster(&events);
+
+        // Signing as the new account → Valid (the device is certified to it).
+        let as_new = authored(p.device_id, &p.device_kp, new_account, 100);
+        assert_eq!(verdict_for(&roster, &as_new), Verdict::Valid);
+        // Signing as the old account → still Valid.
+        let as_old = authored(p.device_id, &p.device_kp, old_account, 101);
+        assert_eq!(verdict_for(&roster, &as_old), Verdict::Valid);
+        // Signing as a third, uncertified account → Impersonation.
+        let as_other = authored(p.device_id, &p.device_kp, Uuid::new_v4(), 102);
+        assert_eq!(
+            verdict_for(&roster, &as_other),
             Verdict::Quarantine(QuarantineReason::Impersonation)
         );
     }

@@ -404,7 +404,16 @@ impl SyncEngine {
         let mut applied = 0;
         for (seq, env) in &decoded {
             let base = verdict_for(&roster, env);
-            let signer_account = env.signer_device_id.and_then(|d| roster.account_of(d));
+            // The account this event is authored as — `verdict_for` has already
+            // confirmed the signing device is cert-verified for it (else it's
+            // quarantined as impersonation), so it's the right account to run the
+            // Option-C GitHub identity gate against. Fall back to the device's
+            // account for events that carry no stamp (e.g. some trust events).
+            let signer_account = env
+                .actor_stamp
+                .as_ref()
+                .and_then(|s| s.actor.account_id)
+                .or_else(|| env.signer_device_id.and_then(|d| roster.account_of(d)));
             let account_key = signer_account.and_then(|a| roster.account_signing_key(a));
             match gate_ingest(self.identity_mode, base, signer_account, account_key, &identity) {
                 IngestAction::Quarantine(reason) => {

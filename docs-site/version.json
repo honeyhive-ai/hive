@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.0",
-  "name": "Hive 1.5.0",
+  "tag": "v1.5.1",
+  "name": "Hive 1.5.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "In-app workspace invites. Inviting a teammate by GitHub handle now also delivers a Pending invite to their account inbox — the invite code (with the key) is sealed to their device's key-agreement key, so the relay stays content-blind. The invitee sees a 'Workspace invite' banner and Accepts to join, no code to copy/paste. (Requires the relay's new invite endpoint; until it's deployed, invites still seal the key as before.)"
+  "notes": "Fixes messages being silently dropped between teammates. When a device's identity transitions (e.g. a local id that later signs into GitHub), it holds a valid device certificate under each account — but verify-on-ingest only recognized one, so the other account's events were quarantined as 'Impersonation' and never applied. A device may now sign as any account it's cert-verified to (each certificate is signed by that account's own key, so it can't be forged), so cross-teammate messages flow instead of being dropped."
 }
