@@ -251,8 +251,23 @@ pub struct RelayClient {
 
 impl RelayClient {
     pub fn new(base: impl Into<String>) -> Self {
+        // The default reqwest client keeps idle keep-alive connections in its pool
+        // with no TCP keepalive probing, so a connection that dies while the
+        // machine sleeps (or during a network blip) sits in the pool and gets
+        // reused — every request then fails with "error sending request" until the
+        // process restarts and rebuilds the pool. TCP keepalive lets a dead socket
+        // be detected and dropped, and a short idle timeout evicts stale ones, so
+        // the next request opens a fresh connection and sync self-heals without a
+        // restart. connect_timeout bounds a wedged connect (SSE streams stay
+        // untimed — no per-request timeout, which would sever a long-lived stream).
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .pool_idle_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            http: reqwest::Client::new(),
+            http,
             base: base.into().trim_end_matches('/').to_string(),
             auth: None,
             github_token: None,

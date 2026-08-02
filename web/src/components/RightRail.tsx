@@ -1147,6 +1147,10 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
   // myself" would rotate a key you keep). Leaving a workspace is the workspace
   // rail's job. Matches the sidebar People count, which already excludes self.
   const collaborators = (members.data ?? []).filter((m) => !m.isSelf);
+  // Your own membership row — shown so a solo/owned workspace doesn't read as
+  // empty ("0 people / no extra members"). Absent means you aren't in this
+  // workspace's roster (e.g. it was created under a different/previous identity).
+  const selfMember = (members.data ?? []).find((m) => m.isSelf);
 
   // Show `#index` only on names that actually collide; matchable as `@Name#N`.
   const nameCounts = new Map<string, number>();
@@ -1272,6 +1276,21 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
         {error && (
           <div className="text-xs" style={{ color: "var(--hive-danger)" }}>
             {error}
+          </div>
+        )}
+        {selfMember ? (
+          <Card className="flex items-center justify-between px-3 py-2">
+            <div className="min-w-0">
+              <div className="font-medium">
+                {selfMember.displayName} <span className="text-xs opacity-50">· you</span>
+              </div>
+              <div className="text-xs opacity-50">{selfMember.role}</div>
+            </div>
+          </Card>
+        ) : (
+          <div className="rounded-xl border px-3 py-2 text-xs" style={{ borderColor: "var(--hive-line)", color: "var(--hive-accent-warm)" }}>
+            You aren't in this workspace's roster — it was created under a different identity. If it's
+            your own, re-create it; identity is stable going forward.
           </div>
         )}
         {collaborators.map((member) => {
