@@ -7123,7 +7123,20 @@ fn remove_workspace(state: State<AppState>, workspace_id: String) -> Result<(), 
     let id = Uuid::parse_str(&workspace_id).map_err(map_err)?;
     {
         let mut s = state.settings.lock().unwrap();
+        let removed_room = s.workspaces.iter().find(|w| w.id() == id).map(|w| w.room.clone());
         s.workspaces.retain(|w| w.id() != id);
+        // If the live sync pointer was aimed at the room we're leaving, clear it —
+        // otherwise the sync loop stays connected to it AND the legacy single-relay
+        // migration re-adds it as a workspace on the next launch (so "leave" keeps
+        // putting you back in).
+        if let Some(room) = &removed_room {
+            if &s.sync_room == room {
+                s.relay_url = None;
+                s.sync_room = default_sync_room();
+                s.workspace_passphrase = None;
+            }
+            s.joined_rooms.retain(|r| r != room);
+        }
         save_settings(&state.data_dir, &s);
     }
     if state.active_workspace_id() == id {
@@ -7819,8 +7832,29 @@ async fn invite_by_handle(
             .or(passphrase_key);
         if let Some(key) = current_key {
             let version = rotations.iter().map(|r| r.version).max().unwrap_or(0) + 1;
-            let rotation = hive_core::e2ee::WorkspaceKeyRotation::seal_for_devices(version, &key, &recipients)
-                .map_err(|e| format!("{e:?}"))?;
+            // Seal the new epoch to the invitee's devices AND to every current
+            // member (including THIS device — the inviter). Sealing only to the
+            // invitee left everyone else — the inviter included — unable to open
+            // anything encrypted under the new epoch ("no key for epoch N"), which
+            // silently broke the whole room after an invite.
+            let mut all_recipients = recipients.clone();
+            {
+                let svc = state.service.lock().unwrap();
+                let cfg_id = hive_core::workspace_config_session_id(state.active_workspace_id());
+                if let Ok(Some(cfg)) = svc.load(cfg_id) {
+                    for m in &cfg.members {
+                        if let Some(kap) = m.actor.key_agreement_public.as_ref().filter(|k| !k.is_empty()) {
+                            all_recipients.push((m.id.clone(), kap.clone()));
+                        }
+                    }
+                }
+            }
+            if let (Some(kp), Some((dev, _))) = (&ka, this_device_ka(&state)) {
+                all_recipients.push((dev, kp.public_key_bytes().to_vec()));
+            }
+            let rotation =
+                hive_core::e2ee::WorkspaceKeyRotation::seal_for_devices(version, &key, &all_recipients)
+                    .map_err(|e| format!("{e:?}"))?;
             client.publish_key_rotation(&room, &rotation).await.map_err(|e| e.to_string())?;
             sealed = true;
         }
