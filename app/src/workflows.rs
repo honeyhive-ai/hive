@@ -27,7 +27,7 @@ use tokio::sync::Notify;
 use uuid::Uuid;
 
 use crate::{
-    map_err, owns_responder, responder_for, rfc3339, run_prepared_turn, windowed_context,
+    map_err, responder_for, rfc3339, run_prepared_turn, windowed_context,
     AppState, Responder, TurnOutcome,
 };
 
@@ -427,10 +427,19 @@ async fn prepare_stage(
     let agent = resolve_stage_agent(&before, agent_id, &node.name)?;
     let responder = responder_for(state, &before, agent.as_ref());
     let local_actor_id = state.local_actor_id();
+    // A relay-less (local) or solo workspace has no other device to defer a stage
+    // to, so this device always runs it — even when the responder's recorded owner
+    // differs (churned identity). Mirrors `send_message`/`maybe_respond`; all three
+    // gates must use `turn_runs_here` or they drift. Without this, a stale
+    // `creator_actor_id` classifies the stage Remote, the driver holds the
+    // SessionBusyGuard for the whole run (blocking local `maybe_respond`), and the
+    // stage hangs `REMOTE_STAGE_TIMEOUT` then fails with no local fallback.
+    let local_only = state.is_local_only();
+    let solo = crate::human_member_count(&before) <= 1;
 
     // Remote-owned stage: dispatch it over the existing cross-device path by
     // posting a prompt that @mentions its agent, then wait for the reply.
-    if !owns_responder(&local_actor_id, &responder) {
+    if !crate::turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id) {
         let prompt = format!(
             "{} **[Workflow · {} → {}]**\n\n{rendered}",
             stage_mention_token(agent.as_ref()),
@@ -1189,13 +1198,19 @@ pub(crate) fn cancel_workflow_run(
 ) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
     let rid = Uuid::parse_str(&run_id).map_err(map_err)?;
-    let has_driver = state.run_wakers.lock().unwrap().contains_key(&rid);
-    if has_driver {
-        state.canceled_runs.lock().unwrap().insert(rid);
-        if let Some(w) = state.run_wakers.lock().unwrap().get(&rid) {
+    // Mark canceled + notify the driver's waker while holding the `run_wakers`
+    // lock, so `DriverRegistration::drop` (which removes from `run_wakers` first,
+    // then `canceled_runs`) can't deregister in a gap between the check and the
+    // insert and leave a stale `canceled_runs` entry no live driver will consume.
+    // Safe from deadlock: `drop` releases `run_wakers` before touching
+    // `canceled_runs`, so it never nests the two in the opposite order.
+    {
+        let wakers = state.run_wakers.lock().unwrap();
+        if let Some(w) = wakers.get(&rid) {
+            state.canceled_runs.lock().unwrap().insert(rid);
             w.notify_waiters();
+            return Ok(());
         }
-        return Ok(());
     }
     // No live driver (e.g. the app restarted mid-run): settle the record directly.
     let workspace_id = state.active_workspace_id();

@@ -4914,12 +4914,16 @@ async fn regenerate(
     session_id: String,
 ) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let workspace_id = state.active_workspace_id();
     // Load (and drop the lock) before resolving the responder, which reads state.
     let session = {
         let svc = state.service.lock().unwrap();
         svc.load(sid).map_err(map_err)?.ok_or("unknown session")?
     };
+    // Stamp/sync the removal + regenerated turn under the SESSION's workspace, not
+    // whatever workspace happens to be active — a room chat regenerated while a
+    // different workspace is active would otherwise mis-scope its events (matches
+    // `send_message`, which uses `session.workspace_id`).
+    let workspace_id = session.workspace_id;
     let last_id = session
         .messages
         .iter()
@@ -6033,6 +6037,16 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
         .await
         .map_err(|e| format!("couldn't check for updates: {e}"))?
         .ok_or_else(|| "already up to date".to_string())?;
+    // `check()` runs here independently of the UI's earlier `check_for_update`, so
+    // a release cut between the two calls means we install a different version than
+    // the one the user was shown. We can't easily thread the surfaced version in
+    // without a signature change, so at least record + echo what is actually being
+    // installed (log + the progress events) so the delta is observable, not silent.
+    tracing::info!(target: "update", version = %update.version, "installing update");
+    let _ = app.emit(
+        "update://progress",
+        serde_json::json!({ "installing": update.version.clone() }),
+    );
     let mut downloaded: usize = 0;
     update
         .download_and_install(
