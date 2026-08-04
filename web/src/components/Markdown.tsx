@@ -3,6 +3,18 @@ import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
+/// Only open links with a safe scheme. react-markdown's default urlTransform
+/// already neutralizes `javascript:`/`data:` hrefs, but this is defense-in-depth
+/// so a future config change (adding rehype-raw or a custom urlTransform) can't
+/// turn a synced/agent-authored link into a code-execution or exfil vector.
+const SAFE_LINK = /^(https?:|mailto:)/i;
+function safeHref(href: string | undefined): string | null {
+  const h = href?.trim();
+  // Require an explicit safe scheme. Anything else — javascript:/data:/vbscript:,
+  // scheme-relative, or bare relative — is not opened.
+  return h && SAFE_LINK.test(h) ? h : null;
+}
+
 /// GitHub-flavored markdown for chat messages. Memoized on `content` so it only
 /// re-parses when the text actually changes — the transcript stays cheap during
 /// typing/streaming (streaming bubbles render plain text until complete).
@@ -18,20 +30,24 @@ export const Markdown = memo(function Markdown({ content }: { content: string })
       <ReactMarkdown
         remarkPlugins={[remarkGfm, remarkBreaks]}
         components={{
-          a: ({ href, children }) => (
-            <a
-              href={href}
-              // Never let a link navigate the app's own webview away.
-              onClick={(e) => {
-                e.preventDefault();
-                if (href) window.open(href, "_blank", "noopener,noreferrer");
-              }}
-              className="underline decoration-dotted underline-offset-2"
-              style={{ color: "var(--hive-accent-cool)" }}
-            >
-              {children}
-            </a>
-          ),
+          a: ({ href, children }) => {
+            const safe = safeHref(href);
+            return (
+              <a
+                href={safe ?? undefined}
+                // Never let a link navigate the app's own webview away; only open
+                // links that pass the scheme allowlist in a new window.
+                onClick={(e) => {
+                  e.preventDefault();
+                  if (safe) window.open(safe, "_blank", "noopener,noreferrer");
+                }}
+                className="underline decoration-dotted underline-offset-2"
+                style={{ color: "var(--hive-accent-cool)" }}
+              >
+                {children}
+              </a>
+            );
+          },
           pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
           code: ({ className, children }) => (
             // Inline code (block code is handled by the `pre` wrapper above).

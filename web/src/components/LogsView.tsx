@@ -12,6 +12,16 @@ const XTERM_THEMES = {
   light: { background: "#f6f5f1", foreground: "#26282b" },
 } as const;
 
+// Strip terminal escape/control sequences from untrusted (model/agent/log) text
+// before writing it to xterm, so crafted output can't move the cursor, recolor,
+// or clear the diagnostics view. Keeps tab/newline/CR; our own status lines add
+// their (trusted) SGR codes separately.
+// eslint-disable-next-line no-control-regex
+const TERM_ESCAPE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-Z\\-_]|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g;
+function sanitizeTerm(s: string): string {
+  return s.replace(TERM_ESCAPE, "");
+}
+
 /// The Logs canvas: an xterm.js terminal that tails runtime activity. Phase 4
 /// streams chat lifecycle (deltas/completions/errors); agent/tool/command
 /// output is added as those subsystems land.
@@ -45,7 +55,7 @@ export function LogsView() {
       .then((text) => {
         if (!alive || !text.trim()) return;
         term.writeln("\x1b[2m─── recent ───\x1b[0m");
-        for (const line of text.split("\n")) term.writeln(`\x1b[2m${line}\x1b[0m`);
+        for (const line of text.split("\n")) term.writeln(`\x1b[2m${sanitizeTerm(line)}\x1b[0m`);
         term.writeln("\x1b[2m─── live ───\x1b[0m");
       })
       .catch(() => {});
@@ -53,11 +63,11 @@ export function LogsView() {
     const unlisten = onChatStream((e) => {
       const ts = new Date().toLocaleTimeString();
       if (e.phase === "delta") {
-        term.write(e.text);
+        term.write(sanitizeTerm(e.text));
       } else if (e.phase === "completed") {
         term.writeln(`\r\n\x1b[32m[${ts}] ✓ completed (${e.messageId.slice(0, 8)})\x1b[0m`);
       } else {
-        term.writeln(`\r\n\x1b[31m[${ts}] ✗ error: ${e.text}\x1b[0m`);
+        term.writeln(`\r\n\x1b[31m[${ts}] ✗ error: ${sanitizeTerm(e.text)}\x1b[0m`);
       }
     });
 

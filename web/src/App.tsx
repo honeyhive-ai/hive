@@ -167,6 +167,9 @@ export function App() {
     ),
   );
   const previousOverflowCount = useRef(0);
+  // Whether the Context pane was already auto-surfaced for the current chat, so we
+  // do it at most once and don't repeatedly hijack the user's layout.
+  const autoOpenedContext = useRef(false);
   const qc = useQueryClient();
 
   const settings = useQuery({ queryKey: ["settings"], queryFn: getAppSettings });
@@ -397,6 +400,11 @@ export function App() {
   useEffect(() => {
     const unlisten = onChatStream((event) => {
       if (event.sessionId !== selectedId) return;
+      // Only refresh context telemetry on a terminal phase. Invalidating on every
+      // "delta" fired a fresh get_context_telemetry IPC round-trip per streamed
+      // token (the query has active observers), hammering the Tauri bridge during
+      // long replies. The counts only meaningfully change once the turn lands.
+      if (event.phase === "delta") return;
       qc.invalidateQueries({ queryKey: ["context-telemetry", selectedId] });
     });
     return () => {
@@ -406,15 +414,26 @@ export function App() {
 
   useEffect(() => {
     previousOverflowCount.current = 0;
+    autoOpenedContext.current = false;
   }, [selectedId]);
 
   useEffect(() => {
     const overflowCount = contextTelemetry.data?.overflowMessageCount ?? 0;
-    if (overflowCount > 0 && previousOverflowCount.current === 0) {
+    // Auto-open the Context pane at most ONCE per chat when overflow first appears,
+    // and never when the user has deliberately closed the tools rail (focus mode) —
+    // yanking their pane open on every overflow tick feels like the app fighting
+    // them. After the first surface, respect their layout choice.
+    if (
+      overflowCount > 0 &&
+      previousOverflowCount.current === 0 &&
+      !autoOpenedContext.current &&
+      showUtilityPane
+    ) {
       openUtilityPane("context");
+      autoOpenedContext.current = true;
     }
     previousOverflowCount.current = overflowCount;
-  }, [contextTelemetry.data?.overflowMessageCount]);
+  }, [contextTelemetry.data?.overflowMessageCount, showUtilityPane]);
 
   const workspaceRoot = settings.data?.workspaceRoot ?? "";
   const activeWorkspace = workspaceList.data?.find((w) => w.active);
@@ -449,6 +468,13 @@ export function App() {
       qc.invalidateQueries({ queryKey: ["diffs"] }),
       qc.invalidateQueries({ queryKey: ["mention-states"] }),
       qc.invalidateQueries({ queryKey: ["all-mention-states"] }),
+      // Workspace-scoped but globally-keyed (no activeWorkspaceId in the key) — must
+      // be invalidated on switch or the Activity/People panes show the previous
+      // workspace's queued mentions / hosts / server roster until the next sync
+      // (and workspace-hosts, which has no refetchInterval without a relay, never).
+      qc.invalidateQueries({ queryKey: ["queued-work"] }),
+      qc.invalidateQueries({ queryKey: ["workspace-hosts"] }),
+      qc.invalidateQueries({ queryKey: ["server-members"] }),
     ]);
   }
 

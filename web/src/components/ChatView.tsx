@@ -478,6 +478,10 @@ export function ChatView({
   // Stable so the memoized last-assistant Bubble doesn't re-render every render
   // (e.g. on each composer keystroke).
   const handleRegenerate = useCallback(async () => {
+    // Clear any prior failure banner up front — otherwise the stale red
+    // "Generation failed" message keeps shouting over the new (often successful)
+    // regenerated turn as it streams in.
+    setStreamError(null);
     try {
       await regenerate(sessionId);
     } catch (e) {
@@ -1015,6 +1019,11 @@ export function ChatView({
                     setEmojiSc(null);
                   }}
                   onKeyDown={(e) => {
+                    // While an IME is composing (CJK and other multi-keystroke
+                    // input), Enter confirms the candidate — it must not send the
+                    // message or drive the composer menus. `keyCode === 229` is the
+                    // legacy signal for the same state.
+                    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
                     // One shared reducer (↑↓ move · ↩/⇥ accept · esc dismiss) for the
                     // composer menus (R5).
                     if (
@@ -1094,9 +1103,17 @@ export function ChatView({
                         <button
                           key={rt.id}
                           className={`pop-i${rt.id === currentRuntimeId ? " sel" : ""}`}
+                          // onMouseDown preventDefaults to keep the textarea from
+                          // blurring on pointer select. That alone is mouse-only —
+                          // a keyboard Enter/Space fires `click`, not `mousedown`,
+                          // so also handle onClick (guarded so the mouse path, which
+                          // already ran on mousedown, doesn't double-fire).
                           onMouseDown={(e) => {
                             e.preventDefault();
                             void selectRuntime(rt.id);
+                          }}
+                          onClick={(e) => {
+                            if (e.detail === 0) void selectRuntime(rt.id);
                           }}
                         >
                           <span className="route-glyph"><IconWrench size={11} /></span>

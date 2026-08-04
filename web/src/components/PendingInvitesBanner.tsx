@@ -32,8 +32,16 @@ export function PendingInvitesBanner() {
   if (list.length === 0) return null;
 
   return (
-    <div className="fixed right-4 top-4 z-[60] flex w-[320px] flex-col gap-2">
-      {list.map((inv) => (
+    // Cap the stack to the viewport with internal scroll — a user invited to many
+    // workspaces at once shouldn't get a column of cards taller than the window.
+    <div className="fixed right-4 top-4 z-[60] flex max-h-[calc(100vh-2rem)] w-[320px] flex-col gap-2 overflow-y-auto">
+      {list.map((inv) => {
+        // Scope the busy state to THIS invite so joining one doesn't grey out the
+        // rest (the mutations are single-flight, `variables` is the in-flight arg).
+        const joining = accept.isPending && accept.variables === inv.code;
+        const dismissing = dismiss.isPending && dismiss.variables === inv.seq;
+        const busy = joining || dismissing;
+        return (
         <div
           key={inv.seq}
           className="rounded-2xl border p-4 shadow-xl"
@@ -51,15 +59,16 @@ export function PendingInvitesBanner() {
               <div className="mt-3 flex items-center gap-2">
                 <button
                   onClick={() => accept.mutate(inv.code)}
-                  disabled={accept.isPending}
+                  disabled={busy}
                   className="rounded-lg px-3 py-1.5 text-sm font-medium text-white hover:brightness-110 disabled:opacity-70"
                   style={{ background: "var(--hive-accent-cool)" }}
                 >
-                  {accept.isPending ? "Joining…" : "Accept"}
+                  {joining ? "Joining…" : "Accept"}
                 </button>
                 <button
                   onClick={() => dismiss.mutate(inv.seq)}
-                  className="rounded-lg px-3 py-1.5 text-sm opacity-60 hover:opacity-100"
+                  disabled={busy}
+                  className="rounded-lg px-3 py-1.5 text-sm opacity-60 hover:opacity-100 disabled:opacity-40"
                 >
                   Dismiss
                 </button>
@@ -67,14 +76,16 @@ export function PendingInvitesBanner() {
             </div>
             <button
               onClick={() => dismiss.mutate(inv.seq)}
+              disabled={busy}
               aria-label="Dismiss"
-              className="shrink-0 opacity-40 hover:opacity-80"
+              className="shrink-0 opacity-40 hover:opacity-80 disabled:opacity-20"
             >
               <IconX size={14} />
             </button>
           </div>
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
