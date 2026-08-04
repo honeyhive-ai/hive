@@ -7787,12 +7787,25 @@ async fn github_login_poll(
         save_settings(&state.data_dir, &s);
     }
     {
+        let active = state.active_workspace_id();
         let mut svc = state.service.lock().unwrap();
-        svc.set_author_account(
+        // Migrate the provisional pre-sign-in self into the account identity instead
+        // of leaving a duplicate "self" in the roster (the root of the churn class:
+        // inflated membership → broken solo detection). Falls back to a plain switch
+        // if the migration can't be applied.
+        if let Err(e) = svc.adopt_account_identity(
+            active,
             account.account_id().to_string(),
             account.display_name(),
             account.email.clone(),
-        );
+        ) {
+            tracing::warn!(target: "identity", error = %e, "adopt_account_identity failed; switching identity without migration");
+            svc.set_author_account(
+                account.account_id().to_string(),
+                account.display_name(),
+                account.email.clone(),
+            );
+        }
         svc.set_author_git_email(account.email.clone().filter(|e| !e.is_empty()));
     }
     // Adopt the GitHub name as the local display name on sign-in, so the user

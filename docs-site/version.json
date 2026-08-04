@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.7",
-  "name": "Hive 1.5.7",
+  "tag": "v1.5.8",
+  "name": "Hive 1.5.8",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "In a local (relay-less) workspace, Hive now auto-responds to an unaddressed message again — you no longer have to @hive every time. Same root cause as 1.5.6: identity churn leaves an old 'you' in the hoisted roster under a stale account id, which inflated the human count so an unaddressed 'hi' looked like a multi-human room and stayed silent. With no relay, every roster member was necessarily created on this device and is you, so the workspace is treated as solo. Explicit @hive already worked; this restores the no-mention default."
+  "notes": "Root-cause fix for the identity-churn class behind the recent @hive issues. A fresh install creates your workspace under a provisional identity before you sign in; on GitHub sign-in Hive now MIGRATES that provisional self into your account (adds the account at the same role, switches identity, then drops the provisional) instead of leaving a duplicate second 'self' in the roster. That duplicate was what inflated membership and broke solo detection. New installs will never accumulate the duplicate; the 1.5.4-1.5.7 relay-less safeguards remain as defense in depth."
 }

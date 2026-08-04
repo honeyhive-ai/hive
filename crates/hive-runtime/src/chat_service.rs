@@ -153,6 +153,95 @@ impl ChatService {
         }
     }
 
+    /// Adopt a signed-in account identity for `workspace_id`, **migrating** the
+    /// provisional pre-sign-in self instead of leaving a second "self" behind.
+    ///
+    /// Root cause of the churn class: a fresh install creates the workspace +
+    /// self-member under a provisional device identity (no `account_id`) *before*
+    /// sign-in. Plain [`set_author_account`] then switches the actor id to the
+    /// account, and `ensure_self_member` — unable to match the provisional member
+    /// (whose `account_id` is `None`) — **adds a second member**. With membership
+    /// hoisted onto the config log (#61), that inflates every chat's roster to two
+    /// humans and breaks solo detection (auto-reply, ownership).
+    ///
+    /// Fix: while still authorized as the provisional member, add the account at
+    /// the **same role** (an Owner adds an Owner — `min_role_for(MemberAdded)` is
+    /// Admin and there's no grant-above-self rule), switch identity, publish the
+    /// account key + device certificate, then drop the provisional self (now not
+    /// the last owner, so last-owner protection doesn't fire). Authz-clean, no
+    /// bypass. Idempotent and a no-op when not churning (already an account, or the
+    /// provisional isn't a member). Returns whether a migration happened.
+    pub fn adopt_account_identity(
+        &mut self,
+        workspace_id: Uuid,
+        account_id: impl Into<String>,
+        display_name: impl Into<String>,
+        git_email: Option<String>,
+    ) -> Result<bool> {
+        let account_id = account_id.into();
+        let display_name = display_name.into();
+        let old = self.author.clone();
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let churning =
+            old.account_id.is_none() && !old.id.is_empty() && old.id != account_id;
+
+        if churning {
+            let config = self.load(config_id)?.expect("config log exists after ensure");
+            let old_role = config.members.iter().find(|m| m.id == old.id).map(|m| m.role);
+            if let Some(role) = old_role {
+                // The account actor: same device keys, account id/name/flag swapped in.
+                let mut acct_actor = self.author.clone();
+                acct_actor.id = account_id.clone();
+                acct_actor.account_id = Uuid::parse_str(&account_id).ok();
+                acct_actor.display_name = display_name.clone();
+                match config.members.iter().find(|m| m.id == account_id).map(|m| m.role) {
+                    // Account not yet present → add it at the provisional self's role
+                    // (authorized as the provisional member at that same role).
+                    None => {
+                        let next_index =
+                            config.members.iter().map(|m| m.index).max().unwrap_or(0) + 1;
+                        self.add_member(
+                            config_id,
+                            workspace_id,
+                            WorkspaceMember {
+                                id: account_id.clone(),
+                                actor: acct_actor,
+                                role,
+                                title: String::new(),
+                                index: next_index,
+                                joined_at: Timestamp::now(),
+                            },
+                        )?;
+                    }
+                    // Account already a member but below the provisional self's role
+                    // (e.g. ensure_self_member added it as Contributor): promote it so
+                    // removing the provisional owner can't strip the last owner.
+                    Some(existing) if existing.rank() < role.rank() => {
+                        self.set_member_role(config_id, workspace_id, &account_id, role)?;
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+
+        // Switch to the account identity + publish its key/device certificate so the
+        // account's own events verify.
+        self.set_author_account(account_id, display_name, git_email);
+        self.publish_identity(config_id, workspace_id)?;
+
+        // Drop the stale provisional self now that the account carries its role.
+        if churning {
+            let still_present = self
+                .load(config_id)?
+                .map(|s| s.members.iter().any(|m| m.id == old.id))
+                .unwrap_or(false);
+            if still_present {
+                self.remove_member(config_id, workspace_id, &old.id)?;
+            }
+        }
+        Ok(churning)
+    }
+
     /// The acting actor's role in the projected roster. A non-member gets the
     /// **safe floor** (`Viewer`), never Owner — so being absent from the roster
     /// can't grant governance powers (PR #61 seam). The one bootstrap that needs
@@ -1916,6 +2005,102 @@ mod tests {
         let account_kp = SigningKeypair::generate().unwrap();
         let author = ActorIdentity::new(id, name, hive_core::ActorKind::Human);
         ChatService::new(store, Uuid::new_v4(), kp, account_kp, author)
+    }
+
+    #[test]
+    fn adopt_account_identity_migrates_provisional_self_without_duplicate() {
+        // The churn root cure: a provisional pre-sign-in self (Owner, no account_id)
+        // must become the ONE account self — not a second member.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        let account = Uuid::new_v4().to_string();
+        let cfg = workspace_config_session_id(wid);
+
+        let mut svc = svc_on(&path, "prov-device", "You"); // provisional, account_id None
+        svc.ensure_workspace_config(wid).unwrap(); // seeds prov as Owner
+        let before = svc.load(cfg).unwrap().unwrap();
+        assert_eq!(before.members.len(), 1);
+        assert_eq!(before.members[0].id, "prov-device");
+
+        let migrated = svc
+            .adopt_account_identity(wid, account.clone(), "Michael", Some("m@x.com".into()))
+            .unwrap();
+        assert!(migrated, "should report a migration");
+
+        let after = svc.load(cfg).unwrap().unwrap();
+        let humans: Vec<_> = after
+            .members
+            .iter()
+            .filter(|m| m.actor.kind == hive_core::ActorKind::Human)
+            .collect();
+        assert_eq!(humans.len(), 1, "exactly one self after migration");
+        assert_eq!(humans[0].id, account);
+        assert_eq!(humans[0].role, WorkspaceRole::Owner);
+        assert!(
+            after.members.iter().all(|m| m.id != "prov-device"),
+            "provisional self removed"
+        );
+        assert_eq!(svc.author().id, account, "author switched to the account");
+    }
+
+    #[test]
+    fn adopt_account_identity_promotes_then_dedups_a_preexisting_contributor_self() {
+        // The already-churned shape: sign-in already added the account as a
+        // Contributor (ensure_self_member) while the provisional stayed Owner.
+        // Adopt must promote the account to Owner, then drop the provisional —
+        // never stripping the last owner.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        let account = Uuid::new_v4().to_string();
+        let cfg = workspace_config_session_id(wid);
+
+        let mut svc = svc_on(&path, "prov-device", "You");
+        svc.ensure_workspace_config(wid).unwrap(); // prov = Owner
+        // Simulate ensure_self_member having added the account as a Contributor.
+        svc.add_member(cfg, wid, test_member(&account, "Michael", WorkspaceRole::Contributor))
+            .unwrap();
+
+        let migrated = svc
+            .adopt_account_identity(wid, account.clone(), "Michael", None)
+            .unwrap();
+        assert!(migrated);
+
+        let after = svc.load(cfg).unwrap().unwrap();
+        let humans: Vec<_> = after
+            .members
+            .iter()
+            .filter(|m| m.actor.kind == hive_core::ActorKind::Human)
+            .collect();
+        assert_eq!(humans.len(), 1);
+        assert_eq!(humans[0].id, account);
+        assert_eq!(humans[0].role, WorkspaceRole::Owner, "account promoted to owner");
+    }
+
+    #[test]
+    fn adopt_account_identity_is_a_noop_when_already_an_account() {
+        // Signing in again (already an account identity) must not churn or migrate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        let account = Uuid::new_v4().to_string();
+        let mut svc = svc_on(&path, &account, "Michael");
+        svc.set_author_account(account.clone(), "Michael", None); // author already an account
+        svc.ensure_workspace_config(wid).unwrap();
+        // Re-adopting the SAME account (e.g. a second sign-in) is a no-op migration.
+        let migrated = svc.adopt_account_identity(wid, account.clone(), "Michael", None).unwrap();
+        assert!(!migrated, "no migration when the prior identity was already an account");
+        let cfg = workspace_config_session_id(wid);
+        let humans = svc
+            .load(cfg)
+            .unwrap()
+            .unwrap()
+            .members
+            .iter()
+            .filter(|m| m.actor.kind == hive_core::ActorKind::Human)
+            .count();
+        assert_eq!(humans, 1, "still exactly one self");
     }
 
     #[test]
