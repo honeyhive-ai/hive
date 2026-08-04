@@ -108,9 +108,11 @@ pub async fn stream_reply(
     }
     super::subprocess::suppress_console_window(&mut cmd);
 
+    tracing::debug!(target: "claude", %program, ?args, ?working_dir, "spawning claude");
     let mut child = cmd
         .spawn()
         .map_err(|e| ProviderError::Subprocess(format!("spawn {program}: {e}")))?;
+    tracing::debug!(target: "claude", "claude spawned; streaming");
 
     if let Some(mut stdin) = child.stdin.take() {
         let prompt = render_prompt(system, turns);

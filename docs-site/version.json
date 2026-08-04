@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.2",
-  "name": "Hive 1.5.2",
+  "tag": "v1.5.3",
+  "name": "Hive 1.5.3",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Two collaboration fixes. Inviting by handle created a new key epoch sealed only to the invitee — so the inviter (and existing members) could no longer decrypt anything after the invite ('no key for epoch N'), silently breaking the room. The invite now seals the new epoch to the invitee AND every current member, including your own device. And leaving a workspace now clears the sync pointer, so the room isn't re-added on the next launch (leave used to put you right back in)."
+  "notes": "Diagnostics for agent turns: the runtime now logs each turn's dispatch (provider, model, working dir, isolation) and its outcome (completed / failed / timed out), plus the exact CLI spawn — so a hung or misconfigured agent shows up in Settings -> Diagnostics instead of being an invisible 'thinking...'. Also fixes running an agent when no workspace folder is set (an empty working directory used to fail the spawn)."
 }

@@ -4520,6 +4520,19 @@ async fn run_prepared_turn(
         .as_ref()
         .map(|w| w.path.to_string_lossy().into_owned())
         .unwrap_or_else(|| workspace_root.clone());
+    // Never pass an EMPTY working dir to a subprocess agent: `current_dir("")`
+    // fails the spawn (chdir to "" → ENOENT). When no workspace folder is set,
+    // run the agent in the app's own cwd (None) instead.
+    let working_dir = (!effective_root.trim().is_empty()).then_some(effective_root.as_str());
+    tracing::info!(
+        target: "dispatch",
+        provider = ?responder.runtime.provider,
+        model = %responder.runtime.model,
+        endpoint = %responder.runtime.endpoint,
+        dir = %effective_root,
+        isolated = worktree.is_some(),
+        "dispatching turn"
+    );
 
     // Stream deltas to the UI in-memory on every token, but persist to SQLite
     // only as a throttled checkpoint (~1×/750ms) for crash-recovery — not per
@@ -4544,7 +4557,7 @@ async fn run_prepared_turn(
         &responder.runtime,
         Some(&system),
         &turns,
-        Some(&effective_root),
+        working_dir,
         &git_env,
         1024,
         |text| {
@@ -4576,6 +4589,7 @@ async fn run_prepared_turn(
 
     match result {
         Ok(full) => {
+            tracing::info!(target: "dispatch", chars = full.len(), "turn completed");
             let body = {
                 let root = state.workspace_root.lock().unwrap().clone();
                 let mut svc = state.service.lock().unwrap();
@@ -4629,6 +4643,7 @@ async fn run_prepared_turn(
                 let _ = wt.remove();
             }
             let msg = e.to_string();
+            tracing::error!(target: "dispatch", error = %msg, "turn failed");
             {
                 let mut svc = state.service.lock().unwrap();
                 let _ = svc.complete_assistant_message(
