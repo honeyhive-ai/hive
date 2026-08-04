@@ -1717,23 +1717,39 @@ impl AppState {
                 .cloned()
                 .filter(|s| !s.is_empty());
             let args = if provider == ModelProviderKind::ClaudeCode {
-                claude_args
+                claude_args.clone()
             } else {
                 Vec::new()
             };
-            return ResolvedRuntime {
-                provider,
-                model: rt.model_id.clone(),
-                endpoint,
-                // Per-provider key → legacy global key → env.
-                api_key: provider_key.or(settings_key).or_else(|| api_key_for(provider)),
-                args,
-                // For `pi` → OpenAI-compatible backends (e.g. local Ollama):
-                // carry the provider id + base URL so the bridge can point pi
-                // at it. (`endpoint` here is the executable path, not a URL.)
-                model_provider_id: rt.model_provider_id.clone(),
-                model_base_url: rt.model_base_url.clone().filter(|s| !s.is_empty()),
-            };
+            // Per-provider key → legacy global key → env.
+            let api_key = provider_key.or(settings_key).or_else(|| api_key_for(provider));
+            // A hosted-API provider with no key would dispatch and fail (401) — the
+            // classic "fresh install, no API key, @hive won't answer" case, since
+            // the compiled default runtime is `anthropic`. Fall back to the
+            // bring-your-own Claude Code CLI (a subscription, no key) so the agent
+            // actually responds. A configured key (per-provider/global/env) is
+            // always honored; subprocess/local providers never need one.
+            if provider_needs_key(provider) && api_key.is_none() {
+                tracing::info!(
+                    target: "dispatch",
+                    runtime = %runtime_id,
+                    provider = ?provider,
+                    "no API key for provider — falling back to Claude Code CLI"
+                );
+            } else {
+                return ResolvedRuntime {
+                    provider,
+                    model: rt.model_id.clone(),
+                    endpoint,
+                    api_key,
+                    args,
+                    // For `pi` → OpenAI-compatible backends (e.g. local Ollama):
+                    // carry the provider id + base URL so the bridge can point pi
+                    // at it. (`endpoint` here is the executable path, not a URL.)
+                    model_provider_id: rt.model_provider_id.clone(),
+                    model_base_url: rt.model_base_url.clone().filter(|s| !s.is_empty()),
+                };
+            }
         }
         // Fallback when no runtime is configured: the bring-your-own Claude Code
         // CLI (`claude`) — streams via stream-json, needs no API key. The
@@ -3744,6 +3760,22 @@ fn turn_runs_here(solo: bool, local: &str, owner: &str) -> bool {
     solo || crate::workflows::stage_owner_runs_here(local, owner)
 }
 
+/// Whether a provider authenticates with an API key we must supply. A hosted-API
+/// provider (Anthropic/OpenAI/OpenRouter/Azure/Custom) with no key would 401 on
+/// dispatch, so `resolve_runtime` falls back to the keyless Claude Code CLI.
+/// Subprocess/local providers (Claude Code, Codex, Aider, Pi, Hermes, Ollama,
+/// HiveDaemon) never need a supplied key.
+fn provider_needs_key(provider: ModelProviderKind) -> bool {
+    matches!(
+        provider,
+        ModelProviderKind::Anthropic
+            | ModelProviderKind::OpenAI
+            | ModelProviderKind::OpenRouter
+            | ModelProviderKind::Azure
+            | ModelProviderKind::Custom
+    )
+}
+
 /// Who, if anyone, a message should be answered by.
 #[derive(Clone, Copy)]
 enum DispatchTarget {
@@ -4742,7 +4774,21 @@ async fn send_message(
         // Cross-device dispatch: only the device that owns this responder runs
         // the turn. If it's owned elsewhere, we've already recorded the user
         // message (it syncs); the owner's device picks it up via `maybe_respond`.
-        if !owns_responder(&local_actor_id, &responder) {
+        // In a solo workspace (≤1 human) there is no other device to defer to, so
+        // this device always answers even when the recorded owner differs — the
+        // churned-identity case (creator/member stamped with a pre-sign-in id,
+        // local id now the GitHub account id) that otherwise wedges the primary at
+        // "thinking…" forever with no dispatch. Mirrors `maybe_respond`; both gates
+        // must use `turn_runs_here` or the local send path silently no-ops.
+        let solo = human_member_count(&session) <= 1;
+        if !turn_runs_here(solo, &local_actor_id, &responder.owner_actor_id) {
+            tracing::info!(
+                target: "dispatch",
+                responder = %responder.author,
+                owner = %responder.owner_actor_id,
+                local = %local_actor_id,
+                "send_message: responder owned by another device — deferring"
+            );
             break;
         }
 
@@ -9258,6 +9304,36 @@ mod dispatch_ownership_tests {
         assert!(!turn_runs_here(false, "me", "teammate"));
         assert!(turn_runs_here(false, "me", "me"));
         assert!(turn_runs_here(false, "me", "")); // unowned/legacy
+    }
+}
+
+#[cfg(test)]
+mod runtime_fallback_tests {
+    use super::provider_needs_key;
+    use hive_core::ModelProviderKind as P;
+
+    #[test]
+    fn hosted_api_providers_need_a_key() {
+        // With no key these would 401 → resolve_runtime falls back to Claude Code.
+        for p in [P::Anthropic, P::OpenAI, P::OpenRouter, P::Azure, P::Custom] {
+            assert!(provider_needs_key(p), "{p:?} should require a key");
+        }
+    }
+
+    #[test]
+    fn subprocess_and_local_providers_need_no_key() {
+        // These run without a supplied key, so no fallback ever triggers.
+        for p in [
+            P::ClaudeCode,
+            P::Codex,
+            P::Aider,
+            P::Pi,
+            P::Hermes,
+            P::Ollama,
+            P::HiveDaemon,
+        ] {
+            assert!(!provider_needs_key(p), "{p:?} should not require a key");
+        }
     }
 }
 

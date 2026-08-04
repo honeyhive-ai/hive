@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.4",
-  "name": "Hive 1.5.4",
+  "tag": "v1.5.5",
+  "name": "Hive 1.5.5",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes the primary agent silently never answering (stuck on 'thinking…') in a solo workspace after the local identity changed — e.g. the author id switching from a device/anon id to your GitHub account on sign-in left chats whose recorded owner no longer matched this device, so the ownership check skipped the turn. In a solo workspace (one human) this device now always answers, since there is no other device to defer to. Includes 1.5.3's per-turn dispatch diagnostics (provider/model/dir/isolation, completed/failed) and the empty-working-dir spawn fix."
+  "notes": "Fixes @hive never answering on a fresh solo install. Two stacked causes: (1) the LOCAL send path had the same cross-device ownership gate as the sync path but without the solo bypass, so after the local identity changed to your GitHub account, a chat created under the old id was silently skipped ('thinking…' with nothing logged); solo workspaces now always answer on the device. (2) With no API key configured, chats defaulted to the hosted 'anthropic' runtime and would 401; the runtime now falls back to the keyless Claude Code CLI (your subscription) whenever a hosted provider has no key, so the agent actually responds out of the box."
 }
