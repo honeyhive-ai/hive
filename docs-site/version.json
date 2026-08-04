@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.3",
-  "name": "Hive 1.5.3",
+  "tag": "v1.5.4",
+  "name": "Hive 1.5.4",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Diagnostics for agent turns: the runtime now logs each turn's dispatch (provider, model, working dir, isolation) and its outcome (completed / failed / timed out), plus the exact CLI spawn — so a hung or misconfigured agent shows up in Settings -> Diagnostics instead of being an invisible 'thinking...'. Also fixes running an agent when no workspace folder is set (an empty working directory used to fail the spawn)."
+  "notes": "Fixes the primary agent silently never answering (stuck on 'thinking…') in a solo workspace after the local identity changed — e.g. the author id switching from a device/anon id to your GitHub account on sign-in left chats whose recorded owner no longer matched this device, so the ownership check skipped the turn. In a solo workspace (one human) this device now always answers, since there is no other device to defer to. Includes 1.5.3's per-turn dispatch diagnostics (provider/model/dir/isolation, completed/failed) and the empty-working-dir spawn fix."
 }

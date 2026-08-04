@@ -3734,6 +3734,16 @@ fn owns_responder(local_actor_id: &str, responder: &Responder) -> bool {
     crate::workflows::stage_owner_runs_here(local_actor_id, &responder.owner_actor_id)
 }
 
+/// Whether *this* device runs a turn for a responder owned by `owner_actor_id`.
+/// In a `solo` workspace (≤1 human) there is no other device to defer to, so this
+/// device always answers even when the recorded owner differs from `local` — the
+/// case a churned local identity produces (author id changes on GitHub sign-in),
+/// which would otherwise silently wedge the primary at "thinking…". Only a real
+/// multi-human room falls back to the cross-device ownership split.
+fn turn_runs_here(solo: bool, local: &str, owner: &str) -> bool {
+    solo || crate::workflows::stage_owner_runs_here(local, owner)
+}
+
 /// Who, if anyone, a message should be answered by.
 #[derive(Clone, Copy)]
 enum DispatchTarget {
@@ -4871,6 +4881,17 @@ async fn maybe_respond(
             .iter()
             .rev()
             .find(|m| m.role != MessageRole::System);
+        // In a solo workspace (≤1 human) there is no *other* device to defer the
+        // turn to, so this device always answers — regardless of the responder's
+        // recorded owner. Without this, a churned local identity (e.g. the author
+        // id changes from a device/anon id to the GitHub account id on sign-in,
+        // via `set_author_account`) leaves a chat whose `creator_actor_id` no
+        // longer matches `local_actor_id`: `owns_responder` returns false and the
+        // primary silently never answers ("thinking…" forever, nothing logged).
+        // The cross-device ownership split only matters in a real multi-human room.
+        let solo = human_member_count(&session) <= 1;
+        let runs_here =
+            |responder: &Responder| turn_runs_here(solo, &local_actor_id, &responder.owner_actor_id);
         match last {
             Some(m) if m.role == MessageRole::User => match dispatch_target(&m.body, &session) {
                 Some(target) => {
@@ -4881,8 +4902,17 @@ async fn maybe_respond(
                         DispatchTarget::Primary => None,
                     };
                     let responder = responder_for(&state, &session, agent.as_ref());
-                    owns_responder(&local_actor_id, &responder)
-                        .then_some((session.workspace_id, responder, m.id))
+                    let owns = runs_here(&responder);
+                    if !owns {
+                        tracing::info!(
+                            target: "dispatch",
+                            responder = %responder.author,
+                            owner = %responder.owner_actor_id,
+                            local = %local_actor_id,
+                            "skipping turn: responder owned by another device"
+                        );
+                    }
+                    owns.then_some((session.workspace_id, responder, m.id))
                 }
                 None => None,
             },
@@ -4902,7 +4932,7 @@ async fn maybe_respond(
                         .filter(|a| a.name != m.author)
                         .find_map(|a| {
                             let responder = responder_for(&state, &session, Some(a));
-                            owns_responder(&local_actor_id, &responder)
+                            runs_here(&responder)
                                 .then_some((session.workspace_id, responder, m.id))
                         })
                 }
@@ -9205,6 +9235,30 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hive");
+}
+
+#[cfg(test)]
+mod dispatch_ownership_tests {
+    use super::turn_runs_here;
+
+    #[test]
+    fn solo_workspace_always_runs_here_even_on_owner_mismatch() {
+        // The churned-identity regression: a chat created under an old author id
+        // ("anon") whose owner no longer matches the current local id ("github").
+        // In a solo workspace this device must still answer.
+        assert!(turn_runs_here(true, "github", "anon"));
+        assert!(turn_runs_here(true, "github", ""));
+        assert!(turn_runs_here(true, "github", "github"));
+    }
+
+    #[test]
+    fn multi_human_room_defers_to_owner() {
+        // Not solo → fall back to the ownership split: only the owner (or an
+        // unowned/legacy responder) runs here; a teammate's responder does not.
+        assert!(!turn_runs_here(false, "me", "teammate"));
+        assert!(turn_runs_here(false, "me", "me"));
+        assert!(turn_runs_here(false, "me", "")); // unowned/legacy
+    }
 }
 
 #[cfg(test)]
