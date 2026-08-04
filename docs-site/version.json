@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.5",
-  "name": "Hive 1.5.5",
+  "tag": "v1.5.6",
+  "name": "Hive 1.5.6",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes @hive never answering on a fresh solo install. Two stacked causes: (1) the LOCAL send path had the same cross-device ownership gate as the sync path but without the solo bypass, so after the local identity changed to your GitHub account, a chat created under the old id was silently skipped ('thinking…' with nothing logged); solo workspaces now always answer on the device. (2) With no API key configured, chats defaulted to the hosted 'anthropic' runtime and would 401; the runtime now falls back to the keyless Claude Code CLI (your subscription) whenever a hosted provider has no key, so the agent actually responds out of the box."
+  "notes": "Definitive fix for @hive not answering on a local (relay-less) install. Root cause confirmed from the on-disk log: repeated local-identity changes leave the OLD self hoisted into the workspace roster as a second human member under a different account id, so the workspace looked multi-human and the primary deferred the turn to a stale self-identity that no live device owns — silent 'thinking…'. With no relay configured nothing ever syncs to another device, so this device now always answers regardless of the recorded owner (both the local send path and the sync path). Combined with 1.5.5's keyless Claude Code fallback, a fresh no-key install responds out of the box."
 }

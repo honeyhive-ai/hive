@@ -3641,6 +3641,20 @@ impl AppState {
         *self.active_workspace.lock().unwrap()
     }
 
+    /// No relay configured → a purely local install: nothing ever syncs to another
+    /// device, so this device is the only one that can answer a turn. Used to
+    /// bypass the cross-device ownership deferral (which would otherwise be
+    /// permanent silence here). See [`turn_runs_here`].
+    fn is_local_only(&self) -> bool {
+        self.settings
+            .lock()
+            .unwrap()
+            .relay_url
+            .as_deref()
+            .map(|u| u.trim().is_empty())
+            .unwrap_or(true)
+    }
+
     /// Workspace ids for every relay room this device knows about (joined set +
     /// the currently configured room). Chats with these ids belong to a room,
     /// not "My workspace".
@@ -3751,13 +3765,21 @@ fn owns_responder(local_actor_id: &str, responder: &Responder) -> bool {
 }
 
 /// Whether *this* device runs a turn for a responder owned by `owner_actor_id`.
-/// In a `solo` workspace (≤1 human) there is no other device to defer to, so this
-/// device always answers even when the recorded owner differs from `local` — the
-/// case a churned local identity produces (author id changes on GitHub sign-in),
-/// which would otherwise silently wedge the primary at "thinking…". Only a real
-/// multi-human room falls back to the cross-device ownership split.
-fn turn_runs_here(solo: bool, local: &str, owner: &str) -> bool {
-    solo || crate::workflows::stage_owner_runs_here(local, owner)
+///
+/// The cross-device ownership split only means anything when the workspace
+/// actually syncs to other devices — i.e. a relay is configured. Two cases make
+/// this device the sole possible responder, so it must always answer:
+///   - `local_only`: no relay configured. Nothing ever syncs off this device, so
+///     deferring to an "owner" would be permanent silence. This is also the only
+///     robust guard against identity churn: a churned self (author id changes on
+///     GitHub sign-in) is hoisted into the workspace roster as a *second* human
+///     member under a new account id, so `solo` (≤1 human) no longer holds and
+///     the primary would defer to a stale self-identity that no live device owns.
+///   - `solo`: a relay *is* configured but there's ≤1 human — a room you made
+///     that no one else has joined. Still no other device to defer to.
+/// Only a real, synced, multi-human room falls back to the ownership check.
+fn turn_runs_here(local_only: bool, solo: bool, local: &str, owner: &str) -> bool {
+    local_only || solo || crate::workflows::stage_owner_runs_here(local, owner)
 }
 
 /// Whether a provider authenticates with an API key we must supply. A hosted-API
@@ -4774,14 +4796,15 @@ async fn send_message(
         // Cross-device dispatch: only the device that owns this responder runs
         // the turn. If it's owned elsewhere, we've already recorded the user
         // message (it syncs); the owner's device picks it up via `maybe_respond`.
-        // In a solo workspace (≤1 human) there is no other device to defer to, so
-        // this device always answers even when the recorded owner differs — the
-        // churned-identity case (creator/member stamped with a pre-sign-in id,
-        // local id now the GitHub account id) that otherwise wedges the primary at
-        // "thinking…" forever with no dispatch. Mirrors `maybe_respond`; both gates
-        // must use `turn_runs_here` or the local send path silently no-ops.
+        // A relay-less (local) workspace, or a solo one, always answers here —
+        // there's no other device to defer to. Without this, identity churn (a
+        // churned self hoisted into the roster as a 2nd human under a new account
+        // id) makes the workspace look multi-human and the primary defers to a
+        // stale self-identity no live device owns → "thinking…" forever, no
+        // dispatch. Mirrors `maybe_respond`; both gates must use `turn_runs_here`.
+        let local_only = state.is_local_only();
         let solo = human_member_count(&session) <= 1;
-        if !turn_runs_here(solo, &local_actor_id, &responder.owner_actor_id) {
+        if !turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id) {
             tracing::info!(
                 target: "dispatch",
                 responder = %responder.author,
@@ -4935,9 +4958,11 @@ async fn maybe_respond(
         // longer matches `local_actor_id`: `owns_responder` returns false and the
         // primary silently never answers ("thinking…" forever, nothing logged).
         // The cross-device ownership split only matters in a real multi-human room.
+        let local_only = state.is_local_only();
         let solo = human_member_count(&session) <= 1;
-        let runs_here =
-            |responder: &Responder| turn_runs_here(solo, &local_actor_id, &responder.owner_actor_id);
+        let runs_here = |responder: &Responder| {
+            turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id)
+        };
         match last {
             Some(m) if m.role == MessageRole::User => match dispatch_target(&m.body, &session) {
                 Some(target) => {
@@ -9291,19 +9316,29 @@ mod dispatch_ownership_tests {
     fn solo_workspace_always_runs_here_even_on_owner_mismatch() {
         // The churned-identity regression: a chat created under an old author id
         // ("anon") whose owner no longer matches the current local id ("github").
-        // In a solo workspace this device must still answer.
-        assert!(turn_runs_here(true, "github", "anon"));
-        assert!(turn_runs_here(true, "github", ""));
-        assert!(turn_runs_here(true, "github", "github"));
+        // In a solo workspace this device must still answer. (not local_only)
+        assert!(turn_runs_here(false, true, "github", "anon"));
+        assert!(turn_runs_here(false, true, "github", ""));
+        assert!(turn_runs_here(false, true, "github", "github"));
     }
 
     #[test]
-    fn multi_human_room_defers_to_owner() {
-        // Not solo → fall back to the ownership split: only the owner (or an
-        // unowned/legacy responder) runs here; a teammate's responder does not.
-        assert!(!turn_runs_here(false, "me", "teammate"));
-        assert!(turn_runs_here(false, "me", "me"));
-        assert!(turn_runs_here(false, "me", "")); // unowned/legacy
+    fn local_only_always_runs_here_even_when_roster_looks_multi_human() {
+        // The real churn case: no relay, but the hoisted roster carries the old
+        // self as a 2nd human (solo=false) and the owner is a stale self-id.
+        // No relay ⇒ nothing syncs elsewhere ⇒ this device must answer.
+        assert!(turn_runs_here(true, false, "github", "stale-self-id"));
+        assert!(turn_runs_here(true, false, "github", "anything"));
+    }
+
+    #[test]
+    fn synced_multi_human_room_defers_to_owner() {
+        // Relay configured (not local_only) AND multiple humans (not solo) → fall
+        // back to the ownership split: only the owner (or an unowned/legacy
+        // responder) runs here; a teammate's responder does not.
+        assert!(!turn_runs_here(false, false, "me", "teammate"));
+        assert!(turn_runs_here(false, false, "me", "me"));
+        assert!(turn_runs_here(false, false, "me", "")); // unowned/legacy
     }
 }
 
