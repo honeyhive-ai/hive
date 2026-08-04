@@ -3815,9 +3815,17 @@ fn human_member_count(session: &ChatSession) -> usize {
 
 /// Decide whether a message triggers a runtime, and which one. An `@agent` or
 /// `@primary` mention is always answered. An *un-addressed* message defaults to
-/// the primary **only in a solo workspace** (≤1 human) — multi-human chats stay
+/// the primary **only in an effectively-solo workspace** — multi-human rooms stay
 /// human-to-human until someone explicitly addresses an assistant.
-fn dispatch_target(body: &str, session: &ChatSession) -> Option<DispatchTarget> {
+///
+/// `local_only` (no relay) means nothing ever syncs in from another device, so
+/// every roster member was necessarily created here and *is this user* — the
+/// workspace is solo by definition however many members the churned/hoisted
+/// roster shows. Without this, identity churn (an old self left in the roster
+/// under a stale account id) inflates the human count and an unaddressed "hi"
+/// stops auto-triggering Hive — you'd have to `@hive` every message. A
+/// relay-backed room still uses the real human count.
+fn dispatch_target(body: &str, session: &ChatSession, local_only: bool) -> Option<DispatchTarget> {
     let mentions = parse_mentions(body, session);
     if let Some(id) = mentions.agents.first().copied() {
         return Some(DispatchTarget::Agent(id));
@@ -3825,7 +3833,7 @@ fn dispatch_target(body: &str, session: &ChatSession) -> Option<DispatchTarget> 
     if mentions.primary {
         return Some(DispatchTarget::Primary);
     }
-    (human_member_count(session) <= 1).then_some(DispatchTarget::Primary)
+    (local_only || human_member_count(session) <= 1).then_some(DispatchTarget::Primary)
 }
 
 // `cascade_depth` now lives on `hive_core::ChatSession` (shared with the worker
@@ -4754,6 +4762,8 @@ async fn send_message(
 ) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
     let local_actor_id = state.local_actor_id();
+    // Relay-less ⇒ every roster member was created here (nothing syncs in) ⇒ solo.
+    let local_only = state.is_local_only();
     // Stop signal for this session's turn(s): the Stop button fires it, breaking
     // the cascade loop and aborting the in-flight generation below.
     let stop = state.turn_stops.lock().unwrap().entry(sid).or_default().clone();
@@ -4768,7 +4778,7 @@ async fn send_message(
         // never `.unwrap()` under the `service` lock, or a None poisons the
         // global mutex and bricks every future `service.lock()` this process.
         let Some(session) = svc.load(sid).map_err(map_err)? else { return Ok(()) };
-        (workspace_id, posted.id, dispatch_target(&body, &session))
+        (workspace_id, posted.id, dispatch_target(&body, &session, local_only))
     };
 
     // Turn loop: a reply that mentions another (distinct) agent cascades a
@@ -4964,7 +4974,7 @@ async fn maybe_respond(
             turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id)
         };
         match last {
-            Some(m) if m.role == MessageRole::User => match dispatch_target(&m.body, &session) {
+            Some(m) if m.role == MessageRole::User => match dispatch_target(&m.body, &session, local_only) {
                 Some(target) => {
                     let agent = match target {
                         DispatchTarget::Agent(id) => {
@@ -9339,6 +9349,56 @@ mod dispatch_ownership_tests {
         assert!(!turn_runs_here(false, false, "me", "teammate"));
         assert!(turn_runs_here(false, false, "me", "me"));
         assert!(turn_runs_here(false, false, "me", "")); // unowned/legacy
+    }
+}
+
+#[cfg(test)]
+mod dispatch_target_tests {
+    use super::{dispatch_target, DispatchTarget};
+    use hive_core::{session::ChatSession, ActorIdentity, ActorKind, WorkspaceMember, WorkspaceRole};
+    use hive_core::Timestamp;
+    use uuid::Uuid;
+
+    fn human(id: &str, name: &str) -> WorkspaceMember {
+        WorkspaceMember {
+            id: id.into(),
+            actor: ActorIdentity::new(id, name, ActorKind::Human),
+            role: WorkspaceRole::Owner,
+            title: String::new(),
+            index: 0,
+            joined_at: Timestamp::now(),
+        }
+    }
+
+    /// A session whose roster carries two humans — the churn shape: an old self
+    /// and the current account self, both counted as separate people.
+    fn two_human_session() -> ChatSession {
+        let mut s = ChatSession::new("t", Uuid::nil(), "anthropic");
+        s.members = vec![human("old-self", "You"), human("account-self", "Michael")];
+        s
+    }
+
+    #[test]
+    fn local_only_auto_answers_unaddressed_despite_inflated_roster() {
+        // Relay-less: every member is this user, so an unaddressed "hi" still
+        // auto-triggers the primary even though the roster shows two humans.
+        let s = two_human_session();
+        assert!(matches!(
+            dispatch_target("hi", &s, true),
+            Some(DispatchTarget::Primary)
+        ));
+    }
+
+    #[test]
+    fn synced_room_stays_human_to_human_until_addressed() {
+        // Relay-backed, two real humans: an unaddressed message is human-to-human.
+        let s = two_human_session();
+        assert!(dispatch_target("hi", &s, false).is_none());
+        // …but an explicit @primary/@hive always dispatches.
+        assert!(matches!(
+            dispatch_target("@hive hi", &s, false),
+            Some(DispatchTarget::Primary)
+        ));
     }
 }
 

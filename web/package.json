@@ -1,7 +1,7 @@
 {
   "name": "hive-web",
   "private": true,
-  "version": "1.5.6",
+  "version": "1.5.7",
   "type": "module",
   "trustedDependencies": ["esbuild"],
   "scripts": {
