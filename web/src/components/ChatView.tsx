@@ -110,6 +110,13 @@ export function ChatView({
   // Set when a turn dies mid-stream (phase "error") so a failed generation is
   // visibly distinct from a finished one; cleared on the next send / session.
   const [streamError, setStreamError] = useState<string | null>(null);
+  // Watchdog: a turn is "stalled" when it's been in flight with no delta for a
+  // while. The backend can resolve `sendMessage` yet emit nothing (a hung CLI, a
+  // dropped event), leaving "thinking" forever with no recovery — this surfaces a
+  // Stop-and-retry affordance instead of an indefinite spinner. `lastActivityRef`
+  // is the ms timestamp of the last send/delta (a ref so deltas don't re-render).
+  const [stalled, setStalled] = useState(false);
+  const lastActivityRef = useRef(0);
   // Autoscroll only when already pinned to the bottom; otherwise surface a pill.
   const [atBottom, setAtBottom] = useState(true);
   // Mirrors `atBottom` for the pin loop, which runs across frames and needs the
@@ -207,6 +214,10 @@ export function ChatView({
     const unlisten = onChatStream((e) => {
       if (e.sessionId !== sessionRef.current) return;
       if (e.phase === "delta") {
+        // Progress → reset the stall watchdog (setState is a no-op when already
+        // false, so this is cheap even at token rate).
+        lastActivityRef.current = Date.now();
+        setStalled(false);
         setStreams((prev) => applyStreamDelta(prev, e.messageId, e.text));
       } else {
         // completed/error: retire only this message's live stream; others may
@@ -251,6 +262,7 @@ export function ChatView({
   useEffect(() => {
     setStreams(new Map());
     setStreamError(null);
+    setStalled(false);
     setOptimisticUser(null);
     setSending(false);
     setInput("");
@@ -592,6 +604,8 @@ export function ChatView({
     clearTyping();
     setOptimisticUser(body);
     setSending(true);
+    lastActivityRef.current = Date.now();
+    setStalled(false);
     if (taRef.current) taRef.current.style.height = "auto";
     try {
       await sendMessage(sessionId, body);
@@ -626,6 +640,20 @@ export function ChatView({
   }
   // A turn is in flight whenever we're sending or a stream is live.
   const busy = sending || streams.size > 0;
+
+  // Stall watchdog: while a turn is in flight, flag it `stalled` if no delta has
+  // arrived for ~40s. Cleared automatically when the turn ends (busy → false) or
+  // resumes (a delta bumps lastActivityRef and clears the flag).
+  useEffect(() => {
+    if (!busy) {
+      setStalled(false);
+      return;
+    }
+    const id = window.setInterval(() => {
+      if (Date.now() - lastActivityRef.current > 40_000) setStalled(true);
+    }, 4000);
+    return () => window.clearInterval(id);
+  }, [busy]);
 
   const messages: ChatMessageDto[] = chat.data?.messages ?? [];
   // Retire the optimistic echo the moment the persisted user message lands in
@@ -841,7 +869,27 @@ export function ChatView({
           {[...streams.entries()].map(([id, text]) => (
             <Bubble key={id} role="assistant" author={streamAuthor} handle={streamHandle} body={text} via={runtimeProvider} model={currentRuntime?.model || undefined} host={runtimeHost} streaming />
           ))}
-          {sending && streams.size === 0 && <TypingDots label={`${streamAuthor} is thinking`} />}
+          {sending && streams.size === 0 && !stalled && <TypingDots label={`${streamAuthor} is thinking`} />}
+          {busy && stalled && (
+            <div className="tt-note" role="status">
+              <span aria-hidden className="shrink-0" style={{ flex: "0 0 auto" }}>
+                <IconInfo size={14} />
+              </span>
+              <div className="min-w-0 flex-1">
+                <div style={{ fontWeight: 650 }}>Still working…</div>
+                <div className="mt-0.5 break-words opacity-80">
+                  This is taking longer than usual — the runtime may be stalled or waiting to log in.
+                </div>
+              </div>
+              <button
+                onClick={() => void handleStop()}
+                className="shrink-0 rounded-md px-2 py-0.5 text-xs font-semibold leading-none opacity-80 transition-opacity hover:opacity-100"
+                style={{ border: "1px solid var(--hive-line)" }}
+              >
+                Stop &amp; retry
+              </button>
+            </div>
+          )}
           {typingNames.length > 0 && <TypingDots label={typingLabel(typingNames)} />}
           {streamError && (
             <div className="tt-note bad" role="alert">
