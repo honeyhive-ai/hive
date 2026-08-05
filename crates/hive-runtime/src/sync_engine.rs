@@ -396,10 +396,14 @@ impl SyncEngine {
         let mut roster_src = store.roster_envelopes()?;
         roster_src.extend(decoded.iter().map(|(_, e)| e.clone()));
         let roster = build_roster(&roster_src);
+        // Recover from a poisoned lock instead of panicking the sync task: the
+        // identity cache holds only best-effort verification results (rebuilt/
+        // re-fetched), so a panic in a prior holder shouldn't crash every future
+        // sync pass. This path is network-input-adjacent — fail soft, not hard.
         let identity = self
             .identity_cache
             .lock()
-            .expect("identity cache mutex poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         let mut applied = 0;
         for (seq, env) in &decoded {
