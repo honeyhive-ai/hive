@@ -4625,6 +4625,14 @@ async fn run_prepared_turn(
             .and_then(|v| v.parse().ok())
             .unwrap_or(600),
     );
+    // Honor the Stop button on EVERY dispatch path — not just send_message's outer
+    // select. maybe_respond and the workflow driver call run_prepared_turn directly,
+    // so without this, Stop was a no-op for a synced-in or workflow turn (it ran to
+    // the timeout backstop). Racing the session's stop signal here aborts the stream
+    // (dropping it kills any CLI via kill_on_drop). send_message keeps its own biased
+    // outer select, which still wins there, so its clean break path is unchanged.
+    let stop = state.turn_stops.lock().unwrap().entry(session_id).or_default().clone();
+    let mut stopped = false;
     let stream_fut = dispatch::stream(
         &responder.runtime,
         Some(&system),
@@ -4651,12 +4659,19 @@ async fn run_prepared_turn(
             }
         },
     );
-    let result = match tokio::time::timeout(turn_timeout, stream_fut).await {
-        Ok(r) => r,
-        Err(_) => Err(ProviderError::Subprocess(format!(
-            "runtime timed out after {}s with no completion — the agent may be waiting on login/auth, input, or a blocked tool. Verify it with Settings \u{2192} Models \u{2192} Test, or raise HIVE_TURN_TIMEOUT_SECS.",
-            turn_timeout.as_secs()
-        ))),
+    let result = tokio::select! {
+        biased;
+        _ = stop.notified() => {
+            stopped = true;
+            Err(ProviderError::Subprocess("stopped by user".into()))
+        }
+        r = tokio::time::timeout(turn_timeout, stream_fut) => match r {
+            Ok(r) => r,
+            Err(_) => Err(ProviderError::Subprocess(format!(
+                "runtime timed out after {}s with no completion — the agent may be waiting on login/auth, input, or a blocked tool. Verify it with Settings \u{2192} Models \u{2192} Test, or raise HIVE_TURN_TIMEOUT_SECS.",
+                turn_timeout.as_secs()
+            ))),
+        },
     };
 
     match result {
@@ -4715,6 +4730,31 @@ async fn run_prepared_turn(
                 let _ = wt.remove();
             }
             let msg = e.to_string();
+            if stopped {
+                // User pressed Stop — this isn't a failure. Finalize the streaming
+                // placeholder cleanly (no "[error]" text) and retire the live bubble
+                // with a terminal "completed" phase instead of a red error banner.
+                tracing::info!(target: "dispatch", "turn stopped by user");
+                {
+                    let mut svc = state.service.lock().unwrap();
+                    let _ = svc.complete_assistant_message(
+                        session_id,
+                        workspace_id,
+                        message_id,
+                        String::new(),
+                    );
+                }
+                let _ = app.emit(
+                    ChatStreamEvent::EVENT,
+                    ChatStreamEvent {
+                        session_id: session_id.to_string(),
+                        message_id: message_id.to_string(),
+                        phase: "completed".into(),
+                        text: String::new(),
+                    },
+                );
+                return Err(msg);
+            }
             tracing::error!(target: "dispatch", error = %msg, "turn failed");
             {
                 let mut svc = state.service.lock().unwrap();
