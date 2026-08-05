@@ -292,7 +292,20 @@ pub enum Verdict {
 /// Classify an envelope against the roster (see [`Verdict`]).
 pub fn verdict_for(roster: &WorkspaceRoster, env: &SessionEventEnvelope) -> Verdict {
     let Some(device_id) = env.signer_device_id else {
-        return Verdict::Unverifiable(QuarantineReason::Unsigned);
+        // A genuine event is ALWAYS signed — `append_signed` sets the signature and
+        // the actor stamp together — so an unsigned envelope that nonetheless
+        // carries an `actor_stamp` is provably forged: it claims an author with no
+        // signature to prove it. It must be QUARANTINED, not merely held/accepted;
+        // otherwise the default (Relay) ingest accepts it and projection-authz +
+        // seed-selection trust the unverified stamped author — a workspace takeover
+        // (a forged `MemberRoleChanged`/`MemberRemoved` or founder-stamped snapshot
+        // stamped as the real Owner). An unsigned event with NO stamp claims no
+        // author, so it stays the lenient `Unverifiable`.
+        return if env.actor_stamp.is_some() {
+            Verdict::Quarantine(QuarantineReason::Unsigned)
+        } else {
+            Verdict::Unverifiable(QuarantineReason::Unsigned)
+        };
     };
     if roster.is_revoked(device_id) {
         return Verdict::Quarantine(QuarantineReason::RevokedDevice);
@@ -500,6 +513,73 @@ mod tests {
         });
         hive_core::sign_envelope(&mut e, signer_device, signer_kp);
         e
+    }
+
+    #[test]
+    fn unsigned_event_with_a_forged_stamp_is_quarantined_not_accepted() {
+        // P0-1 PoC: a malicious member forges an UNSIGNED governance event stamped
+        // as the real Owner. Genuine events are always signed (append_signed signs
+        // + stamps together), so this is provably forged and MUST be quarantined —
+        // not accepted (Relay mode), where projection-authz would trust the stamped
+        // Owner and apply the takeover on every device.
+        use crate::identity_verifier::{gate_ingest, IdentityCache, IdentityMode, IngestAction};
+
+        let owner = principal();
+        let roster = build_roster(&trust_events(&owner, 1));
+
+        // Forged: unsigned (signer_device_id stays None) but stamped as the owner,
+        // carrying a self-promotion to Owner.
+        let mut forged = env(
+            10,
+            SessionEvent::MemberRoleChanged {
+                change: hive_core::MemberRoleChange {
+                    member_id: owner.account_id.to_string(),
+                    old_role: WorkspaceRole::Contributor,
+                    new_role: WorkspaceRole::Owner,
+                },
+            },
+        );
+        forged.actor_stamp = Some(ActorStamp {
+            actor: ActorIdentity {
+                id: owner.account_id.to_string(),
+                display_name: "P".into(),
+                kind: ActorKind::Human,
+                account_id: Some(owner.account_id),
+                device_id: Some(owner.device_id),
+                git_email: None,
+                key_agreement_public: None,
+                avatar_url: None,
+            },
+            recorded_at: Timestamp::epoch(),
+        });
+        assert!(forged.signer_device_id.is_none(), "PoC envelope must be unsigned");
+
+        // The verdict must be Quarantine, and Relay-mode ingest must DROP it.
+        assert_eq!(
+            verdict_for(&roster, &forged),
+            Verdict::Quarantine(QuarantineReason::Unsigned)
+        );
+        let cache = IdentityCache::new();
+        assert!(
+            matches!(
+                gate_ingest(IdentityMode::Relay, verdict_for(&roster, &forged), None, None, &cache),
+                IngestAction::Quarantine(_)
+            ),
+            "Relay-mode ingest must quarantine a forged unsigned stamped event, not Accept it",
+        );
+
+        // Sanity: an unsigned event with NO stamp claims no author, so it stays the
+        // lenient Unverifiable — genuinely unauthored events aren't newly dropped.
+        let unstamped = env(
+            11,
+            SessionEvent::MessageAppended {
+                message: ChatMessage::new(MessageRole::User, "x", "y"),
+            },
+        );
+        assert_eq!(
+            verdict_for(&roster, &unstamped),
+            Verdict::Unverifiable(QuarantineReason::Unsigned)
+        );
     }
 
     #[test]
