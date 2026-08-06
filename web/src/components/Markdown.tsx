@@ -1,15 +1,22 @@
 import { memo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
 
 /// GitHub-flavored markdown for chat messages. Memoized on `content` so it only
 /// re-parses when the text actually changes — the transcript stays cheap during
 /// typing/streaming (streaming bubbles render plain text until complete).
+///
+/// `remark-breaks` keeps single newlines as line breaks. Runtime output (Claude
+/// Code especially) uses bare newlines for meaningful line structure, and plain
+/// markdown would reflow those into one run-on paragraph — which also made text
+/// visibly re-wrap the moment a streaming bubble (rendered `whitespace-pre-wrap`)
+/// retired into its persisted copy.
 export const Markdown = memo(function Markdown({ content }: { content: string }) {
   return (
     <div className="hive-md text-[0.95rem] leading-7">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={[remarkGfm, remarkBreaks]}
         components={{
           a: ({ href, children }) => (
             <a
