@@ -3391,8 +3391,8 @@ fn vote_proposal(
 /// Fails cleanly (no partial apply) if the tree drifted from the patch's base.
 fn apply_patch(workspace_root: &str, diff: &str) -> Result<(), String> {
     use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
+    use std::process::Stdio;
+    let mut child = hive_core::process_util::command("git")
         .arg("-C")
         .arg(workspace_root)
         .args(["apply", "--whitespace=nowarn"])
@@ -5243,7 +5243,7 @@ fn get_file_diff_sides(state: State<AppState>, path: String) -> Result<FileDiffS
     if rel.is_empty() || rel.starts_with('/') || rel.contains("..") {
         return Err("invalid path".into());
     }
-    let original = std::process::Command::new("git")
+    let original = hive_core::process_util::command("git")
         .args(["show", &format!("HEAD:{rel}")])
         .current_dir(&root)
         .output()
@@ -5332,7 +5332,7 @@ fn open_path_in_editor(
         std::path::Path::new(&root).join(rel)
     };
     if on_path(cli) {
-        return std::process::Command::new(cli)
+        return hive_core::process_util::command(cli)
             .arg(&target)
             .spawn()
             .map(|_| ())
@@ -5816,7 +5816,7 @@ fn set_agent_avatar(
 fn open_in_editor(state: State<AppState>) -> Result<(), String> {
     let root = state.workspace_root.lock().unwrap().clone();
     if let Ok(editor) = std::env::var("VISUAL").or_else(|_| std::env::var("EDITOR")) {
-        return std::process::Command::new(editor)
+        return hive_core::process_util::command(editor)
             .arg(&root)
             .spawn()
             .map(|_| ())
@@ -5828,7 +5828,7 @@ fn open_in_editor(state: State<AppState>) -> Result<(), String> {
     let program = "explorer";
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let program = "xdg-open";
-    std::process::Command::new(program)
+    hive_core::process_util::command(program)
         .arg(&root)
         .spawn()
         .map(|_| ())
@@ -5856,7 +5856,7 @@ fn open_url_in_browser(url: &str) -> std::io::Result<()> {
     let (program, args): (&str, Vec<&str>) = ("cmd", vec!["/C", "start", "", url]);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let (program, args): (&str, Vec<&str>) = ("xdg-open", vec![url]);
-    std::process::Command::new(program).args(&args).spawn().map(|_| ())
+    hive_core::process_util::command(program).args(&args).spawn().map(|_| ())
 }
 
 /// macOS launch-health signals that predict silent agent stalls. Hive spawns
@@ -8569,7 +8569,7 @@ fn on_path(bin: &str) -> bool {
 }
 
 fn git_config_value(key: &str) -> Option<String> {
-    std::process::Command::new("git")
+    hive_core::process_util::command("git")
         .args(["config", "--get", key])
         .output()
         .ok()

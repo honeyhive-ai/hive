@@ -14,6 +14,7 @@ pub mod events;
 pub mod git_context;
 pub mod identity;
 pub mod policy;
+pub mod process_util;
 pub mod proposals;
 pub mod runtime;
 pub mod schedule;

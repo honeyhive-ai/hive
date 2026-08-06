@@ -14,7 +14,9 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+// Spawns go through `process_util::command` so the ~dozen `git` invocations an
+// isolated turn makes don't each flash a console window on Windows.
+use hive_core::process_util::command;
 
 /// A live isolated worktree for one turn. Drop does NOT auto-remove — call
 /// [`Worktree::remove`] once the turn's diff has been captured (merged or
@@ -31,7 +33,7 @@ pub struct Worktree {
 
 /// Whether `root` is inside a git working tree. Isolation only applies to repos.
 pub fn is_git_repo(root: &Path) -> bool {
-    Command::new("git")
+    command("git")
         .arg("-C")
         .arg(root)
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -41,7 +43,7 @@ pub fn is_git_repo(root: &Path) -> bool {
 }
 
 fn git(dir: &Path, args: &[&str]) -> io::Result<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output()?;
+    let out = command("git").arg("-C").arg(dir).args(args).output()?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "git {}: {}",
@@ -76,7 +78,7 @@ impl Worktree {
         }
         // A stale worktree/branch from a crashed prior turn with the same id
         // would block creation — best-effort clear it first.
-        let _ = Command::new("git")
+        let _ = command("git")
             .arg("-C")
             .arg(repo_root)
             .args(["worktree", "remove", "--force"])
@@ -124,7 +126,7 @@ mod tests {
     use super::*;
 
     fn run(dir: &Path, prog: &str, args: &[&str]) {
-        let ok = Command::new(prog)
+        let ok = command(prog)
             .arg("-C")
             .arg(dir)
             .args(args)
@@ -210,7 +212,7 @@ mod tests {
         let diff = wt.diff().unwrap();
         wt.remove().unwrap();
 
-        let mut child = Command::new("git")
+        let mut child = command("git")
             .arg("-C")
             .arg(&repo)
             .args(["apply", "--whitespace=nowarn"])

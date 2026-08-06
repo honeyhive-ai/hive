@@ -326,10 +326,12 @@ async fn call_tool_stdio(
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
 
-    let mut child = Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    crate::provider::subprocess::suppress_console_window(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| McpError::Transport(format!("spawn {command}: {e}")))?;
 
@@ -372,10 +374,12 @@ async fn list_tools_stdio(command: &str, args: &[String]) -> Result<Vec<McpTool>
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
 
-    let mut child = Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    crate::provider::subprocess::suppress_console_window(&mut cmd);
+    let mut child = cmd
         .spawn()
         .map_err(|e| McpError::Transport(format!("spawn {command}: {e}")))?;
 
