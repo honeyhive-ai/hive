@@ -28,3 +28,15 @@ bun run typecheck  # tsc --noEmit
 
 The full app runs via `cargo tauri dev` from the repo root, which serves this
 frontend and the Rust backend together.
+
+### If `bun run test` fails with `Cannot find package 'esbuild'`
+
+You don't have Node.js installed. `esbuild` is a `trustedDependency`, so bun
+runs its postinstall — which is `node install.js`. That fails, bun drops the
+package, and Vite can't start. Nothing in the output says "Node is missing".
+
+Install Node, or skip the postinstall:
+
+```bash
+bun install --ignore-scripts
+```
