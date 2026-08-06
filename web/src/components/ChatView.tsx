@@ -63,6 +63,7 @@ import { Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui"
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
 import { applyStreamDelta, retireStream } from "@/lib/streams";
+import { pinToBottom, pinAfterScroll } from "@/lib/autoscroll";
 import { detectSlash } from "@/lib/slash";
 import { confirmThen } from "@/lib/confirm";
 import { promptDialog } from "@/components/Dialog";
@@ -111,6 +112,12 @@ export function ChatView({
   const [streamError, setStreamError] = useState<string | null>(null);
   // Autoscroll only when already pinned to the bottom; otherwise surface a pill.
   const [atBottom, setAtBottom] = useState(true);
+  // Mirrors `atBottom` for the pin loop, which runs across frames and needs the
+  // live value, not the one captured when it started.
+  const atBottomRef = useRef(true);
+  // Last position the scroll handler saw, so it can tell a reader scrolling up
+  // from the layout growing underneath a settling pin (lib/autoscroll).
+  const scrollMark = useRef(0);
   const [hasNew, setHasNew] = useState(false);
   // @-mention autocomplete in the composer.
   const [mention, setMention] = useState<{ start: number; query: string } | null>(null);
@@ -250,36 +257,56 @@ export function ChatView({
     setMention(null);
     setSlash(null);
     setAttachments([]);
+    // A fresh chat always starts at the bottom. Re-pinning here (rather than in
+    // an effect declared after the follow effect below) matters on a session
+    // switch: the follow effect fires on the incoming chat's data and must not
+    // see the outgoing session's "reader had scrolled up" state.
+    atBottomRef.current = true;
+    setAtBottom(true);
+    setHasNew(false);
+    scrollMark.current = 0;
     if (stopTypingTimer.current) clearTimeout(stopTypingTimer.current);
     lastTypingPing.current = 0;
   }, [sessionId]);
 
+  // Jump to the newest turn and hold there while the layout settles — one
+  // scroll isn't enough, because the turn rows' `content-visibility` makes
+  // scrollHeight an underestimate until they're really laid out (lib/autoscroll).
+  const cancelPin = useRef<(() => void) | null>(null);
+  const pin = useCallback(() => {
+    cancelPin.current?.();
+    cancelPin.current = pinToBottom(() => scrollRef.current, {
+      pinned: () => atBottomRef.current,
+    });
+  }, []);
+  useEffect(() => () => cancelPin.current?.(), []);
+
+  function setPinned(next: boolean) {
+    atBottomRef.current = next;
+    setAtBottom(next);
+  }
   function scrollToBottom() {
-    const el = scrollRef.current;
-    if (!el) return;
-    el.scrollTo({ top: el.scrollHeight });
+    setPinned(true);
     setHasNew(false);
+    pin();
   }
   function onScroll() {
     const el = scrollRef.current;
     if (!el) return;
-    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-    setAtBottom(near);
-    if (near) setHasNew(false);
+    const next = pinAfterScroll({ top: scrollMark.current, pinned: atBottomRef.current }, el);
+    scrollMark.current = el.scrollTop;
+    setPinned(next);
+    if (next) setHasNew(false);
   }
   // Follow the conversation only when pinned to the bottom; if the user has
   // scrolled up, flag new content with a pill instead of yanking them down.
+  // This also covers mount: switching to another view unmounts ChatView, so
+  // coming back re-runs it and re-pins the freshly rendered transcript.
   useEffect(() => {
-    if (atBottom) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    if (atBottomRef.current) pin();
     else setHasNew(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat.data, streams, optimisticUser]);
-
-  // A fresh chat always starts at the bottom.
-  useEffect(() => {
-    setAtBottom(true);
-    setHasNew(false);
-  }, [sessionId]);
 
   const currentRuntime = useMemo(
     () => runtimes.find((rt) => rt.id === currentRuntimeId) ?? runtimes[0] ?? null,
@@ -1457,7 +1484,12 @@ const Bubble = memo(function Bubble({
   const kindClass = isUser ? "human" : shared ? "shared" : "agent";
   const rowStyle: CSSProperties = streaming
     ? {}
-    : { contentVisibility: "auto", containIntrinsicSize: "0 80px" };
+    // `auto` in the intrinsic size makes a row remember its measured height
+    // after it has been on screen once, instead of snapping back to the 80px
+    // guess when it scrolls away. Without that the container's scrollHeight
+    // oscillates as you move through a long thread and never settles, so
+    // autoscroll can't find a stable bottom to pin to (lib/autoscroll).
+    : { contentVisibility: "auto", containIntrinsicSize: "auto 80px" };
   if (!isUser && !shared && turnAccent) {
     (rowStyle as Record<string, string>)["--turn-accent"] = turnAccent;
   }
