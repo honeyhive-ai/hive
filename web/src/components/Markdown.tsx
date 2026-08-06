@@ -55,6 +55,22 @@ export const Markdown = memo(function Markdown({ content }: { content: string })
   );
 });
 
+/// The text the Copy button puts on the clipboard for a `<pre>`.
+///
+/// Reads `textContent`, not `innerText`, because jsdom implements no layout and
+/// returns `undefined` for `innerText` — a test that clicks Copy and asserts on
+/// the clipboard passed vacuously, whatever the markup rendered to.
+///
+/// Inside a `<pre>` the two properties agree on everything that matters here:
+/// `white-space: pre` means nothing collapses, and the block has no hidden
+/// children for `innerText` to skip. They diverge on exactly one thing — the
+/// trailing newline every fenced block carries. `innerText` strips trailing LFs
+/// per spec; `textContent` keeps them. Strip it, or copying a shell command and
+/// pasting it into a terminal would run it instead of leaving it on the prompt.
+export function codeBlockText(el: HTMLElement | null): string {
+  return (el?.textContent ?? "").replace(/\n+$/, "");
+}
+
 function CodeBlock({ children }: { children: React.ReactNode }) {
   const ref = useRef<HTMLPreElement>(null);
   const [copied, setCopied] = useState(false);
@@ -68,8 +84,7 @@ function CodeBlock({ children }: { children: React.ReactNode }) {
           color: copied ? "var(--hive-success)" : undefined,
         }}
         onClick={() => {
-          const text = ref.current?.innerText ?? "";
-          void navigator.clipboard.writeText(text);
+          void navigator.clipboard.writeText(codeBlockText(ref.current));
           setCopied(true);
           window.setTimeout(() => setCopied(false), 1500);
         }}
