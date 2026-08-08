@@ -2737,6 +2737,37 @@ struct RevokeResultDto {
     recipients: u32,
 }
 
+/// Every key-agreement public key ever seen for each member account, gathered from
+/// the actor stamps on the workspace-config log (account id → set of KA keys). Each
+/// device stamps its own KA key on the events it authors, so this captures ALL of a
+/// member's devices — not just the one KA last synced onto their roster actor.
+///
+/// P2-4: sealing a rotation/invite to `member.actor.key_agreement_public` (one key
+/// per member) left a member's *other* devices unable to open the new epoch ("no
+/// key for epoch N"). Seal to every device instead.
+fn member_device_ka_keys(
+    svc: &hive_runtime::chat_service::ChatService,
+    workspace_id: Uuid,
+) -> std::collections::HashMap<String, Vec<Vec<u8>>> {
+    let config_id = hive_core::workspace_config_session_id(workspace_id);
+    let mut map: std::collections::HashMap<String, std::collections::HashSet<Vec<u8>>> =
+        Default::default();
+    if let Ok(envs) = svc.store().list(config_id) {
+        for env in envs {
+            if let Some(stamp) = &env.actor_stamp {
+                if let (Some(acct), Some(ka)) =
+                    (stamp.actor.account_id, stamp.actor.key_agreement_public.as_ref())
+                {
+                    if !ka.is_empty() {
+                        map.entry(acct.to_string()).or_default().insert(ka.clone());
+                    }
+                }
+            }
+        }
+    }
+    map.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect()
+}
+
 /// Remove a member AND rotate the workspace key, sealed only to the remaining
 /// members' devices. The removed member keeps the old key but can't open the
 /// rotation, so they can't read traffic sent after revocation. Authorization
@@ -2758,19 +2789,28 @@ async fn remove_and_revoke(
             .load(sid)
             .map_err(map_err)?
             .ok_or_else(|| "Unknown chat.".to_string())?;
+        // All KA keys per member account, across every device (P2-4) — not just the
+        // one on the roster actor, so a remaining member's other devices can open
+        // the new epoch too.
+        let device_keys = member_device_ka_keys(&svc, active_ws);
         let mut map: std::collections::BTreeMap<String, Vec<u8>> = Default::default();
         for m in &session.members {
             if m.id == member_id {
-                continue;
+                continue; // exclude the removed member's devices from the new epoch
             }
+            let mut keys: std::collections::HashSet<Vec<u8>> =
+                device_keys.get(&m.actor.id).cloned().unwrap_or_default().into_iter().collect();
             if let Some(pk) = &m.actor.key_agreement_public {
-                map.insert(m.actor.id.clone(), pk.clone());
+                keys.insert(pk.clone());
+            }
+            for (i, ka) in keys.into_iter().enumerate() {
+                map.insert(format!("{}:{i}", m.actor.id), ka);
             }
         }
         // Always seal to the acting owner's own device so they adopt the new key.
         let me = svc.author().clone();
         if let Some(pk) = &me.key_agreement_public {
-            map.insert(me.id.clone(), pk.clone());
+            map.insert(format!("{}:self", me.id), pk.clone());
         }
         svc.remove_member(sid, active_ws, member_id.clone())
             .map_err(map_err)?;
@@ -8037,10 +8077,25 @@ async fn invite_by_handle(
             {
                 let svc = state.service.lock().unwrap();
                 let cfg_id = hive_core::workspace_config_session_id(state.active_workspace_id());
+                // Every device KA of every current member (P2-4), so a member's
+                // second device can open the new epoch too — not just the one KA on
+                // their roster actor.
+                let device_keys = member_device_ka_keys(&svc, state.active_workspace_id());
                 if let Ok(Some(cfg)) = svc.load(cfg_id) {
                     for m in &cfg.members {
-                        if let Some(kap) = m.actor.key_agreement_public.as_ref().filter(|k| !k.is_empty()) {
-                            all_recipients.push((m.id.clone(), kap.clone()));
+                        let mut keys: std::collections::HashSet<Vec<u8>> = device_keys
+                            .get(&m.actor.id)
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect();
+                        if let Some(kap) =
+                            m.actor.key_agreement_public.as_ref().filter(|k| !k.is_empty())
+                        {
+                            keys.insert(kap.clone());
+                        }
+                        for (i, ka) in keys.into_iter().enumerate() {
+                            all_recipients.push((format!("{}:{i}", m.id), ka));
                         }
                     }
                 }
