@@ -211,6 +211,7 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
 
     let mut account_keys: HashMap<Uuid, Vec<u8>> = HashMap::new();
     let mut disputed: HashSet<Uuid> = HashSet::new();
+    let mut explicit_revoked: HashSet<Uuid> = HashSet::new();
     let mut members: HashSet<Uuid> = HashSet::new();
     let mut member_account: HashMap<String, Uuid> = HashMap::new();
     let mut certs: Vec<hive_core::crypto::DeviceCertificate> = Vec::new();
@@ -259,12 +260,18 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
             SessionEvent::DeviceCertificateAdded { certificate } => {
                 certs.push(certificate.clone());
             }
+            SessionEvent::DeviceRevoked { device_id } => {
+                explicit_revoked.insert(*device_id);
+            }
             _ => {}
         }
     }
 
     let mut roster = WorkspaceRoster::default();
     roster.disputed = disputed;
+    // Explicitly-revoked devices (a `DeviceRevoked` event) are never trusted, even
+    // if they still hold a valid member cert — verdict_for checks is_revoked first.
+    roster.revoked.extend(explicit_revoked);
     // Retain the pinned account signing keys for accounts that are members — the
     // Option-C gate checks these against GitHub. (Non-member account keys are
     // irrelevant; their devices are revoked below.)
@@ -550,6 +557,27 @@ mod tests {
         });
         hive_core::sign_envelope(&mut e, signer_device, signer_kp);
         e
+    }
+
+    #[test]
+    fn explicitly_revoked_device_is_quarantined_even_with_a_valid_cert() {
+        // P1-3: a DeviceRevoked event revokes a single device without removing its
+        // account — its signed events are quarantined even though its cert still
+        // chains to a current member account.
+        let p = principal();
+        let mut events = trust_events(&p, 1);
+        // Sanity: without revocation the device's event is Valid.
+        let before = build_roster(&events);
+        let signed = authored(p.device_id, &p.device_kp, p.account_id, 10);
+        assert_eq!(verdict_for(&before, &signed), Verdict::Valid);
+
+        // Revoke the device; now the same signed event is quarantined.
+        events.push(env(20, SessionEvent::DeviceRevoked { device_id: p.device_id }));
+        let after = build_roster(&events);
+        assert_eq!(
+            verdict_for(&after, &signed),
+            Verdict::Quarantine(QuarantineReason::RevokedDevice)
+        );
     }
 
     #[test]

@@ -108,6 +108,7 @@ pub fn requires_projection_authz(event: &SessionEvent) -> bool {
             | SessionEvent::ChannelReordered { .. }
             | SessionEvent::ChannelArchived { .. }
             | SessionEvent::ChatChannelChanged { .. }
+            | SessionEvent::DeviceRevoked { .. }
     )
 }
 
@@ -162,7 +163,10 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         // Workspace runtimes carry credentials — governance, admin+.
         | SessionEvent::WorkspaceRuntimesUpdated { .. }
         | SessionEvent::WorkspaceRuntimeUpserted { .. }
-        | SessionEvent::WorkspaceRuntimeRemoved { .. } => WorkspaceRole::Admin,
+        | SessionEvent::WorkspaceRuntimeRemoved { .. }
+        // Revoking a device cuts trust — governance, admin+ (unlike publishing your
+        // own account key/cert, which is a self-validated bootstrap at a low floor).
+        | SessionEvent::DeviceRevoked { .. } => WorkspaceRole::Admin,
         // content / collaboration
         SessionEvent::SessionSnapshot { .. }
         | SessionEvent::MessageAppended { .. }

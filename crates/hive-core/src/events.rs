@@ -132,6 +132,13 @@ pub enum SessionEvent {
     DeviceCertificateAdded {
         certificate: DeviceCertificate,
     },
+    /// Revoke a single device (e.g. a lost/compromised laptop) without removing its
+    /// whole account. Folded into the roster's revoked set, so the device can no
+    /// longer sign events — even though its account is still a member. Pair with a
+    /// `WorkspaceKeyRotation` that excludes the device to also cut its read access.
+    DeviceRevoked {
+        device_id: Uuid,
+    },
     /// Create (or upsert by id) a channel. Rides the workspace-config log
     /// (spec §11); folded into `ChatSession.channels`. Workspace-scoped.
     ChannelCreated { channel: Channel },
@@ -212,6 +219,7 @@ impl SessionEvent {
             SessionEvent::MessageReactionRemoved { .. } => "messageReactionRemoved",
             SessionEvent::AccountKeyRegistered { .. } => "accountKeyRegistered",
             SessionEvent::DeviceCertificateAdded { .. } => "deviceCertificateAdded",
+            SessionEvent::DeviceRevoked { .. } => "deviceRevoked",
             SessionEvent::ChannelCreated { .. } => "channelCreated",
             SessionEvent::ChannelRenamed { .. } => "channelRenamed",
             SessionEvent::ChannelReordered { .. } => "channelReordered",
@@ -521,7 +529,8 @@ impl ChatSession {
             // Trust metadata — inert in the session projection; consumed only by
             // the device-roster builder (see hive-runtime::envelope_verifier).
             SessionEvent::AccountKeyRegistered { .. }
-            | SessionEvent::DeviceCertificateAdded { .. } => {}
+            | SessionEvent::DeviceCertificateAdded { .. }
+            | SessionEvent::DeviceRevoked { .. } => {}
             // Unrecognized (newer-client) event — inert in this build.
             SessionEvent::Unknown => {}
         }

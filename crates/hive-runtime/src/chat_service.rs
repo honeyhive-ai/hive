@@ -1185,6 +1185,21 @@ impl ChatService {
         Ok(())
     }
 
+    /// Revoke a single device (lost/compromised) without removing its account
+    /// (authz: admin+). Folds into the roster's revoked set so the device can no
+    /// longer sign events. Pair with a `WorkspaceKeyRotation` excluding the device
+    /// to also cut its read access. Rides the workspace-config log (workspace-wide).
+    pub fn revoke_device(
+        &mut self,
+        _session_id: Uuid,
+        workspace_id: Uuid,
+        device_id: Uuid,
+    ) -> Result<()> {
+        let session_id = self.ensure_workspace_config(workspace_id)?;
+        self.append_signed(session_id, workspace_id, SessionEvent::DeviceRevoked { device_id })?;
+        Ok(())
+    }
+
     /// Change a member's role (authz: admin+, last-owner protected).
     pub fn set_member_role(
         &mut self,
