@@ -98,18 +98,29 @@ pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<(),
 /// the canonical order. JSON encodings are stable because serde serializes
 /// struct fields and tagged enums in declaration order.
 pub fn envelope_preimage(env: &SessionEventEnvelope) -> Vec<u8> {
-    let mut out = Vec::with_capacity(160);
-    // v2: added lamport + timestamp + actor_stamp + scope to the signed bytes.
-    out.extend_from_slice(b"hive-envelope-v2\0");
+    let mut out = Vec::with_capacity(192);
+    // v3: LENGTH-PREFIX every variable-length JSON field so the concatenation is
+    // injective — two distinct envelopes can't collide to the same preimage by
+    // shifting bytes across a field boundary (v2 concatenated the JSON blobs with
+    // no delimiter). And FAIL CLOSED on a serialization error (these serde types
+    // never fail in practice) rather than emitting empty bytes, which would have
+    // let two payloads share a preimage — and thus a signature. Breaking: v3
+    // signatures differ from v2, so events signed under v2 no longer verify.
+    out.extend_from_slice(b"hive-envelope-v3\0");
     out.extend_from_slice(env.workspace_id.as_bytes());
     out.extend_from_slice(env.session_id.as_bytes());
     out.extend_from_slice(&env.sequence.to_le_bytes());
     out.extend_from_slice(&env.lamport.to_le_bytes());
     out.extend_from_slice(env.event_id.as_bytes());
-    out.extend_from_slice(&serde_json::to_vec(&env.scope).unwrap_or_default());
-    out.extend_from_slice(&serde_json::to_vec(&env.timestamp).unwrap_or_default());
-    out.extend_from_slice(&serde_json::to_vec(&env.actor_stamp).unwrap_or_default());
-    out.extend_from_slice(&serde_json::to_vec(&env.payload).unwrap_or_default());
+    for json in [
+        serde_json::to_vec(&env.scope).expect("serialize scope"),
+        serde_json::to_vec(&env.timestamp).expect("serialize timestamp"),
+        serde_json::to_vec(&env.actor_stamp).expect("serialize actor_stamp"),
+        serde_json::to_vec(&env.payload).expect("serialize payload"),
+    ] {
+        out.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        out.extend_from_slice(&json);
+    }
     out
 }
 
