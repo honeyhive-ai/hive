@@ -4613,17 +4613,20 @@ async fn run_prepared_turn(
     const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_millis(750);
     let mut pending = String::new();
     let mut last_flush = std::time::Instant::now();
-    // Backstop timeout: a subprocess agent can wedge (waiting on auth/input, a
-    // blocked MCP, a hung network call) and stream nothing — which otherwise
-    // leaves the UI on "thinking" forever. Cap the whole turn so a wedged runtime
-    // surfaces as an error and frees the chat. Generous by default (real coding
-    // turns run minutes); override with HIVE_TURN_TIMEOUT_SECS. Dropping the
-    // future on timeout kills any spawned CLI (kill_on_drop).
+    // Total wall-clock BACKSTOP only — the real "wedged?" gate is the provider's
+    // per-line IDLE timeout (HIVE_TURN_IDLE_TIMEOUT_SECS), which resets on any
+    // activity and so doesn't kill a long-but-working turn. This cap just stops a
+    // runaway that streams forever; it must sit well above a real turn's cost — a
+    // cold build + `cargo test` here can exceed ten minutes, so the old 600s
+    // default was below the floor for the repo's own turns and killed working
+    // agents (#100). One hour by default; override with HIVE_TURN_TIMEOUT_SECS.
+    // Dropping the future on timeout kills any spawned CLI (kill_on_drop).
     let turn_timeout = std::time::Duration::from_secs(
         std::env::var("HIVE_TURN_TIMEOUT_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(600),
+            .filter(|&s| s > 0)
+            .unwrap_or(3600),
     );
     // Honor the Stop button on EVERY dispatch path — not just send_message's outer
     // select. maybe_respond and the workflow driver call run_prepared_turn directly,

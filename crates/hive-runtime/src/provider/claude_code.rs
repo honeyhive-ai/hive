@@ -141,13 +141,36 @@ pub async fn stream_reply(
     });
     let mut reader = BufReader::new(stdout).lines();
 
+    // Idle timeout, not wall-clock. The cap exists to catch a runtime that streams
+    // *nothing* (wedged on auth/input/a blocked tool) — not to bound how long real
+    // work takes. So we time out only when NO line arrives for the idle window;
+    // ANY stream-json line (a text delta OR a tool_use/tool_result/system event)
+    // resets it, so a long-but-active turn — e.g. a multi-minute `cargo test` tool
+    // run that emits no text — won't trip it, while a truly silent CLI still does.
+    // Override with HIVE_TURN_IDLE_TIMEOUT_SECS. (#100)
+    let idle = std::time::Duration::from_secs(
+        std::env::var("HIVE_TURN_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(300),
+    );
     let mut assembled = String::new();
     let mut result_fallback: Option<String> = None;
-    while let Some(line) = reader
-        .next_line()
-        .await
-        .map_err(|e| ProviderError::Subprocess(format!("read stdout: {e}")))?
-    {
+    loop {
+        let line = match tokio::time::timeout(idle, reader.next_line()).await {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break, // clean EOF
+            Ok(Err(e)) => return Err(ProviderError::Subprocess(format!("read stdout: {e}"))),
+            Err(_) => {
+                // No output at all for the idle window — dropping the future kills
+                // the CLI (kill_on_drop) once we return.
+                return Err(ProviderError::Subprocess(format!(
+                    "claude produced no output for {}s — it may be waiting on login/auth, input, or a blocked tool. Any activity (text or a tool call) resets this; a long but active build won't trip it. Verify with Settings \u{2192} Models \u{2192} Test, or raise HIVE_TURN_IDLE_TIMEOUT_SECS.",
+                    idle.as_secs()
+                )));
+            }
+        };
         if let Some(text) = extract_text_delta(&line) {
             assembled.push_str(&text);
             on_delta(text);
