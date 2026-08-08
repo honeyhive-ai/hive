@@ -62,7 +62,7 @@ import { Avatar } from "@/components/Avatar";
 import { Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui";
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
-import { applyStreamDelta, retireStream } from "@/lib/streams";
+import { applyStreamDelta, handleTerminal } from "@/lib/streams";
 import { pinToBottom, pinAfterScroll } from "@/lib/autoscroll";
 import { detectSlash } from "@/lib/slash";
 import { confirmThen } from "@/lib/confirm";
@@ -236,27 +236,22 @@ export function ChatView({
         // recomputes — so the whole thread visibly jumps up then drops. Refetch,
         // then retire, so the persisted copy replaces the bubble seamlessly.
         const mid = e.messageId;
-        // Idempotency guard (P2-11): ignore a DUPLICATE terminal for a message we
-        // already retired. Without this, a repeated completed/error for one message
-        // re-runs retire when `streams` is empty and prematurely tears down a
-        // *sibling* turn's "thinking"/optimistic state (fan-out / back-to-back
-        // turns). The first terminal for a message still proceeds normally, so the
-        // zero-delta completion path is unaffected. (Full out-of-order correlation
-        // across distinct messages would need a backend per-turn id.)
+        // Skip the refetch for an already-handled duplicate terminal (perf); the
+        // authoritative idempotency + retire + clear decision is `handleTerminal`
+        // (unit-tested in lib/streams). It ignores a duplicate so it can't collapse
+        // a sibling turn's state, retires this message's live stream, and reports
+        // whether the LAST one is gone (→ clear sending/optimistic). Zero-delta
+        // completions still clear when they're the only in-flight turn.
         if (retiredIdsRef.current.has(mid)) return;
-        retiredIdsRef.current.add(mid);
         const retire = () =>
           setStreams((prev) => {
-            const next = retireStream(prev, mid);
-            // Clear the shared "sending"/optimistic state only when the LAST live
-            // stream retires — a sibling parallel workflow-stage stream may still
-            // be generating, so clearing on the first completion read as "done"
-            // while others were mid-flight.
-            if (next.size === 0) {
+            const t = handleTerminal(prev, retiredIdsRef.current, mid);
+            retiredIdsRef.current = t.retired;
+            if (t.cleared) {
               setSending(false);
               setOptimisticUser(null);
             }
-            return next;
+            return t.streams;
           });
         void qc
           .invalidateQueries({ queryKey: ["chat", sessionRef.current] })
