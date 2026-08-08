@@ -1355,4 +1355,43 @@ mod tests {
             store_b.has_event(content.event_id).unwrap(),
         );
     }
+
+    #[test]
+    fn option_c_content_before_trust_across_pulls_converges_not_wedged() {
+        // P2-21 adversarial fetch-split: content arrives in one pull BEFORE its
+        // trust events (a hostile/fragmented relay ordering, or trust straddling a
+        // cursor boundary). Under Option C the content must be HELD (device
+        // unknown) — never dropped — and once a later pull carries the trust it
+        // must converge (apply), not wedge behind a permanently-held cursor.
+        let p = oc_principal();
+        let content = oc_content(&p, 1);
+        let cache = shared_cache();
+        cache.lock().unwrap().put(
+            p.account_id,
+            p.account_key.clone(),
+            IdentityVerdict::Verified,
+            std::time::Duration::from_secs(600),
+        );
+        let mut eng = oc_engine(Arc::clone(&cache));
+        let mut store = EventStore::open_in_memory().unwrap();
+
+        // Pull 1: content alone at seq 1, no trust yet → held (device unknown).
+        let pull1 = vec![(1u64, serde_json::to_value(&content).unwrap())];
+        eng.apply_fetched(&mut store, &pull1).unwrap();
+        assert!(
+            !store.has_event(content.event_id).unwrap(),
+            "content with no trust must be HELD, not applied and not dropped"
+        );
+
+        // Pull 2: re-fetch from the held cursor now carries content + its trust.
+        let mut pull2 = pull1.clone();
+        for (i, e) in p.trust.iter().enumerate() {
+            pull2.push((i as u64 + 2, serde_json::to_value(e).unwrap()));
+        }
+        eng.apply_fetched(&mut store, &pull2).unwrap();
+        assert!(
+            store.has_event(content.event_id).unwrap(),
+            "content converges once its trust arrives in a later pull — no permanent wedge"
+        );
+    }
 }
