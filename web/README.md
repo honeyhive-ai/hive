@@ -26,5 +26,17 @@ bun run test       # vitest
 bun run typecheck  # tsc --noEmit
 ```
 
+> **Node.js is a prerequisite for `bun install` here.** `esbuild` is a
+> `trustedDependency`, so bun runs its postinstall (`node install.js`). With no
+> `node` on PATH that script fails and bun **removes esbuild** rather than leaving
+> a broken install — quietly: `bun install` reports success, and the breakage only
+> surfaces later as vitest failing with `Cannot find package 'esbuild'` (which
+> points at the symptom, not the cause). If you can't install Node, install
+> without postinstall scripts instead:
+>
+> ```bash
+> bun install --ignore-scripts
+> ```
+
 The full app runs via `cargo tauri dev` from the repo root, which serves this
 frontend and the Rust backend together.
