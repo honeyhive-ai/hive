@@ -1,7 +1,21 @@
-import { memo, useRef, useState } from "react";
+import { memo, isValidElement, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+
+/// Recursively collect the text of a React node tree — used to copy a fenced code
+/// block's SOURCE (what the user actually wants) rather than reading the rendered
+/// DOM's `innerText` (which jsdom doesn't implement, so tests passed vacuously, and
+/// which is layout-normalized rather than the literal source). #97
+export function nodeText(node: ReactNode): string {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(nodeText).join("");
+  if (isValidElement(node)) {
+    return nodeText((node.props as { children?: ReactNode }).children);
+  }
+  return "";
+}
 
 /// Only open links with a safe scheme. react-markdown's default urlTransform
 /// already neutralizes `javascript:`/`data:` hrefs, but this is defense-in-depth
@@ -71,9 +85,11 @@ export const Markdown = memo(function Markdown({ content }: { content: string })
   );
 });
 
-function CodeBlock({ children }: { children: React.ReactNode }) {
-  const ref = useRef<HTMLPreElement>(null);
+function CodeBlock({ children }: { children: ReactNode }) {
   const [copied, setCopied] = useState(false);
+  // Copy the block's source text (derived from the node tree), not the rendered
+  // DOM — testable and faithful to what was written. #97
+  const source = nodeText(children);
   return (
     <div className="group/code relative my-2">
       <button
@@ -84,8 +100,7 @@ function CodeBlock({ children }: { children: React.ReactNode }) {
           color: copied ? "var(--hive-success)" : undefined,
         }}
         onClick={() => {
-          const text = ref.current?.innerText ?? "";
-          void navigator.clipboard.writeText(text);
+          void navigator.clipboard.writeText(source);
           setCopied(true);
           window.setTimeout(() => setCopied(false), 1500);
         }}
@@ -95,7 +110,6 @@ function CodeBlock({ children }: { children: React.ReactNode }) {
         {copied ? "Copied ✓" : "Copy"}
       </button>
       <pre
-        ref={ref}
         className="overflow-x-auto rounded-xl p-3 text-[0.85rem] leading-6"
         style={{ background: "var(--hive-overlay)", border: "1px solid var(--hive-line)" }}
       >

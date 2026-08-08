@@ -1,6 +1,6 @@
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
-import { Markdown } from "./Markdown";
+import { describe, it, expect, vi } from "vitest";
+import { render, screen, fireEvent } from "@testing-library/react";
+import { Markdown, nodeText } from "./Markdown";
 
 describe("Markdown", () => {
   it("keeps single newlines as line breaks", () => {
@@ -47,5 +47,23 @@ describe("Markdown", () => {
     // item now breaks instead of reflowing. Hard breaks apply to every author,
     // and preserving runtime line structure is worth this.
     expect(container.querySelectorAll("li")[0].querySelectorAll("br")).toHaveLength(1);
+  });
+
+  it("nodeText collects the source text of a node tree (#97)", () => {
+    expect(nodeText("abc")).toBe("abc");
+    expect(nodeText(["a", "b", 1])).toBe("ab1");
+    expect(nodeText(null)).toBe("");
+  });
+
+  it("Copy writes the code block's SOURCE to the clipboard (#97)", async () => {
+    // The copy path used to read `pre.innerText`, which jsdom returns as undefined —
+    // so any clipboard assertion passed vacuously. It now copies the source text.
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    render(<Markdown content={"```ts\nconst a = 1;\nconst b = 2;\n```"} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy code" }));
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText.mock.calls[0][0]).toContain("const a = 1;");
+    expect(writeText.mock.calls[0][0]).toContain("const b = 2;");
   });
 });
