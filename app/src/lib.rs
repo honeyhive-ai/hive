@@ -4628,6 +4628,33 @@ async fn run_prepared_turn(
     } else {
         None
     };
+    // P2-5: a non-subprocess (API) turn with MCP tools enabled writes to the
+    // workspace root directly through its filesystem MCP server — it gets NO
+    // worktree isolation and NO review-gated diff (that path covers only subprocess
+    // agents, above). Surface it so these unguarded writes are at least observable.
+    // A full fix would isolate the turn AND redirect the MCP filesystem server's
+    // root to a per-turn worktree so its edits are captured as a proposal like a
+    // subprocess agent's — a larger change (the MCP server's root is workspace-level
+    // today), tracked as the remaining P2-5 work. Post-hoc diff capture can't gate:
+    // an in-place turn's edits are already applied.
+    if worktree.is_none()
+        && !matches!(
+            responder.runtime.provider,
+            ModelProviderKind::ClaudeCode
+                | ModelProviderKind::Pi
+                | ModelProviderKind::Aider
+                | ModelProviderKind::Codex
+                | ModelProviderKind::Hermes
+        )
+        && state.combined_mcp_servers().iter().any(|s| s.enabled)
+        && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root))
+    {
+        tracing::warn!(
+            target: "dispatch",
+            provider = ?responder.runtime.provider,
+            "API turn has MCP tools enabled and runs in place — its file writes are NOT worktree-isolated or diff-gated (unlike subprocess agents). See P2-5."
+        );
+    }
     let effective_root = worktree
         .as_ref()
         .map(|w| w.path.to_string_lossy().into_owned())
