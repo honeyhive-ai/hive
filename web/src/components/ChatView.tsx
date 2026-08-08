@@ -117,6 +117,9 @@ export function ChatView({
   // is the ms timestamp of the last send/delta (a ref so deltas don't re-render).
   const [stalled, setStalled] = useState(false);
   const lastActivityRef = useRef(0);
+  // Message ids whose terminal (completed/error) we've already handled, so a
+  // duplicate terminal for the same message can't re-run retire (P2-11).
+  const retiredIdsRef = useRef<Set<string>>(new Set());
   // Autoscroll only when already pinned to the bottom; otherwise surface a pill.
   const [atBottom, setAtBottom] = useState(true);
   // Mirrors `atBottom` for the pin loop, which runs across frames and needs the
@@ -233,6 +236,15 @@ export function ChatView({
         // recomputes — so the whole thread visibly jumps up then drops. Refetch,
         // then retire, so the persisted copy replaces the bubble seamlessly.
         const mid = e.messageId;
+        // Idempotency guard (P2-11): ignore a DUPLICATE terminal for a message we
+        // already retired. Without this, a repeated completed/error for one message
+        // re-runs retire when `streams` is empty and prematurely tears down a
+        // *sibling* turn's "thinking"/optimistic state (fan-out / back-to-back
+        // turns). The first terminal for a message still proceeds normally, so the
+        // zero-delta completion path is unaffected. (Full out-of-order correlation
+        // across distinct messages would need a backend per-turn id.)
+        if (retiredIdsRef.current.has(mid)) return;
+        retiredIdsRef.current.add(mid);
         const retire = () =>
           setStreams((prev) => {
             const next = retireStream(prev, mid);
@@ -263,6 +275,7 @@ export function ChatView({
     setStreams(new Map());
     setStreamError(null);
     setStalled(false);
+    retiredIdsRef.current = new Set();
     setOptimisticUser(null);
     setSending(false);
     setInput("");
