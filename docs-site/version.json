@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.9",
-  "name": "Hive 1.5.9 — security audit",
+  "tag": "v1.5.10",
+  "name": "Hive 1.5.10 — audit completion",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "A cross-repo security + reliability pass. Highlights: closes two critical workspace-takeover paths (a forged unsigned-but-stamped event is now quarantined; a contested account-key binding now fails closed instead of a first-wins hijack); per-device revocation; passphrase keys hardened to Argon2id; the P2P path now runs the full identity gate; and the signing preimage is injective/fail-closed. Reliability: agent turns now time out on IDLE (no output) rather than a wall-clock cap, so a long working turn is no longer killed at 600s; Stop aborts every turn path; a stuck-'thinking' watchdog; and progressive Markdown while streaming. Plus a CSP on the webview, a dependency-vuln CI gate, and many app/frontend fixes. See the release for the full list."
+  "notes": "Completes the security-audit follow-ups. Key rotations/invites now seal to ALL of a member's devices (a second device no longer gets locked out of a new key epoch). Signed account-key succession lets an owner legitimately rotate their key while the dispute protection still fails closed on a forged rotation. The chat 'thinking' lifecycle is now a unit-tested pure contract (a duplicate completion can't collapse a sibling turn). Progressive Markdown while streaming, composer accessibility, a webview CSP, and an Option-C convergence test round it out."
 }
