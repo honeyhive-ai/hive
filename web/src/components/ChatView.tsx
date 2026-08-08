@@ -1117,6 +1117,12 @@ export function ChatView({
                   }}
                   rows={1}
                   placeholder="Message the room"
+                  // Accessible name (the placeholder is not a reliable one) + signal
+                  // the state of the @-mention / slash / emoji suggestion menus to
+                  // assistive tech so a screen-reader user knows a popup is open.
+                  aria-label="Message the room"
+                  aria-haspopup="menu"
+                  aria-expanded={Boolean(mention || slash || emojiSc)}
                 />
               </div>
 
@@ -1520,10 +1526,15 @@ const Bubble = memo(function Bubble({
   }, [reactOpen]);
 
   const content = streaming ? (
-    <span className="whitespace-pre-wrap">
-      {body}
+    // Render Markdown progressively while streaming (not raw pre-wrap source), so
+    // code fences / lists / headings appear formatted as they arrive instead of
+    // popping into shape only when the turn retires. Markdown is memoized on
+    // content, so each delta re-parses the accumulated text once; partial/unclosed
+    // markup (an open ``` fence) renders gracefully. The caret trails the content.
+    <div className="hive-stream">
+      <MessageBody body={body} />
       <span className="tt-caret" />
-    </span>
+    </div>
   ) : body ? (
     <MessageBody body={body} />
   ) : toolCalls && toolCalls.length > 0 ? null : (
