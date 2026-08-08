@@ -30,6 +30,12 @@ pub enum QuarantineReason {
     /// `ssh_signing_keys` — a provably-bad identity binding. See
     /// `identity_verifier` and docs/security-hardening-plan.md S1 Option C.
     GithubKeyNotListed,
+    /// Two different signing keys were registered for the same account id — an
+    /// ambiguous/contested identity binding. Fail closed: don't trust events
+    /// stamped as a disputed account (a forged `AccountKeyRegistered` under a
+    /// victim's account id can no longer silently win first-registration and
+    /// hijack the victim). See `build_roster`.
+    DisputedAccountKey,
 }
 
 /// Resolves device public keys + revocation status for verification.
@@ -144,6 +150,10 @@ pub struct WorkspaceRoster {
     /// identity gate can check this exact key against the account's GitHub
     /// `ssh_signing_keys`. Not used by Option A (relay-trusted) verification.
     account_keys: HashMap<Uuid, Vec<u8>>,
+    /// Accounts for which two *different* signing keys were registered — a
+    /// contested binding. Events stamped as one of these are quarantined (fail
+    /// closed), so a forged registration under a victim's account can't hijack it.
+    disputed: HashSet<Uuid>,
 }
 
 impl WorkspaceRoster {
@@ -166,6 +176,11 @@ impl WorkspaceRoster {
     /// Option-C identity gate to compare against GitHub `ssh_signing_keys`.
     pub fn account_signing_key(&self, account_id: Uuid) -> Option<&[u8]> {
         self.account_keys.get(&account_id).map(Vec::as_slice)
+    }
+    /// Whether `account_id` has a contested key binding (two different keys
+    /// registered). Events stamped as it are quarantined — fail closed.
+    pub fn is_disputed(&self, account_id: Uuid) -> bool {
+        self.disputed.contains(&account_id)
     }
     pub fn is_empty(&self) -> bool {
         self.devices.is_empty() && self.revoked.is_empty()
@@ -195,6 +210,7 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
     ordered.sort_by_key(|e| e.canonical_key());
 
     let mut account_keys: HashMap<Uuid, Vec<u8>> = HashMap::new();
+    let mut disputed: HashSet<Uuid> = HashSet::new();
     let mut members: HashSet<Uuid> = HashSet::new();
     let mut member_account: HashMap<String, Uuid> = HashMap::new();
     let mut certs: Vec<hive_core::crypto::DeviceCertificate> = Vec::new();
@@ -211,9 +227,21 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
     for env in &ordered {
         match &env.payload {
             SessionEvent::AccountKeyRegistered { account_id, signing_public_key } => {
-                account_keys
-                    .entry(*account_id)
-                    .or_insert_with(|| signing_public_key.clone());
+                match account_keys.get(account_id) {
+                    // A different key than the one already pinned for this account:
+                    // a contested binding. Mark disputed (fail closed in verdict_for)
+                    // instead of silently keeping first-wins — which let a forged
+                    // registration under a victim's account id, sorted to lamport 0,
+                    // deterministically win and hijack the victim's identity.
+                    Some(existing) if existing != signing_public_key => {
+                        disputed.insert(*account_id);
+                    }
+                    // Idempotent re-registration of the same key — not a conflict.
+                    Some(_) => {}
+                    None => {
+                        account_keys.insert(*account_id, signing_public_key.clone());
+                    }
+                }
             }
             SessionEvent::SessionSnapshot { session } => {
                 for m in &session.members {
@@ -236,6 +264,7 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
     }
 
     let mut roster = WorkspaceRoster::default();
+    roster.disputed = disputed;
     // Retain the pinned account signing keys for accounts that are members — the
     // Option-C gate checks these against GitHub. (Non-member account keys are
     // irrelevant; their devices are revoked below.)
@@ -324,6 +353,14 @@ pub fn verdict_for(roster: &WorkspaceRoster, env: &SessionEventEnvelope) -> Verd
     // certified accounts is provably an impersonation.
     if let Some(stamp) = &env.actor_stamp {
         if let Some(claimed) = stamp.actor.account_id {
+            // Contested identity: two different keys were registered for this
+            // account, so we can't tell which is genuine. Fail closed — this is
+            // what stops a forged `AccountKeyRegistered` under a victim's account
+            // id from hijacking it (the victim's real registration now makes the
+            // account disputed rather than silently losing first-registration).
+            if roster.is_disputed(claimed) {
+                return Verdict::Quarantine(QuarantineReason::DisputedAccountKey);
+            }
             if !roster.device_signs_for(device_id, claimed) {
                 return Verdict::Quarantine(QuarantineReason::Impersonation);
             }
@@ -513,6 +550,42 @@ mod tests {
         });
         hive_core::sign_envelope(&mut e, signer_device, signer_kp);
         e
+    }
+
+    #[test]
+    fn conflicting_account_key_registration_disputes_the_account_and_fails_closed() {
+        // P0-2 PoC: an attacker forges AccountKeyRegistered{victim_account, attacker_key}
+        // (victim's account id is a guessable UUIDv5), racing the victim's genuine
+        // registration. First-wins previously let the forgery pin the attacker's key
+        // and impersonate the victim. Now the two different keys make the account
+        // DISPUTED, and events stamped as it are quarantined — fail closed, no hijack.
+        let victim = principal();
+        let attacker_key = SigningKeypair::generate().unwrap();
+
+        // Genuine trust events for the victim (registers victim's real key at
+        // lamport 2), PLUS a forged registration of the SAME account id under the
+        // attacker's key at a later lamport — a second, different key.
+        let mut events = trust_events(&victim, 1);
+        events.push(env(
+            5,
+            SessionEvent::AccountKeyRegistered {
+                account_id: victim.account_id,
+                signing_public_key: attacker_key.public_key_bytes().to_vec(),
+            },
+        ));
+        let roster = build_roster(&events);
+        assert!(roster.is_disputed(victim.account_id), "conflicting keys must dispute the account");
+
+        // The victim's OWN genuinely-signed event (valid signature, certified
+        // device) stamped as the victim is now quarantined because the account is
+        // disputed — fail closed. Ambiguity is resolved as "trust neither," which
+        // denies the attacker the takeover (their forged key can't be relied on).
+        let genuine =
+            authored(victim.device_id, &victim.device_kp, victim.account_id, 10);
+        assert_eq!(
+            verdict_for(&roster, &genuine),
+            Verdict::Quarantine(QuarantineReason::DisputedAccountKey)
+        );
     }
 
     #[test]
