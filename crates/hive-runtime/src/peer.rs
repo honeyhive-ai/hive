@@ -12,12 +12,14 @@
 use std::collections::HashSet;
 
 use hive_core::SessionEventEnvelope;
+
+use crate::identity_verifier::{gate_ingest, IdentityCache, IdentityMode, IngestAction};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::envelope_verifier::{build_roster, verdict_for, Verdict};
+use crate::envelope_verifier::{build_roster, verdict_for};
 use crate::event_store::EventStore;
 
 #[derive(Debug, Error)]
@@ -159,14 +161,33 @@ impl PeerLink for LoopbackLink {
 /// Exchanges signed envelopes with peers over a [`PeerLink`]. Transport-
 /// agnostic: it serializes/deserializes envelopes and tracks which it has
 /// already seen, so the same instance can broadcast and ingest without loops.
-#[derive(Default)]
 pub struct PeerSync {
     seen: HashSet<Uuid>,
+    /// Same identity policy as the relay path, so P2P isn't a weaker door: under
+    /// Option C a not-yet-GitHub-verified event is held, not silently accepted.
+    identity_mode: IdentityMode,
+    identity_cache: IdentityCache,
+}
+
+impl Default for PeerSync {
+    fn default() -> Self {
+        Self {
+            seen: HashSet::new(),
+            identity_mode: IdentityMode::from_env(),
+            identity_cache: IdentityCache::new(),
+        }
+    }
 }
 
 impl PeerSync {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Override the identity-verification mode (mirrors `SyncEngine`).
+    pub fn with_identity_mode(mut self, mode: IdentityMode) -> Self {
+        self.identity_mode = mode;
+        self
     }
 
     /// Serialize every local envelope not yet shared, marking them seen.
@@ -219,12 +240,37 @@ impl PeerSync {
             .map_err(|e| PeerError::Store(e.to_string()))?;
         roster_src.push(env.clone());
         let roster = build_roster(&roster_src);
-        if let Verdict::Quarantine(reason) = verdict_for(&roster, &env) {
-            tracing::warn!(?reason, event_id = %env.event_id, "rejected a quarantined peer event");
-            return Ok(false);
+        // Run the SAME gate as the relay path (not just verdict_for): so the
+        // Option-C GitHub-identity check applies on P2P too, instead of silently
+        // accepting anything not provably-bad. Mirrors sync_engine::apply_fetched.
+        let base = verdict_for(&roster, &env);
+        let signer_account = env
+            .actor_stamp
+            .as_ref()
+            .and_then(|s| s.actor.account_id)
+            .or_else(|| env.signer_device_id.and_then(|d| roster.account_of(d)));
+        let account_key = signer_account.and_then(|a| roster.account_signing_key(a));
+        match gate_ingest(
+            self.identity_mode,
+            base,
+            signer_account,
+            account_key,
+            &self.identity_cache,
+        ) {
+            IngestAction::Accept => {
+                store.ingest(&env).map_err(|e| PeerError::Store(e.to_string()))
+            }
+            IngestAction::Quarantine(reason) => {
+                tracing::warn!(?reason, event_id = %env.event_id, "rejected a quarantined peer event");
+                Ok(false)
+            }
+            IngestAction::Hold(reason) => {
+                // Can't verify yet (Option C: identity pending/unreachable). Don't
+                // ingest; a re-send re-checks once the roster/identity is known.
+                tracing::debug!(reason, event_id = %env.event_id, "holding a peer event for identity re-verification");
+                Ok(false)
+            }
         }
-
-        store.ingest(&env).map_err(|e| PeerError::Store(e.to_string()))
     }
 }
 
