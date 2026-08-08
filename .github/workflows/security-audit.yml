@@ -1,0 +1,48 @@
+name: security-audit
+
+# Dependency-security gate: RUSTSEC advisories + license/ban policy (cargo-deny)
+# and a frontend dependency audit. Runs on dependency changes, on PRs, and weekly
+# (so a newly-disclosed advisory against an unchanged tree is still caught).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "web/package.json"
+      - "web/bun.lock"
+      - ".github/workflows/security-audit.yml"
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "web/package.json"
+      - "web/bun.lock"
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: cargo-deny (advisories, licenses, bans, sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources
+
+  web-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Frontend dependency audit
+        working-directory: web
+        # `bun audit` reports known vulns in the resolved tree. Advisory (non-
+        # blocking) for now so a transitive advisory doesn't wedge the pipeline;
+        # tighten to failing once the tree is clean.
+        run: bun audit || true
