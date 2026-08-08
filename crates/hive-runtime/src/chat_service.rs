@@ -369,6 +369,49 @@ impl ChatService {
         Ok(true)
     }
 
+    /// Rotate this account's signing key (P2-2). Signs the new public key with the
+    /// CURRENT account key (the succession proof the roster verifies), emits
+    /// `AccountKeyRotated`, adopts the new keypair, and re-certifies this device
+    /// under it — the device's old certificate no longer verifies against the newly
+    /// pinned key, so without the fresh cert the device would drop out of the
+    /// roster. A no-op (Ok(false)) if the local actor has no account id.
+    pub fn rotate_account_key(
+        &mut self,
+        new_keypair: SigningKeypair,
+        session_id: Uuid,
+        workspace_id: Uuid,
+    ) -> Result<bool> {
+        let Some(account_id) = self.author.account_id else {
+            return Ok(false);
+        };
+        let new_pub = new_keypair.public_key_bytes().to_vec();
+        let succession_signature = self.account_keypair.sign(&new_pub).to_vec();
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::AccountKeyRotated {
+                account_id,
+                new_signing_public_key: new_pub,
+                succession_signature,
+            },
+        )?;
+        // Adopt the new account key, then re-certify this device under it.
+        self.account_keypair = new_keypair;
+        let certificate = DeviceCertificate::issue(
+            &self.account_keypair,
+            account_id,
+            self.device_id,
+            &self.keypair.public_key_bytes(),
+            Timestamp::now(),
+        );
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::DeviceCertificateAdded { certificate },
+        )?;
+        Ok(true)
+    }
+
     /// Record a user message. Returns the stored message.
     pub fn post_user_message(
         &mut self,

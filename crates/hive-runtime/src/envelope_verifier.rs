@@ -244,6 +244,38 @@ pub fn build_roster(envelopes: &[SessionEventEnvelope]) -> WorkspaceRoster {
                     }
                 }
             }
+            SessionEvent::AccountKeyRotated {
+                account_id,
+                new_signing_public_key,
+                succession_signature,
+            } => {
+                // A legitimate rotation: the new key must be signed by the account's
+                // CURRENT (pinned) key — proof the same owner rotated it (P2-2). Then
+                // re-pin to the new key. A rotation with no prior key, or one whose
+                // signature doesn't verify against the current key, is a forged/
+                // contested binding → disputed (fail closed). Idempotent if it's
+                // already the pinned key.
+                match account_keys.get(account_id) {
+                    Some(current) if current == new_signing_public_key => {}
+                    Some(current) => {
+                        if hive_core::crypto::verify(
+                            current,
+                            new_signing_public_key,
+                            succession_signature,
+                        )
+                        .is_ok()
+                        {
+                            account_keys.insert(*account_id, new_signing_public_key.clone());
+                        } else {
+                            disputed.insert(*account_id);
+                        }
+                    }
+                    None => {
+                        // Rotation without an established key can't be authenticated.
+                        disputed.insert(*account_id);
+                    }
+                }
+            }
             SessionEvent::SessionSnapshot { session } => {
                 for m in &session.members {
                     note_member(&mut members, &mut member_account, m);
@@ -557,6 +589,62 @@ mod tests {
         });
         hive_core::sign_envelope(&mut e, signer_device, signer_kp);
         e
+    }
+
+    #[test]
+    fn valid_account_key_rotation_re_pins_without_dispute() {
+        // P2-2: an owner rotates K1 → K2 by signing K2 with K1 (succession proof),
+        // and re-certs the device under K2. The roster re-pins to K2 without a
+        // dispute, and the device stays trusted.
+        let p = principal();
+        let new_kp = SigningKeypair::generate().unwrap();
+        let mut events = trust_events(&p, 1); // establishes K1 + device cert under K1
+
+        let sig = p.account_kp.sign(&new_kp.public_key_bytes()).to_vec();
+        events.push(env(
+            10,
+            SessionEvent::AccountKeyRotated {
+                account_id: p.account_id,
+                new_signing_public_key: new_kp.public_key_bytes().to_vec(),
+                succession_signature: sig,
+            },
+        ));
+        // Re-cert the device under K2 (its K1 cert no longer verifies vs pinned K2).
+        let cert2 = DeviceCertificate::issue(
+            &new_kp,
+            p.account_id,
+            p.device_id,
+            &p.device_kp.public_key_bytes(),
+            Timestamp::epoch(),
+        );
+        events.push(env(11, SessionEvent::DeviceCertificateAdded { certificate: cert2 }));
+
+        let roster = build_roster(&events);
+        assert!(!roster.is_disputed(p.account_id), "a valid succession must NOT dispute");
+        let signed = authored(p.device_id, &p.device_kp, p.account_id, 20);
+        assert_eq!(verdict_for(&roster, &signed), Verdict::Valid);
+    }
+
+    #[test]
+    fn forged_account_key_rotation_is_disputed() {
+        // A rotation whose succession signature is NOT by the current key (an
+        // attacker trying to seize an established account) is disputed — fail closed.
+        let p = principal();
+        let attacker = SigningKeypair::generate().unwrap();
+        let mut events = trust_events(&p, 1);
+        let bad_sig = attacker.sign(&attacker.public_key_bytes()).to_vec(); // signed by attacker, not K1
+        events.push(env(
+            10,
+            SessionEvent::AccountKeyRotated {
+                account_id: p.account_id,
+                new_signing_public_key: attacker.public_key_bytes().to_vec(),
+                succession_signature: bad_sig,
+            },
+        ));
+        assert!(
+            build_roster(&events).is_disputed(p.account_id),
+            "a rotation not signed by the current key must dispute"
+        );
     }
 
     #[test]

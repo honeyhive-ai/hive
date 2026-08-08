@@ -126,6 +126,20 @@ pub enum SessionEvent {
         account_id: Uuid,
         signing_public_key: Vec<u8>,
     },
+    /// Rotate an account's signing key. `succession_signature` is the NEW key,
+    /// signed by the account's CURRENT (pre-rotation) key — proof that the same
+    /// owner performed the rotation, not an attacker. The roster accepts the new
+    /// key only when that signature verifies against the currently-pinned key; an
+    /// absent/forged signature is a contested binding (disputed, fail-closed). This
+    /// is what lets a legitimate owner rotate a key without tripping the
+    /// first-wins/dispute protection (P2-2). It does NOT re-open the initial
+    /// land-grab (a forged FIRST registration) — that still needs an external
+    /// anchor (Option C).
+    AccountKeyRotated {
+        account_id: Uuid,
+        new_signing_public_key: Vec<u8>,
+        succession_signature: Vec<u8>,
+    },
     /// Publishes a device certificate (`device_id → device signing key`, signed
     /// by the account key), extending trust from an account to one of its
     /// devices. Trust metadata — inert in projection; consumed by the roster.
@@ -218,6 +232,7 @@ impl SessionEvent {
             SessionEvent::MessageReactionAdded { .. } => "messageReactionAdded",
             SessionEvent::MessageReactionRemoved { .. } => "messageReactionRemoved",
             SessionEvent::AccountKeyRegistered { .. } => "accountKeyRegistered",
+            SessionEvent::AccountKeyRotated { .. } => "accountKeyRotated",
             SessionEvent::DeviceCertificateAdded { .. } => "deviceCertificateAdded",
             SessionEvent::DeviceRevoked { .. } => "deviceRevoked",
             SessionEvent::ChannelCreated { .. } => "channelCreated",
@@ -529,6 +544,7 @@ impl ChatSession {
             // Trust metadata — inert in the session projection; consumed only by
             // the device-roster builder (see hive-runtime::envelope_verifier).
             SessionEvent::AccountKeyRegistered { .. }
+            | SessionEvent::AccountKeyRotated { .. }
             | SessionEvent::DeviceCertificateAdded { .. }
             | SessionEvent::DeviceRevoked { .. } => {}
             // Unrecognized (newer-client) event — inert in this build.

@@ -191,6 +191,9 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         // roster only trusts a self-consistent chain (cert signed by the account
         // key), so a lower floor here can't forge trust.
         | SessionEvent::AccountKeyRegistered { .. }
+        // Self-validated by the succession signature (verified in build_roster), not
+        // by role — like AccountKeyRegistered, so it carries the same low floor.
+        | SessionEvent::AccountKeyRotated { .. }
         | SessionEvent::DeviceCertificateAdded { .. }
         // Channels are cheap organization (spec §11) — any contributor may
         // create, rename, reorder, archive, or file a chat into one.
