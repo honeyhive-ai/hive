@@ -135,13 +135,27 @@ pub fn generate_workspace_key() -> Result<[u8; 32], CryptoError> {
     Ok(key)
 }
 
-/// Derive a stable 32-byte workspace key from a shared passphrase (HKDF-SHA256).
+/// Derive a stable 32-byte workspace key from a shared passphrase (Argon2id).
 /// Lets peers agree on a key out-of-band without exchanging raw bytes — the
 /// relay-forwarding E2EE path.
+///
+/// Argon2id (memory-hard), NOT HKDF: a human-chosen room passphrase must resist an
+/// offline dictionary attack by anyone holding ciphertext (the content-blind relay,
+/// or any reader on an open relay). HKDF is a cheap hash — millions of guesses/sec;
+/// Argon2id makes each guess cost real memory + time. The salt is a fixed
+/// application constant because both peers must derive the same key from the
+/// passphrase alone; the memory/time cost is the dominant defense (per-workspace
+/// salting would only stop one precomputed table spanning many workspaces — a
+/// marginal add over the memory-hardness, and left as a possible follow-up).
 pub fn derive_workspace_key(passphrase: &str) -> [u8; 32] {
-    let hk = Hkdf::<Sha256>::new(Some(b"hive-workspace-key"), passphrase.as_bytes());
+    use argon2::{Algorithm, Argon2, Params, Version};
+    // ~19 MiB, 2 passes, 1 lane (OWASP-recommended floor), 32-byte output.
+    let params = Params::new(19 * 1024, 2, 1, Some(32)).expect("valid argon2 params");
+    let argon = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
     let mut key = [0u8; 32];
-    hk.expand(b"hive-workspace-key-v1", &mut key).expect("hkdf expand");
+    argon
+        .hash_password_into(passphrase.as_bytes(), b"hive-workspace-key-argon2id", &mut key)
+        .expect("argon2 derive");
     key
 }
 
