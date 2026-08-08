@@ -117,6 +117,10 @@ export function ChatView({
   // is the ms timestamp of the last send/delta (a ref so deltas don't re-render).
   const [stalled, setStalled] = useState(false);
   const lastActivityRef = useRef(0);
+  // A follow-up composed while a turn is in flight (#101). The composer stays live;
+  // rather than block it or race a concurrent turn, we hold one queued message and
+  // deliver it as the next turn when the current one ends. Cancelable until sent.
+  const [queued, setQueued] = useState<string | null>(null);
   // Message ids whose terminal (completed/error) we've already handled, so a
   // duplicate terminal for the same message can't re-run retire (P2-11).
   const retiredIdsRef = useRef<Set<string>>(new Set());
@@ -270,6 +274,7 @@ export function ChatView({
     setStreams(new Map());
     setStreamError(null);
     setStalled(false);
+    setQueued(null);
     retiredIdsRef.current = new Set();
     setOptimisticUser(null);
     setSending(false);
@@ -596,9 +601,31 @@ export function ChatView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [slash]);
 
-  async function handleSend() {
+  // Dispatch a fully-built message body as a turn (the actual send).
+  async function sendBody(body: string, sentAttachments: typeof attachments) {
+    setStreamError(null);
+    setOptimisticUser(body);
+    setSending(true);
+    lastActivityRef.current = Date.now();
+    setStalled(false);
+    try {
+      await sendMessage(sessionId, body);
+    } catch (e) {
+      // Keep the draft + attachments so nothing is lost, and offer a retry.
+      setSending(false);
+      setOptimisticUser(null);
+      setInput((cur) => cur || body);
+      setAttachments((cur) => (cur.length ? cur : sentAttachments));
+      toast.error(`Couldn't send: ${errMsg(e)}`, { label: "Retry", run: () => void sendBody(body, sentAttachments) });
+    } finally {
+      qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+      qc.invalidateQueries({ queryKey: ["chats"] });
+    }
+  }
+
+  function handleSend() {
     const text = input.trim();
-    if ((!text && attachments.length === 0) || sending) return;
+    if (!text && attachments.length === 0) return;
     // Append attachment path markers; agents read the path, the API runtime
     // inlines image markers as vision blocks.
     const markers = attachments.map((a) => attachmentMarker(a.path)).join("\n");
@@ -608,26 +635,16 @@ export function ChatView({
     setAttachments([]);
     setMention(null);
     setSlash(null);
-    setStreamError(null);
     clearTyping();
-    setOptimisticUser(body);
-    setSending(true);
-    lastActivityRef.current = Date.now();
-    setStalled(false);
     if (taRef.current) taRef.current.style.height = "auto";
-    try {
-      await sendMessage(sessionId, body);
-    } catch (e) {
-      // Keep the draft + attachments so nothing is lost, and offer a retry.
-      setSending(false);
-      setOptimisticUser(null);
-      setInput((cur) => cur || text);
-      setAttachments((cur) => (cur.length ? cur : sentAttachments));
-      toast.error(`Couldn't send: ${errMsg(e)}`, { label: "Retry", run: () => void handleSend() });
-    } finally {
-      qc.invalidateQueries({ queryKey: ["chat", sessionId] });
-      qc.invalidateQueries({ queryKey: ["chats"] });
+    if (busy) {
+      // A turn is in flight (#101): queue this as the next turn instead of blocking
+      // the composer or racing a concurrent turn. The queue holds one message;
+      // sending again replaces it. Delivered by the flush effect when the turn ends.
+      setQueued(body);
+      return;
     }
+    void sendBody(body, sentAttachments);
   }
 
   // Stop the in-flight turn and free the composer immediately. The backend
@@ -662,6 +679,17 @@ export function ChatView({
     }, 4000);
     return () => window.clearInterval(id);
   }, [busy]);
+
+  // Flush a queued follow-up once the current turn ends (#101).
+  useEffect(() => {
+    if (!busy && queued != null) {
+      const body = queued;
+      setQueued(null);
+      void sendBody(body, []);
+    }
+    // sendBody is a stable-enough closure; deps intentionally narrow to the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [busy, queued]);
 
   const messages: ChatMessageDto[] = chat.data?.messages ?? [];
   // Retire the optimistic echo the moment the persisted user message lands in
@@ -877,6 +905,23 @@ export function ChatView({
           {[...streams.entries()].map(([id, text]) => (
             <Bubble key={id} role="assistant" author={streamAuthor} handle={streamHandle} body={text} via={runtimeProvider} model={currentRuntime?.model || undefined} host={runtimeHost} streaming />
           ))}
+          {queued != null && (
+            <div className="flex items-start justify-end gap-2 py-1 pr-1 text-sm opacity-60" role="status">
+              <span aria-hidden style={{ opacity: 0.7 }}>⏳</span>
+              <div className="min-w-0 max-w-[70%] whitespace-pre-wrap break-words">
+                <span style={{ fontWeight: 600 }}>Queued — sends after this turn: </span>
+                {queued}
+              </div>
+              <button
+                onClick={() => setQueued(null)}
+                aria-label="Cancel queued message"
+                title="Cancel queued message"
+                className="shrink-0 rounded-md px-1 leading-none opacity-70 hover:opacity-100"
+              >
+                <IconX size={12} />
+              </button>
+            </div>
+          )}
           {sending && streams.size === 0 && !stalled && <TypingDots label={`${streamAuthor} is thinking`} />}
           {busy && stalled && (
             <div className="tt-note" role="status">
@@ -1241,7 +1286,9 @@ export function ChatView({
                 >
                   @file
                 </button>
-                {busy ? (
+                {/* Stop is now a SEPARATE control, not a replacement for Send, so
+                    the composer stays usable mid-turn (#101). */}
+                {busy && (
                   <button
                     type="button"
                     onClick={() => void handleStop()}
@@ -1251,17 +1298,16 @@ export function ChatView({
                   >
                     <IconStop size={15} />
                   </button>
-                ) : (
-                  <button
-                    onClick={handleSend}
-                    disabled={!input.trim() && attachments.length === 0}
-                    className="send"
-                    aria-label="Send message"
-                    title="Send (Enter)"
-                  >
-                    <IconSend size={15} />
-                  </button>
                 )}
+                <button
+                  onClick={handleSend}
+                  disabled={!input.trim() && attachments.length === 0}
+                  className="send"
+                  aria-label={busy ? "Queue as next turn" : "Send message"}
+                  title={busy ? "Queue as next turn (Enter)" : "Send (Enter)"}
+                >
+                  <IconSend size={15} />
+                </button>
               </div>
             </div>
 
