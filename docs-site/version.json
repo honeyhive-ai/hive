@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.10",
-  "name": "Hive 1.5.10 — audit completion",
+  "tag": "v1.5.11",
+  "name": "Hive 1.5.11",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Completes the security-audit follow-ups. Key rotations/invites now seal to ALL of a member's devices (a second device no longer gets locked out of a new key epoch). Signed account-key succession lets an owner legitimately rotate their key while the dispute protection still fails closed on a forged rotation. The chat 'thinking' lifecycle is now a unit-tested pure contract (a duplicate completion can't collapse a sibling turn). Progressive Markdown while streaming, composer accessibility, a webview CSP, and an Option-C convergence test round it out."
+  "notes": "The composer no longer goes dead while an agent is working: Send stays available and Stop is a separate control, so you can queue a follow-up (shown as a cancelable pending bubble) that's delivered as the next turn when the current one finishes. Copy on a code block now copies the exact source text. Two GitHub issues (#101, #97) closed."
 }
