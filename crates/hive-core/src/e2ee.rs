@@ -120,6 +120,16 @@ pub fn open(recipient: &KeyAgreementKeypair, blob: &SealedBlob) -> Result<Vec<u8
 }
 
 /// A versioned symmetric workspace key, sealed to each trusted device.
+///
+/// **Forward-secrecy limitation (by design, documented — P3-3):** the key is
+/// sealed to each device's *long-term static* X25519 key, and within an epoch all
+/// events share one symmetric key (no per-message ratchet). So compromising a
+/// device's static secret later opens every past rotation sealed to it, and
+/// compromising one epoch key exposes every event in that epoch. This is an
+/// accepted trade for the product requirement that any member can decrypt history
+/// at rest on any of their devices. A ratcheting group-key scheme (MLS /
+/// double-ratchet) would add forward secrecy + cheaper membership churn, at the
+/// cost of that at-rest-history property — tracked as a possible future direction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceKeyRotation {
