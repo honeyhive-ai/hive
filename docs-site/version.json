@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.11",
-  "name": "Hive 1.5.11",
+  "tag": "v1.5.12",
+  "name": "Hive 1.5.12",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "The composer no longer goes dead while an agent is working: Send stays available and Stop is a separate control, so you can queue a follow-up (shown as a cancelable pending bubble) that's delivered as the next turn when the current one finishes. Copy on a code block now copies the exact source text. Two GitHub issues (#101, #97) closed."
+  "notes": "In a local / home workspace the People pane now shows a single 'you' instead of duplicating you (a leftover of the earlier identity churn) with governance controls that don't apply to a solo workspace. No data reset needed."
 }
