@@ -2451,13 +2451,30 @@ fn list_all_mention_states(state: State<AppState>) -> Result<Vec<MentionStateDto
 #[tauri::command]
 fn list_members(state: State<AppState>, session_id: String) -> Result<Vec<WorkspaceMemberDto>, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
+    // A local (non-room) workspace never syncs anyone in, so every member was
+    // created on THIS device and is you. Collapse identity-churn artifacts (a stale
+    // pre-sign-in "self" left in the hoisted roster under a different id) to a single
+    // "you" — marking all human members is_self, so the People pane shows one card
+    // with no governance/Remove controls, instead of you appearing twice.
+    let known_rooms = state.known_room_ids();
     let svc = state.service.lock().unwrap();
     let me = svc.author().id.clone();
-    Ok(svc
-        .load(id)
-        .map_err(map_err)?
-        .map(|s| s.members.iter().map(|m| member_dto(m, &me)).collect())
-        .unwrap_or_default())
+    let Some(s) = svc.load(id).map_err(map_err)? else {
+        return Ok(Vec::new());
+    };
+    let local = !known_rooms.contains(&s.workspace_id);
+    let mut out: Vec<WorkspaceMemberDto> = s.members.iter().map(|m| member_dto(m, &me)).collect();
+    if local {
+        for (dto, m) in out.iter_mut().zip(s.members.iter()) {
+            if m.actor.kind == ActorKind::Human {
+                dto.is_self = true;
+            }
+        }
+        // Show the real signed-in account as the "you" card (the frontend picks the
+        // first self), not a churned provisional id.
+        out.sort_by_key(|d| d.actor_id != me);
+    }
+    Ok(out)
 }
 
 /// One membership-history entry projected from the signed config log.
