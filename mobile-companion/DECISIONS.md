@@ -9,6 +9,10 @@ Two proposals were approved together and are recorded here as one baseline, plus
 - **MC-002** — Security baseline (pinned-key pairing, desktop-enforced approval tiers, LAN-only)
 - **MC-002-A** — Amendment to MC-002 §2: Tier 2 biometric is OS-enforced and desktop-verified, not a client-attested boolean
 
+A third, independent of the security baseline, was approved on 2026-08-10 and is recorded below:
+
+- **MC-003** — Visual scale: Tailwind rem resolves against a 14px root, so every desktop length is 0.875× nominal
+
 Two follow-up votes on 2026-08-10 closed the questions MC-002-A left open, and are recorded inside
 its section rather than as new amendments: the **curve erratum is ratified** (ECDSA P-256 / SHA-256,
 not the Ed25519 of the approved text), and the **platform asymmetry is accepted** — Tier 2 ships on
@@ -207,3 +211,30 @@ this baseline exists to prevent.
 MC-002-A extends this: approval-key registration and desktop-side signature verification land **with
 pairing**, before any Tier 2 approve control is reachable. A Tier 2 approve path that ships ahead of
 its verifier is the boolean again, in the form of a check nobody wrote yet.
+
+---
+
+## MC-003 — Visual scale is Tailwind rem × 14px
+
+Status: **approved, binding** (2026-08-10). Applies to the base build and everything after it.
+Full detail and provenance in [spec/visual-scale.md](spec/visual-scale.md); the implementation is
+`app/src/theme/scale.ts`.
+
+| # | Decision |
+|---|---|
+| 1 | **Root is 14px.** `web/src/styles.css:8` sets `:root { font-size: 14px }`, Tailwind v4 with no `@theme` override. Every rem-based utility on desktop renders at **0.875× nominal**. |
+| 2 | **Normative radii** — `md` 5.25, `lg` 7, `xl` **10.5**, `2xl` 14, `3xl` 21. Spacing is Tailwind step × 3.5px (`p-4` = 14). Type is step × 14px (`text-sm` = 12.25, `text-base` = 14). |
+| 3 | **The literal ramp ports unchanged.** `.tt-text` 14px, `.tt-time` 12px, `.tt-model` 11px and the rest of the chat layer are written in literal px in `styles.css` and are not rem-scaled. The two ramps do not align on the desktop either; **do not reconcile them**. |
+| 4 | **Single source, enforced.** `rem(n) = n * 14` in `app/src/theme/scale.ts`. Raw px literals are forbidden for anything that maps to a Tailwind utility, enforced by a guard test, with a `// px-ok:` escape hatch for values that have no desktop equivalent. |
+
+### Why this is binding rather than advisory
+
+The base-build brief originally specified radii of 12 / 16 / 24. Those are the 16px-root values and
+they are wrong for this app. A port built on them is uniformly ~14% oversized and over-rounded — it
+looks entirely plausible in isolation and is detectable only side-by-side with the desktop, which is
+the one comparison a phone build gate cannot make.
+
+The enforcement clause matters as much as the numbers. The 0.875 factor does not get dropped all at
+once; it gets dropped one component at a time by whoever types `borderRadius: 12` from memory. A
+per-file guard catches that on the commit that introduces it, which is the only point at which it is
+cheap to see.
