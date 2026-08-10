@@ -10,6 +10,7 @@
 
 import { useSyncExternalStore } from "react";
 import { setTitlebarColor } from "@/lib/ipc";
+import { formatColor, mixSrgb, oklchReplaceL, type Rgba } from "@/lib/color";
 
 export type ThemeName = "pollen" | "studio" | "harbor" | "meadow" | "midnight";
 export type AppearanceMode = "auto" | "light" | "dark";
@@ -202,6 +203,154 @@ const STORAGE_KEY = "hive.theme";
 const MODE_KEY = "hive.appearance";
 const DEFAULT_THEME: ThemeName = "pollen";
 
+export type Scheme = "light" | "dark";
+
+/// Status + overlay tokens. Scheme-derived and identical across accent families
+/// — one legible green/red/amber per light/dark rather than eight hand-tuned
+/// variants. Components must use these instead of hardcoded #34c759-style
+/// literals so light palettes stay readable.
+export const STATUS: Record<Scheme, { success: string; danger: string; warn: string; overlay: string }> = {
+  light: {
+    success: "rgb(34,140,80)",
+    danger: "rgb(198,55,55)",
+    warn: "rgb(170,116,24)",
+    overlay: "rgba(0,0,0,0.05)",
+  },
+  dark: {
+    success: "rgb(92,205,134)",
+    danger: "rgb(240,112,112)",
+    warn: "rgb(228,180,80)",
+    overlay: "rgba(255,255,255,0.06)",
+  },
+};
+
+/// Chat-layer scheme-derived numbers (redesign). Like the status tokens they
+/// depend on light/dark, never on the accent family — so keying them to a theme
+/// name would be wrong. They set the target lightness for turn rails, tinted
+/// author names, and filled controls, plus the on-accent text colour, so one
+/// CSS rule set stays legible in every palette + scheme.
+///
+/// The lightnesses are 0–1 OKLCH lightness, not CSS percentage strings, because
+/// they are no longer handed to the engine — `applyTheme()` resolves them here
+/// and publishes finished colours. See `deriveTokens`.
+export const CHAT: Record<
+  Scheme,
+  { turnMix: string; turnRailL: number; turnNameL: number; accentInkL: number; fillL: number; onAccent: string }
+> = {
+  light: {
+    turnMix: "91%",
+    turnRailL: 0.54,
+    turnNameL: 0.4,
+    accentInkL: 0.42,
+    fillL: 0.45,
+    onAccent: "rgb(255,255,255)",
+  },
+  dark: {
+    turnMix: "87%",
+    turnRailL: 0.7,
+    turnNameL: 0.82,
+    accentInkL: 0.84,
+    fillL: 0.82,
+    onAccent: "rgb(18,20,24)",
+  },
+};
+
+/// The turn-identity accents. `.tt` tints one way per identity; a personal agent
+/// substitutes its own stored avatar colour for `cool` at render time.
+export type TurnIdentity = "warm" | "cool" | "muted";
+
+/// The `:root` custom properties whose value is an OKLCH derivation.
+///
+/// These used to be `oklch(from var(--x) L c h)` declarations in styles.css and
+/// the engine finished them. It no longer does — see lib/color.ts for why the
+/// engine's answer was not the same answer on every desktop. `applyTheme()`
+/// computes them and sets resolved `rgb()` strings, so all three platforms show
+/// the same bytes.
+export interface DerivedTokens {
+  successInk: string;
+  dangerInk: string;
+  warnInk: string;
+  warmInk: string;
+  accentFill: string;
+  warmFill: string;
+  /// Per-identity turn rail (`--tr`) and tinted author name (`--tn`).
+  rail: Record<TurnIdentity, string>;
+  name: Record<TurnIdentity, string>;
+}
+
+/// The neutral "muted" accent — the shared-workspace / system identity.
+///
+/// styles.css still spells this as a `color-mix()`, which every engine agrees
+/// on, so `--hive-accent-muted` itself is left to CSS. It is recomputed here
+/// only because the muted turn rail derives *from* it in OKLCH, and that chain
+/// has to stay unrounded: the browser kept full precision through the mix, so
+/// snapping to 8-bit in between costs a count or two against what it rendered.
+function accentMuted(p: Palette): Rgba {
+  return mixSrgb(p.ink, 34, p.panel);
+}
+
+/// Resolve every OKLCH-derived token for a palette. Pure — no DOM — so the
+/// parity tests can assert it against browser-measured pixels directly.
+export function deriveTokens(p: Palette): DerivedTokens {
+  const s = STATUS[p.scheme];
+  const c = CHAT[p.scheme];
+  const ink = (src: string) => formatColor(oklchReplaceL(src, c.accentInkL));
+  const fill = (src: string) => formatColor(oklchReplaceL(src, c.fillL));
+
+  const accents: Record<TurnIdentity, string | Rgba> = {
+    warm: p.accentWarm,
+    cool: p.accentCool,
+    muted: accentMuted(p),
+  };
+  const rail = {} as Record<TurnIdentity, string>;
+  const name = {} as Record<TurnIdentity, string>;
+  for (const id of ["warm", "cool", "muted"] as const) {
+    rail[id] = formatColor(oklchReplaceL(accents[id], c.turnRailL));
+    name[id] = formatColor(oklchReplaceL(accents[id], c.turnNameL));
+  }
+
+  return {
+    successInk: ink(s.success),
+    dangerInk: ink(s.danger),
+    warnInk: ink(s.warn),
+    warmInk: ink(p.accentWarm),
+    accentFill: fill(p.accentCool),
+    warmFill: fill(p.accentWarm),
+    rail,
+    name,
+  };
+}
+
+// A personal agent's turn accent is its stored avatar colour, which is not
+// known until render. Resolving two OKLCH derivations per turn per render is
+// wasteful when a thread shows the same handful of agents over and over, so
+// cache by accent + scheme. Bounded by (agents × 2), which is small.
+const turnCache = new Map<string, { rail: string; name: string }>();
+
+/// The rail (`--tr`) and tinted-name (`--tn`) colours for an arbitrary turn
+/// accent — the personal-agent case, where the accent is a stored avatar colour
+/// rather than one of the three theme identities. Falls back to the accent
+/// itself if it is in some notation we cannot parse, which is the same thing
+/// the stylesheet's `oklch(from …)` did with an invalid source: leave it alone
+/// rather than blank the rail.
+export function turnAccentColors(accent: string, scheme: Scheme): { rail: string; name: string } {
+  const key = `${scheme}|${accent}`;
+  const hit = turnCache.get(key);
+  if (hit) return hit;
+  const c = CHAT[scheme];
+  let out: { rail: string; name: string };
+  try {
+    out = {
+      rail: formatColor(oklchReplaceL(accent, c.turnRailL)),
+      name: formatColor(oklchReplaceL(accent, c.turnNameL)),
+    };
+  } catch {
+    out = { rail: accent, name: accent };
+  }
+  turnCache.set(key, out);
+  return out;
+}
+
 /// The user's preferred accent family (independent of light/dark mode).
 export function loadTheme(): ThemeName {
   const stored = localStorage.getItem(STORAGE_KEY);
@@ -249,57 +398,29 @@ export function resolvePalette(name: ThemeName, mode: AppearanceMode): Palette {
 
 export function applyTheme(p: Palette) {
   const root = document.documentElement;
-  // Status + overlay tokens are scheme-derived (identical across accent
-  // families) — one legible green/red/amber per light/dark rather than eight
-  // hand-tuned variants. Components must use these instead of hardcoded
-  // #34c759-style literals so light palettes stay readable.
-  const status =
-    p.scheme === "dark"
-      ? {
-          success: "rgb(92,205,134)",
-          danger: "rgb(240,112,112)",
-          warn: "rgb(228,180,80)",
-          overlay: "rgba(255,255,255,0.06)",
-        }
-      : {
-          success: "rgb(34,140,80)",
-          danger: "rgb(198,55,55)",
-          warn: "rgb(170,116,24)",
-          overlay: "rgba(0,0,0,0.05)",
-        };
+  const status = STATUS[p.scheme];
   root.style.setProperty("--hive-success", status.success);
   root.style.setProperty("--hive-danger", status.danger);
   root.style.setProperty("--hive-warn", status.warn);
   root.style.setProperty("--hive-overlay", status.overlay);
-  // Chat-layer scheme-derived numbers (redesign). Like the status tokens they
-  // depend on light/dark, never on the accent family — so keying them to a
-  // theme name would be wrong. They set the target lightness for turn fills,
-  // rails, tinted author names, and filled controls, plus the on-accent text
-  // colour, so one CSS rule set stays legible in every palette + scheme.
-  const chat =
-    p.scheme === "dark"
-      ? {
-          turnMix: "87%",
-          turnRailL: "70%",
-          turnNameL: "82%",
-          accentInkL: "84%",
-          fillL: "82%",
-          onAccent: "rgb(18,20,24)",
-        }
-      : {
-          turnMix: "91%",
-          turnRailL: "54%",
-          turnNameL: "40%",
-          accentInkL: "42%",
-          fillL: "45%",
-          onAccent: "rgb(255,255,255)",
-        };
-  root.style.setProperty("--hive-turn-mix", chat.turnMix);
-  root.style.setProperty("--hive-turn-rail-l", chat.turnRailL);
-  root.style.setProperty("--hive-turn-name-l", chat.turnNameL);
-  root.style.setProperty("--hive-accent-ink-l", chat.accentInkL);
-  root.style.setProperty("--hive-fill-l", chat.fillL);
-  root.style.setProperty("--hive-on-accent", chat.onAccent);
+  root.style.setProperty("--hive-turn-mix", CHAT[p.scheme].turnMix);
+  root.style.setProperty("--hive-on-accent", CHAT[p.scheme].onAccent);
+  // The OKLCH-derived tokens, resolved here rather than by the engine. The
+  // lightness knobs they used to be built from (--hive-turn-rail-l and friends)
+  // are deliberately no longer published: leaving them would invite the next
+  // `oklch(from … var(--hive-fill-l) c h)` and re-open the platform split this
+  // closed. lib/color.ts has the full story.
+  const d = deriveTokens(p);
+  root.style.setProperty("--hive-success-ink", d.successInk);
+  root.style.setProperty("--hive-danger-ink", d.dangerInk);
+  root.style.setProperty("--hive-warn-ink", d.warnInk);
+  root.style.setProperty("--hive-warm-ink", d.warmInk);
+  root.style.setProperty("--hive-accent-fill", d.accentFill);
+  root.style.setProperty("--hive-warm-fill", d.warmFill);
+  for (const id of ["warm", "cool", "muted"] as const) {
+    root.style.setProperty(`--hive-rail-${id}`, d.rail[id]);
+    root.style.setProperty(`--hive-name-${id}`, d.name[id]);
+  }
   root.style.setProperty("--hive-canvas", p.canvas);
   root.style.setProperty("--hive-ink", p.ink);
   root.style.setProperty("--hive-panel", p.panel);

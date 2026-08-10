@@ -28,6 +28,7 @@ import {
 import { attachmentMarker, splitAttachments, fileBaseName, isImagePath } from "@/lib/attachments";
 import { relTime, absTime, clockTime, dayKey, dayLabel } from "@/lib/time";
 import { PRIMARY_NAME, PRIMARY_HANDLE } from "@/lib/agent";
+import { turnAccentColors, useColorScheme } from "@/lib/theme";
 import {
   IconCopy,
   IconRegenerate,
@@ -101,6 +102,10 @@ export function ChatView({
   embedded?: boolean;
 }) {
   const qc = useQueryClient();
+  // A personal agent's turn colours are derived from its avatar accent against
+  // the current scheme's lightness targets, so the list has to re-render when
+  // the scheme flips (Bubble is memoised and would otherwise keep stale rails).
+  const scheme = useColorScheme();
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
   const [optimisticUser, setOptimisticUser] = useState<string | null>(null);
@@ -858,6 +863,12 @@ export function ChatView({
               // takes its stored avatar colour as the turn accent.
               const shared = Boolean(rosterAgent) && rosterAgent!.ownerActorId.trim() === "";
               const turnColor = rosterAgent?.avatarColorHex ?? m.authorColorHex ?? undefined;
+              // Rail + tinted handle for a personal agent's own accent. Resolved
+              // here rather than in CSS because the OKLCH step is not the same
+              // on every desktop engine (lib/color.ts); `scheme` is in the
+              // dependency chain so a light/dark flip re-derives them and the
+              // memoised Bubble actually sees the change.
+              const turn = turnColor ? turnAccentColors(turnColor, scheme) : undefined;
               // The mentionable handle for an agent turn: the roster name, else
               // the default agent's "@hive" (its author is stored as "Hive").
               const handle =
@@ -883,6 +894,8 @@ export function ChatView({
                   // Personal agents tint the turn with their own avatar colour;
                   // shared/human turns fall back to the theme (warm/muted/cool).
                   turnAccent={shared ? undefined : turnColor}
+                  turnRail={shared ? undefined : turn?.rail}
+                  turnName={shared ? undefined : turn?.name}
                   // Prefer the avatar stamped/resolved on the message; for the local
                   // user's own turns, fall back to their freshly-set local avatar so
                   // older turns aren't left blank before a re-stamp.
@@ -1514,6 +1527,8 @@ const Bubble = memo(function Bubble({
   host,
   shared = false,
   turnAccent,
+  turnRail,
+  turnName,
   avatarUrl,
   colorHex,
   reactions,
@@ -1539,6 +1554,12 @@ const Bubble = memo(function Bubble({
   host?: "local" | "remote" | null;
   shared?: boolean;
   turnAccent?: string;
+  /// Rail + tinted-name colours for `turnAccent`, already resolved out of OKLCH
+  /// by the caller. Passed as two flat strings rather than derived here so the
+  /// memo boundary still sees a change when the scheme flips, and so the
+  /// derivation happens once per accent instead of once per turn.
+  turnRail?: string;
+  turnName?: string;
   avatarUrl?: string | null;
   colorHex?: string | null;
   reactions?: { emoji: string; actorId: string; actorDisplayName: string }[];
@@ -1621,7 +1642,15 @@ const Bubble = memo(function Bubble({
     // autoscroll can't find a stable bottom to pin to (lib/autoscroll).
     : { contentVisibility: "auto", containIntrinsicSize: "auto 80px" };
   if (!isUser && !shared && turnAccent) {
-    (rowStyle as Record<string, string>)["--turn-accent"] = turnAccent;
+    const s = rowStyle as Record<string, string>;
+    s["--turn-accent"] = turnAccent;
+    // --tr/--tn are no longer derived from --turn-accent in CSS (the engine
+    // disagreed with itself across platforms on the OKLCH step — see
+    // lib/color.ts), so overriding the accent means overriding both. Without
+    // this the rail and handle would keep the theme's cool colour while the
+    // fill took the agent's.
+    if (turnRail) s["--tr"] = turnRail;
+    if (turnName) s["--tn"] = turnName;
   }
 
   return (

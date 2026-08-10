@@ -42,25 +42,49 @@
 
   /* Scheme-derived numbers — light first-paint defaults; applyTheme() overrides
      these per light/dark scheme (they depend on scheme, never on the accent
-     family). Drive the turn fill/rail/name lightness + filled-control lightness
-     so a single rule set stays legible in every palette. */
+     family). */
   --hive-turn-mix: 91%;
-  --hive-turn-rail-l: 54%;
-  --hive-turn-name-l: 40%;
-  --hive-accent-ink-l: 42%;
-  --hive-fill-l: 45%;
   --hive-on-accent: rgb(255, 255, 255);
 
-  /* Text-weight + fill-weight variants of the semantic accents: same hue and
-     chroma, lightness replaced via relative-colour so they follow every palette
-     with no per-theme wiring. *-ink read as text; *-fill back filled controls
-     where --hive-on-accent is guaranteed legible. */
-  --hive-success-ink: oklch(from var(--hive-success) var(--hive-accent-ink-l) c h);
-  --hive-danger-ink: oklch(from var(--hive-danger) var(--hive-accent-ink-l) c h);
-  --hive-warn-ink: oklch(from var(--hive-warn) var(--hive-accent-ink-l) c h);
-  --hive-warm-ink: oklch(from var(--hive-accent-warm) var(--hive-accent-ink-l) c h);
-  --hive-accent-fill: oklch(from var(--hive-accent-cool) var(--hive-fill-l) c h);
-  --hive-warm-fill: oklch(from var(--hive-accent-warm) var(--hive-fill-l) c h);
+  /* ---- OKLCH-derived tokens: RESOLVED VALUES ONLY, NEVER oklch() ----
+
+     These are the lightness-replaced variants of the semantic accents: same
+     hue and chroma, lightness moved so *-ink reads as text and *-fill backs
+     filled controls where --hive-on-accent is legible. They used to be written
+     here as `oklch(from var(--x) var(--hive-…-l) c h)` and left to the engine.
+
+     They are not any more, and this is load-bearing rather than stylistic:
+     replacing lightness while holding chroma routinely leaves the sRGB gamut,
+     and engines disagree about the recovery. Chromium clips per channel; WebKit
+     runs the CSS Color 4 §13.2 chroma reduction. Hive's desktop is Tauri —
+     WebView2 on Windows, WKWebView on macOS — so the same palette rendered two
+     different colours per platform (dark --hive-danger-ink was rgb(255,157,155)
+     on Windows against rgb(255,173,170) on macOS: saturated red vs pink).
+
+     applyTheme() now resolves all of them in JS and sets finished rgb() here,
+     pinned to the Chromium result so no shipped Windows colour moved. The
+     values below are only the pollen-light first paint, before the theme JS
+     runs. The lightness knobs they were built from are gone on purpose: keeping
+     them would invite the next oklch(from …) and re-open the split.
+
+     Do not reintroduce oklch() in this file — src/lib/theme.token-parity.test.ts
+     fails if you do. lib/color.ts has the full account. */
+  --hive-success-ink: rgb(0, 96, 39);
+  --hive-danger-ink: rgb(151, 0, 13);
+  --hive-warn-ink: rgb(114, 64, 0);
+  --hive-warm-ink: rgb(128, 51, 0);
+  --hive-accent-fill: rgb(129, 68, 0);
+  --hive-warm-fill: rgb(137, 60, 0);
+
+  /* Per-identity turn rail (--tr) and tinted author name (--tn), same story.
+     warm = human, cool = agent, muted = shared workspace. A personal agent
+     substitutes its own avatar colour at render time (ChatView). */
+  --hive-rail-warm: rgb(166, 87, 0);
+  --hive-name-warm: rgb(122, 45, 0);
+  --hive-rail-cool: rgb(157, 95, 0);
+  --hive-name-cool: rgb(114, 54, 0);
+  --hive-rail-muted: rgb(115, 110, 101);
+  --hive-name-muted: rgb(75, 71, 63);
 
   --hive-mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
 }
@@ -77,19 +101,24 @@
   /* Fill is a *whisper* — ~8% accent (guide §5.3). Mixed in sRGB, not OKLCH:
      OKLCH preserves chroma, so an 8% amber over a dark panel reads as a
      saturated 30–40% card. sRGB keeps the tint a hint of identity, never a
-     selected-row highlight. Rail + name stay OKLCH so they hold hue+contrast. */
+     selected-row highlight. Rail + name are still OKLCH derivations so they
+     hold hue+contrast — just computed in JS now, see below. */
   --tf: color-mix(in srgb, var(--hive-panel) 92%, var(--turn-accent));
-  --tr: oklch(from var(--turn-accent) var(--hive-turn-rail-l) c h);
-  --tn: oklch(from var(--turn-accent) var(--hive-turn-name-l) c h);
+  /* Rail + name are resolved by applyTheme(), not derived here — see the
+     :root block. --turn-accent still drives the sRGB fill above, which every
+     engine agrees on; only the OKLCH pair had to move into JS. A personal
+     agent overriding --turn-accent must override --tr/--tn alongside it. */
+  --tr: var(--hive-rail-cool);
+  --tn: var(--hive-name-cool);
   display: flex; gap: 10px; padding: 6px 12px; border-radius: 8px; position: relative;
   background: var(--tf); border-inline-start: 2px solid var(--tr); outline: none;
 }
 .tt + .tt { margin-top: 2px; }
 .tt:hover { background: color-mix(in srgb, var(--hive-panel) 88%, var(--turn-accent)); }
 .tt:focus-visible { outline: 2px solid var(--tr); outline-offset: 2px; }
-.tt.human { --turn-accent: var(--hive-accent-warm); }
-.tt.agent { --turn-accent: var(--hive-accent-cool); }
-.tt.shared { --turn-accent: var(--hive-accent-muted); background: var(--hive-mist); border-inline-start-color: transparent; }
+.tt.human { --turn-accent: var(--hive-accent-warm); --tr: var(--hive-rail-warm); --tn: var(--hive-name-warm); }
+.tt.agent { --turn-accent: var(--hive-accent-cool); --tr: var(--hive-rail-cool); --tn: var(--hive-name-cool); }
+.tt.shared { --turn-accent: var(--hive-accent-muted); --tr: var(--hive-rail-muted); --tn: var(--hive-name-muted); background: var(--hive-mist); border-inline-start-color: transparent; }
 .tt.shared:hover { background: color-mix(in srgb, var(--hive-mist) 90%, var(--hive-ink)); }
 .tt.shared .tt-handle, .tt.shared .tt-name { color: var(--hive-ink-soft); }
 .tt.shared .tt-text { color: var(--hive-ink-soft); }

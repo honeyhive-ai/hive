@@ -36,6 +36,7 @@ with the code, the code wins.
 - Agent model: [`hive-agent-architecture-matrix.md`](hive-agent-architecture-matrix.md) — agent modes, execution/state/tool/permission shape.
 - Relay protocol: [`hive-relay-api.md`](hive-relay-api.md) — the `/v1` wire contract (client ↔ relay).
 - Branding: [`hive-logo-system.md`](hive-logo-system.md) — logo/brand assets.
+- Theming: [`hive-color-tokens.md`](hive-color-tokens.md) — how derived colours are built, and why the OKLCH ones are computed in JS rather than by the browser.
 
 The user-facing tiering / managed-service / pricing docs live on the published
 site under [`docs-site/ops/`](../docs-site/ops/).
