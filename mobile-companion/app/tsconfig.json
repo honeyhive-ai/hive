@@ -4,7 +4,7 @@
     "strict": true,
     "noUncheckedIndexedAccess": false,
     "resolveJsonModule": true,
-    "types": ["jest", "react", "react-native"]
+    "types": ["jest", "node", "react", "react-native"]
   },
   "include": ["**/*.ts", "**/*.tsx"],
   "exclude": ["node_modules"]

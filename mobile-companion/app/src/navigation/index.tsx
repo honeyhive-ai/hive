@@ -40,9 +40,9 @@ export type StackParams = {
 };
 
 const Stack = createNativeStackNavigator<StackParams>();
-const Drawer = createDrawerNavigator();
-
 type DrawerParams = { Main: undefined };
+
+const Drawer = createDrawerNavigator<DrawerParams>();
 
 function MainStack({ navigation }: DrawerScreenProps<DrawerParams, "Main">) {
   const { tokens: t } = useTheme();
