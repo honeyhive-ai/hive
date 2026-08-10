@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "Hive",
+    "slug": "hive-mobile-companion",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "hive",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": false,
+    "splash": {
+      "resizeMode": "contain",
+      "backgroundColor": "#F9F3E4"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "ai.honeyhive.hive.companion"
+    },
+    "android": {
+      "package": "ai.honeyhive.hive.companion",
+      "adaptiveIcon": {
+        "backgroundColor": "#F9F3E4"
+      }
+    },
+    "plugins": ["expo-dev-client", "expo-font", "expo-splash-screen"],
+    "experiments": {
+      "typedRoutes": false
+    }
+  }
+}
