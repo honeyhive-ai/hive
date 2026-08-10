@@ -31,7 +31,7 @@ import { ChatScreen } from "../screens/ChatScreen";
 import { DetailsScreen } from "../screens/DetailsScreen";
 import { useTheme } from "../theme/ThemeProvider";
 import { useWorkspace } from "../state/workspace";
-import { space, text } from "../theme/scale";
+import { space, text, touch } from "../theme/scale";
 
 export type StackParams = {
   Chat: undefined;
@@ -106,10 +106,10 @@ function HeaderButton({
       onPress={onPress}
       accessibilityRole="button"
       accessibilityLabel={hint}
-      hitSlop={12}
+      hitSlop={touch.headerButtonSlop}
       style={styles.headerButton}
     >
-      <Text style={{ color: t.ink, fontSize: 18 }}>{label}</Text>
+      <Text style={{ color: t.ink, fontSize: touch.headerGlyph }}>{label}</Text>
     </Pressable>
   );
 }
@@ -144,7 +144,7 @@ export function RootNavigator({ onReady }: { onReady?: () => void }) {
         screenOptions={{
           headerShown: false,
           drawerType: "front",
-          drawerStyle: { backgroundColor: t.sidebarTop, width: 300 },
+          drawerStyle: { backgroundColor: t.sidebarTop, width: touch.drawerWidth },
           overlayColor: "rgba(0,0,0,0.4)",
         }}
       >
@@ -155,5 +155,5 @@ export function RootNavigator({ onReady }: { onReady?: () => void }) {
 }
 
 const styles = StyleSheet.create({
-  headerButton: { paddingHorizontal: space(1), minWidth: 32 },
+  headerButton: { paddingHorizontal: space(1), minWidth: touch.headerButtonMin },
 });

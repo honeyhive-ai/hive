@@ -204,4 +204,17 @@ export const touch = {
   /// Platform minimum tap target (44pt iOS / 48dp Android — take the larger).
   minTarget: 48,
   tabBarHeight: 56,
+
+  /// Header glyph buttons. The visible box stays small so the glyph does not
+  /// crowd the title; `hitSlop` is what carries it up to `minTarget`, which is
+  /// why this is below 48 and not a bug.
+  headerButtonMin: 32,
+  headerButtonSlop: 12,
+  /// The glyph itself is an icon that happens to be a character, so it is sized
+  /// like an icon rather than taken off the type ramp.
+  headerGlyph: 18,
+
+  /// Drawer width. The desktop sidebar is a fixed column in a 1280px window; a
+  /// drawer sliding over a phone is a different object, so this is chosen.
+  drawerWidth: 300,
 } as const;
