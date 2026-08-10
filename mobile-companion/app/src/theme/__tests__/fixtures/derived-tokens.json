@@ -1,6 +1,6 @@
 {
   "_comment": "Measured from a real browser — do not hand-edit. sRGB mixes via getComputedStyle (exact); oklch() via rendered pixels (the only way to see what the engine does out of gamut). Regenerate with `bun run tools/extract-desktop-tokens.ts`.",
-  "_renderer": "C:/Program Files/Google/Chrome/Application/chrome.exe",
+  "_renderer": "chrome.exe 151.0.7922.77",
   "tokens": {
     "pollen.light.inkSoft": "rgba(38, 29, 16, 0.55)",
     "pollen.light.inkFaint": "rgba(38, 29, 16, 0.42)",

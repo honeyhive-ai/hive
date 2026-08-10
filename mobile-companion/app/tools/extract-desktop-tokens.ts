@@ -29,7 +29,7 @@
 import { mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { CHAT, STATUS, THEMES, THEME_NAMES } from "../src/theme/palettes";
 
 const CHROMIUM_CANDIDATES = [
@@ -118,6 +118,33 @@ function runChromium(bin: string, args: string[], profile: string) {
     ["--headless", "--disable-gpu", "--no-first-run", `--user-data-dir=${profile}`, ...args],
     { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
   );
+}
+
+/// The renderer's version string, recorded in the fixture so a future reader
+/// knows which engine measured it.
+///
+/// This must not start a browser, and on Windows that rules out `--version`.
+/// `--version` is a POSIX-only switch: on Windows Chrome does not recognise it,
+/// ignores it, and starts a *normal* browser — and with no `--user-data-dir`
+/// that browser opens on the user's own profile. `spawnSync`'s `timeout` then
+/// kills it. To the person at the keyboard that is Hive killing their browser
+/// and restarting it, some seconds after they ran a test command. It also
+/// silently produced an empty version string, which is why the committed
+/// fixture recorded a bare binary path where a version belongs.
+///
+/// The PE version resource carries the same string and starts no process.
+function chromiumVersion(bin: string): string {
+  if (process.platform === "win32") {
+    const r = spawnSync(
+      "powershell",
+      ["-NoProfile", "-Command", `(Get-Item ${JSON.stringify(bin)}).VersionInfo.ProductVersion`],
+      { encoding: "utf8", timeout: 15_000 },
+    );
+    const v = r.stdout?.trim();
+    return v ? `${basename(bin)} ${v}` : bin;
+  }
+  // Elsewhere `--version` genuinely prints and exits without opening a window.
+  return spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 15_000 }).stdout.trim() || bin;
 }
 
 /// Normalise whatever the engine hands back — `rgb()`, `rgba()`, or the
@@ -255,9 +282,7 @@ function main() {
   mkdirSync(profile, { recursive: true });
 
   const bin = findChromium();
-  // `--version` on its own; pairing it with `--user-data-dir` makes Chrome
-  // launch a real browser instead of printing and exiting, and the script hangs.
-  const version = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 15_000 }).stdout.trim() || bin;
+  const version = chromiumVersion(bin);
 
   const tokens: Record<string, string> = {};
   const computed = measureComputed(bin, dir, profile, mixes);
