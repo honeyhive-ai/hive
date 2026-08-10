@@ -6,11 +6,6 @@
     "orientation": "portrait",
     "scheme": "hive",
     "userInterfaceStyle": "automatic",
-    "newArchEnabled": false,
-    "splash": {
-      "resizeMode": "contain",
-      "backgroundColor": "#F9F3E4"
-    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "ai.honeyhive.hive.companion"
@@ -21,7 +16,17 @@
         "backgroundColor": "#F9F3E4"
       }
     },
-    "plugins": ["expo-dev-client", "expo-font", "expo-splash-screen"],
+    "plugins": [
+      "expo-dev-client",
+      "expo-font",
+      [
+        "expo-splash-screen",
+        {
+          "resizeMode": "contain",
+          "backgroundColor": "#F9F3E4"
+        }
+      ]
+    ],
     "experiments": {
       "typedRoutes": false
     }

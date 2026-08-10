@@ -22,7 +22,26 @@ dev server must share a LAN.
 ```sh
 npm test          # jest — theme, tokens, avatar
 npm run typecheck
+npx expo-doctor   # 20 checks: config schema, version alignment
 ```
+
+## Toolchain
+
+Expo SDK 57 / React Native 0.86 / React 19 / TypeScript 6.
+
+Every native version is the exact one SDK 57 was built against — `expo-doctor`
+enforces that, and deviating risks an ABI mismatch that only shows up in a
+cloud build. React is the deliberate exception: it is pinned to the latest
+19.2.x rather than the SDK's 19.2.3, which is why `expo.install.exclude` in
+`package.json` lists it. React is JS-only, and `react-native@0.86` asks for
+`^19.2.3`, so this is inside the supported range.
+
+**The app runs on the New Architecture, and that is no longer a choice.**
+`app.json` used to set `newArchEnabled: false`; React Native 0.82 deleted the
+legacy renderer, so the key is gone and generated projects write
+`newArchEnabled=true`. Nothing in `src/` touches the difference — the only
+animation is RN's own `Animated` — but native modules added later must be
+Fabric/TurboModule compatible. That constrains the MC-002-A approval module.
 
 ## What mirrors the desktop, and what doesn't
 
@@ -86,8 +105,13 @@ browser, so the tests can disagree with the implementation. Regenerate after
 any palette change:
 
 ```sh
-bun run tools/extract-desktop-tokens.ts   # or: node --experimental-strip-types
+bun run tools/extract-desktop-tokens.ts
 ```
+
+**bun only** — this one script is not portable to Node. It imports
+`../src/theme/palettes` without a file extension, and Node resolves a
+type-stripped `.ts` file as ESM, where extensionless specifiers are an error.
+bun resolves them. Everything else in the repo runs on either.
 
 It needs Chrome or Edge on PATH (or `CHROMIUM_BIN` set). sRGB mixes are read
 from `getComputedStyle` — screenshotting a 6% tint and un-compositing it

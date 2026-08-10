@@ -301,9 +301,11 @@ function main() {
   };
 
   // `__dirname`, not `import.meta.dir`. Both are Bun-isms here — Bun defines
-  // `__dirname` even in ESM scope — but `import.meta` is a type error under the
-  // commonjs `module` setting this app inherits from expo/tsconfig.base, so it
-  // was the one line of the repo that `tsc --noEmit` could never accept.
+  // `__dirname` even in ESM scope — but `.dir` is a Bun extension to
+  // `ImportMeta` that TypeScript does not ship a type for, so `import.meta.dir`
+  // is a TS2339 without `bun-types`, which this app has no other reason to
+  // carry. It was the one line of the repo that `tsc --noEmit` could not
+  // accept.
   const dest = join(__dirname, "..", "src", "theme", "__tests__", "fixtures");
   mkdirSync(dest, { recursive: true });
   writeFileSync(
