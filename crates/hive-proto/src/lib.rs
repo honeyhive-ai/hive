@@ -131,6 +131,11 @@ pub struct ProposalDto {
     /// Paths the diff touches, for a compact summary in the Review pane.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_files: Vec<String>,
+    /// RFC 3339. The Review pane orders newest-first; without this the UI only
+    /// has fold order (oldest first, settled interleaved with open).
+    pub created_at: String,
+    /// Hidden from the Review inbox (the record survives; see `ActionProposal`).
+    pub dismissed: bool,
 }
 
 /// A chat as listed in the sidebar.

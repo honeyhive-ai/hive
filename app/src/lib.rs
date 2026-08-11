@@ -1098,6 +1098,8 @@ fn proposal_dto(p: &ActionProposal) -> ProposalDto {
             .collect(),
         diff: p.diff.clone(),
         changed_files: p.changed_files.clone(),
+        created_at: rfc3339(p.created_at),
+        dismissed: p.dismissed,
     }
 }
 
@@ -3442,6 +3444,30 @@ fn vote_proposal(
         }
     }
     Ok(updated.as_ref().map(proposal_dto))
+}
+
+/// Hide (or restore) proposals in the Review inbox. Takes a list so "Clear
+/// settled" is one call. Returns the number actually changed.
+///
+/// This hides; it does not delete. The proposal stays in the event log, so the
+/// paper trail survives and the dismiss replicates to the other devices.
+#[tauri::command]
+fn dismiss_proposals(
+    state: State<AppState>,
+    session_id: String,
+    proposal_ids: Vec<String>,
+    dismissed: bool,
+) -> Result<u32, String> {
+    let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let ids = proposal_ids
+        .iter()
+        .map(|p| Uuid::parse_str(p).map_err(map_err))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut svc = state.service.lock().unwrap();
+    let changed = svc
+        .set_proposals_dismissed(sid, state.active_workspace_id(), &ids, dismissed)
+        .map_err(map_err)?;
+    Ok(changed.len() as u32)
 }
 
 /// Apply a unified diff to `workspace_root` with `git apply` (patch on stdin).
@@ -9358,6 +9384,7 @@ pub fn run() {
             list_proposals,
             create_proposal,
             vote_proposal,
+            dismiss_proposals,
             implement_proposal,
             toggle_reaction,
             list_members,

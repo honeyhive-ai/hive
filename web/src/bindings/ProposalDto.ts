@@ -27,4 +27,13 @@ diff?: string | null,
 /**
  * Paths the diff touches, for a compact summary in the Review pane.
  */
-changedFiles?: Array<string>, };
+changedFiles?: Array<string>, 
+/**
+ * RFC 3339. The Review pane orders newest-first; without this the UI only
+ * has fold order (oldest first, settled interleaved with open).
+ */
+createdAt: string, 
+/**
+ * Hidden from the Review inbox (the record survives; see `ActionProposal`).
+ */
+dismissed: boolean, };

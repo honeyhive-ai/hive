@@ -41,12 +41,16 @@ import {
   syncStatus,
   onChatStream,
   voteProposal,
+  dismissProposals,
+  type ProposalDto,
   type RuntimeSummaryDto,
   type McpServerDto,
   type QueuedWorkDto,
   type WorkspaceHostDto,
   type WorkspaceAgentDto,
 } from "@/lib/ipc";
+import { groupProposals, isSettled, isVotable } from "@/lib/proposals";
+import { relTime } from "@/lib/time";
 import { LogsView } from "@/components/LogsView";
 import { Avatar } from "@/components/Avatar";
 import { fileToAvatarDataUrl } from "@/lib/avatar";
@@ -991,127 +995,225 @@ function QueuedWorkSection() {
   );
 }
 
+/// One proposal in the Review inbox.
+///
+/// `settled` proposals keep their record and their diff, but lose the vote
+/// buttons — a proposal that's already applied or rejected can't be voted on, so
+/// offering Approve/Reject there only invites a click that does nothing.
+function ProposalCard({
+  proposal,
+  sessionId,
+  onChanged,
+  onDismiss,
+}: {
+  proposal: ProposalDto;
+  sessionId: string;
+  onChanged: () => void;
+  onDismiss: (dismissed: boolean) => void;
+}) {
+  const settled = isSettled(proposal);
+  return (
+    <Card className="px-4 py-4">
+      <div className="flex items-center justify-between gap-3">
+        <div className="font-semibold">{proposal.title}</div>
+        <div className="flex shrink-0 items-center gap-2">
+          <div className="text-xs uppercase tracking-[0.16em] opacity-55">{proposal.status}</div>
+          {/* Dismiss is offered once a proposal is settled: before that it's
+              work, after that it's a paper trail taking up the pane. */}
+          {settled && (
+            <IconButton
+              label={proposal.dismissed ? "Restore to the inbox" : "Dismiss"}
+              onClick={() => onDismiss(!proposal.dismissed)}
+            >
+              <IconX size={12} />
+            </IconButton>
+          )}
+        </div>
+      </div>
+      <div className="mt-0.5 text-xs opacity-50">{relTime(proposal.createdAt)}</div>
+      {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
+      {/* A fileDiff proposal (from an agent's isolated worktree) carries a
+          unified diff — render it here so it's reviewable in place, then
+          Implement applies it to the workspace. */}
+      {proposal.diff && (
+        <div className="mt-3">
+          {proposal.changedFiles && proposal.changedFiles.length > 0 && (
+            <div className="mb-1.5 text-xs opacity-60">
+              {proposal.changedFiles.length} file
+              {proposal.changedFiles.length === 1 ? "" : "s"}:{" "}
+              {proposal.changedFiles.join(", ")}
+            </div>
+          )}
+          <div
+            className="max-h-72 overflow-auto rounded-lg border p-2 font-mono text-[11px] leading-[1.5]"
+            style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+          >
+            {proposal.diff.split("\n").map((line, i) => {
+              const color =
+                line.startsWith("+") && !line.startsWith("+++")
+                  ? "var(--hive-success)"
+                  : line.startsWith("-") && !line.startsWith("---")
+                    ? "var(--hive-danger)"
+                    : line.startsWith("@@")
+                      ? "var(--hive-accent-cool)"
+                      : "var(--hive-ink-soft)";
+              return (
+                <div key={i} style={{ color, whiteSpace: "pre" }}>
+                  {line || " "}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      <div className="mt-3 text-xs opacity-60">
+        {proposal.qualifyingApprovals}/{proposal.requiredApprovals} approvals
+      </div>
+      <div className="mt-3 flex gap-2">
+        {isVotable(proposal) && (
+          <>
+            <button
+              className="rounded-xl px-3 py-2 text-sm font-medium"
+              style={{
+                background: "color-mix(in srgb, var(--hive-success) 20%, transparent)",
+                color: "var(--hive-success)",
+              }}
+              onClick={async () => {
+                try {
+                  await voteProposal(sessionId, proposal.id, true);
+                  onChanged();
+                } catch (e) {
+                  toast.error(`Couldn't approve: ${errMsg(e)}`);
+                }
+              }}
+            >
+              Approve
+            </button>
+            <button
+              className="rounded-xl px-3 py-2 text-sm font-medium"
+              style={{
+                background: "color-mix(in srgb, var(--hive-danger) 18%, transparent)",
+                color: "var(--hive-danger)",
+              }}
+              onClick={async () => {
+                try {
+                  await voteProposal(sessionId, proposal.id, false);
+                  onChanged();
+                } catch (e) {
+                  toast.error(`Couldn't reject: ${errMsg(e)}`);
+                }
+              }}
+            >
+              Reject
+            </button>
+          </>
+        )}
+        {/* Agreement gate: an approved proposal only runs when a human
+            explicitly implements it; the agent then carries it out.
+            (Ported from the retired standalone ReviewView.) */}
+        {proposal.quorumMet && proposal.status !== "applied" && (
+          <Button
+            variant="primary"
+            className="ml-auto"
+            onClick={async () => {
+              try {
+                await implementProposal(sessionId, proposal.id);
+                onChanged();
+                toast.success("Sent to the agent to implement.");
+              } catch (e) {
+                toast.error(`Couldn't implement: ${errMsg(e)}`);
+              }
+            }}
+          >
+            Implement
+          </Button>
+        )}
+        {proposal.status === "applied" && (
+          <span className="ml-auto self-center text-xs opacity-60">Implemented</span>
+        )}
+      </div>
+    </Card>
+  );
+}
+
 function ReviewPane({ sessionId }: { sessionId: string }) {
   const qc = useQueryClient();
   const proposals = useQuery({
     queryKey: ["proposals", sessionId],
     queryFn: () => listProposals(sessionId),
   });
+  // Settled work is history, so it starts collapsed; dismissed work is history
+  // the reader has explicitly filed away, so it stays out of the way until asked
+  // for. Neither is deleted — both shelves can be reopened.
+  const [showSettled, setShowSettled] = useState(false);
+  const [showDismissed, setShowDismissed] = useState(false);
+
+  const groups = groupProposals(proposals.data ?? []);
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+    qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+  };
+  const dismiss = async (ids: string[], dismissed: boolean) => {
+    try {
+      await dismissProposals(sessionId, ids, dismissed);
+      qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
+    } catch (e) {
+      toast.error(`Couldn't ${dismissed ? "dismiss" : "restore"}: ${errMsg(e)}`);
+    }
+  };
+  const card = (proposal: ProposalDto) => (
+    <ProposalCard
+      key={proposal.id}
+      proposal={proposal}
+      sessionId={sessionId}
+      onChanged={refresh}
+      onDismiss={(dismissed) => dismiss([proposal.id], dismissed)}
+    />
+  );
 
   return (
     <RailFrame title="Review" subtitle="Pending decisions and proposal quorum for this chat.">
       <QueuedWorkSection />
       <Section title="Pending Proposals">
-        {(proposals.data ?? []).map((proposal) => (
-          <Card key={proposal.id} className="px-4 py-4">
-            <div className="flex items-center justify-between gap-3">
-              <div className="font-semibold">{proposal.title}</div>
-              <div className="text-xs uppercase tracking-[0.16em] opacity-55">{proposal.status}</div>
-            </div>
-            {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
-            {/* A fileDiff proposal (from an agent's isolated worktree) carries a
-                unified diff — render it here so it's reviewable in place, then
-                Implement applies it to the workspace. */}
-            {proposal.diff && (
-              <div className="mt-3">
-                {proposal.changedFiles && proposal.changedFiles.length > 0 && (
-                  <div className="mb-1.5 text-xs opacity-60">
-                    {proposal.changedFiles.length} file
-                    {proposal.changedFiles.length === 1 ? "" : "s"}:{" "}
-                    {proposal.changedFiles.join(", ")}
-                  </div>
-                )}
-                <div
-                  className="max-h-72 overflow-auto rounded-lg border p-2 font-mono text-[11px] leading-[1.5]"
-                  style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
-                >
-                  {proposal.diff.split("\n").map((line, i) => {
-                    const color =
-                      line.startsWith("+") && !line.startsWith("+++")
-                        ? "var(--hive-success)"
-                        : line.startsWith("-") && !line.startsWith("---")
-                          ? "var(--hive-danger)"
-                          : line.startsWith("@@")
-                            ? "var(--hive-accent-cool)"
-                            : "var(--hive-ink-soft)";
-                    return (
-                      <div key={i} style={{ color, whiteSpace: "pre" }}>
-                        {line || " "}
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            )}
-            <div className="mt-3 text-xs opacity-60">
-              {proposal.qualifyingApprovals}/{proposal.requiredApprovals} approvals
-            </div>
-            <div className="mt-3 flex gap-2">
-              <button
-                className="rounded-xl px-3 py-2 text-sm font-medium"
-                style={{
-                  background: "color-mix(in srgb, var(--hive-success) 20%, transparent)",
-                  color: "var(--hive-success)",
-                }}
-                onClick={async () => {
-                  try {
-                    await voteProposal(sessionId, proposal.id, true);
-                    qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
-                  } catch (e) {
-                    toast.error(`Couldn't approve: ${errMsg(e)}`);
-                  }
-                }}
-              >
-                Approve
-              </button>
-              <button
-                className="rounded-xl px-3 py-2 text-sm font-medium"
-                style={{
-                  background: "color-mix(in srgb, var(--hive-danger) 18%, transparent)",
-                  color: "var(--hive-danger)",
-                }}
-                onClick={async () => {
-                  try {
-                    await voteProposal(sessionId, proposal.id, false);
-                    qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
-                  } catch (e) {
-                    toast.error(`Couldn't reject: ${errMsg(e)}`);
-                  }
-                }}
-              >
-                Reject
-              </button>
-              {/* Agreement gate: an approved proposal only runs when a human
-                  explicitly implements it; the agent then carries it out.
-                  (Ported from the retired standalone ReviewView.) */}
-              {proposal.quorumMet && proposal.status !== "applied" && (
-                <Button
-                  variant="primary"
-                  className="ml-auto"
-                  onClick={async () => {
-                    try {
-                      await implementProposal(sessionId, proposal.id);
-                      qc.invalidateQueries({ queryKey: ["proposals", sessionId] });
-                      qc.invalidateQueries({ queryKey: ["chat", sessionId] });
-                      toast.success("Sent to the agent to implement.");
-                    } catch (e) {
-                      toast.error(`Couldn't implement: ${errMsg(e)}`);
-                    }
-                  }}
-                >
-                  Implement
-                </Button>
-              )}
-              {proposal.status === "applied" && (
-                <span className="ml-auto self-center text-xs opacity-60">Implemented</span>
-              )}
-            </div>
-          </Card>
-        ))}
-        {(proposals.data ?? []).length === 0 && (
+        {groups.active.map(card)}
+        {groups.active.length === 0 && (
           <EmptyHint text="No proposals are waiting for review." />
         )}
       </Section>
+
+      {groups.settled.length > 0 && (
+        <Section
+          title="Settled"
+          action={
+            <button
+              className="text-xs opacity-60 transition-opacity hover:opacity-100"
+              onClick={() => dismiss(groups.settled.map((p) => p.id), true)}
+            >
+              Clear settled
+            </button>
+          }
+        >
+          <FormDisclosure
+            label={`${groups.settled.length} settled proposal${groups.settled.length === 1 ? "" : "s"}`}
+            open={showSettled}
+            onToggle={() => setShowSettled((v) => !v)}
+          >
+            <div className="space-y-2.5">{groups.settled.map(card)}</div>
+          </FormDisclosure>
+        </Section>
+      )}
+
+      {groups.dismissed.length > 0 && (
+        <Section title="Dismissed">
+          <FormDisclosure
+            label={`${groups.dismissed.length} dismissed`}
+            open={showDismissed}
+            onToggle={() => setShowDismissed((v) => !v)}
+          >
+            <div className="space-y-2.5">{groups.dismissed.map(card)}</div>
+          </FormDisclosure>
+        </Section>
+      )}
     </RailFrame>
   );
 }

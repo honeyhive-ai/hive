@@ -73,6 +73,15 @@ pub struct ActionProposal {
     /// Paths the diff touches — a compact summary without parsing the patch.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub changed_files: Vec<String>,
+    /// Hidden from the Review inbox. A settled proposal is a paper trail, not
+    /// work, so dismissing it reclaims the pane without losing the record — the
+    /// proposal stays in the folded state and can be shown again.
+    ///
+    /// This is a field on the proposal rather than a local UI preference so a
+    /// dismiss replicates: clearing the inbox on one device clears it on the
+    /// others, the same way a vote does.
+    #[serde(default)]
+    pub dismissed: bool,
 }
 
 fn default_floor() -> WorkspaceRole {
@@ -98,6 +107,7 @@ impl ActionProposal {
             created_at: Timestamp::now(),
             diff: None,
             changed_files: Vec::new(),
+            dismissed: false,
         }
     }
 

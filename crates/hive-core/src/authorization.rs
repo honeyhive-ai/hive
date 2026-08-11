@@ -184,6 +184,9 @@ pub fn min_role_for(event: &SessionEvent) -> WorkspaceRole {
         | SessionEvent::SkillsUpdated { .. }
         | SessionEvent::ProposalUpserted { .. }
         | SessionEvent::ProposalVoteCast { .. }
+        // Dismiss only hides a proposal from the inbox; it destroys no record
+        // and settles no vote, so it carries the same content-level floor.
+        | SessionEvent::ProposalDismissed { .. }
         | SessionEvent::VaultSourcesUpdated { .. }
         | SessionEvent::WorkflowDefinitionsUpdated { .. }
         | SessionEvent::WorkflowRunUpserted { .. }

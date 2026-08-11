@@ -1393,6 +1393,35 @@ impl ChatService {
         Ok(Some(proposal))
     }
 
+    /// Hide (or restore) a proposal in the Review inbox. Returns the ids that
+    /// actually changed, so a bulk "clear settled" is one pass and a no-op
+    /// dismiss appends nothing to the log.
+    pub fn set_proposals_dismissed(
+        &mut self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        proposal_ids: &[Uuid],
+        dismissed: bool,
+    ) -> Result<Vec<Uuid>> {
+        let Some(session) = self.load(session_id)? else {
+            return Ok(Vec::new());
+        };
+        let changed: Vec<Uuid> = session
+            .proposals
+            .iter()
+            .filter(|p| proposal_ids.contains(&p.id) && p.dismissed != dismissed)
+            .map(|p| p.id)
+            .collect();
+        for proposal_id in &changed {
+            self.append_signed(
+                session_id,
+                workspace_id,
+                SessionEvent::ProposalDismissed { proposal_id: *proposal_id, dismissed },
+            )?;
+        }
+        Ok(changed)
+    }
+
     /// Toggle an emoji reaction on a message for an actor: removes it if the
     /// same actor+emoji vote already exists, otherwise adds it.
     pub fn toggle_reaction(

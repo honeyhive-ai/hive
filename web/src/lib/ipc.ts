@@ -621,6 +621,14 @@ export const createProposal = (
 export const voteProposal = (sessionId: string, proposalId: string, approved: boolean) =>
   invoke<ProposalDto | null>("vote_proposal", { sessionId, proposalId, approved });
 
+/// Hide (or restore) proposals in the Review inbox. Hides only — the proposals
+/// stay in the event log as a paper trail. Resolves to the number changed.
+export const dismissProposals = (
+  sessionId: string,
+  proposalIds: string[],
+  dismissed: boolean,
+) => invoke<number>("dismiss_proposals", { sessionId, proposalIds, dismissed });
+
 export const toggleReaction = (sessionId: string, messageId: string, emoji: string) =>
   invoke<void>("toggle_reaction", { sessionId, messageId, emoji });
 

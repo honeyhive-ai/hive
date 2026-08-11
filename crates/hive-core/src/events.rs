@@ -102,6 +102,12 @@ pub enum SessionEvent {
         proposal_id: Uuid,
         approval: ProposalApproval,
     },
+    /// Hide (or restore) a proposal in the Review inbox. A delta, like a vote,
+    /// rather than a full-proposal upsert — so clearing the inbox on one device
+    /// can't clobber a concurrent vote from another. Deliberately *not* a row
+    /// delete: the session is an event-sourced log, so a delete wouldn't survive
+    /// a re-fold and wouldn't replicate.
+    ProposalDismissed { proposal_id: Uuid, dismissed: bool },
     /// Replace the session's vault source set.
     VaultSourcesUpdated { sources: Vec<MountedVault> },
     /// Replace the session's workflow definition set.
@@ -226,6 +232,7 @@ impl SessionEvent {
             SessionEvent::SkillsUpdated { .. } => "skillsUpdated",
             SessionEvent::ProposalUpserted { .. } => "proposalUpserted",
             SessionEvent::ProposalVoteCast { .. } => "proposalVoteCast",
+            SessionEvent::ProposalDismissed { .. } => "proposalDismissed",
             SessionEvent::VaultSourcesUpdated { .. } => "vaultSourcesUpdated",
             SessionEvent::WorkflowDefinitionsUpdated { .. } => "workflowDefinitionsUpdated",
             SessionEvent::WorkflowRunUpserted { .. } => "workflowRunUpserted",
@@ -439,6 +446,11 @@ impl ChatSession {
                     // Per-actor LWW + quorum recompute; folded in canonical order
                     // so the latest vote per actor wins on every device.
                     p.cast_vote(approval.clone());
+                }
+            }
+            SessionEvent::ProposalDismissed { proposal_id, dismissed } => {
+                if let Some(p) = self.proposals.iter_mut().find(|p| p.id == *proposal_id) {
+                    p.dismissed = *dismissed;
                 }
             }
             SessionEvent::VaultSourcesUpdated { sources } => {
@@ -1279,6 +1291,73 @@ mod tests {
             let permuted = shuffled(events.clone(), seed | 1);
             assert_eq!(project(&permuted).expect("session"), expected, "vote divergence at seed {seed}");
         }
+    }
+
+    /// Dismiss hides a proposal without destroying it, and — being a delta
+    /// rather than a whole-proposal upsert — must not clobber a vote that landed
+    /// concurrently on another device, in either arrival order.
+    #[test]
+    fn dismiss_hides_the_proposal_without_losing_it_or_clobbering_votes() {
+        use crate::proposals::{ActionProposal, ProposalApproval, ProposalKind, ProposalStatus};
+
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let mut proposal = ActionProposal::new("Ship it", ProposalKind::Decision, "");
+        proposal.required_approvals = 1;
+        let pid = proposal.id;
+
+        let events = vec![
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            env(sid, wid, 2, SessionEvent::ProposalUpserted { proposal }),
+            env(
+                sid,
+                wid,
+                3,
+                SessionEvent::ProposalVoteCast {
+                    proposal_id: pid,
+                    approval: ProposalApproval {
+                        actor_id: "u1".into(),
+                        role: WorkspaceRole::Contributor,
+                        approved: true,
+                        created_at: Timestamp::epoch(),
+                    },
+                },
+            ),
+            env(sid, wid, 4, SessionEvent::ProposalDismissed { proposal_id: pid, dismissed: true }),
+        ];
+
+        let expected = project(&events).expect("session");
+        let p = &expected.proposals[0];
+        assert!(p.dismissed, "dismissed");
+        assert_eq!(expected.proposals.len(), 1, "hidden, not deleted — the record survives a re-fold");
+        assert_eq!(p.status, ProposalStatus::Approved, "the concurrent vote still counts");
+
+        for seed in 0..300u64 {
+            let permuted = shuffled(events.clone(), seed | 1);
+            assert_eq!(project(&permuted).expect("session"), expected, "divergence at seed {seed}");
+        }
+    }
+
+    /// Restoring is the same event with `dismissed: false`, so a mistaken
+    /// "Clear settled" is recoverable rather than a one-way door.
+    #[test]
+    fn dismiss_is_reversible() {
+        use crate::proposals::{ActionProposal, ProposalKind};
+
+        let base = base_session();
+        let (sid, wid) = (base.id, base.workspace_id);
+        let proposal = ActionProposal::new("Ship it", ProposalKind::Decision, "");
+        let pid = proposal.id;
+
+        let session = project(&[
+            env(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(base) }),
+            env(sid, wid, 2, SessionEvent::ProposalUpserted { proposal }),
+            env(sid, wid, 3, SessionEvent::ProposalDismissed { proposal_id: pid, dismissed: true }),
+            env(sid, wid, 4, SessionEvent::ProposalDismissed { proposal_id: pid, dismissed: false }),
+        ])
+        .expect("session");
+
+        assert!(!session.proposals[0].dismissed, "restored to the inbox");
     }
 
     #[test]
