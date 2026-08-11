@@ -11,7 +11,8 @@
     "test": "jest",
     "typecheck": "tsc --noEmit",
     "lint": "expo lint",
-    "extract-tokens": "bun run tools/extract-desktop-tokens.ts"
+    "extract-tokens": "bun run tools/extract-desktop-tokens.ts",
+    "generate-assets": "bun run tools/generate-app-assets.mjs"
   },
   "dependencies": {
     "@expo-google-fonts/jetbrains-mono": "^0.4.1",

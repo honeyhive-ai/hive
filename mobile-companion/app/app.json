@@ -6,6 +6,7 @@
     "orientation": "portrait",
     "scheme": "hive",
     "userInterfaceStyle": "automatic",
+    "icon": "./assets/icon.png",
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "ai.honeyhive.hive.companion"
@@ -13,6 +14,7 @@
     "android": {
       "package": "ai.honeyhive.hive.companion",
       "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#F9F3E4"
       }
     },
@@ -22,6 +24,8 @@
       [
         "expo-splash-screen",
         {
+          "image": "./assets/splash.png",
+          "imageWidth": 200,
           "resizeMode": "contain",
           "backgroundColor": "#F9F3E4"
         }
