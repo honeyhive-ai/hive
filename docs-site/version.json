@@ -1,6 +1,6 @@
 {
-  "tag": "v1.5.12",
-  "name": "Hive 1.5.12",
+  "tag": "v1.5.13",
+  "name": "Hive 1.5.13",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "In a local / home workspace the People pane now shows a single 'you' instead of duplicating you (a leftover of the earlier identity churn) with governance controls that don't apply to a solo workspace. No data reset needed."
+  "notes": "Two quality-of-life fixes. The chat transcript now offers a jump-to-latest button any time you're scrolled up, not only when new messages arrived — so re-reading something no longer means scrolling all the way back by hand. The Review inbox is ordered newest-first with work that still needs a decision on top, and settled proposals can be dismissed (individually or with 'Clear settled') instead of accumulating in the pane forever. Dismissing hides, never deletes: the record stays in the session log and dismissed items remain reachable."
 }
