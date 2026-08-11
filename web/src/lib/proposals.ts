@@ -7,6 +7,7 @@
 // finished work occupies the same space as work that still needs a decision.
 
 import type { ProposalDto } from "@/bindings/ProposalDto";
+import { parseTimestamp } from "@/lib/time";
 
 /// A proposal nobody can act on any further: applied, or rejected by quorum.
 ///
@@ -29,12 +30,17 @@ function rank(p: ProposalDto): number {
   return p.quorumMet ? 0 : 1;
 }
 
-/// Newest first. An unparseable/missing `createdAt` sorts to the end rather than
-/// poisoning the comparator with NaN (which would make the order depend on the
-/// input sequence and differ between engines).
+/// Newest first. Goes through `parseTimestamp` rather than `Date.parse` so a
+/// timestamp that arrives without a timezone designator is read as UTC, not as
+/// local time — the backend always writes RFC 3339 with one, but every other
+/// timestamp surface here guards the case and a silent offset shift would
+/// reorder the pane by hours (see lib/time).
+///
+/// An unparseable/missing `createdAt` sorts to the end rather than poisoning the
+/// comparator with NaN, which would make the order depend on the input sequence
+/// and differ between engines.
 function createdMs(p: ProposalDto): number {
-  const t = Date.parse(p.createdAt ?? "");
-  return Number.isNaN(t) ? -Infinity : t;
+  return parseTimestamp(p.createdAt)?.getTime() ?? -Infinity;
 }
 
 /// Inbox order: actionable first, newest first within each group.

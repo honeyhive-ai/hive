@@ -76,6 +76,20 @@ describe("sortProposals", () => {
 
   // A NaN comparator result makes the order depend on the input sequence and can
   // differ between engines, so a bad timestamp must not poison the sort.
+  // A designator-less timestamp is read as UTC, not local time. Parsed as local
+  // at a +8h offset the "older" one would appear 8h later and jump the newer one.
+  //
+  // Note this can only fail where local time is not UTC — on a UTC runner (CI)
+  // the two readings coincide and it passes either way. It is defense in depth,
+  // not a guard CI enforces.
+  it("reads a timestamp with no timezone designator as UTC", () => {
+    const fold = [
+      at("older", "2026-08-01T10:00:00"),
+      at("newer", "2026-08-01T12:00:00Z"),
+    ];
+    expect(sortProposals(fold).map((p) => p.id)).toEqual(["newer", "older"]);
+  });
+
   it("keeps a total order when a timestamp is unparseable", () => {
     const fold = [
       at("bad", "not-a-date"),
