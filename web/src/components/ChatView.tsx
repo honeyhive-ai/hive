@@ -63,7 +63,7 @@ import { Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui"
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
 import { applyStreamDelta, handleTerminal } from "@/lib/streams";
-import { pinToBottom, pinAfterScroll } from "@/lib/autoscroll";
+import { pinToBottom, pinAfterScroll, jumpHint } from "@/lib/autoscroll";
 import { detectSlash } from "@/lib/slash";
 import { confirmThen } from "@/lib/confirm";
 import { promptDialog } from "@/components/Dialog";
@@ -964,16 +964,38 @@ export function ChatView({
             </div>
           )}
         </div>
-          {hasNew && !atBottom && (
-            <button
-              onClick={scrollToBottom}
-              className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full px-3.5 py-1.5 text-xs font-semibold shadow-lg transition-transform hover:scale-105"
-              style={{ background: "var(--hive-accent-fill)", color: "var(--hive-on-accent)" }}
-            >
-              <span aria-hidden><IconArrowDown size={13} /></span>
-              New messages
-            </button>
-          )}
+          {/* Scroll-to-newest. Shown whenever the reader is away from the bottom,
+              not only when new content arrived — scrolling up to re-read
+              something otherwise left no way back but dragging (lib/autoscroll).
+              Unread content keeps the loud accent treatment; a plain jump is a
+              quiet icon button so it doesn't compete with the transcript. */}
+          {(() => {
+            const hint = jumpHint({ atBottom, hasNew });
+            if (!hint) return null;
+            const isNew = hint === "new";
+            return (
+              <button
+                onClick={scrollToBottom}
+                title={isNew ? "Jump to new messages" : "Jump to the latest"}
+                aria-label={isNew ? "Jump to new messages" : "Jump to the latest"}
+                className={`absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full shadow-lg transition-transform hover:scale-105 ${
+                  isNew ? "px-3.5 py-1.5 text-xs font-semibold" : "p-2"
+                }`}
+                style={
+                  isNew
+                    ? { background: "var(--hive-accent-fill)", color: "var(--hive-on-accent)" }
+                    : {
+                        background: "var(--hive-surface)",
+                        color: "var(--hive-ink-soft)",
+                        border: "1px solid var(--hive-line)",
+                      }
+                }
+              >
+                <span aria-hidden><IconArrowDown size={13} /></span>
+                {isNew && "New messages"}
+              </button>
+            );
+          })()}
         </div>
 
         {/* The Claude-Code routing note lives in the route-pill popover (below),

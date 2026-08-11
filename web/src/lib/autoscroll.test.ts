@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { pinToBottom, pinAfterScroll } from "./autoscroll";
+import { pinToBottom, pinAfterScroll, jumpHint } from "./autoscroll";
 
 // A stand-in for the transcript container under `content-visibility: auto`.
 // A row reports an 80px estimate until it has been inside the viewport once,
@@ -138,6 +138,29 @@ describe("pinToBottom", () => {
     pinToBottom(() => el, { raf: clock.raf, cancelRaf: clock.cancelRaf });
     el = null;
     expect(() => clock.drain()).not.toThrow();
+  });
+});
+
+describe("jumpHint", () => {
+  // The gap this closes. The pill used to render on `hasNew && !atBottom`, so
+  // scrolling up to re-read something with no new content arriving offered no
+  // way back to the live end. This is that exact state.
+  it("offers a jump when the reader scrolled up and nothing new arrived", () => {
+    expect(jumpHint({ atBottom: false, hasNew: false })).toBe("jump");
+  });
+
+  it("negative control: the old condition hides the button in that state", () => {
+    const oldCondition = (s: { atBottom: boolean; hasNew: boolean }) => s.hasNew && !s.atBottom;
+    expect(oldCondition({ atBottom: false, hasNew: false })).toBe(false);
+  });
+
+  it("still advertises unread content distinctly", () => {
+    expect(jumpHint({ atBottom: false, hasNew: true })).toBe("new");
+  });
+
+  it("hides at the bottom, even if new content just landed there", () => {
+    expect(jumpHint({ atBottom: true, hasNew: false })).toBeNull();
+    expect(jumpHint({ atBottom: true, hasNew: true })).toBeNull();
   });
 });
 

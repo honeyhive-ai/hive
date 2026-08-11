@@ -50,6 +50,22 @@ export function pinAfterScroll(
   return prev.pinned && now.scrollTop >= prev.top;
 }
 
+/// What the scroll-to-newest affordance should show, or `null` to hide it.
+///
+/// Two different situations want the same button, and only the first was
+/// handled: content arrived while the reader was scrolled up ("New messages").
+/// The second — the reader scrolled up to re-read something and now just wants
+/// back to the live end — surfaced nothing, so the only way down was to drag the
+/// whole way by hand. Both mean "put me at the newest turn", so both get the
+/// button; they differ only in label and emphasis, since unread content is worth
+/// advertising and a plain jump should stay quiet.
+export type JumpHint = "new" | "jump";
+
+export function jumpHint(state: { atBottom: boolean; hasNew: boolean }): JumpHint | null {
+  if (state.atBottom) return null;
+  return state.hasNew ? "new" : "jump";
+}
+
 /// Frames of unchanged scrollHeight before the layout counts as settled.
 const STABLE_FRAMES = 2;
 /// Hard cap, so a live stream (which grows the transcript every frame) can't
