@@ -3,9 +3,10 @@
 Status: **approved, binding**. Adopted before any mobile code is written.
 Any change to the constraints below requires a new approved proposal, not a PR discussion.
 
-Two proposals were approved together and are recorded here as one baseline, plus one amendment:
+Two proposals were approved together and are recorded here as one baseline, plus two amendments:
 
 - **MC-001** — Stack, architecture and v1 scope (React Native + Expo, companion-not-peer, approvals-first)
+- **MC-001-A** — Amendment to MC-001 §1: the app is on the New Architecture, and that is no longer optional
 - **MC-002** — Security baseline (pinned-key pairing, desktop-enforced approval tiers, LAN-only)
 - **MC-002-A** — Amendment to MC-002 §2: Tier 2 biometric is OS-enforced and desktop-verified, not a client-attested boolean
 
@@ -30,12 +31,50 @@ is proven — see below.
 
 | # | Decision |
 |---|---|
-| 1 | **Stack** — React Native + Expo, one codebase for iOS and Android. v1 surface is lists, transcripts and buttons; OTA updates support fast iteration. Revisit native-per-platform only on real platform depth. **Amended by MC-002-A:** a custom native module and **dev-client builds** — not Expo Go — are now required. |
+| 1 | **Stack** — React Native + Expo, one codebase for iOS and Android. v1 surface is lists, transcripts and buttons; OTA updates support fast iteration. Revisit native-per-platform only on real platform depth. **Amended by MC-002-A:** a custom native module and **dev-client builds** — not Expo Go — are now required. **Amended by MC-001-A:** the app runs on the **New Architecture**; the legacy renderer is no longer available at any version. |
 | 2 | **Architecture** — the phone is a companion, **not a peer**. Desktop Hive is the sole source of authoritative state. The phone caches for read and queues for write. |
 | 3 | **Transport** — desktop exposes a companion service: HTTP fetch + WebSocket live stream, two interchangeable paths behind one interface. |
 | 4 | **Push** — wake-up ping only. No message content over APNs/FCM; content is fetched over the secure channel after wake. |
 | 5 | **v1 scope** — pair with desktop; workspace list; conversation view with agent-attributed turns; compose/reply; approvals inbox (workflow gates + proposals); run status with stop. The approvals inbox is the primary justification for the app. |
 | 6 | **Out of scope for v1** — workflow authoring, file editing, agent configuration. |
+
+## MC-001-A — New Architecture is mandatory (amendment to MC-001 §1)
+
+Status: **approved, binding**. Amends MC-001 §1. Does not change MC-001 §2–§6, and does not change
+MC-002, MC-002-A or MC-003.
+
+### What changed
+
+MC-001 §1 chose React Native + Expo, and the app shipped with `newArchEnabled: false` — an explicit
+choice of the legacy Paper renderer and the bridge.
+
+The SDK 51 → 57 upgrade (commit `34aa3d4`) removes that choice. React Native 0.82 deleted the legacy
+renderer: the `newArchEnabled` key no longer appears in `app.json`, and generated native projects
+write `newArchEnabled=true` unconditionally. Verified 2026-08-10 — `expo prebuild` on SDK 57 writes
+`newArchEnabled=true` into `android/gradle.properties`.
+
+This is a change of fact rather than a change of intent, and nothing in `src/` is affected: the app's
+only animation is React Native's own `Animated` API in `Turn.tsx`, and the upgrade commit records the
+suite passing unchanged. It is recorded here rather than only in the app README because it reverses a
+choice this log states, and because it constrains a milestone that has not been built yet.
+
+The dependency tree had already foreclosed the alternative independently: `react-native-reanimated`
+4.5.1, pulled in by React Navigation's drawer, dropped Paper support at v4 and is itself New
+Architecture only. Even had React Native kept the legacy renderer, staying on it would have meant
+giving up the navigation stack MC-001 §1 assumes.
+
+### The consequence — MC-002-A
+
+MC-002-A §1 requires a per-device approval signing key in Secure Enclave / StrongBox, which means a
+custom native module over Keychain and Keystore. That module must now be **Fabric / TurboModule
+compatible**, and any third-party native dependency considered for the approval path must likewise be
+New Architecture ready.
+
+**Bridge-only modules are not an option at any version.** This removes the schedule escape hatch: if
+the TurboModule work runs long, shipping the approval key over the old bridge is not available as a
+fallback, because there is no version of React Native still carrying it. The choice is a New
+Architecture module or no Tier 2 — and MC-002-A §3 already fixes what "no Tier 2" means, which is
+view/defer only, not a downgrade path.
 
 ## MC-002 — Security baseline
 
