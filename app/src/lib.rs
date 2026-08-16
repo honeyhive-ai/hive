@@ -3898,8 +3898,32 @@ fn deferred_turn_unanswered(session: &ChatSession, trigger_id: Uuid) -> bool {
     if session.turn_claims.contains_key(&trigger_id) {
         return false;
     }
+    let Some(at) = session.messages.iter().position(|m| m.id == trigger_id) else {
+        // Trigger vanished (message deleted mid-wait) — nothing to answer.
+        return false;
+    };
     // 2. Someone is answering (or has answered) it, claim synced or not.
-    if session.messages.iter().any(|m| m.reply_to_message_id == Some(trigger_id)) {
+    //
+    //    Positional rather than an exact match on `trigger_id`, because the two
+    //    ends of this handshake pick their id differently and don't always
+    //    agree: `maybe_respond` dispatches against the last *non-System* message
+    //    (the trigger we were handed), while the answering device stamps its
+    //    placeholder with the last *non-streaming* one (`run_prepared_turn`). A
+    //    System row trailing the user turn splits them — an exact match would
+    //    miss a live peer in precisely the unsynced-claim case guard 2 exists
+    //    for, and both devices would answer.
+    //
+    //    So: an assistant row after the trigger that replies to anything at or
+    //    after the trigger's own position. `/summarize` and `/compact` output
+    //    stays excluded (`reply_to_message_id: None` — they answer nothing), as
+    //    do replies to earlier turns, including a reply whose target has since
+    //    been deleted.
+    let answered = session.messages[at + 1..].iter().any(|m| {
+        m.role == MessageRole::Assistant
+            && m.reply_to_message_id
+                .is_some_and(|id| session.messages[at..].iter().any(|target| target.id == id))
+    });
+    if answered {
         return false;
     }
     // 3. The user moved on: a later user turn supersedes this one, and its own
@@ -3911,10 +3935,6 @@ fn deferred_turn_unanswered(session: &ChatSession, trigger_id: Uuid) -> bool {
     //    far too broad: any assistant-role transcript row after the trigger (a
     //    proposal record, a reply to some *other* trigger) would suppress the
     //    fallback forever and reintroduce the silent no-response this fixes.
-    let Some(at) = session.messages.iter().position(|m| m.id == trigger_id) else {
-        // Trigger vanished (message deleted mid-wait) — nothing to answer.
-        return false;
-    };
     !session.messages[at + 1..].iter().any(|m| m.role == MessageRole::User)
 }
 
@@ -9792,6 +9812,58 @@ mod dispatch_ownership_tests {
         let mut unrelated = ChatMessage::new(MessageRole::Assistant, "Hive", "re: something else");
         unrelated.reply_to_message_id = Some(Uuid::new_v4());
         s.messages.push(unrelated);
+        assert!(deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_placeholder_stamped_on_a_trailing_system_row_keeps_us_deferred() {
+        // The two ends of the handshake disagree on which id names the turn.
+        // `maybe_respond` hands us the last non-System message as the trigger;
+        // the answering device stamps its placeholder with the last
+        // non-*streaming* one. A System row landing between them splits the two,
+        // so the peer's placeholder points at the System row, not at our
+        // trigger. Exact-match on `trigger_id` would miss the live peer here —
+        // and with its claim not yet synced (the case this guard exists for),
+        // both devices would answer.
+        let (mut s, trigger_id) = deferred_session();
+        let system = ChatMessage::new(MessageRole::System, "", "Michael joined");
+        let system_id = system.id;
+        s.messages.push(system);
+        let mut placeholder = ChatMessage::new(MessageRole::Assistant, "Hive", "");
+        placeholder.is_streaming = true;
+        placeholder.reply_to_message_id = Some(system_id);
+        s.messages.push(placeholder);
+        assert!(s.turn_claims.is_empty(), "guard must hold with no claim synced");
+        assert!(!deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_reply_to_an_earlier_turn_does_not_suppress_the_fallback() {
+        // The other half of "positional": widening guard 2 past an exact id match
+        // must not widen it to *any* stamped reply. A late cross-device answer to
+        // the previous turn lands after ours and answers nothing of ours.
+        let mut s = ChatSession::new("t", Uuid::nil(), "anthropic");
+        let earlier = ChatMessage::new(MessageRole::User, "Michael", "first");
+        let earlier_id = earlier.id;
+        let trigger = ChatMessage::new(MessageRole::User, "Michael", "second");
+        let trigger_id = trigger.id;
+        s.messages = vec![earlier, trigger];
+        let mut late = ChatMessage::new(MessageRole::Assistant, "Hive", "re: first");
+        late.reply_to_message_id = Some(earlier_id);
+        s.messages.push(late);
+        assert!(deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_compaction_row_does_not_suppress_the_fallback() {
+        // `/summarize` and `/compact` call `begin_assistant_message` with
+        // `reply_to_message_id: None` — assistant rows that answer nothing. They
+        // must not stand the fallback down, or a compaction mid-wait would
+        // restore the silent no-response.
+        let (mut s, trigger_id) = deferred_session();
+        let mut summary = ChatMessage::new(MessageRole::Assistant, "Hive", "…summary…");
+        summary.reply_to_message_id = None;
+        s.messages.push(summary);
         assert!(deferred_turn_unanswered(&s, trigger_id));
     }
 
