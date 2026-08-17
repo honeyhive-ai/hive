@@ -3865,6 +3865,79 @@ fn turn_runs_here(local_only: bool, solo: bool, local: &str, owner: &str) -> boo
     local_only || solo || crate::workflows::stage_owner_runs_here(local, owner)
 }
 
+/// How long a deferred turn waits for its owner's device to pick it up before
+/// this device answers it anyway.
+///
+/// The deferral above is right whenever the owner is a live peer, but nothing
+/// bounded it: an owner *no* device can satisfy — a chat created under a churned
+/// self-identity, an owner whose device is offline or retired — left the turn
+/// silently unanswered forever, with only a log line to show for it. Long enough
+/// that a healthy peer's `TurnClaimed` syncs first and this never fires; short
+/// enough that the user isn't left staring at a dead chat.
+const DEFERRED_CLAIM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(25);
+
+/// Whether a turn we deferred is *still* unanswered once
+/// [`DEFERRED_CLAIM_TIMEOUT`] has elapsed, and this device should take it over.
+///
+/// Three independent guards, because the claim alone is not enough to prevent a
+/// duplicate answer. `claim_turn` resolves only once claims sync, so a peer's
+/// claim that hasn't reached us yet is indistinguishable from no claim at all —
+/// exactly the state a lagging or briefly-offline relay produces, and exactly
+/// when this fallback fires. The reply check closes that gap on a separate
+/// signal: `begin_assistant_message` stamps `reply_to_message_id` with the
+/// message being answered, so a peer's placeholder is evidence the turn is in
+/// hand even while it's still empty and streaming. This is the second-line guard
+/// `claim_turn`'s own docs point at.
+///
+/// Every guard is conservative in the same direction, which is the property that
+/// makes the fallback safe: a false "already handled" costs one unanswered turn
+/// (today's behaviour, no worse), while a false "unanswered" costs a duplicate
+/// answer in a live room.
+fn deferred_turn_unanswered(session: &ChatSession, trigger_id: Uuid) -> bool {
+    // 1. Someone claimed it — including us, on an earlier pass.
+    if session.turn_claims.contains_key(&trigger_id) {
+        return false;
+    }
+    let Some(at) = session.messages.iter().position(|m| m.id == trigger_id) else {
+        // Trigger vanished (message deleted mid-wait) — nothing to answer.
+        return false;
+    };
+    // 2. Someone is answering (or has answered) it, claim synced or not.
+    //
+    //    Positional rather than an exact match on `trigger_id`, because the two
+    //    ends of this handshake pick their id differently and don't always
+    //    agree: `maybe_respond` dispatches against the last *non-System* message
+    //    (the trigger we were handed), while the answering device stamps its
+    //    placeholder with the last *non-streaming* one (`run_prepared_turn`). A
+    //    System row trailing the user turn splits them — an exact match would
+    //    miss a live peer in precisely the unsynced-claim case guard 2 exists
+    //    for, and both devices would answer.
+    //
+    //    So: an assistant row after the trigger that replies to anything at or
+    //    after the trigger's own position. `/summarize` and `/compact` output
+    //    stays excluded (`reply_to_message_id: None` — they answer nothing), as
+    //    do replies to earlier turns, including a reply whose target has since
+    //    been deleted.
+    let answered = session.messages[at + 1..].iter().any(|m| {
+        m.role == MessageRole::Assistant
+            && m.reply_to_message_id
+                .is_some_and(|id| session.messages[at..].iter().any(|target| target.id == id))
+    });
+    if answered {
+        return false;
+    }
+    // 3. The user moved on: a later user turn supersedes this one, and its own
+    //    `send_message` arms a fresh fallback against the fuller history.
+    //
+    //    Deliberately keyed on a later *user* message rather than on the trigger
+    //    still being the trailing row. "Still trailing" would subsume guard 2 —
+    //    a reply always lands after the message it answers — while also being
+    //    far too broad: any assistant-role transcript row after the trigger (a
+    //    proposal record, a reply to some *other* trigger) would suppress the
+    //    fallback forever and reintroduce the silent no-response this fixes.
+    !session.messages[at + 1..].iter().any(|m| m.role == MessageRole::User)
+}
+
 /// Whether a provider authenticates with an API key we must supply. A hosted-API
 /// provider (Anthropic/OpenAI/OpenRouter/Azure/Custom) with no key would 401 on
 /// dispatch, so `resolve_runtime` falls back to the keyless Claude Code CLI.
@@ -4906,6 +4979,103 @@ fn stop_turn(state: State<AppState>, session_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Arm the bounded-deferral fallback for a turn we just handed to another
+/// device: wait out [`DEFERRED_CLAIM_TIMEOUT`], then answer here if nothing
+/// claimed or answered the trigger in the meantime.
+///
+/// Spawned rather than awaited inline so `send_message` still returns straight
+/// away — a healthy multi-device room defers on every turn and must not pay the
+/// timeout each time.
+fn arm_deferred_claim_fallback(
+    app: &AppHandle,
+    session_id: Uuid,
+    workspace_id: Uuid,
+    trigger_id: Uuid,
+    stop: Arc<tokio::sync::Notify>,
+) {
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Stop cancels a pending fallback: the user asked for silence, not for a
+        // late answer.
+        tokio::select! {
+            biased;
+            _ = stop.notified() => return,
+            _ = tokio::time::sleep(DEFERRED_CLAIM_TIMEOUT) => {}
+        }
+        if let Err(e) =
+            run_deferred_claim_fallback(&app, session_id, workspace_id, trigger_id).await
+        {
+            tracing::warn!(
+                target: "dispatch",
+                error = %e,
+                "deferred-claim fallback failed"
+            );
+        }
+    });
+}
+
+/// The fallback body: re-read the session, re-resolve the responder from the
+/// trigger, and answer only if the turn is still going begging.
+async fn run_deferred_claim_fallback(
+    app: &AppHandle,
+    session_id: Uuid,
+    workspace_id: Uuid,
+    trigger_id: Uuid,
+) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let local_only = state.is_local_only();
+    // Re-resolve rather than capture: over the timeout the relay may have been
+    // cleared, the roster may have changed, and — the case this exists for — the
+    // owner's device may have answered after all.
+    let responder = {
+        let svc = state.service.lock().unwrap();
+        let Some(session) = svc.load(session_id).map_err(map_err)? else {
+            return Ok(());
+        };
+        if !deferred_turn_unanswered(&session, trigger_id) {
+            return Ok(());
+        }
+        let Some(trigger) = session.messages.iter().find(|m| m.id == trigger_id) else {
+            return Ok(());
+        };
+        match dispatch_target(&trigger.body, &session, local_only) {
+            Some(DispatchTarget::Agent(id)) => session
+                .workspace_agents
+                .iter()
+                .find(|a| a.id == id)
+                .cloned()
+                .map(|a| responder_for(&state, &session, Some(&a))),
+            Some(DispatchTarget::Primary) => Some(responder_for(&state, &session, None)),
+            None => None,
+        }
+    };
+    let Some(responder) = responder else { return Ok(()) };
+
+    // Same double-dispatch guard `maybe_respond` takes — a sync tick may be
+    // dispatching this very chat right now.
+    let _guard = match crate::workflows::SessionBusyGuard::acquire(app, session_id) {
+        Ok(g) => g,
+        Err(_) => return Ok(()),
+    };
+    // Final gate before we commit. A peer that claimed while we were resolving
+    // still wins, and this is a genuine first claim — the deferral above breaks
+    // *before* `send_message`'s own claim block, so nothing claimed on our behalf.
+    {
+        let mut svc = state.service.lock().unwrap();
+        if !svc.claim_turn(session_id, workspace_id, trigger_id).map_err(map_err)? {
+            return Ok(());
+        }
+    }
+    tracing::info!(
+        target: "dispatch",
+        responder = %responder.author,
+        owner = %responder.owner_actor_id,
+        after_secs = DEFERRED_CLAIM_TIMEOUT.as_secs(),
+        "deferred turn went unclaimed — answering locally"
+    );
+    run_turn(app, &state, session_id, workspace_id, &responder).await.map(|_| ())
+}
+
 #[tauri::command]
 async fn send_message(
     app: AppHandle,
@@ -4975,6 +5145,14 @@ async fn send_message(
                 local = %local_actor_id,
                 "send_message: responder owned by another device — deferring"
             );
+            // Bounded, not indefinite. If no device claims or answers the trigger
+            // within DEFERRED_CLAIM_TIMEOUT, answer it here — otherwise an owner
+            // no live device can satisfy means permanent silence. Only the initial
+            // user turn is claimable; a cascaded turn (depth > 0) is a
+            // single-device continuation with no trigger of its own to fall back on.
+            if depth == 0 {
+                arm_deferred_claim_fallback(&app, sid, workspace_id, trigger_id, stop.clone());
+            }
             break;
         }
 
@@ -9545,6 +9723,155 @@ mod dispatch_ownership_tests {
         assert!(!turn_runs_here(false, false, "me", "teammate"));
         assert!(turn_runs_here(false, false, "me", "me"));
         assert!(turn_runs_here(false, false, "me", "")); // unowned/legacy
+    }
+
+    // ── Bounded deferral (#103) ────────────────────────────────────────────
+    // `turn_runs_here` deferring is correct; deferring *forever* is the bug.
+    // These cover the decision the timeout fallback makes once it fires.
+
+    use super::deferred_turn_unanswered;
+    use hive_core::chat::{ChatMessage, MessageRole};
+    use hive_core::session::ChatSession;
+    use uuid::Uuid;
+
+    /// A chat whose trailing message is an unanswered user turn — what a
+    /// deferral leaves behind. Returns the session and that trigger's id.
+    fn deferred_session() -> (ChatSession, Uuid) {
+        let mut s = ChatSession::new("t", Uuid::nil(), "anthropic");
+        let trigger = ChatMessage::new(MessageRole::User, "Michael", "hi");
+        let trigger_id = trigger.id;
+        s.messages = vec![trigger];
+        (s, trigger_id)
+    }
+
+    #[test]
+    fn unclaimed_deferred_turn_is_taken_over() {
+        // The reported bug: relay configured, chat created under a churned
+        // identity, so the turn deferred to an owner no live device has. Nothing
+        // claimed it and nothing answered it → this device must step in.
+        let (s, trigger_id) = deferred_session();
+        assert!(deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_synced_claim_keeps_us_deferred() {
+        // A genuinely live peer claimed the turn before the timeout fired. It is
+        // answering; we stay silent.
+        let (mut s, trigger_id) = deferred_session();
+        s.turn_claims.insert(trigger_id, Uuid::new_v4());
+        assert!(!deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_peers_streaming_placeholder_keeps_us_deferred_without_a_claim() {
+        // The race `claim_turn` explicitly does NOT close: the peer is already
+        // streaming but its TurnClaimed hasn't synced to us, so the claim map
+        // looks empty. The placeholder is still empty and mid-stream — only
+        // `reply_to_message_id` ties it to our trigger. Without this guard the
+        // fallback would claim and answer alongside a live peer.
+        let (mut s, trigger_id) = deferred_session();
+        let mut placeholder = ChatMessage::new(MessageRole::Assistant, "Hive", "");
+        placeholder.is_streaming = true;
+        placeholder.reply_to_message_id = Some(trigger_id);
+        s.messages.push(placeholder);
+        assert!(s.turn_claims.is_empty(), "guard must hold with no claim synced");
+        assert!(!deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_completed_reply_keeps_us_deferred() {
+        // The owner's device answered late but before the timeout fired.
+        let (mut s, trigger_id) = deferred_session();
+        let mut reply = ChatMessage::new(MessageRole::Assistant, "Hive", "hello");
+        reply.reply_to_message_id = Some(trigger_id);
+        s.messages.push(reply);
+        assert!(!deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_later_user_turn_supersedes_this_one() {
+        // The user sent again while we waited. That newer message arms its own
+        // fallback against the fuller history; answering the stale one would
+        // drop a reply into the middle of the transcript.
+        let (mut s, trigger_id) = deferred_session();
+        s.messages.push(ChatMessage::new(MessageRole::User, "Michael", "actually…"));
+        assert!(!deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn unrelated_trailing_rows_do_not_suppress_the_fallback() {
+        // Regression guard on the shape of check 3. Keying it on "the trigger is
+        // still the trailing row" would let any assistant-role transcript row
+        // land after the trigger and suppress the fallback forever — silent
+        // no-response again, which is the whole bug. Only a reply to *this*
+        // trigger (check 2) or a newer user turn (check 3) may stand us down.
+        let (mut s, trigger_id) = deferred_session();
+        s.messages.push(ChatMessage::new(MessageRole::System, "", "joined"));
+        // An assistant row answering some *other* message — e.g. a cross-device
+        // reply to an earlier turn, or a proposal record.
+        let mut unrelated = ChatMessage::new(MessageRole::Assistant, "Hive", "re: something else");
+        unrelated.reply_to_message_id = Some(Uuid::new_v4());
+        s.messages.push(unrelated);
+        assert!(deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_placeholder_stamped_on_a_trailing_system_row_keeps_us_deferred() {
+        // The two ends of the handshake disagree on which id names the turn.
+        // `maybe_respond` hands us the last non-System message as the trigger;
+        // the answering device stamps its placeholder with the last
+        // non-*streaming* one. A System row landing between them splits the two,
+        // so the peer's placeholder points at the System row, not at our
+        // trigger. Exact-match on `trigger_id` would miss the live peer here —
+        // and with its claim not yet synced (the case this guard exists for),
+        // both devices would answer.
+        let (mut s, trigger_id) = deferred_session();
+        let system = ChatMessage::new(MessageRole::System, "", "Michael joined");
+        let system_id = system.id;
+        s.messages.push(system);
+        let mut placeholder = ChatMessage::new(MessageRole::Assistant, "Hive", "");
+        placeholder.is_streaming = true;
+        placeholder.reply_to_message_id = Some(system_id);
+        s.messages.push(placeholder);
+        assert!(s.turn_claims.is_empty(), "guard must hold with no claim synced");
+        assert!(!deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_reply_to_an_earlier_turn_does_not_suppress_the_fallback() {
+        // The other half of "positional": widening guard 2 past an exact id match
+        // must not widen it to *any* stamped reply. A late cross-device answer to
+        // the previous turn lands after ours and answers nothing of ours.
+        let mut s = ChatSession::new("t", Uuid::nil(), "anthropic");
+        let earlier = ChatMessage::new(MessageRole::User, "Michael", "first");
+        let earlier_id = earlier.id;
+        let trigger = ChatMessage::new(MessageRole::User, "Michael", "second");
+        let trigger_id = trigger.id;
+        s.messages = vec![earlier, trigger];
+        let mut late = ChatMessage::new(MessageRole::Assistant, "Hive", "re: first");
+        late.reply_to_message_id = Some(earlier_id);
+        s.messages.push(late);
+        assert!(deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_compaction_row_does_not_suppress_the_fallback() {
+        // `/summarize` and `/compact` call `begin_assistant_message` with
+        // `reply_to_message_id: None` — assistant rows that answer nothing. They
+        // must not stand the fallback down, or a compaction mid-wait would
+        // restore the silent no-response.
+        let (mut s, trigger_id) = deferred_session();
+        let mut summary = ChatMessage::new(MessageRole::Assistant, "Hive", "…summary…");
+        summary.reply_to_message_id = None;
+        s.messages.push(summary);
+        assert!(deferred_turn_unanswered(&s, trigger_id));
+    }
+
+    #[test]
+    fn a_deleted_trigger_is_not_answered() {
+        // The message was removed while we waited out the timeout.
+        let (s, _) = deferred_session();
+        assert!(!deferred_turn_unanswered(&s, Uuid::new_v4()));
     }
 }
 
