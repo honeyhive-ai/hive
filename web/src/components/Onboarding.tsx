@@ -137,6 +137,22 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
   // A connection is "good enough to finish" only when the last probe was ok.
   const connectionOk = probe?.status === "ok";
 
+  const [reChecking, setReChecking] = useState(false);
+  // Re-run environment detection — so a user who installs a CLI mid-onboarding
+  // can pick it up without restarting the app. Doesn't override an explicit
+  // runtime choice the user already made.
+  async function reDetect() {
+    setReChecking(true);
+    try {
+      const d = await detectEnvironment();
+      setEnv(d);
+    } catch {
+      /* best-effort */
+    } finally {
+      setReChecking(false);
+    }
+  }
+
   useEffect(() => {
     void (async () => {
       try {
@@ -552,7 +568,46 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
 
         {step === 3 && (
           <div className="space-y-3">
-            <div className="text-sm font-medium">Choose your agent</div>
+            <div className="flex items-center justify-between">
+              <div className="text-sm font-medium">Choose your agent</div>
+              <button
+                type="button"
+                onClick={() => void reDetect()}
+                disabled={reChecking}
+                className="text-xs underline opacity-60 hover:opacity-100 disabled:opacity-40"
+              >
+                {reChecking ? "Checking…" : "Re-check"}
+              </button>
+            </div>
+            {/* A CLI runtime the user selected but that isn't on PATH won't
+                answer — warn (and link to install) instead of letting them finish
+                believing they're set up. */}
+            {((choice === "claudeCode" && env && !env.claudeCode) ||
+              (choice === "codex" && env && !env.codex)) && (
+              <div
+                className="rounded-xl border px-3 py-2 text-xs"
+                style={{ borderColor: "color-mix(in srgb, var(--hive-warn) 45%, transparent)", background: "color-mix(in srgb, var(--hive-warn) 12%, transparent)" }}
+              >
+                <span style={{ color: "var(--hive-warn)" }}>
+                  {choice === "claudeCode" ? "Claude Code" : "Codex"} isn't on your PATH yet, so
+                  @hive won't answer until it's installed.
+                </span>{" "}
+                <button
+                  type="button"
+                  className="underline"
+                  onClick={() =>
+                    void openExternal(
+                      choice === "claudeCode"
+                        ? "https://docs.anthropic.com/en/docs/claude-code/overview"
+                        : "https://github.com/openai/codex",
+                    ).catch(() => {})
+                  }
+                >
+                  Install instructions ↗
+                </button>{" "}
+                — then <button type="button" className="underline" onClick={() => void reDetect()}>re-check</button>.
+              </div>
+            )}
             <div className="space-y-1.5">
               <RuntimeOption v="claudeCode" choice={choice} setChoice={setChoice} label="Claude Code" note={env?.claudeCode ? "detected · no API key" : "not found on PATH — install the claude CLI"} />
               {choice === "claudeCode" && (() => {
