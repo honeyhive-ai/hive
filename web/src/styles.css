@@ -289,3 +289,25 @@ select optgroup {
   color: var(--hive-ink);
   opacity: 0.35;
 }
+
+/* Syntax highlighting (highlight.js) — token colors derived from the app's
+   theme vars so they adapt to every palette + light/dark with no separate dark
+   rules. Kept deliberately restrained: a few hue families over the code fg. */
+.hljs { color: var(--hive-ink); background: transparent; }
+.hljs-comment, .hljs-quote { color: var(--hive-ink-soft); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-literal, .hljs-doctag, .hljs-name {
+  color: oklch(from var(--hive-accent-cool) 0.62 0.16 h);
+}
+.hljs-string, .hljs-regexp, .hljs-addition, .hljs-attribute, .hljs-meta .hljs-string {
+  color: oklch(from var(--hive-success) 0.62 0.14 h);
+}
+.hljs-number, .hljs-symbol, .hljs-bullet, .hljs-link, .hljs-selector-attr, .hljs-selector-pseudo {
+  color: oklch(from var(--hive-accent-warm) 0.7 0.14 h);
+}
+.hljs-title, .hljs-title.function_, .hljs-section, .hljs-built_in, .hljs-type, .hljs-class .hljs-title {
+  color: oklch(from var(--hive-accent-cool) 0.7 0.12 h);
+}
+.hljs-attr, .hljs-variable, .hljs-template-variable, .hljs-property { color: var(--hive-ink); }
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 600; }
+.hljs-deletion { color: var(--hive-danger-ink, var(--hive-danger)); }

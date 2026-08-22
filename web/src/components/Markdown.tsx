@@ -1,7 +1,20 @@
-import { memo, isValidElement, useState, type ReactNode } from "react";
+import { memo, isValidElement, useEffect, useState, type ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkBreaks from "remark-breaks";
 import remarkGfm from "remark-gfm";
+import { highlightCode } from "@/lib/highlight";
+
+/// Pull the fence language ("language-ts" → "ts") off the inner <code> element
+/// that react-markdown puts inside <pre>, so the block can label + highlight it.
+function codeLanguage(children: ReactNode): string {
+  const el = Array.isArray(children) ? children[0] : children;
+  if (isValidElement(el)) {
+    const cls = (el.props as { className?: string }).className ?? "";
+    const m = /language-([\w-]+)/.exec(cls);
+    if (m) return m[1];
+  }
+  return "";
+}
 
 /// Recursively collect the text of a React node tree — used to copy a fenced code
 /// block's SOURCE (what the user actually wants) rather than reading the rendered
@@ -90,30 +103,55 @@ function CodeBlock({ children }: { children: ReactNode }) {
   // Copy the block's source text (derived from the node tree), not the rendered
   // DOM — testable and faithful to what was written. #97
   const source = nodeText(children);
+  const hint = codeLanguage(children);
+
+  // Lazily syntax-highlight. Renders plain first, then upgrades once
+  // highlight.js resolves — so a huge log or a streaming block never blocks.
+  const [hl, setHl] = useState<{ html: string; language: string } | null>(null);
+  useEffect(() => {
+    let alive = true;
+    if (!source.trim()) return;
+    void highlightCode(source, hint || undefined).then((r) => {
+      if (alive && r) setHl(r);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [source, hint]);
+
+  const language = hl?.language || hint;
+
   return (
-    <div className="group/code relative my-2">
-      <button
-        className="absolute right-2 top-2 rounded-lg px-2 py-0.5 text-xs opacity-0 transition-opacity group-hover/code:opacity-80 group-focus-within/code:opacity-80 focus-visible:!opacity-100 hover:!opacity-100"
-        style={{
-          background: "var(--hive-panel)",
-          border: "1px solid var(--hive-line)",
-          color: copied ? "var(--hive-success)" : undefined,
-        }}
-        onClick={() => {
-          void navigator.clipboard.writeText(source);
-          setCopied(true);
-          window.setTimeout(() => setCopied(false), 1500);
-        }}
-        title="Copy code"
-        aria-label="Copy code"
+    <div className="group/code relative my-2 overflow-hidden rounded-xl border" style={{ borderColor: "var(--hive-line)" }}>
+      {/* Header bar: language label (left) + Copy (right). */}
+      <div
+        className="flex items-center justify-between px-3 py-1 text-[11px]"
+        style={{ background: "var(--hive-panel)", borderBottom: "1px solid var(--hive-line)", color: "var(--hive-ink-soft)" }}
       >
-        {copied ? "Copied ✓" : "Copy"}
-      </button>
+        <span className="font-mono lowercase">{language || "text"}</span>
+        <button
+          className="rounded-md px-1.5 py-0.5 opacity-0 transition-opacity group-hover/code:opacity-80 group-focus-within/code:opacity-80 focus-visible:!opacity-100 hover:!opacity-100"
+          style={{ color: copied ? "var(--hive-success)" : undefined }}
+          onClick={() => {
+            void navigator.clipboard.writeText(source);
+            setCopied(true);
+            window.setTimeout(() => setCopied(false), 1500);
+          }}
+          title="Copy code"
+          aria-label="Copy code"
+        >
+          {copied ? "Copied ✓" : "Copy"}
+        </button>
+      </div>
       <pre
-        className="overflow-x-auto rounded-xl p-3 text-[0.85rem] leading-6"
-        style={{ background: "var(--hive-overlay)", border: "1px solid var(--hive-line)" }}
+        className="hljs overflow-x-auto p-3 text-[0.85rem] leading-6"
+        style={{ background: "var(--hive-overlay)" }}
       >
-        {children}
+        {hl ? (
+          <code className={`hljs language-${language}`} dangerouslySetInnerHTML={{ __html: hl.html }} />
+        ) : (
+          children
+        )}
       </pre>
     </div>
   );
