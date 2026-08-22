@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { listChats, listWorkspaces } from "@/lib/ipc";
 import { Modal } from "@/components/ui";
+import { PANES, type UtilityPane } from "@/lib/panes";
+import { SETTINGS_TABS } from "@/components/SettingsView";
 
 export interface PaletteActions {
   newChat: () => void;
@@ -11,6 +13,12 @@ export interface PaletteActions {
   /// Focus mode: collapse/restore the sidebar (⌘B) and tools rail (⌘J).
   toggleSidebar?: () => void;
   toggleTools?: () => void;
+  /// Navigation + actions (all optional so the palette degrades gracefully).
+  setCanvasMode?: (m: "chat" | "diff") => void;
+  openFriends?: () => void;
+  openPane?: (pane: UtilityPane) => void;
+  openSettingsTab?: (tab: string) => void;
+  cycleAppearance?: () => void;
 }
 
 interface Cmd {
@@ -54,6 +62,38 @@ export function CommandPalette({
       { id: "new-chat", label: "New chat", hint: "Action", run: run(actions.newChat) },
       { id: "settings", label: "Open settings", hint: "Action", run: run(actions.openSettings) },
     ];
+    if (actions.setCanvasMode) {
+      items.push(
+        { id: "view-chat", label: "View: Chat", hint: "Go", run: run(() => actions.setCanvasMode!("chat")) },
+        { id: "view-diff", label: "View: Diff", hint: "Go", run: run(() => actions.setCanvasMode!("diff")) },
+      );
+    }
+    if (actions.openFriends) {
+      items.push({ id: "friends", label: "Open Friends & DMs", hint: "Go", run: run(actions.openFriends) });
+    }
+    if (actions.openPane) {
+      for (const p of PANES) {
+        items.push({
+          id: `pane-${p.id}`,
+          label: `Open ${p.label}`,
+          hint: "Pane",
+          run: run(() => actions.openPane!(p.id)),
+        });
+      }
+    }
+    if (actions.cycleAppearance) {
+      items.push({ id: "appearance", label: "Toggle light / dark", hint: "Action", run: run(actions.cycleAppearance) });
+    }
+    if (actions.openSettingsTab) {
+      for (const t of SETTINGS_TABS) {
+        items.push({
+          id: `settings-${t.id}`,
+          label: `Settings: ${t.label}`,
+          hint: "Settings",
+          run: run(() => actions.openSettingsTab!(t.id)),
+        });
+      }
+    }
     if (actions.toggleSidebar) {
       items.push({
         id: "toggle-sidebar",
@@ -145,6 +185,14 @@ export function CommandPalette({
             {c.hint && <span className="shrink-0 text-xs opacity-45">{c.hint}</span>}
           </button>
         ))}
+      </div>
+      <div
+        className="flex items-center gap-3 border-t px-4 py-2 text-[11px] opacity-45"
+        style={{ borderColor: "var(--hive-line)" }}
+      >
+        <span>↑↓ navigate</span>
+        <span>↵ select</span>
+        <span>esc close</span>
       </div>
     </Modal>
   );

@@ -641,6 +641,18 @@ export function App() {
           },
           toggleSidebar: () => setSidebarVisible((v) => !v),
           toggleTools: () => setShowUtilityPane((v) => !v),
+          setCanvasMode: (m) => {
+            setView("workspace");
+            setMode(m);
+          },
+          openFriends: () => setView("friends"),
+          openPane: (pane) => {
+            setView("workspace");
+            openUtilityPane(pane);
+          },
+          openSettingsTab: (tab) => openSettings(tab),
+          cycleAppearance: () =>
+            setAppearanceMode(appearanceMode === "dark" ? "light" : "dark"),
         }}
       />
       <WorkspaceRail

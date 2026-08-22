@@ -84,6 +84,11 @@ const TAB_LABEL: Record<SettingsTab, string> = Object.fromEntries(
   NAV_GROUPS.flatMap((g) => g.items.map((i) => [i.id, i.label])),
 ) as Record<SettingsTab, string>;
 
+/// Flat {id,label} list of every settings tab, for the command palette.
+export const SETTINGS_TABS: { id: SettingsTab; label: string }[] = NAV_GROUPS.flatMap((g) =>
+  g.items.map((i) => ({ id: i.id, label: i.label })),
+);
+
 // Accepts a new id, a legacy tab name ("Account", "Team", …), or a deep-link
 // fragment and resolves it to a current tab. Keeps the `settings:<tab>` tray
 // route and older callers (e.g. FriendsView) working across the rename.
