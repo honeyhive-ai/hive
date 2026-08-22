@@ -50,6 +50,7 @@ import {
   type WorkspaceAgentDto,
 } from "@/lib/ipc";
 import { groupProposals, isSettled, isVotable } from "@/lib/proposals";
+import { parseUnifiedDiff } from "@/lib/diff";
 import { relTime } from "@/lib/time";
 import { LogsView } from "@/components/LogsView";
 import { Avatar } from "@/components/Avatar";
@@ -999,6 +1000,81 @@ function QueuedWorkSection() {
 /// `settled` proposals keep their record and their diff, but lose the vote
 /// buttons — a proposal that's already applied or rejected can't be voted on, so
 /// offering Approve/Reject there only invites a click that does nothing.
+/// Per-file, collapsible unified-diff view for a proposal — closer to a PR
+/// review than one flat block: each file has its own header (+adds/−removes) and
+/// its own horizontal scroll, with line numbers on the new side.
+function ProposalDiff({ diff }: { diff: string }) {
+  const files = parseUnifiedDiff(diff);
+  return (
+    <div className="mt-3 space-y-2">
+      {files.map((f, fi) => (
+        <DiffFileBlock key={`${f.path}-${fi}`} file={f} defaultOpen={files.length <= 2} />
+      ))}
+    </div>
+  );
+}
+
+function DiffFileBlock({
+  file,
+  defaultOpen,
+}: {
+  file: ReturnType<typeof parseUnifiedDiff>[number];
+  defaultOpen: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  let newLine = 0;
+  return (
+    <div className="overflow-hidden rounded-lg border" style={{ borderColor: "var(--hive-line)" }}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left"
+        style={{ background: "var(--hive-mist)" }}
+      >
+        <span className="opacity-50" aria-hidden>{open ? "▾" : "▸"}</span>
+        <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{file.path}</span>
+        {file.added > 0 && <span className="text-[11px]" style={{ color: "var(--hive-success)" }}>+{file.added}</span>}
+        {file.removed > 0 && <span className="text-[11px]" style={{ color: "var(--hive-danger)" }}>−{file.removed}</span>}
+      </button>
+      {open && (
+        <div className="overflow-x-auto font-mono text-[11px] leading-[1.5]" style={{ background: "var(--hive-overlay)" }}>
+          {file.lines.map((line, i) => {
+            const isAdd = line.startsWith("+") && !line.startsWith("+++");
+            const isDel = line.startsWith("-") && !line.startsWith("---");
+            const isHunk = line.startsWith("@@");
+            const isMeta = line.startsWith("diff ") || line.startsWith("index ") || line.startsWith("+++") || line.startsWith("---");
+            if (isHunk) {
+              const m = /\+(\d+)/.exec(line);
+              if (m) newLine = parseInt(m[1], 10);
+            }
+            const num = isDel || isMeta || isHunk ? "" : String(newLine++);
+            const color = isAdd
+              ? "var(--hive-success)"
+              : isDel
+                ? "var(--hive-danger)"
+                : isHunk
+                  ? "var(--hive-accent-cool)"
+                  : isMeta
+                    ? "var(--hive-ink-faint)"
+                    : "var(--hive-ink-soft)";
+            return (
+              <div key={i} className="flex" style={{ whiteSpace: "pre" }}>
+                <span
+                  className="select-none pr-2 pl-2 text-right"
+                  style={{ minWidth: "3ch", color: "var(--hive-ink-faint)" }}
+                  aria-hidden
+                >
+                  {num}
+                </span>
+                <span style={{ color }}>{line || " "}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProposalCard({
   proposal,
   sessionId,
@@ -1032,39 +1108,9 @@ function ProposalCard({
       <div className="mt-0.5 text-xs opacity-50">{relTime(proposal.createdAt)}</div>
       {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
       {/* A fileDiff proposal (from an agent's isolated worktree) carries a
-          unified diff — render it here so it's reviewable in place, then
-          Implement applies it to the workspace. */}
-      {proposal.diff && (
-        <div className="mt-3">
-          {proposal.changedFiles && proposal.changedFiles.length > 0 && (
-            <div className="mb-1.5 text-xs opacity-60">
-              {proposal.changedFiles.length} file
-              {proposal.changedFiles.length === 1 ? "" : "s"}:{" "}
-              {proposal.changedFiles.join(", ")}
-            </div>
-          )}
-          <div
-            className="max-h-72 overflow-auto rounded-lg border p-2 font-mono text-[11px] leading-[1.5]"
-            style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
-          >
-            {proposal.diff.split("\n").map((line, i) => {
-              const color =
-                line.startsWith("+") && !line.startsWith("+++")
-                  ? "var(--hive-success)"
-                  : line.startsWith("-") && !line.startsWith("---")
-                    ? "var(--hive-danger)"
-                    : line.startsWith("@@")
-                      ? "var(--hive-accent-cool)"
-                      : "var(--hive-ink-soft)";
-              return (
-                <div key={i} style={{ color, whiteSpace: "pre" }}>
-                  {line || " "}
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
+          unified diff — render it grouped per file so it's reviewable like a PR,
+          then Implement applies it to the workspace. */}
+      {proposal.diff && <ProposalDiff diff={proposal.diff} />}
       <div className="mt-3 text-xs opacity-60">
         {proposal.qualifyingApprovals}/{proposal.requiredApprovals} approvals
       </div>
