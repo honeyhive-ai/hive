@@ -312,22 +312,50 @@ function RunCard({ sessionId, run }: { sessionId: string; run: WorkflowRunDto })
 
 function NodeChip({ node }: { node: WorkflowNodeRunDto }) {
   const tone = statusTone(node.status);
+  const [open, setOpen] = useState(false);
+  // A stage's output/error was only reachable via the native hover tooltip.
+  // Make the chip click-to-expand so a run is actually readable — the stage's
+  // status, attempts, error, and output excerpt inline (a full run-log view).
+  const hasDetail = Boolean(node.outputExcerpt || node.error || node.attempts > 1);
   return (
-    <span
-      className="rounded-lg px-2 py-0.5 text-[11px] font-medium"
-      style={{
-        ...tone,
-        textDecoration: node.status === "skipped" ? "line-through" : undefined,
-      }}
-      title={
-        node.outputExcerpt
-          ? node.outputExcerpt
-          : `${node.name}: ${statusLabel(node.status)}${node.error ? ` — ${node.error}` : ""}`
-      }
-    >
-      {node.kind === "gate" ? "◈ " : ""}
-      {node.name}
-      {node.attempts > 1 ? ` ×${node.attempts}` : ""}
+    <span className="inline-flex flex-col">
+      <button
+        type="button"
+        onClick={() => hasDetail && setOpen((o) => !o)}
+        className="rounded-lg px-2 py-0.5 text-left text-[11px] font-medium"
+        style={{
+          ...tone,
+          textDecoration: node.status === "skipped" ? "line-through" : undefined,
+          cursor: hasDetail ? "pointer" : "default",
+        }}
+        aria-expanded={hasDetail ? open : undefined}
+        title={`${node.name}: ${statusLabel(node.status)}`}
+      >
+        {node.kind === "gate" ? "◈ " : ""}
+        {node.name}
+        {node.attempts > 1 ? ` ×${node.attempts}` : ""}
+      </button>
+      {open && (
+        <div
+          className="mt-1 max-w-full rounded-lg border p-2 text-[11px] leading-[1.5]"
+          style={{ borderColor: "var(--hive-line)", background: "var(--hive-overlay)" }}
+        >
+          <div className="opacity-55">
+            {statusLabel(node.status)}
+            {node.attempts > 1 ? ` · ${node.attempts} attempts` : ""}
+          </div>
+          {node.error && (
+            <div className="mt-1 whitespace-pre-wrap break-words" style={{ color: "var(--hive-danger)" }}>
+              {node.error}
+            </div>
+          )}
+          {node.outputExcerpt && (
+            <div className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words opacity-80">
+              {node.outputExcerpt}
+            </div>
+          )}
+        </div>
+      )}
     </span>
   );
 }
