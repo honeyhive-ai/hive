@@ -1062,6 +1062,8 @@ fn message_dto(m: &ChatMessage, agents: &[WorkspaceAgent]) -> ChatMessageDto {
         author_avatar_url,
         author_color_hex,
         responder_name,
+        runtime_id: m.runtime_id.clone(),
+        runtime_label: m.runtime_label.clone(),
     }
 }
 

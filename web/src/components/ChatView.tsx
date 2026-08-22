@@ -704,18 +704,34 @@ export function ChatView({
       setOptimisticUser(null);
     }
   }, [messages, optimisticUser]);
-  // The only real provenance we have today is the chat's runtime (there's no
-  // per-message model/provider on ChatMessageDto). Derive a single "via
-  // provider/model" attribution line for agent turns from it.
+  // Attribution is PER MESSAGE: each turn is stamped with the runtime that
+  // produced it (m.runtimeId), so we resolve provenance from the message, not
+  // from the chat's currently-selected runtime — otherwise switching the runtime
+  // retroactively relabels every historical turn with the wrong model.
+  const runtimeById = useMemo(() => {
+    const map = new Map<string, RuntimeSummaryDto>();
+    for (const rt of runtimes) map.set(rt.id, rt);
+    return map;
+  }, [runtimes]);
+  // Provenance for a message's turn: prefer its stamped runtime; the streaming
+  // turn (still generating now) legitimately uses the current runtime. An
+  // unknown/unstamped runtime yields no guess (better silent than wrong).
+  const provenanceFor = (runtimeId?: string | null) => {
+    const rt = (runtimeId && runtimeById.get(runtimeId)) || null;
+    if (!rt) return { via: undefined, model: undefined, host: "local" as const };
+    return {
+      via: rt.provider?.trim() || rt.label?.trim() || undefined,
+      model: rt.model || undefined,
+      host: (rt.location?.trim().toLowerCase() === "remote" ? "remote" : "local") as
+        | "local"
+        | "remote",
+    };
+  };
+  // The live/streaming turn uses the current runtime (it's what's generating).
+  const liveProvenance = provenanceFor(currentRuntimeId);
+  // The composer's route pill shows where a NEW message will go — the current
+  // runtime — so it (unlike historical turns) legitimately labels the current one.
   const runtimeVia = currentRuntime ? runtimePickerLabel(currentRuntime) : undefined;
-  // Provenance line under an agent turn (§D11): the *runtime* only ("via
-  // claude-code"). The model already rides the turn head (.tt-model), so the
-  // attribution must not repeat it — "via claude-code / opus" said it twice.
-  const runtimeProvider =
-    currentRuntime?.provider?.trim() || currentRuntime?.label?.trim() || undefined;
-  // Where the answering runtime runs — drives the avatar host badge (F5).
-  const runtimeHost: "local" | "remote" =
-    currentRuntime?.location?.trim().toLowerCase() === "remote" ? "remote" : "local";
 
   // The composer's resolved route (mockup §7.5): the first @mention in the draft
   // routes the turn; with none, it falls back to @primary (the chat's runtime).
@@ -864,6 +880,7 @@ export function ChatView({
                 m.role === "user" || m.role === "system"
                   ? undefined
                   : rosterAgent?.name ?? (m.author === PRIMARY_NAME ? PRIMARY_HANDLE : m.author);
+              const prov = provenanceFor(m.runtimeId);
               return (
                 <Fragment key={m.id}>
                   {showDay && <DaySeparator label={dayLabel(m.createdAt)} />}
@@ -876,9 +893,9 @@ export function ChatView({
                   body={m.body}
                   createdAt={m.createdAt}
                   streaming={m.isStreaming}
-                  via={runtimeProvider}
-                  model={currentRuntime?.model || undefined}
-                  host={runtimeHost}
+                  via={prov.via}
+                  model={prov.model}
+                  host={prov.host}
                   shared={shared}
                   // Personal agents tint the turn with their own avatar colour;
                   // shared/human turns fall back to the theme (warm/muted/cool).
@@ -903,7 +920,7 @@ export function ChatView({
             })}
           {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} avatarUrl={selfAvatarUrl} />}
           {[...streams.entries()].map(([id, text]) => (
-            <Bubble key={id} role="assistant" author={streamAuthor} handle={streamHandle} body={text} via={runtimeProvider} model={currentRuntime?.model || undefined} host={runtimeHost} streaming />
+            <Bubble key={id} role="assistant" author={streamAuthor} handle={streamHandle} body={text} via={liveProvenance.via} model={liveProvenance.model} host={liveProvenance.host} streaming />
           ))}
           {queued != null && (
             <div className="flex items-start justify-end gap-2 py-1 pr-1 text-sm opacity-60" role="status">
@@ -1210,7 +1227,7 @@ export function ChatView({
                     type="button"
                     onClick={() => setRouteOpen((o) => !o)}
                     className={`rp${routeOpen ? " on" : ""}`}
-                    title="Default recipient"
+                    title="Runtime backing @hive — click to switch which model answers untagged messages"
                     aria-expanded={routeOpen}
                   >
                     <span className="rp-ar" aria-hidden>→</span>
@@ -1227,7 +1244,9 @@ export function ChatView({
                   </button>
                   {routeOpen && (
                     <div className="pop">
-                      <div className="pop-h">Default recipient · when no @mention</div>
+                      <div className="pop-h">
+                        Runtime for @{PRIMARY_HANDLE} · answers untagged messages (alias @primary)
+                      </div>
                       {runtimes.map((rt) => (
                         <button
                           key={rt.id}
@@ -1247,11 +1266,15 @@ export function ChatView({
                         >
                           <span className="route-glyph"><IconWrench size={11} /></span>
                           <span className="pop-t">
-                            <b>{rt.id === currentRuntimeId ? `@${PRIMARY_HANDLE}` : rt.label || rt.name}</b>
+                            <b>{rt.label || rt.name}</b>
                             <span>{runtimePickerLabel(rt)}</span>
                           </span>
                           {rt.id === currentRuntimeId && (
-                            <span aria-hidden style={{ color: "var(--hive-accent-fill)" }}>
+                            <span
+                              aria-label={`backs @${PRIMARY_HANDLE}`}
+                              style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "var(--hive-accent-fill)" }}
+                            >
+                              <span style={{ fontSize: 11, fontWeight: 600 }}>@{PRIMARY_HANDLE}</span>
                               <IconCheck size={12} />
                             </span>
                           )}

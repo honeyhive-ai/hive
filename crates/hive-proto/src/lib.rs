@@ -67,6 +67,15 @@ pub struct ChatMessageDto {
     /// named agents (whose own name is the label).
     #[serde(default)]
     pub responder_name: Option<String>,
+    /// The runtime that produced THIS turn (stamped at generation), so the UI
+    /// attributes each turn to the model that actually ran it — not the chat's
+    /// currently-selected runtime, which retroactively relabels history. None on
+    /// human/system turns and pre-existing messages.
+    #[serde(default)]
+    pub runtime_id: Option<String>,
+    /// A human label for that runtime (e.g. "claude-code / opus"), when stamped.
+    #[serde(default)]
+    pub runtime_label: Option<String>,
 }
 
 /// A tool invocation an assistant turn made (MCP or built-in).

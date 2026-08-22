@@ -38,4 +38,15 @@ authorColorHex: string | null,
  * disambiguates "Alice's hive" from "Bob's hive"). None for human turns and
  * named agents (whose own name is the label).
  */
-responderName: string | null, };
+responderName: string | null, 
+/**
+ * The runtime that produced THIS turn (stamped at generation), so the UI
+ * attributes each turn to the model that actually ran it — not the chat's
+ * currently-selected runtime, which retroactively relabels history. None on
+ * human/system turns and pre-existing messages.
+ */
+runtimeId: string | null, 
+/**
+ * A human label for that runtime (e.g. "claude-code / opus"), when stamped.
+ */
+runtimeLabel: string | null, };
