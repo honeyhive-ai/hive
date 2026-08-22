@@ -8,6 +8,7 @@ import {
 } from "@/lib/ipc";
 import { Button, Section, SelectField } from "@/components/ui";
 import { toast, errMsg } from "@/components/Toast";
+import { confirmThen } from "@/lib/confirm";
 
 /// Permissions — the one page to audit what agents may reach. Today only the
 /// Claude Code permission mode is backed by an enforcement path, so it is the
@@ -33,6 +34,22 @@ export function PermissionsSection() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["connection-settings"] }),
     onError: (e) => toast.error(`Couldn't set permission mode: ${errMsg(e)}`),
   });
+
+  // Granting unattended shell execution deserves at least the friction a data
+  // reset gets — confirm before switching into bypass mode (a plain dropdown
+  // pick was writing it through instantly).
+  const setMode = (v: ClaudePermissionMode) => {
+    if (v === "bypassPermissions") {
+      confirmThen(
+        "Bypass all permissions? The claude agent will be able to edit files AND run shell " +
+          "commands in this workspace with no approval prompt. Only enable this if you fully " +
+          "trust the agents and tasks running here.",
+        () => save.mutate(v),
+      );
+      return;
+    }
+    save.mutate(v);
+  };
 
   const health = useQuery({ queryKey: ["launch-health"], queryFn: launchHealth });
   const openFileAccess = useMutation({
@@ -80,7 +97,7 @@ export function PermissionsSection() {
       <label className="block text-xs opacity-60">Claude Code permission mode</label>
       <SelectField
         value={permissionMode}
-        onChange={(v) => save.mutate(v as ClaudePermissionMode)}
+        onChange={(v) => setMode(v as ClaudePermissionMode)}
         ariaLabel="Claude Code permission mode"
         disabled={!c}
       >

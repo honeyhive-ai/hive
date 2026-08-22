@@ -40,39 +40,42 @@ export type SettingsTab =
   | "diagnostics"
   | "danger";
 
-type NavItem = { id: SettingsTab; label: string; icon: React.ReactNode };
+// `keywords` are extra search terms (synonyms + the controls a section contains)
+// so search matches what a user actually types ("api key", "dark mode", "relay",
+// "reset", "mcp") — not just the visible section label.
+type NavItem = { id: SettingsTab; label: string; icon: React.ReactNode; keywords?: string[] };
 type NavGroup = { cap: string; items: NavItem[] };
 
 const NAV_GROUPS: NavGroup[] = [
   {
     cap: "You",
     items: [
-      { id: "account", label: "Account", icon: <IconUsers size={16} /> },
-      { id: "appearance", label: "Appearance", icon: <IconSparkle size={16} /> },
+      { id: "account", label: "Account", icon: <IconUsers size={16} />, keywords: ["github", "sign in", "login", "identity", "profile", "name"] },
+      { id: "appearance", label: "Appearance", icon: <IconSparkle size={16} />, keywords: ["theme", "dark mode", "light", "color", "font"] },
     ],
   },
   {
     cap: "This workspace",
     items: [
-      { id: "folder-git", label: "Folder & Git", icon: <IconFile size={16} /> },
-      { id: "team-sync", label: "Team sync", icon: <IconUsers size={16} /> },
-      { id: "schedules", label: "Schedules", icon: <IconActivity size={16} /> },
+      { id: "folder-git", label: "Folder & Git", icon: <IconFile size={16} />, keywords: ["project", "folder", "directory", "path", "git", "branch", "repo"] },
+      { id: "team-sync", label: "Team sync", icon: <IconUsers size={16} />, keywords: ["relay", "e2ee", "encryption", "sync", "token", "invite", "p2p", "peer", "collaborate"] },
+      { id: "schedules", label: "Schedules", icon: <IconActivity size={16} />, keywords: ["cron", "recurring", "timer", "automation"] },
     ],
   },
   {
     cap: "Agents",
     items: [
-      { id: "models", label: "Models & runtimes", icon: <IconHexagon size={16} /> },
-      { id: "tools", label: "Tools & MCP", icon: <IconWrench size={16} /> },
-      { id: "permissions", label: "Permissions", icon: <IconLock size={16} /> },
+      { id: "models", label: "Models & runtimes", icon: <IconHexagon size={16} />, keywords: ["api key", "provider", "anthropic", "openai", "openrouter", "ollama", "claude", "model", "runtime", "endpoint", "agent", "prompt"] },
+      { id: "tools", label: "Tools & MCP", icon: <IconWrench size={16} />, keywords: ["mcp", "server", "linear", "github", "tool", "integration"] },
+      { id: "permissions", label: "Permissions", icon: <IconLock size={16} />, keywords: ["permission", "bypass", "shell", "edits", "file access", "safety", "sandbox"] },
     ],
   },
   {
     cap: "Advanced",
     items: [
-      { id: "updates", label: "Updates & data", icon: <IconArrowDown size={16} /> },
-      { id: "diagnostics", label: "Diagnostics", icon: <IconActivity size={16} /> },
-      { id: "danger", label: "Danger zone", icon: <IconAlertTriangle size={16} /> },
+      { id: "updates", label: "Updates & data", icon: <IconArrowDown size={16} />, keywords: ["update", "version", "upgrade", "data", "storage"] },
+      { id: "diagnostics", label: "Diagnostics", icon: <IconActivity size={16} />, keywords: ["logs", "debug", "health", "troubleshoot"] },
+      { id: "danger", label: "Danger zone", icon: <IconAlertTriangle size={16} />, keywords: ["reset", "delete", "wipe", "erase", "clear data", "factory"] },
     ],
   },
 ];
@@ -141,7 +144,11 @@ export function SettingsView({
     if (!q) return NAV_GROUPS;
     return NAV_GROUPS.map((g) => ({
       cap: g.cap,
-      items: g.items.filter((i) => i.label.toLowerCase().includes(q)),
+      items: g.items.filter(
+        (i) =>
+          i.label.toLowerCase().includes(q) ||
+          (i.keywords ?? []).some((k) => k.includes(q)),
+      ),
     })).filter((g) => g.items.length > 0);
   }, [query]);
 
