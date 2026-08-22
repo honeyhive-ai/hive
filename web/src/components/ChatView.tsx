@@ -1706,7 +1706,7 @@ const Bubble = memo(function Bubble({
               {emoji} <span>{n}</span>
             </button>
           ))}
-          <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+          <div className="flex items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
             {!streaming && body && <CopyAction body={body} />}
             {!streaming && onRegenerate && (
               <IconAction title="Regenerate" onClick={() => void onRegenerate()}>

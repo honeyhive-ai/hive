@@ -39,9 +39,13 @@ const DEFAULT_TTL: Record<ToastKind, number> = {
   error: 7000, // errors linger longer so they're not missed
 };
 
+/// Cap the visible stack so a burst of errors can't fill the screen; the oldest
+/// beyond the cap are dropped (they'd have aged out on their TTL anyway).
+const MAX_TOASTS = 5;
+
 function push(kind: ToastKind, message: string, action?: Toast["action"], ttl?: number) {
   const id = nextId++;
-  toasts = [...toasts, { id, kind, message, action }];
+  toasts = [...toasts, { id, kind, message, action }].slice(-MAX_TOASTS);
   emit();
   const life = ttl ?? DEFAULT_TTL[kind];
   if (life > 0) setTimeout(() => dismissToast(id), life);

@@ -93,7 +93,7 @@ function CodeBlock({ children }: { children: ReactNode }) {
   return (
     <div className="group/code relative my-2">
       <button
-        className="absolute right-2 top-2 rounded-lg px-2 py-0.5 text-xs opacity-0 transition-opacity group-hover/code:opacity-80 hover:!opacity-100"
+        className="absolute right-2 top-2 rounded-lg px-2 py-0.5 text-xs opacity-0 transition-opacity group-hover/code:opacity-80 group-focus-within/code:opacity-80 focus-visible:!opacity-100 hover:!opacity-100"
         style={{
           background: "var(--hive-panel)",
           border: "1px solid var(--hive-line)",

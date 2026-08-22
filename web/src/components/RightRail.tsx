@@ -123,6 +123,17 @@ export function RightRail({
 
   const panes = PANES;
 
+  // Badge the Review icon with proposals/gates awaiting a decision, so the
+  // pending count is visible even from the collapsed-sidebar icon rail.
+  const railProposals = useQuery({
+    queryKey: ["proposals", sessionId],
+    queryFn: () => listProposals(sessionId),
+    enabled: Boolean(sessionId),
+  });
+  const paneBadges: Partial<Record<UtilityPane, number>> = {
+    review: groupProposals(railProposals.data ?? []).active.length,
+  };
+
   return (
     <aside
       className="relative flex shrink-0 overflow-hidden border-l"
@@ -137,7 +148,7 @@ export function RightRail({
             <button
               key={item.id}
               onClick={() => onChangePane(item.id)}
-              className="flex h-10 w-10 items-center justify-center rounded-2xl transition-colors"
+              className="relative flex h-10 w-10 items-center justify-center rounded-2xl transition-colors"
               style={{
                 background: pane === item.id ? "var(--hive-mist)" : "transparent",
                 color: pane === item.id ? "var(--hive-accent-cool)" : "var(--hive-ink)",
@@ -149,6 +160,15 @@ export function RightRail({
               aria-pressed={pane === item.id}
             >
               {item.icon(17)}
+              {(paneBadges[item.id] ?? 0) > 0 && (
+                <span
+                  className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-semibold leading-none"
+                  style={{ background: "var(--hive-accent-warm)", color: "var(--hive-on-accent)" }}
+                  aria-label={`${paneBadges[item.id]} awaiting review`}
+                >
+                  {paneBadges[item.id]}
+                </span>
+              )}
             </button>
           ))}
         </div>

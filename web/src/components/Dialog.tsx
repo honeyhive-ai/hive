@@ -125,12 +125,15 @@ export function DialogHost() {
       <div className="mt-5 flex justify-end gap-2">
         <button
           onClick={onCancel}
+          // For a destructive confirm, focus Cancel — so a reflexive Enter
+          // cancels rather than executing the dangerous action.
+          autoFocus={req.kind === "confirm" && req.danger}
           className="rounded-lg px-3 py-1.5 text-sm opacity-60 hover:opacity-100"
         >
           Cancel
         </button>
         <button
-          autoFocus={req.kind === "confirm"}
+          autoFocus={req.kind === "confirm" && !req.danger}
           onClick={onAccept}
           className="rounded-lg px-4 py-1.5 text-sm font-medium text-white hover:brightness-110"
           style={{

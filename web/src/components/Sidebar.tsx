@@ -15,6 +15,7 @@ import {
   listChats,
   listMembers,
   listMentionStates,
+  listProposals,
   listSkills,
   listVaults,
   renameChannel,
@@ -28,6 +29,7 @@ import { SkeletonRows } from "@/components/Skeleton";
 import { Avatar } from "@/components/Avatar";
 import { confirmDialog, promptDialog } from "@/components/Dialog";
 import { confirmThen } from "@/lib/confirm";
+import { groupProposals } from "@/lib/proposals";
 import { relTime } from "@/lib/time";
 import {
   NavRow,
@@ -125,6 +127,14 @@ export function Sidebar({
     queryFn: () => listSkills(sessionId ?? ""),
     enabled: Boolean(sessionId),
   });
+  const proposals = useQuery({
+    queryKey: ["proposals", sessionId],
+    queryFn: () => listProposals(sessionId ?? ""),
+    enabled: Boolean(sessionId),
+  });
+  // Proposals + gates awaiting a human decision — the Review pane is the only
+  // time-sensitive pane, so it gets a badge like the others.
+  const reviewCount = groupProposals(proposals.data ?? []).active.length;
 
   // Git branch for the workspace header line 2 (F14) — otherwise it just
   // repeats the folder name. Keyed on the path so switching workspaces refetches;
@@ -266,6 +276,7 @@ export function Sidebar({
     people: memberCount,
     // +1 for the always-present default agent (@hive) so it never reads 0.
     tools: (agents.data ?? []).length + 1,
+    review: reviewCount || undefined,
     skills: (skills.data ?? []).length,
     vaults: (vaults.data ?? []).length,
   };

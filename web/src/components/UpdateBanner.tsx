@@ -45,7 +45,14 @@ export function UpdateBanner() {
 
   if (!info) return null;
 
-  function dismiss() {
+  // "Later" hides it for this session only — it returns on next launch.
+  function later() {
+    setInfo(null);
+  }
+
+  // "Skip this version" persists, so this specific tag never shows again (until
+  // a newer release supersedes it).
+  function skipVersion() {
     if (info) window.localStorage.setItem(DISMISS_KEY, info.tag);
     setInfo(null);
   }
@@ -94,13 +101,22 @@ export function UpdateBanner() {
               {label}
             </button>
             {!installing && (
-              <button onClick={dismiss} className="rounded-lg px-3 py-1.5 text-sm opacity-60 hover:opacity-100">
-                Later
-              </button>
+              <>
+                <button onClick={later} className="rounded-lg px-3 py-1.5 text-sm opacity-60 hover:opacity-100">
+                  Later
+                </button>
+                <button
+                  onClick={skipVersion}
+                  className="rounded-lg px-2 py-1.5 text-xs opacity-45 hover:opacity-80"
+                  title="Don't show this version again"
+                >
+                  Skip
+                </button>
+              </>
             )}
           </div>
         </div>
-        <button onClick={dismiss} aria-label="Dismiss" className="shrink-0 opacity-40 hover:opacity-80">
+        <button onClick={later} aria-label="Remind me later" className="shrink-0 opacity-40 hover:opacity-80">
           <IconX size={14} />
         </button>
       </div>
