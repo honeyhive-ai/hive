@@ -216,6 +216,10 @@ export const pickWorkspaceFolder = () =>
 export const readWorkspaceFile = (path: string) =>
   invoke<string>("read_workspace_file", { path });
 
+/// Repo-relative file paths in the workspace (git-tracked + untracked-not-ignored,
+/// capped) for the @file picker's fuzzy search.
+export const listWorkspaceFiles = () => invoke<string[]>("list_workspace_files");
+
 /// Export a chat transcript to a Markdown file via a save dialog. Resolves to
 /// the written path, or null if the user cancelled.
 export const exportChat = (sessionId: string) =>

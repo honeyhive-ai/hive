@@ -12,6 +12,7 @@ import {
   saveAttachment,
   readImageDataUrl,
   readWorkspaceFile,
+  listWorkspaceFiles,
   sendMessage,
   stopTurn,
   regenerate,
@@ -59,7 +60,7 @@ import {
   type EmojiEntry,
 } from "@/lib/emoji";
 import { Avatar } from "@/components/Avatar";
-import { Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui";
+import { Modal, Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui";
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
 import { applyStreamDelta, handleTerminal } from "@/lib/streams";
@@ -143,6 +144,9 @@ export function ChatView({
   const [attachments, setAttachments] = useState<{ name: string; path: string; image: boolean }[]>([]);
   // Composer emoji: the picker-panel toggle + the inline `:shortcode` menu.
   const [showEmoji, setShowEmoji] = useState(false);
+  // @file picker: a fuzzy-searchable list of workspace files (loaded on open),
+  // replacing the blind "type the exact path" prompt.
+  const [filePicker, setFilePicker] = useState<{ files: string[]; query: string } | null>(null);
   const [emojiIndex, setEmojiIndex] = useState<EmojiEntry[]>([]);
   const [emojiSc, setEmojiSc] = useState<{ start: number; query: string } | null>(null);
   const [emojiScActive, setEmojiScActive] = useState(0);
@@ -483,13 +487,28 @@ export function ChatView({
   // @file: pull a workspace file's contents into the composer as a fenced block,
   // so it rides into the model's context with the message.
   async function addFileRef() {
+    // Open the fuzzy picker. Fall back to a plain prompt if the file list can't
+    // be loaded (no git / no root), so referencing a file still works.
+    try {
+      const files = await listWorkspaceFiles();
+      if (files.length > 0) {
+        setFilePicker({ files, query: "" });
+        return;
+      }
+    } catch {
+      /* fall through to the prompt */
+    }
     const path = await promptDialog("Reference a workspace file", {
       placeholder: "path relative to the workspace root",
     });
-    if (!path || !path.trim()) return;
+    if (path && path.trim()) await insertFileRef(path.trim());
+  }
+
+  async function insertFileRef(path: string) {
+    setFilePicker(null);
     try {
-      const content = await readWorkspaceFile(path.trim());
-      const block = "```" + path.trim() + "\n" + content.replace(/\s+$/, "") + "\n```\n";
+      const content = await readWorkspaceFile(path);
+      const block = "```" + path + "\n" + content.replace(/\s+$/, "") + "\n```\n";
       setInput((cur) => (cur ? `${cur}\n${block}` : block));
       requestAnimationFrame(() => {
         taRef.current?.focus();
@@ -844,7 +863,7 @@ export function ChatView({
                 style={{ borderColor: "var(--hive-line)" }}
               >
                 <span><code>/</code> for commands</span>
-                <span><code>@file</code> to reference a file</span>
+                <span><code>@file</code> button to add a file</span>
                 <button onClick={onOpenTools} className="underline underline-offset-2 hover:opacity-100">
                   Configure agents &amp; tools
                 </button>
@@ -1364,6 +1383,13 @@ export function ChatView({
           </div>
         </div>
       </div>
+      {filePicker && (
+        <FilePickerModal
+          files={filePicker.files}
+          onPick={(p) => void insertFileRef(p)}
+          onClose={() => setFilePicker(null)}
+        />
+      )}
     </div>
   );
 }
@@ -1757,6 +1783,69 @@ const Bubble = memo(function Bubble({
     </div>
   );
 });
+
+/// Fuzzy-searchable workspace file picker for @file — replaces typing an exact
+/// relative path from memory. Substring filter, keyboard-navigable.
+function FilePickerModal({
+  files,
+  onPick,
+  onClose,
+}: {
+  files: string[];
+  onPick: (path: string) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [active, setActive] = useState(0);
+  const q = query.trim().toLowerCase();
+  const filtered = q ? files.filter((f) => f.toLowerCase().includes(q)).slice(0, 200) : files.slice(0, 200);
+  useEffect(() => {
+    setActive(0);
+  }, [query]);
+  return (
+    <Modal
+      onClose={onClose}
+      overlayClassName="z-[900] flex items-start justify-center pt-[12vh]"
+      overlayStyle={{ background: "color-mix(in srgb, var(--hive-ink) 45%, transparent)" }}
+      panelClassName="w-full max-w-lg overflow-hidden rounded-2xl border shadow-2xl"
+      panelStyle={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)", color: "var(--hive-ink)" }}
+    >
+      <input
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="Search workspace files…"
+        className="w-full border-b bg-transparent px-4 py-3 text-base outline-none"
+        style={{ borderColor: "var(--hive-line)" }}
+        onKeyDown={(e) => {
+          if (e.key === "ArrowDown") {
+            e.preventDefault();
+            setActive((a) => Math.min(a + 1, filtered.length - 1));
+          } else if (e.key === "ArrowUp") {
+            e.preventDefault();
+            setActive((a) => Math.max(a - 1, 0));
+          } else if (e.key === "Enter") {
+            e.preventDefault();
+            if (filtered[active]) onPick(filtered[active]);
+          }
+        }}
+      />
+      <div className="max-h-[50vh] overflow-y-auto py-1">
+        {filtered.length === 0 && <div className="px-4 py-6 text-center text-sm opacity-50">No files match.</div>}
+        {filtered.map((f, i) => (
+          <button
+            key={f}
+            onMouseEnter={() => setActive(i)}
+            onClick={() => onPick(f)}
+            className="block w-full truncate px-4 py-2 text-left font-mono text-sm"
+            style={{ background: i === active ? "var(--hive-mist)" : "transparent" }}
+          >
+            {f}
+          </button>
+        ))}
+      </div>
+    </Modal>
+  );
+}
 
 /// Copy-message action with transient "copied" feedback (icon flips to a
 /// check) — a silent clipboard write left users unsure it worked.

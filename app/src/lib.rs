@@ -812,6 +812,33 @@ fn read_workspace_file(state: State<AppState>, path: String) -> Result<String, S
     std::fs::read_to_string(&target).map_err(|_| "file isn't valid UTF-8 text".to_string())
 }
 
+/// Repo-relative file paths in the workspace, for the composer's @file picker.
+/// Uses `git ls-files` (tracked + untracked-but-not-ignored) so it respects
+/// `.gitignore` and stays fast on big trees; capped so a huge repo can't flood
+/// the picker. Empty when there's no workspace root or git isn't available.
+#[tauri::command]
+fn list_workspace_files(state: State<AppState>) -> Vec<String> {
+    const MAX_FILES: usize = 5000;
+    let root = state.workspace_root.lock().unwrap().clone();
+    if root.trim().is_empty() {
+        return Vec::new();
+    }
+    let out = std::process::Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .current_dir(&root)
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .take(MAX_FILES)
+        .collect()
+}
+
 fn workspace_paths_match(candidate: &str, target: &str) -> bool {
     candidate == target
         || normalize_workspace_path(candidate)
@@ -9592,6 +9619,7 @@ pub fn run() {
             add_workspace_to_list,
             pick_workspace_folder,
             read_workspace_file,
+            list_workspace_files,
             remove_workspace_from_list,
             set_display_name,
             set_avatar,
