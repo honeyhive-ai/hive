@@ -73,28 +73,15 @@ import {
   SELECT_TINT,
 } from "@/components/ui";
 import {
-  IconWrench,
-  IconHexagon,
-  IconInbox,
-  IconUsers,
-  IconBook,
-  IconSparkle,
-  IconFlow,
-  IconActivity,
   IconX,
   IconChevronDown,
 } from "@/lib/icons";
+import { PANES, type UtilityPane } from "@/lib/panes";
 import { WorkflowsPane } from "@/components/WorkflowsPane";
 
-export type UtilityPane =
-  | "tools"
-  | "review"
-  | "people"
-  | "vaults"
-  | "skills"
-  | "workflows"
-  | "activity"
-  | "context";
+// Re-exported from the shared pane source so existing
+// `import type { UtilityPane } from "@/components/RightRail"` keeps working.
+export type { UtilityPane };
 
 export function RightRail({
   width,
@@ -134,16 +121,7 @@ export function RightRail({
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const panes: { id: UtilityPane; label: string; icon: ReactNode }[] = [
-    { id: "tools", label: "Tools", icon: <IconWrench size={17} /> },
-    { id: "context", label: "Context", icon: <IconHexagon size={17} /> },
-    { id: "review", label: "Review", icon: <IconInbox size={17} /> },
-    { id: "people", label: "People", icon: <IconUsers size={17} /> },
-    { id: "vaults", label: "Vaults", icon: <IconBook size={17} /> },
-    { id: "skills", label: "Skills", icon: <IconSparkle size={17} /> },
-    { id: "workflows", label: "Workflows", icon: <IconFlow size={17} /> },
-    { id: "activity", label: "Activity", icon: <IconActivity size={17} /> },
-  ];
+  const panes = PANES;
 
   return (
     <aside
@@ -167,9 +145,10 @@ export function RightRail({
               }}
               title={item.label}
               aria-label={`${item.label} pane`}
+              data-pane={item.id}
               aria-pressed={pane === item.id}
             >
-              {item.icon}
+              {item.icon(17)}
             </button>
           ))}
         </div>

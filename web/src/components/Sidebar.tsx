@@ -22,6 +22,7 @@ import {
   type ChatSummaryDto,
 } from "@/lib/ipc";
 import type { UtilityPane } from "@/components/RightRail";
+import { PANES } from "@/lib/panes";
 import { toast, errMsg } from "@/components/Toast";
 import { SkeletonRows } from "@/components/Skeleton";
 import { Avatar } from "@/components/Avatar";
@@ -43,14 +44,7 @@ import {
   IconPlus,
   IconCheck,
   IconMessage,
-  IconUsers,
-  IconWrench,
-  IconInbox,
   IconActivity,
-  IconSparkle,
-  IconBook,
-  IconFlow,
-  IconGrid,
   IconGear,
   IconEllipsis,
   IconChevronRight,
@@ -266,6 +260,15 @@ export function Sidebar({
     : null;
   const canRemoveCurrentWorkspace = workspacePath.trim().length > 0;
   const memberCount = (members.data ?? []).filter((m) => !m.isSelf).length;
+  // Live counts per pane, keyed by the shared PANES id. Panes without a count
+  // (Review/Context/Workflows/Activity) simply omit the badge.
+  const paneCounts: Partial<Record<UtilityPane, number>> = {
+    people: memberCount,
+    // +1 for the always-present default agent (@hive) so it never reads 0.
+    tools: (agents.data ?? []).length + 1,
+    skills: (skills.data ?? []).length,
+    vaults: (vaults.data ?? []).length,
+  };
   const deviceName = settings.data?.deviceName ?? "";
 
   async function handleWorkspaceAdd() {
@@ -756,19 +759,21 @@ export function Sidebar({
           )}
         </div>
 
-        {/* 5 — Workspace panes, one NavRow each with live counts. */}
+        {/* 5 — Workspace panes: rendered from the shared PANES source so icon,
+            label, and order match the right-pane rail exactly (collapsing the
+            sidebar no longer reshuffles the icons). */}
         <div className="mt-2">
           <SectionCap>Workspace</SectionCap>
-          <NavRow icon={<IconUsers size={15} />} label="People" count={memberCount} active={utilityPane === "people"} onClick={() => onOpenUtilityPane("people")} />
-          {/* +1 for the always-present default agent (@hive) so the count never
-              reads 0 while it's answering — matches the Tools pane roster (F1). */}
-          <NavRow icon={<IconWrench size={15} />} label="Agents & tools" count={(agents.data ?? []).length + 1} active={utilityPane === "tools"} onClick={() => onOpenUtilityPane("tools")} />
-          <NavRow icon={<IconInbox size={15} />} label="Review" active={utilityPane === "review"} onClick={() => onOpenUtilityPane("review")} />
-          <NavRow icon={<IconActivity size={15} />} label="Context" active={utilityPane === "context"} onClick={() => onOpenUtilityPane("context")} />
-          <NavRow icon={<IconSparkle size={15} />} label="Skills" count={(skills.data ?? []).length} active={utilityPane === "skills"} onClick={() => onOpenUtilityPane("skills")} />
-          <NavRow icon={<IconBook size={15} />} label="Vaults" count={(vaults.data ?? []).length} active={utilityPane === "vaults"} onClick={() => onOpenUtilityPane("vaults")} />
-          <NavRow icon={<IconFlow size={15} />} label="Workflows" active={utilityPane === "workflows"} onClick={() => onOpenUtilityPane("workflows")} />
-          <NavRow icon={<IconGrid size={15} />} label="Activity" active={utilityPane === "activity"} onClick={() => onOpenUtilityPane("activity")} />
+          {PANES.map((p) => (
+            <NavRow
+              key={p.id}
+              icon={p.icon(15)}
+              label={p.label}
+              count={paneCounts[p.id]}
+              active={utilityPane === p.id}
+              onClick={() => onOpenUtilityPane(p.id)}
+            />
+          ))}
         </div>
       </div>
 
