@@ -747,6 +747,7 @@ export function App() {
               onOpenContext={() => openUtilityPane("context")}
               syncPill={deriveSyncPill(sync.data)}
               onFixSync={() => openSettings("team")}
+              workspaceCrumb={sidebarVisible ? undefined : workspaceLabel}
               mode={mode}
               onChangeMode={setMode}
               utilityPaneVisible={showUtilityPane}
@@ -980,6 +981,7 @@ function ChatHeaderBar({
   contextPct,
   onOpenContext,
   onFixSync,
+  workspaceCrumb,
 }: {
   title: string;
   syncPill: SyncPill;
@@ -988,6 +990,9 @@ function ChatHeaderBar({
   utilityPaneVisible: boolean;
   onToggleTools: () => void;
   onRename: () => void;
+  /// The active workspace name, shown as a crumb before the chat title when the
+  /// sidebar is collapsed — otherwise "which workspace am I in?" is invisible.
+  workspaceCrumb?: string;
   /// Percent of the model's context window the next reply will use (null
   /// until telemetry loads). Clicking the pill opens the Context pane.
   contextPct: number | null;
@@ -1006,6 +1011,14 @@ function ChatHeaderBar({
       style={{ borderColor: "var(--hive-line)" }}
     >
       <div className="flex min-w-0 flex-1 items-center gap-1.5">
+        {workspaceCrumb && (
+          <>
+            <span className="shrink-0 truncate text-base font-semibold tracking-tight opacity-55">
+              {workspaceCrumb}
+            </span>
+            <span className="shrink-0 opacity-30" aria-hidden>/</span>
+          </>
+        )}
         <h1 className="truncate text-base font-semibold tracking-tight">{title}</h1>
         <button
           className="shrink-0 rounded-md p-1 opacity-40 transition-opacity hover:opacity-100"
