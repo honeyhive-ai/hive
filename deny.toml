@@ -3,10 +3,15 @@
 
 [advisories]
 version = 2
-# Fail on any RUSTSEC advisory (vulnerability) or a yanked crate. `unmaintained`
-# is a warning so an advisory-DB flag doesn't block a release on its own.
+# Fail on any RUSTSEC advisory (vulnerability) or a yanked crate. Newer cargo-deny
+# dropped the per-severity `unmaintained = "warn"` in favour of a *scope* selector
+# ("all" | "workspace" | "transitive" | "none") — the old string no longer
+# deserializes, which is what had been failing this workflow. "workspace" only
+# flags unmaintained crates we depend on directly (actionable), so a transitive
+# unmaintained dep we can't fix doesn't wedge the pipeline; ignore specific
+# advisory IDs below if one legitimately shouldn't block.
 yanked = "deny"
-unmaintained = "warn"
+unmaintained = "workspace"
 ignore = []
 
 [licenses]
