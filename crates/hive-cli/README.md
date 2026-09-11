@@ -10,9 +10,12 @@ spec §12 (D21–D23).
 ## Build / install
 
 ```sh
-cargo build --release -p hive-cli      # → target/release/hive
-# or run in place:
-cargo run -p hive-cli -- <command>
+brew install honeyhive-ai/hive/hive-cli   # macOS + Linux; tracks releases
+# or the one-line installer (prebuilt binary onto your PATH):
+curl -fsSL https://raw.githubusercontent.com/honeyhive-ai/hive/main/install.sh | sh
+# or from source:
+cargo build --release -p hive-cli         # → target/release/hive
+cargo run -p hive-cli -- <command>        # run in place
 ```
 
 ## Configuration (environment)
@@ -37,6 +40,11 @@ Everything is env-driven so it drops into a container or a secret mount. A
 ## Commands
 
 ```
+hive enroll <hivews1:invite>       # one-shot: decode the invite (relay/room/key) → save config.toml
+       [--token <hrt1>]            #   …and set the relay identity token (membership-enforcing relays)
+hive join <invite-code>            # redeem a relay invite code → self-enroll this box at its role
+hive setup [--apply]               # detect providers on this box; --apply defines keyless runtimes
+hive config <export|import <file>> # round-trip the workspace runtime set as TOML
 hive whoami                        # this client's identity (account/device ids); bootstraps keys on first run
 hive chats                         # list chats in the local store
 hive new [title]                   # create a chat in the workspace → prints its id

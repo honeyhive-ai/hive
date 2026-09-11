@@ -29,8 +29,24 @@ brew uninstall --cask hive          # remove the app
 brew uninstall --zap --cask hive    # also remove local data/settings
 ```
 
+## The `hive` CLI / daemon
+
+The headless client + agent daemon ships as its own formula (works on macOS
+**and** Linux, Apple Silicon and x86_64):
+
+```sh
+brew install honeyhive-ai/hive/hive-cli   # installs the `hive` binary
+brew upgrade hive-cli                      # track releases
+```
+
+This is the same runtime as the desktop app without the window — for running
+agents on a server, scripting Hive, or connecting a remote agent to a workspace.
+See [Headless agents & setups](../concepts/headless-agents.md) for the full
+workflow (`hive enroll` → `hive worker`).
+
 ## Other platforms
 
-Homebrew on Linux can install CLI formulae, but the desktop app is distributed
-as `.AppImage` / `.deb` / `.rpm` there, and as an installer on Windows. See
+Homebrew installs the **CLI formula** on both macOS and Linux (above). The
+**desktop app** is a macOS-only cask; on Linux it's distributed as
+`.AppImage` / `.deb` / `.rpm`, and on Windows as an installer. See
 [Building the dist](../ops/build.md) for all the bundle formats.

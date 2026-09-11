@@ -11,15 +11,22 @@ covers the ways to wire that up and which one fits your situation.
 
 ## Install the CLI
 
-One line — macOS + Linux, Apple Silicon and x86_64:
+macOS + Linux, Apple Silicon and x86_64. **Homebrew** (recommended — tracks
+releases with `brew upgrade`):
+
+```sh
+brew install honeyhive-ai/hive/hive-cli
+```
+
+Or the one-line installer:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/honeyhive-ai/hive/main/install.sh | sh
 ```
 
-It drops the prebuilt `hive` binary from the latest release onto your `PATH`
-(override the dir with `HIVE_INSTALL_DIR`, pin a tag with `HIVE_VERSION`). Or
-build from source: `cargo install --path crates/hive-cli`.
+Both put the prebuilt `hive` binary on your `PATH` (the installer honors
+`HIVE_INSTALL_DIR` / `HIVE_VERSION`). Or build from source:
+`cargo install --path crates/hive-cli`.
 
 The CLI is the **same runtime as the desktop app, without the window** — so it
 can host agents, drive chats, and sync from a terminal or a background service.
@@ -83,18 +90,42 @@ but it can be **self-hosted**. This is the setup that lets an agent keep working
 while your laptop is closed: the relay's **store-and-forward** holds the agent's
 events, and your app catches up when it next comes online.
 
-Provision the relay URL, token, room, and workspace key out-of-band, then run the
-**worker daemon** — it registers the box as a host and runs every agent bound to
-it on a **workspace-owned credential** (never your personal key):
+**One-command connect.** Instead of hand-exporting four env vars, paste the
+workspace's `hivews1:` invite (the same one the app shares) — `hive enroll`
+decodes the relay URL, room, and E2EE key and saves them to
+`$HIVE_DATA_DIR/config.toml`:
 
 ```sh
-export HIVE_RELAY_URL=…  HIVE_RELAY_ACCESS_TOKEN=…  HIVE_WORKSPACE=acme  HIVE_WORKSPACE_KEY=…
-export HIVE_WS_SECRET_acme=sk-…
+hive enroll "hivews1:…" --token <hrt1-access-token>   # --token only for a membership-enforcing relay
+```
+
+Then provision the agent's model credential (the §12.5 rule — a detached agent
+uses a **workspace-owned** runtime, never your personal key) and run the
+**worker daemon**, which registers the box as a host and answers every agent
+bound to it:
+
+```sh
+export HIVE_WS_SECRET_acme=sk-…              # the secret the workspace runtime references
 hive register-worker --label prod-box        # → this box's host id
 hive add-agent reviewer ws-claude --host <host-id>
 hive sync
 hive worker --label prod-box                 # always-on; @reviewer is now answered here
 ```
+
+(You can still set `HIVE_RELAY_URL` / `HIVE_WORKSPACE` / `HIVE_WORKSPACE_KEY` /
+`HIVE_RELAY_ACCESS_TOKEN` directly — env always overrides the saved config.)
+
+**On a membership-enforcing relay**, the box needs an *identified* token whose
+subject is enrolled in the workspace roster. Either an admin adds the agent's
+account + hands it a token minted with `hive-relay issue --sub github:<agent-id>`
+(used as `--token` above), or — if they shared an **invite code** — the box
+self-enrolls:
+
+```sh
+hive join <invite-code>    # redeems the code → enrolls this box at the invite's role
+```
+
+On an open relay none of this is needed; unclaimed workspaces stay tokenless.
 
 The worker *enforces* the §12.5 rule — a detached agent must use a workspace
 runtime, so it never falls back to a personal key. It also **drains queued work**:
