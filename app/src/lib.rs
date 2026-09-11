@@ -5814,6 +5814,13 @@ async fn test_runtime(
         let r = state.workspace_root.lock().unwrap().clone();
         if r.trim().is_empty() { None } else { Some(r) }
     };
+    Ok(ping_runtime(runtime, workspace_root).await)
+}
+
+/// Send a trivial prompt through the real dispatch path and report pass/fail +
+/// latency. Shared by `test_runtime` (an existing runtime) and `probe_provider`
+/// (a transient provider+model built for credential validation at entry).
+async fn ping_runtime(runtime: ResolvedRuntime, workspace_root: Option<String>) -> RuntimeTestDto {
     let turns = vec![ChatTurn::user("Reply with exactly the token: PINGOK")];
     let system = "You are a connectivity probe. Reply with exactly PINGOK and nothing else.";
     let timeout = std::time::Duration::from_secs(
@@ -5835,7 +5842,7 @@ async fn test_runtime(
     );
     let outcome = tokio::time::timeout(timeout, fut).await;
     let latency_ms = start.elapsed().as_millis() as u64;
-    Ok(match outcome {
+    match outcome {
         Ok(Ok(reply)) => {
             let reply = reply.trim().to_string();
             RuntimeTestDto { ok: !reply.is_empty(), latency_ms, reply, error: None }
@@ -5852,7 +5859,93 @@ async fn test_runtime(
                 timeout.as_secs()
             )),
         },
-    })
+    }
+}
+
+/// Validate a provider's credentials at entry: build a transient runtime for
+/// (provider kind + a chosen/default model + the saved key) and ping it — so the
+/// user learns whether a key works WITHOUT first hand-building a runtime. Powers
+/// the Test button beside the API key and the one-step "add model" flow.
+#[tauri::command]
+async fn probe_provider(
+    state: State<'_, AppState>,
+    kind: String,
+    model: Option<String>,
+) -> Result<RuntimeTestDto, String> {
+    let provider = parse_provider_kind(&kind)?;
+    let (settings_key, provider_keys, provider_base_urls, claude_args) = {
+        let s = state.settings.lock().unwrap();
+        (s.api_key.clone(), s.provider_keys.clone(), s.provider_base_urls.clone(), s.claude_args())
+    };
+    let cfg = provider_config_name(provider);
+    // Same key precedence as resolve_runtime: per-provider → legacy global → env.
+    let api_key = provider_keys
+        .get(cfg)
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .or(settings_key)
+        .or_else(|| api_key_for(provider));
+    if provider_needs_key(provider) && api_key.is_none() {
+        return Ok(RuntimeTestDto {
+            ok: false,
+            latency_ms: 0,
+            reply: String::new(),
+            error: Some("No API key set for this provider — save one first.".to_string()),
+        });
+    }
+    let base = provider_base_urls.get(cfg).cloned().filter(|s| !s.is_empty());
+    let endpoint = match provider {
+        ModelProviderKind::Anthropic => String::new(),
+        _ => {
+            let b = base
+                .clone()
+                .unwrap_or_else(|| dispatch::default_endpoint(provider).to_string());
+            if b.is_empty() {
+                return Ok(RuntimeTestDto {
+                    ok: false,
+                    latency_ms: 0,
+                    reply: String::new(),
+                    error: Some("Set a base URL for this provider first.".to_string()),
+                });
+            }
+            if b.contains("/chat/completions") {
+                b
+            } else {
+                format!("{}/v1/chat/completions", b.trim_end_matches('/'))
+            }
+        }
+    };
+    let model = model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| default_probe_model(provider).to_string());
+    let runtime = ResolvedRuntime {
+        provider,
+        model,
+        endpoint,
+        api_key,
+        args: if provider == ModelProviderKind::ClaudeCode { claude_args } else { Vec::new() },
+        model_provider_id: None,
+        model_base_url: base,
+    };
+    let workspace_root = {
+        let r = state.workspace_root.lock().unwrap().clone();
+        if r.trim().is_empty() { None } else { Some(r) }
+    };
+    Ok(ping_runtime(runtime, workspace_root).await)
+}
+
+/// A safe default model to validate a provider's key against when the caller
+/// hasn't chosen one yet. A model-not-found error still distinguishes a good key
+/// (reaches the model layer) from a bad one (401/403 at auth).
+fn default_probe_model(provider: ModelProviderKind) -> &'static str {
+    match provider {
+        ModelProviderKind::Anthropic => "claude-sonnet-4-5",
+        ModelProviderKind::OpenAI => "gpt-4o-mini",
+        ModelProviderKind::OpenRouter => "openai/gpt-4o-mini",
+        ModelProviderKind::Ollama => "llama3.2",
+        _ => "gpt-4o-mini",
+    }
 }
 
 #[tauri::command]
@@ -9612,6 +9705,7 @@ pub fn run() {
             get_git_status,
             list_runtimes,
             test_runtime,
+            probe_provider,
             add_runtime,
             remove_runtime,
             set_chat_runtime,

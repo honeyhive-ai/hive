@@ -11,6 +11,7 @@ import {
   listRuntimes,
   removeRuntime,
   testRuntime,
+  probeProvider,
   type RuntimeTestResult,
   setDefaultRuntime,
   listProviders,
@@ -125,6 +126,15 @@ function ProvidersSection() {
   );
 }
 
+// Suggested model ids per provider, for the one-step add-model datalist. Just
+// hints — any model string is accepted.
+const MODEL_SUGGESTIONS: Record<string, string[]> = {
+  anthropic: ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
+  openAI: ["gpt-4o", "gpt-4o-mini", "o3-mini"],
+  openRouter: ["openai/gpt-4o-mini", "anthropic/claude-3.5-sonnet"],
+  ollama: ["llama3.2", "qwen2.5-coder", "deepseek-r1"],
+};
+
 function ProviderRow({
   provider,
   open,
@@ -142,6 +152,48 @@ function ProviderRow({
 }) {
   const [key, setKey] = useState("");
   const [baseUrl, setBaseUrl] = useState(provider.baseUrl);
+  const qc = useQueryClient();
+  // One-step "add model": the typed model the Add / Test buttons act on.
+  const [model, setModel] = useState("");
+  // Inline key/connection test result (null = not run, "running" = in flight).
+  const [probe, setProbe] = useState<RuntimeTestResult | "running" | null>(null);
+
+  async function runProbe() {
+    setProbe("running");
+    try {
+      setProbe(await probeProvider(provider.kind, model.trim() || undefined));
+    } catch (e) {
+      setProbe({ ok: false, latency_ms: 0, reply: "", error: errMsg(e) });
+    }
+  }
+
+  // Add a runtime for this provider with sane defaults — collapses the separate
+  // provider→runtime step for the common cloud case. Advanced knobs (endpoint,
+  // context window, embeddings) stay in the Runtimes section below.
+  const addModel = useMutation({
+    mutationFn: async () => {
+      const m = model.trim();
+      if (!m) throw new Error("Enter a model name first.");
+      const id = `${provider.kind}-${m}`.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+      const local = !provider.needsKey;
+      await addRuntime(
+        id,
+        `${provider.name} · ${m}`,
+        provider.kind,
+        local ? "local" : "remote",
+        provider.baseUrl.trim(), // "" lets the backend use the provider default
+        m,
+        true, // supportsTools
+        false, // supportsEmbeddings
+      );
+    },
+    onSuccess: () => {
+      setModel("");
+      qc.invalidateQueries({ queryKey: ["runtimes"] });
+      toast.success("Model added — pick it from the route pill in any chat.");
+    },
+    onError: (e) => toast.error(errMsg(e)),
+  });
   const saveKey = useMutation({
     mutationFn: () => setProviderKey(provider.kind, key.trim()),
     onSuccess: () => {
@@ -210,6 +262,14 @@ function ProviderRow({
               <Button variant="primary" size="md" onClick={() => saveKey.mutate()}>
                 Save
               </Button>
+              <Button
+                variant="ghost"
+                size="md"
+                disabled={probe === "running" || (provider.needsKey && !provider.hasKey)}
+                onClick={() => void runProbe()}
+              >
+                {probe === "running" ? "Testing…" : "Test"}
+              </Button>
             </div>
           )}
           {provider.supportsBaseUrl && (
@@ -224,6 +284,57 @@ function ProviderRow({
               <Button variant="primary" size="md" onClick={() => saveBase.mutate()}>
                 Save
               </Button>
+            </div>
+          )}
+
+          {/* Inline connection/key test result. */}
+          {probe && probe !== "running" && (
+            <div
+              className="mt-2 rounded-lg px-2.5 py-1.5 text-xs"
+              style={{
+                background: probe.ok
+                  ? "color-mix(in srgb, var(--hive-success) 12%, transparent)"
+                  : "color-mix(in srgb, var(--hive-danger) 12%, transparent)",
+                color: probe.ok ? "var(--hive-success)" : "var(--hive-danger)",
+              }}
+            >
+              {probe.ok
+                ? `✓ Connected (${probe.latency_ms} ms)`
+                : `✕ ${probe.error ?? "Failed to connect"}`}
+            </div>
+          )}
+
+          {/* One-step add-model: type a model → Add (creates a runtime with sane
+              defaults). The full runtime form (endpoint/context/embeddings) stays
+              in the Runtimes section below for advanced cases. */}
+          {configured && (
+            <div className="mt-2">
+              <div className="flex items-center gap-2">
+                <input
+                  list={`models-${provider.kind}`}
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder={`Model (e.g. ${MODEL_SUGGESTIONS[provider.kind]?.[0] ?? "gpt-4o"})`}
+                  className="flex-1 rounded-xl border px-3 py-2 font-mono text-sm"
+                  style={fieldStyle}
+                />
+                <datalist id={`models-${provider.kind}`}>
+                  {(MODEL_SUGGESTIONS[provider.kind] ?? []).map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+                <Button
+                  variant="primary"
+                  size="md"
+                  disabled={addModel.isPending || !model.trim()}
+                  onClick={() => addModel.mutate()}
+                >
+                  Add model
+                </Button>
+              </div>
+              <p className="mt-1 text-xs opacity-45">
+                Adds a ready-to-use runtime for this model. Test above validates the key first.
+              </p>
             </div>
           )}
           <div className="mt-2 text-right">
