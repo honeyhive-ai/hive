@@ -12,7 +12,16 @@ version = 2
 # advisory IDs below if one legitimately shouldn't block.
 yanked = "deny"
 unmaintained = "workspace"
-ignore = []
+# quick-xml DoS advisories (quadratic attribute scan; unbounded namespace
+# allocation). Reached ONLY transitively via `plist` (Tauri config + netdev
+# reading local system property lists) — not from parsing attacker-controlled
+# network XML, so exposure is local-input only. No fix exists in the semver range
+# our deps pin; revisit (and drop these) once plist/tauri bump quick-xml to the
+# patched line.
+ignore = [
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2
