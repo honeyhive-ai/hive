@@ -14,6 +14,11 @@ import {
   workspaceAddMember,
   workspaceRemoveMember,
   workspaceClaimMembership,
+  workspaceListInvites,
+  workspaceCreateInvite,
+  workspaceRevokeInvite,
+  workspaceJoinViaInvite,
+  type InviteEntry,
   addVault,
   getContextTelemetry,
   implementProposal,
@@ -1417,6 +1422,55 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
     onError: (e) => toast.error(`Couldn't remove: ${errMsg(e)}`),
   });
 
+  // Relay invites — revocable/expiring self-enroll codes (Admin+ issues).
+  const invites = useQuery({
+    queryKey: ["workspace-invites"],
+    queryFn: workspaceListInvites,
+    enabled: relayOn,
+  });
+  const refreshInvites = () => qc.invalidateQueries({ queryKey: ["workspace-invites"] });
+  const [invRole, setInvRole] = useState("contributor");
+  const [invDays, setInvDays] = useState("7");
+  const [invUses, setInvUses] = useState("1");
+  const [lastCode, setLastCode] = useState<string | null>(null);
+  const createInviteMutation = useMutation({
+    mutationFn: () =>
+      workspaceCreateInvite(invRole, (Number(invDays) || 0) * 86400, Number(invUses) || 0),
+    onSuccess: (inv) => {
+      refreshInvites();
+      if (inv) {
+        setLastCode(inv.code);
+        void navigator.clipboard.writeText(inv.code).catch(() => {});
+        toast.success("Invite created + code copied. Share it with the code — it's shown once.");
+      } else {
+        toast.error("This relay doesn't support invites (open/self-host), or you're not an admin.");
+      }
+    },
+    onError: (e) => toast.error(`Couldn't create invite: ${errMsg(e)}`),
+  });
+  const revokeInviteMutation = useMutation({
+    mutationFn: (id: string) => workspaceRevokeInvite(id),
+    onSuccess: () => {
+      refreshInvites();
+      toast.success("Invite revoked.");
+    },
+    onError: (e) => toast.error(`Couldn't revoke: ${errMsg(e)}`),
+  });
+  const [joinCode, setJoinCode] = useState("");
+  const joinMutation = useMutation({
+    mutationFn: () => workspaceJoinViaInvite(joinCode.trim()),
+    onSuccess: (role) => {
+      if (role) {
+        setJoinCode("");
+        refreshSrv();
+        toast.success(`Joined as ${role}.`);
+      } else {
+        toast.error("That invite code was refused (invalid, expired, revoked, or used up).");
+      }
+    },
+    onError: (e) => toast.error(`Couldn't join: ${errMsg(e)}`),
+  });
+
   return (
     <RailFrame title="People" subtitle="Workspace members and governance roles for this chat.">
       <Section title="Members">
@@ -1646,6 +1700,84 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
                 </Button>
               </Card>
             </FormDisclosure>
+          </>
+        )}
+      </Section>
+
+      <Section title="Invites">
+        {!relayOn ? (
+          <EmptyHint text="Connect a relay (Settings → Team sync) to issue invites." />
+        ) : (
+          <>
+            <p className="text-xs opacity-55">
+              Share a code so someone can join at a set role. Codes are revocable, can expire, and
+              can cap how many times they're used. The code shows once, on creation.
+            </p>
+            {/* Issue */}
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <select
+                value={invRole}
+                onChange={(e) => setInvRole(e.target.value)}
+                className="rounded-lg border px-2 py-1.5 text-sm"
+                style={fieldStyle}
+              >
+                <option value="viewer">viewer</option>
+                <option value="contributor">contributor</option>
+                <option value="admin">admin</option>
+              </select>
+              <label className="flex items-center gap-1 text-xs opacity-70">
+                days
+                <input value={invDays} onChange={(e) => setInvDays(e.target.value)} inputMode="numeric" className="w-12 rounded-lg border px-2 py-1 text-sm" style={fieldStyle} />
+              </label>
+              <label className="flex items-center gap-1 text-xs opacity-70">
+                uses
+                <input value={invUses} onChange={(e) => setInvUses(e.target.value)} inputMode="numeric" className="w-12 rounded-lg border px-2 py-1 text-sm" style={fieldStyle} />
+              </label>
+              <Button variant="primary" disabled={createInviteMutation.isPending} onClick={() => createInviteMutation.mutate()}>
+                Create invite
+              </Button>
+            </div>
+            <p className="mt-1 text-[11px] opacity-45">0 days = never expires · 0 uses = unlimited.</p>
+            {lastCode && (
+              <div
+                className="mt-2 flex items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5"
+                style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+              >
+                <code className="truncate text-xs">{lastCode}</code>
+                <button className="shrink-0 text-xs underline" onClick={() => void navigator.clipboard.writeText(lastCode).catch(() => {})}>
+                  Copy
+                </button>
+              </div>
+            )}
+            {/* Existing invites */}
+            {(invites.data ?? []).filter((i) => !i.revoked).map((i: InviteEntry) => (
+              <div key={i.id} className="mt-1.5 flex items-center justify-between gap-2 text-sm">
+                <span className="min-w-0">
+                  <span className="font-medium">{i.role}</span>{" "}
+                  <span className="text-xs opacity-50">
+                    · {i.maxUses === 0 ? `${i.uses} uses` : `${i.uses}/${i.maxUses} used`}
+                    {i.expiresAt > 0 ? ` · expires ${new Date(i.expiresAt * 1000).toLocaleDateString()}` : ""}
+                  </span>
+                </span>
+                <button className="shrink-0 text-xs" style={{ color: "var(--hive-danger)" }} onClick={() => revokeInviteMutation.mutate(i.id)}>
+                  Revoke
+                </button>
+              </div>
+            ))}
+            {/* Redeem (for a joiner) */}
+            <div className="mt-3 flex items-center gap-2">
+              <input
+                value={joinCode}
+                onChange={(e) => setJoinCode(e.target.value)}
+                placeholder="Have a code? Paste it to join"
+                className="flex-1 rounded-lg border px-2.5 py-1.5 font-mono text-xs"
+                style={fieldStyle}
+                onKeyDown={(e) => e.key === "Enter" && joinCode.trim() && joinMutation.mutate()}
+              />
+              <Button variant="ghost" disabled={!joinCode.trim() || joinMutation.isPending} onClick={() => joinMutation.mutate()}>
+                Join
+              </Button>
+            </div>
           </>
         )}
       </Section>

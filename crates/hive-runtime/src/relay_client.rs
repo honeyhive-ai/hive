@@ -110,6 +110,37 @@ pub struct MemberEntry {
     pub added_at: u64,
 }
 
+/// Invite metadata from a membership-enforcing relay (never the code).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InviteEntry {
+    pub id: String,
+    pub role: String,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub expires_at: i64,
+    #[serde(default)]
+    pub max_uses: i64,
+    #[serde(default)]
+    pub uses: i64,
+    #[serde(default)]
+    pub revoked: bool,
+}
+
+/// A freshly-issued invite. `code` is shown ONCE (only its hash is stored).
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedInvite {
+    pub id: String,
+    pub code: String,
+    pub role: String,
+    #[serde(default)]
+    pub expires_at: i64,
+    #[serde(default)]
+    pub max_uses: i64,
+}
+
 /// One issued access token's metadata, as returned by the relay admin API
 /// (never the raw value or hash).
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -593,6 +624,66 @@ impl RelayClient {
         let url = format!("{}/v1/workspaces/{}/members/{}", self.base, workspace, account);
         self.authed(self.http.delete(url)).send().await?;
         Ok(())
+    }
+
+    /// Issue a revocable/expiring invite (caller must be `Admin`+). The raw
+    /// `code` is returned ONCE. `Ok(None)` if the relay doesn't support invites
+    /// or the caller isn't authorized.
+    pub async fn create_invite(
+        &self,
+        workspace: &str,
+        role: &str,
+        ttl_secs: i64,
+        max_uses: i64,
+    ) -> Result<Option<IssuedInvite>, RelayError> {
+        let url = format!("{}/v1/workspaces/{}/invites", self.base, workspace);
+        let body = serde_json::json!({ "role": role, "ttlSecs": ttl_secs, "maxUses": max_uses });
+        let resp = self.authed(self.http.post(url)).json(&body).send().await?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        Ok(Some(resp.json().await?))
+    }
+
+    /// List a workspace's invites (metadata only; never the codes). `Ok(None)`
+    /// if unsupported or unauthorized.
+    pub async fn list_invites(&self, workspace: &str) -> Result<Option<Vec<InviteEntry>>, RelayError> {
+        let url = format!("{}/v1/workspaces/{}/invites", self.base, workspace);
+        let resp = self.authed(self.http.get(url)).send().await?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        Ok(Some(resp.json().await?))
+    }
+
+    /// Revoke an invite by id (caller must be `Admin`+).
+    pub async fn revoke_invite(&self, workspace: &str, invite_id: &str) -> Result<(), RelayError> {
+        let url = format!("{}/v1/workspaces/{}/invites/{}", self.base, workspace, invite_id);
+        self.authed(self.http.delete(url)).send().await?;
+        Ok(())
+    }
+
+    /// Redeem an invite code to self-enroll in the workspace at its role.
+    /// Returns the granted role, or `Ok(None)` if the code was refused
+    /// (invalid/expired/revoked/used-up) or invites aren't supported.
+    pub async fn join_via_invite(
+        &self,
+        workspace: &str,
+        code: &str,
+        login: &str,
+    ) -> Result<Option<String>, RelayError> {
+        let url = format!("{}/v1/workspaces/{}/join", self.base, workspace);
+        let body = serde_json::json!({ "code": code, "login": login });
+        let resp = self.authed(self.http.post(url)).json(&body).send().await?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        #[derive(serde::Deserialize)]
+        struct JoinResp {
+            role: String,
+        }
+        let jr: JoinResp = resp.json().await?;
+        Ok(Some(jr.role))
     }
 
     // ── Relay access user/token administration (enterprise relay) ──────────

@@ -42,8 +42,8 @@ pub use mcp::{McpRegistry, McpServerSpec, McpTool, McpTransport};
 pub use mentions::{parse_mentions, MentionTargets};
 pub use relay_client::{
     AccountDevice, AccountIdentity, FetchedEnvelope, Friend, FriendPresence, FriendRequestOutcome,
-    IncomingFriendRequest, InboxEvent, IssuedRelayToken, MemberEntry, RelayClient, RelayError,
-    RelayProbe, RelayTokenEntry, RelayUserEntry,
+    IncomingFriendRequest, InboxEvent, InviteEntry, IssuedInvite, IssuedRelayToken, MemberEntry,
+    RelayClient, RelayError, RelayProbe, RelayTokenEntry, RelayUserEntry,
 };
 pub use remote_manifest::resolve_manifest_url;
 pub use sse::{next_backoff, parse_seq, SseConnectError, SseDecoder, SseStream};

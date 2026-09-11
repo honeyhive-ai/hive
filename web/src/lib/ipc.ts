@@ -506,6 +506,37 @@ export const workspaceAddMember = (handle: string, role: string) =>
 export const workspaceRemoveMember = (account: string) =>
   invoke<void>("workspace_remove_member", { account });
 
+/// A relay invite (metadata only; never the code).
+export interface InviteEntry {
+  id: string;
+  role: string;
+  createdBy: string;
+  expiresAt: number; // unix secs; 0 = never
+  maxUses: number; // 0 = unlimited
+  uses: number;
+  revoked: boolean;
+}
+/// A freshly-issued invite — `code` shown once.
+export interface IssuedInvite {
+  id: string;
+  code: string;
+  role: string;
+  expiresAt: number;
+  maxUses: number;
+}
+/// List the active workspace's relay invites (Admin+; empty otherwise).
+export const workspaceListInvites = () => invoke<InviteEntry[]>("workspace_list_invites");
+/// Issue an invite (Admin+); `code` is returned once. 0 = never/unlimited.
+export const workspaceCreateInvite = (role: string, ttlSecs: number, maxUses: number) =>
+  invoke<IssuedInvite | null>("workspace_create_invite", { role, ttlSecs, maxUses });
+/// Revoke an invite by id (Admin+).
+export const workspaceRevokeInvite = (inviteId: string) =>
+  invoke<void>("workspace_revoke_invite", { inviteId });
+/// Redeem an invite code to self-enroll in the active workspace; returns the
+/// granted role, or null if refused.
+export const workspaceJoinViaInvite = (code: string) =>
+  invoke<string | null>("workspace_join_via_invite", { code });
+
 // ── Social graph: friends + presence ───────────────────────────────────────
 
 export type Presence = "online" | "away" | "offline";

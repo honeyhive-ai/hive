@@ -8654,6 +8654,70 @@ async fn workspace_members(state: State<'_, AppState>) -> Result<Vec<hive_runtim
         .unwrap_or_default())
 }
 
+/// List the active workspace's relay invites (metadata only; empty if
+/// unsupported or the caller isn't an admin).
+#[tauri::command]
+async fn workspace_list_invites(state: State<'_, AppState>) -> Result<Vec<hive_runtime::InviteEntry>, String> {
+    let relay = configured_relay(&state)?;
+    let room = state.settings.lock().unwrap().sync_room.clone();
+    Ok(state
+        .relay_client(&relay)
+        .list_invites(&room)
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default())
+}
+
+/// Issue a relay invite for the active workspace (caller must be `Admin`+). The
+/// returned `code` is shown once. `ttl_secs`/`max_uses` of 0 = never/unlimited.
+#[tauri::command]
+async fn workspace_create_invite(
+    state: State<'_, AppState>,
+    role: String,
+    ttl_secs: i64,
+    max_uses: i64,
+) -> Result<Option<hive_runtime::IssuedInvite>, String> {
+    let relay = configured_relay(&state)?;
+    let room = state.settings.lock().unwrap().sync_room.clone();
+    state
+        .relay_client(&relay)
+        .create_invite(&room, &role, ttl_secs, max_uses)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Revoke a relay invite by id (caller must be `Admin`+).
+#[tauri::command]
+async fn workspace_revoke_invite(state: State<'_, AppState>, invite_id: String) -> Result<(), String> {
+    let relay = configured_relay(&state)?;
+    let room = state.settings.lock().unwrap().sync_room.clone();
+    state
+        .relay_client(&relay)
+        .revoke_invite(&room, &invite_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Redeem a relay invite code to self-enroll in the active workspace. Returns
+/// the granted role, or `None` if the code was refused. Enrolls under this
+/// device's GitHub login when signed in.
+#[tauri::command]
+async fn workspace_join_via_invite(state: State<'_, AppState>, code: String) -> Result<Option<String>, String> {
+    let relay = configured_relay(&state)?;
+    let (room, login) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.sync_room.clone(),
+            s.github_account.as_ref().map(|a| a.login.clone()).unwrap_or_default(),
+        )
+    };
+    state
+        .relay_client(&relay)
+        .join_via_invite(&room, &code, &login)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Add a member (by GitHub handle) or change their role on the active workspace.
 /// Caller must be `Admin`+. `role` = owner|admin|contributor|viewer.
 #[tauri::command]
@@ -10064,6 +10128,10 @@ pub fn run() {
             dismiss_invite,
             workspace_claim_membership,
             workspace_members,
+            workspace_list_invites,
+            workspace_create_invite,
+            workspace_revoke_invite,
+            workspace_join_via_invite,
             workspace_add_member,
             workspace_remove_member,
             friends_overview,
