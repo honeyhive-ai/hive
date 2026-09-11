@@ -408,6 +408,17 @@ export interface EnvDetectDto {
 }
 export const detectEnvironment = () => invoke<EnvDetectDto>("detect_environment");
 
+/// A provider Hive can reach right now (creds present or none needed), for the
+/// one-click "detect & configure" setup flow.
+export interface DetectedProviderDto {
+  kind: string;
+  label: string;
+  source: string; // "saved" | "env" | "local" | "path"
+  needsKey: boolean;
+  addable: boolean; // can be turned into a runtime directly (hosted + ollama)
+}
+export const detectProviders = () => invoke<DetectedProviderDto[]>("detect_providers");
+
 /// LLM providers (connections): a backend kind + optional API key + base URL.
 /// Runtimes (models) reference a provider for credentials/endpoint.
 export interface ProviderDto {

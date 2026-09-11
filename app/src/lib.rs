@@ -9235,6 +9235,91 @@ fn detect_environment() -> EnvDetectDto {
     }
 }
 
+/// A provider Hive can already reach on this machine (credentials present, or
+/// none needed), for one-click "detect & configure" setup.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DetectedProviderDto {
+    /// The value `add_runtime` / `probe_provider` expect (e.g. "anthropic").
+    kind: String,
+    label: String,
+    /// Where the credential/binary came from: "saved" | "env" | "local" | "path".
+    source: String,
+    /// True for hosted API providers (key-backed); false for local/subprocess.
+    needs_key: bool,
+    /// A runtime can be created straight from `add_runtime` (hosted + ollama).
+    /// False for subprocess agents (claude-code/codex) that use the built-in
+    /// path — surfaced as "detected" but not auto-added here.
+    addable: bool,
+}
+
+/// Sweep the machine for providers that would answer right now: saved/env API
+/// keys, a local Ollama server, and the claude/codex CLIs on PATH. Powers the
+/// "Detect my setup → add all working" one-click flow (Settings + onboarding).
+#[tauri::command]
+fn detect_providers(state: State<AppState>) -> Vec<DetectedProviderDto> {
+    let saved = { state.settings.lock().unwrap().provider_keys.clone() };
+    let has_saved = |cfg: &str| saved.get(cfg).map(|s| !s.is_empty()).unwrap_or(false);
+    let env_set = |var: &str| std::env::var(var).map(|v| !v.is_empty()).unwrap_or(false);
+    let mut out = Vec::new();
+
+    // Hosted API providers — ready only when a key is present (saved or env).
+    for (kind, label, cfg, env_var) in [
+        ("anthropic", "Anthropic", "anthropic", "ANTHROPIC_API_KEY"),
+        ("openAI", "OpenAI", "openAI", "OPENAI_API_KEY"),
+        ("openRouter", "OpenRouter", "openRouter", "OPENROUTER_API_KEY"),
+    ] {
+        let saved_here = has_saved(cfg);
+        if saved_here || env_set(env_var) {
+            out.push(DetectedProviderDto {
+                kind: kind.to_string(),
+                label: label.to_string(),
+                source: if saved_here { "saved" } else { "env" }.to_string(),
+                needs_key: true,
+                addable: true,
+            });
+        }
+    }
+
+    // Local Ollama (no key) — a quick TCP probe, same as detect_environment.
+    let ollama = "127.0.0.1:11434"
+        .parse()
+        .ok()
+        .map(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
+        })
+        .unwrap_or(false);
+    if ollama {
+        out.push(DetectedProviderDto {
+            kind: "ollama".to_string(),
+            label: "Ollama (local)".to_string(),
+            source: "local".to_string(),
+            needs_key: false,
+            addable: true,
+        });
+    }
+
+    // Subprocess CLIs on PATH (subscription auth, no key). These run via the
+    // built-in/subprocess path, so they're surfaced as available but not
+    // auto-added as a runtime here.
+    for (kind, label, bin) in [
+        ("claude-code", "Claude Code", "claude"),
+        ("codex", "Codex", "codex"),
+    ] {
+        if on_path(bin) {
+            out.push(DetectedProviderDto {
+                kind: kind.to_string(),
+                label: label.to_string(),
+                source: "path".to_string(),
+                needs_key: false,
+                addable: false,
+            });
+        }
+    }
+
+    out
+}
+
 #[tauri::command]
 fn github_logout(state: State<AppState>) -> Result<(), String> {
     let mut s = state.settings.lock().unwrap();
@@ -9788,6 +9873,7 @@ pub fn run() {
             friend_open_dm,
             list_dms,
             detect_environment,
+            detect_providers,
             list_providers,
             list_provider_presets,
             set_provider_key,

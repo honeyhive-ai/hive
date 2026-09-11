@@ -15,6 +15,8 @@ import {
   type RuntimeTestResult,
   setDefaultRuntime,
   listProviders,
+  detectProviders,
+  type DetectedProviderDto,
   listProviderPresets,
   setProviderKey,
   setProviderBaseUrl,
@@ -54,6 +56,91 @@ function isProviderConfigured(p: ProviderDto): boolean {
   return p.hasKey || (p.supportsBaseUrl && p.baseUrl.trim() !== "");
 }
 
+/// "Detect & configure": sweep the machine for providers that would answer now
+/// (saved/env keys, local Ollama, claude/codex CLIs) and add runtimes for them
+/// in one click — the power-user / fresh-machine fast path.
+function DetectPanel({ onConfigured }: { onConfigured: () => void }) {
+  const [found, setFound] = useState<DetectedProviderDto[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function detect() {
+    setBusy(true);
+    try {
+      setFound(await detectProviders());
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function addOne(p: DetectedProviderDto) {
+    const m = MODEL_SUGGESTIONS[p.kind]?.[0] ?? "";
+    const id = `${p.kind}-${m || "default"}`.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    await addRuntime(id, `${p.label}${m ? ` · ${m}` : ""}`, p.kind, p.needsKey ? "remote" : "local", "", m, true, false);
+  }
+
+  async function addAll() {
+    setBusy(true);
+    try {
+      for (const p of (found ?? []).filter((p) => p.addable)) await addOne(p);
+      onConfigured();
+      toast.success("Added detected models — pick one from the route pill in any chat.");
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const addable = (found ?? []).filter((p) => p.addable);
+  return (
+    <div className="mb-3 rounded-2xl border p-3" style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-sm font-medium">Detect my setup</div>
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void detect()}>
+          {busy ? "Scanning…" : found ? "Re-scan" : "Detect"}
+        </Button>
+      </div>
+      <p className="mt-0.5 text-xs opacity-55">
+        Finds providers that would answer right now — saved or environment API keys, a local Ollama
+        server, and the Claude Code / Codex CLIs on your PATH.
+      </p>
+      {found && found.length === 0 && (
+        <p className="mt-2 text-xs opacity-60">
+          Nothing detected. Add a provider below, or set an API key / start Ollama, then re-scan.
+        </p>
+      )}
+      {found && found.length > 0 && (
+        <div className="mt-2 space-y-1.5">
+          {found.map((p) => (
+            <div key={p.kind} className="flex items-center justify-between gap-2 text-sm">
+              <span>
+                <span className="font-medium">{p.label}</span>{" "}
+                <span className="text-xs opacity-50">· {p.source}</span>
+              </span>
+              {p.addable ? (
+                <Button size="sm" variant="ghost" disabled={busy} onClick={() => void addOne(p).then(onConfigured)}>
+                  Add
+                </Button>
+              ) : (
+                <span className="text-xs opacity-55">available as @hive</span>
+              )}
+            </div>
+          ))}
+          {addable.length > 1 && (
+            <div className="pt-1">
+              <Button size="sm" variant="primary" disabled={busy} onClick={() => void addAll()}>
+                Add all {addable.length} working
+              </Button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ProvidersSection() {
   const qc = useQueryClient();
   const providers = useQuery({ queryKey: ["providers"], queryFn: listProviders });
@@ -77,6 +164,7 @@ function ProvidersSection() {
 
   return (
     <Section title="LLM providers">
+      <DetectPanel onConfigured={() => qc.invalidateQueries({ queryKey: ["runtimes"] })} />
       <p className="text-xs opacity-50">
         A provider is a backend + how to reach it (key and/or base URL). Add the ones you use — the
         rest stay tucked away. Models (below) pick a provider; agents pick a model.
