@@ -53,18 +53,115 @@ fn env_opt(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.trim().is_empty())
 }
 
+/// Persisted connection config (written by `hive enroll`), read as a fallback
+/// under the env vars so a headless box needn't re-export them each run.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct FileConfig {
+    #[serde(default)]
+    relay_url: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default)]
+    room: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+}
+
+fn config_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("config.toml")
+}
+
+fn load_file_config(data_dir: &std::path::Path) -> FileConfig {
+    std::fs::read_to_string(config_path(data_dir))
+        .ok()
+        .and_then(|t| toml::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
 fn config() -> Config {
     let data_dir = env_opt("HIVE_DATA_DIR")
         .map(PathBuf::from)
         .or_else(|| env_opt("HOME").map(|h| PathBuf::from(h).join(".hive")))
         .unwrap_or_else(|| PathBuf::from("./hive-data"));
+    // Env wins; the saved config.toml (from `hive enroll`) fills the rest.
+    let f = load_file_config(&data_dir);
     Config {
         data_dir,
-        relay_url: env_opt("HIVE_RELAY_URL"),
-        token: env_opt("HIVE_RELAY_ACCESS_TOKEN"),
+        relay_url: env_opt("HIVE_RELAY_URL").or(f.relay_url),
+        token: env_opt("HIVE_RELAY_ACCESS_TOKEN").or(f.token),
         github_token: env_opt("HIVE_RELAY_GITHUB_TOKEN"),
-        room: env_opt("HIVE_WORKSPACE").unwrap_or_else(|| "default".into()),
-        key: env_opt("HIVE_WORKSPACE_KEY"),
+        room: env_opt("HIVE_WORKSPACE").or(f.room).unwrap_or_else(|| "default".into()),
+        key: env_opt("HIVE_WORKSPACE_KEY").or(f.key),
+    }
+}
+
+/// Decode a `hivews1:` workspace invite → (relay_url, room, key). Mirrors the
+/// app's encoder (base64url(json) of the connection; snake_case fields).
+fn decode_hivews_invite(invite: &str) -> Result<(String, String, Option<String>)> {
+    use base64::Engine;
+    #[derive(serde::Deserialize)]
+    struct Conn {
+        #[serde(default)]
+        relay_url: String,
+        #[serde(default)]
+        room: String,
+        #[serde(default)]
+        key: Option<String>,
+    }
+    let body = invite
+        .trim()
+        .strip_prefix("hivews1:")
+        .ok_or_else(|| anyhow!("not a Hive workspace invite (expected hivews1:…)"))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(body.trim().as_bytes())
+        .context("invalid invite encoding")?;
+    let c: Conn = serde_json::from_slice(&bytes).context("invalid invite payload")?;
+    if c.room.trim().is_empty() {
+        bail!("invite is missing a room");
+    }
+    Ok((c.relay_url, c.room, c.key))
+}
+
+/// `hive enroll <hivews1:…> [--token <access-token>]` — one-command bootstrap:
+/// decode the invite, persist the connection to config.toml, and (with --token)
+/// wire the relay identity. After this a headless box just runs `hive worker`.
+fn cmd_enroll(cfg: &Config, invite: &str, token: Option<String>) -> Result<()> {
+    let (relay_url, room, key) = decode_hivews_invite(invite)?;
+    std::fs::create_dir_all(&cfg.data_dir)?;
+    let mut f = load_file_config(&cfg.data_dir);
+    f.relay_url = Some(relay_url.clone());
+    f.room = Some(room.clone());
+    f.key = key;
+    if let Some(t) = token {
+        f.token = Some(t);
+    }
+    std::fs::write(config_path(&cfg.data_dir), toml::to_string_pretty(&f)?)?;
+    println!("Enrolled workspace '{room}' at {relay_url}.");
+    println!("Saved to {}.", config_path(&cfg.data_dir).display());
+    if f.token.is_none() {
+        println!("No access token set — for a membership-enforcing relay, add one:");
+        println!("  hive enroll <invite> --token <hrt1-token>   (or export HIVE_RELAY_ACCESS_TOKEN)");
+    }
+    println!("Next: `hive sync` then `hive worker` to bring the agent online.");
+    Ok(())
+}
+
+/// `hive join <invite-code>` — redeem a relay invite code to self-enroll this
+/// box's identity in the configured workspace at the invite's role.
+async fn cmd_join(cfg: &Config, code: &str) -> Result<()> {
+    let relay_url = cfg
+        .relay_url
+        .clone()
+        .ok_or_else(|| anyhow!("no relay — run `hive enroll <invite>` or set HIVE_RELAY_URL first"))?;
+    let relay = RelayClient::new(&relay_url)
+        .with_auth(cfg.token.clone())
+        .with_github_token(cfg.github_token.clone());
+    match relay.join_via_invite(&cfg.room, code.trim(), "").await? {
+        Some(role) => {
+            println!("Joined workspace '{}' as {role}. Run `hive sync`.", cfg.room);
+            Ok(())
+        }
+        None => bail!("invite refused (invalid, expired, revoked, or used up)"),
     }
 }
 
@@ -1000,8 +1097,13 @@ fn usage() -> ! {
          hive set-agent-host <agent> <host-id>   bind an agent to a host\n  \
          hive worker [--label <name>]   run the worker daemon (host detached agents, §12.4)\n  \
          hive queue                     show queued work (unanswered mentions + host status)\n\n\
-         Config via env: HIVE_DATA_DIR, HIVE_RELAY_URL, HIVE_RELAY_ACCESS_TOKEN,\n\
-         HIVE_WORKSPACE, HIVE_WORKSPACE_KEY."
+         Setup:\n  \
+         hive enroll <hivews1:invite> [--token <hrt1>]   one-shot: save the workspace connection\n  \
+         hive join <invite-code>        redeem a relay invite to self-enroll this box's identity\n  \
+         hive setup [--apply]           detect providers; --apply defines keyless runtimes\n  \
+         hive config <export|import <file>>   round-trip the workspace runtime set\n\n\
+         Config via env (override the saved config.toml from `enroll`):\n  \
+         HIVE_DATA_DIR, HIVE_RELAY_URL, HIVE_RELAY_ACCESS_TOKEN, HIVE_WORKSPACE, HIVE_WORKSPACE_KEY."
     );
     std::process::exit(2);
 }
@@ -1097,6 +1199,18 @@ fn run() -> Result<()> {
         "rm-runtime" => {
             let id = positional.first().ok_or_else(|| anyhow!("usage: hive rm-runtime <id>"))?;
             cmd_rm_runtime(&cfg, id)
+        }
+        "enroll" => {
+            let invite = positional
+                .first()
+                .ok_or_else(|| anyhow!("usage: hive enroll <hivews1:invite> [--token <access-token>]"))?;
+            cmd_enroll(&cfg, invite, flag_val("--token"))
+        }
+        "join" => {
+            let code = positional
+                .first()
+                .ok_or_else(|| anyhow!("usage: hive join <invite-code>"))?;
+            rt()?.block_on(cmd_join(&cfg, code))
         }
         "setup" => cmd_setup(&cfg, has("--apply")),
         "config" => match positional.first().map(|s| s.as_str()) {
