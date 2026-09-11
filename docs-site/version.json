@@ -1,6 +1,6 @@
 {
-  "tag": "v1.6.0",
-  "name": "Hive 1.6.0",
+  "tag": "v1.7.0",
+  "name": "Hive 1.7.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "A broad UX polish pass. Code blocks are now syntax-highlighted with a language header; each agent turn is attributed to the model that actually produced it (switching runtimes no longer relabels history). The command palette gained real navigation and actions — jump to any pane, settings tab, or view, toggle light/dark — not just chat switching. @file opens a fuzzy workspace-file picker instead of asking you to type a path from memory. The Review pane shows a pending badge and renders proposal diffs per file like a pull request. Settings search matches content (\"api key\", \"relay\", \"reset\"), the workspace root gets a native folder picker, and turning on \"bypass all permissions\" now asks first. Onboarding warns when the chosen agent CLI isn't installed, with a re-check. Plus: keyboard-reachable message actions, a workspace crumb when the sidebar is collapsed, capped toasts, and a clearer update banner."
+  "notes": "Automated setup + relay-managed teams. Settings → Models gains 'Detect my setup' (one click wires every provider that already answers — env/saved API keys, a local Ollama, the Claude Code/Codex CLIs), a Test button that validates a provider key at entry, one-step 'Add model', and portable hive.toml export/import so an architect can version-control a setup and stamp it across a team. Onboarding now verifies an API agent actually responds before finishing. The CLI gains 'hive setup' (headless detect) and 'hive config export/import'. Teams can now be managed on the relay: an owner claims a workspace, assigns roles, and issues revocable/expiring invite codes; the People pane manages members + invites, and a membership-enabled relay enforces who may read/write while staying end-to-end encrypted (it never sees keys or content)."
 }
