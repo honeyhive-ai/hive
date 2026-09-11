@@ -161,7 +161,15 @@ function ProviderRow({
   async function runProbe() {
     setProbe("running");
     try {
-      setProbe(await probeProvider(provider.kind, model.trim() || undefined));
+      // Test the just-typed key/base URL if present (before Save), else stored.
+      setProbe(
+        await probeProvider(
+          provider.kind,
+          model.trim() || undefined,
+          key.trim() || undefined,
+          baseUrl.trim() || undefined,
+        ),
+      );
     } catch (e) {
       setProbe({ ok: false, latency_ms: 0, reply: "", error: errMsg(e) });
     }
@@ -265,7 +273,7 @@ function ProviderRow({
               <Button
                 variant="ghost"
                 size="md"
-                disabled={probe === "running" || (provider.needsKey && !provider.hasKey)}
+                disabled={probe === "running" || (provider.needsKey && !provider.hasKey && !key.trim())}
                 onClick={() => void runProbe()}
               >
                 {probe === "running" ? "Testing…" : "Test"}

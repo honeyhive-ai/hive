@@ -12,6 +12,7 @@ vi.mock("@/lib/ipc", () => ({
   addWorkspaceToList: vi.fn(async () => ["/Users/sam/proj"]),
   setWorkspaceRoot: vi.fn(async () => {}),
   addRuntime: vi.fn(async () => {}),
+  probeProvider: vi.fn(async () => ({ ok: true, latency_ms: 5, reply: "PINGOK", error: null })),
   // The claude-code path persists the chosen --model; missing this mock made
   // applyRuntime() throw (undefined is not a function), silently stranding
   // the wizard on step 3 — the long-standing "pre-existing failure".
@@ -191,6 +192,34 @@ describe("Onboarding wizard flow", () => {
     expect(ipc.updateConnectionSettings).toHaveBeenCalledWith(
       expect.objectContaining({ apiKey: "sk-test-123", permissionMode: "acceptEdits" }),
     );
+  });
+
+  it("holds on a failed agent probe, then proceeds on a second Continue", async () => {
+    // A bad key: the probe fails, so the first Next must NOT advance/configure.
+    (ipc.probeProvider as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      ok: false,
+      latency_ms: 0,
+      reply: "",
+      error: "401 Unauthorized",
+    });
+    render(<Onboarding onComplete={vi.fn()} />);
+
+    await screen.findByPlaceholderText("Continue with a name");
+    await clickByName("Next"); // identity
+    await clickByName("Next"); // project
+
+    await screen.findByText("Choose your agent");
+    await clickByName(/Anthropic API key/);
+    await userEvent.type(screen.getByPlaceholderText(/Anthropic API key/), "sk-ant-bad");
+    await clickByName("Next"); // probes → fails → holds
+
+    // The failure is surfaced and no runtime was configured yet.
+    await screen.findByText(/won't answer until it works/);
+    expect(ipc.addRuntime).not.toHaveBeenCalled();
+
+    // A second Continue proceeds anyway (transient/edge escape hatch).
+    await clickByName("Next");
+    await waitFor(() => expect(ipc.updateConnectionSettings).toHaveBeenCalled());
   });
 
   it("GitHub sign-in pre-copies the device code instead of auto-opening the browser", async () => {

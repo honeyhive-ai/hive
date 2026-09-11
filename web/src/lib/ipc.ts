@@ -173,8 +173,13 @@ export const testRuntime = (runtimeId: string) =>
 /// Validate a provider's key at entry (no runtime needed): pings the provider
 /// with a chosen/default model and reports pass/fail + latency + error. `model`
 /// is optional — omit to use a safe default just to check the key.
-export const probeProvider = (kind: string, model?: string) =>
-  invoke<RuntimeTestResult>("probe_provider", { kind, model: model ?? null });
+export const probeProvider = (kind: string, model?: string, key?: string, baseUrl?: string) =>
+  invoke<RuntimeTestResult>("probe_provider", {
+    kind,
+    model: model ?? null,
+    key: key ?? null,
+    baseUrl: baseUrl ?? null,
+  });
 
 export const setChatRuntime = (sessionId: string, runtimeId: string) =>
   invoke<void>("set_chat_runtime", { sessionId, runtimeId });

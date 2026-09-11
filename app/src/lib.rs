@@ -5871,6 +5871,8 @@ async fn probe_provider(
     state: State<'_, AppState>,
     kind: String,
     model: Option<String>,
+    key: Option<String>,
+    base_url: Option<String>,
 ) -> Result<RuntimeTestDto, String> {
     let provider = parse_provider_kind(&kind)?;
     let (settings_key, provider_keys, provider_base_urls, claude_args) = {
@@ -5878,11 +5880,11 @@ async fn probe_provider(
         (s.api_key.clone(), s.provider_keys.clone(), s.provider_base_urls.clone(), s.claude_args())
     };
     let cfg = provider_config_name(provider);
-    // Same key precedence as resolve_runtime: per-provider → legacy global → env.
-    let api_key = provider_keys
-        .get(cfg)
-        .cloned()
-        .filter(|s| !s.is_empty())
+    // A key passed in wins (test-before-save, e.g. from onboarding); otherwise
+    // the stored precedence: per-provider → legacy global → env.
+    let typed_key = key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty());
+    let api_key = typed_key
+        .or_else(|| provider_keys.get(cfg).cloned().filter(|s| !s.is_empty()))
         .or(settings_key)
         .or_else(|| api_key_for(provider));
     if provider_needs_key(provider) && api_key.is_none() {
@@ -5893,7 +5895,11 @@ async fn probe_provider(
             error: Some("No API key set for this provider — save one first.".to_string()),
         });
     }
-    let base = provider_base_urls.get(cfg).cloned().filter(|s| !s.is_empty());
+    // A passed base URL wins (test-before-save from onboarding); else the stored one.
+    let base = base_url
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .or_else(|| provider_base_urls.get(cfg).cloned().filter(|s| !s.is_empty()));
     let endpoint = match provider {
         ModelProviderKind::Anthropic => String::new(),
         _ => {

@@ -23,6 +23,8 @@ import {
   probeRelay,
   probeRelayAt,
   createRelayUser,
+  probeProvider,
+  type RuntimeTestResult,
   type EnvDetectDto,
   type ClaudeModelOption,
   type ClaudePermissionMode,
@@ -103,8 +105,37 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
   // Step 3 — runtime + access
   const [choice, setChoice] = useState<RuntimeChoice>("claudeCode");
   const [apiKey, setApiKey] = useState("");
+  // Agent connectivity check (API providers): verify the key actually answers
+  // before Finish, so nobody completes onboarding with a silently-dead agent.
+  // `ackFail` lets a user proceed anyway after one clear failure (transient/edge).
+  const [agentProbe, setAgentProbe] = useState<RuntimeTestResult | "running" | null>(null);
+  const [agentAckFail, setAgentAckFail] = useState(false);
+  const agentNeedsKey = choice === "openai" || choice === "anthropic";
+
+  async function probeAgent(): Promise<boolean> {
+    setAgentProbe("running");
+    try {
+      const kind = choice === "anthropic" ? "anthropic" : "openAI";
+      const r = await probeProvider(
+        kind,
+        choice === "openai" ? model.trim() || undefined : undefined,
+        apiKey.trim() || undefined,
+        choice === "openai" ? baseUrl.trim() || undefined : undefined,
+      );
+      setAgentProbe(r);
+      return r.ok;
+    } catch (e) {
+      setAgentProbe({ ok: false, latency_ms: 0, reply: "", error: String(e) });
+      return false;
+    }
+  }
   const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1/chat/completions");
   const [model, setModel] = useState("gpt-4o");
+  // Any change to the agent choice/creds invalidates a prior probe result.
+  useEffect(() => {
+    setAgentProbe(null);
+    setAgentAckFail(false);
+  }, [choice, apiKey, model, baseUrl]);
   const [claudeModel, setClaudeModel] = useState(""); // "" = CLI default
   const [claudeModels, setClaudeModels] = useState<ClaudeModelOption[]>([]);
   const [claudeCustom, setClaudeCustom] = useState(false);
@@ -296,6 +327,20 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
       } else if (step === 2) {
         setStep(3);
       } else if (step === 3) {
+        // Guarantee a responding agent: for an API provider, verify the key
+        // actually answers before advancing. A first failure warns and holds;
+        // a second Next (agentAckFail) proceeds anyway so a transient/edge probe
+        // failure can't trap the user.
+        if (agentNeedsKey && !(typeof agentProbe === "object" && agentProbe?.ok) && !agentAckFail) {
+          const ok = await probeAgent();
+          if (!ok) {
+            setAgentAckFail(true);
+            setError(
+              "Couldn't reach that provider with this key — @hive won't answer until it works. Fix the key, or press Continue again to set it up anyway.",
+            );
+            return;
+          }
+        }
         await applyRuntime();
         setStep(4);
       } else if (step === 4) {
@@ -666,6 +711,29 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
             )}
             {choice === "anthropic" && (
               <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} type="password" placeholder="Anthropic API key (sk-ant-…)" className={field} style={inputStyle} />
+            )}
+
+            {agentNeedsKey && (
+              <div className="space-y-1.5">
+                <button
+                  type="button"
+                  onClick={() => void probeAgent()}
+                  disabled={agentProbe === "running" || apiKey.trim().length === 0}
+                  className="text-xs underline opacity-70 hover:opacity-100 disabled:opacity-40"
+                >
+                  {agentProbe === "running" ? "Testing…" : "Test connection"}
+                </button>
+                {agentProbe && agentProbe !== "running" && (
+                  <div
+                    className="text-xs"
+                    style={{ color: agentProbe.ok ? "var(--hive-success)" : "var(--hive-danger)" }}
+                  >
+                    {agentProbe.ok
+                      ? `✓ Connected (${agentProbe.latency_ms} ms)`
+                      : `✕ ${agentProbe.error ?? "Failed to connect"}`}
+                  </div>
+                )}
+              </div>
             )}
 
             <label className="flex items-center gap-2 text-sm">
