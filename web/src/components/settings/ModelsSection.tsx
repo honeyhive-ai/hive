@@ -17,6 +17,8 @@ import {
   listProviders,
   detectProviders,
   type DetectedProviderDto,
+  exportConfig,
+  importConfig,
   listProviderPresets,
   setProviderKey,
   setProviderBaseUrl,
@@ -45,7 +47,72 @@ export function ModelsSection() {
       <AgentsSection />
       <TemplatesSection />
       <ContextCommandsSection />
+      <PortableConfigSection />
     </>
+  );
+}
+
+/// Export the runtime/agent/MCP setup as portable TOML (no secrets), or import
+/// one — so an architect can version-control a setup and stamp it across a team.
+function PortableConfigSection() {
+  const qc = useQueryClient();
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function doExport() {
+    setBusy(true);
+    try {
+      const toml = await exportConfig();
+      setText(toml);
+      await navigator.clipboard.writeText(toml).catch(() => {});
+      toast.success("Config exported + copied to clipboard.");
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function doImport() {
+    if (!text.trim()) return;
+    setBusy(true);
+    try {
+      const summary = await importConfig(text);
+      qc.invalidateQueries({ queryKey: ["runtimes"] });
+      qc.invalidateQueries({ queryKey: ["providers"] });
+      qc.invalidateQueries({ queryKey: ["agent-templates"] });
+      qc.invalidateQueries({ queryKey: ["mcp"] });
+      toast.success(summary);
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Section title="Portable config">
+      <p className="text-xs opacity-50">
+        Export your runtimes, agents, and MCP servers as TOML to version-control and share with a
+        team — no API keys or tokens are included (each records only the env var its key comes from).
+        Paste one here and Import to stamp that setup onto this machine (additive; nothing is deleted).
+      </p>
+      <div className="flex gap-2">
+        <Button size="sm" variant="ghost" disabled={busy} onClick={() => void doExport()}>
+          Export
+        </Button>
+        <Button size="sm" variant="primary" disabled={busy || !text.trim()} onClick={() => void doImport()}>
+          Import
+        </Button>
+      </div>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="# Export to fill this, or paste a hive.toml to import…"
+        spellCheck={false}
+        className="mt-2 h-40 w-full rounded-xl border p-3 font-mono text-xs"
+        style={fieldStyle}
+      />
+    </Section>
   );
 }
 

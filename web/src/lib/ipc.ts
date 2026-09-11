@@ -419,6 +419,12 @@ export interface DetectedProviderDto {
 }
 export const detectProviders = () => invoke<DetectedProviderDto[]>("detect_providers");
 
+/// Portable config (hive.toml): export the current runtime/agent/MCP setup +
+/// defaults as TOML (no secrets), or import one to stamp a setup. import returns
+/// a human summary.
+export const exportConfig = () => invoke<string>("export_config");
+export const importConfig = (tomlText: string) => invoke<string>("import_config", { tomlText });
+
 /// LLM providers (connections): a backend kind + optional API key + base URL.
 /// Runtimes (models) reference a provider for credentials/endpoint.
 export interface ProviderDto {

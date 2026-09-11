@@ -9320,6 +9320,208 @@ fn detect_providers(state: State<AppState>) -> Vec<DetectedProviderDto> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Declarative config — export/import a portable hive.toml so an architect can
+// version-control a runtime/agent/MCP setup and stamp it across machines. API
+// keys and MCP bearer tokens are NEVER exported — a runtime records only the
+// env var its key is read from (`keyEnv`), a reference the importer resolves.
+// ---------------------------------------------------------------------------
+
+fn portable_version() -> u32 {
+    1
+}
+fn portable_true() -> bool {
+    true
+}
+
+/// The env var a provider's API key is read from — an import hint, never the key.
+fn provider_key_env(kind: ModelProviderKind) -> Option<&'static str> {
+    match kind {
+        ModelProviderKind::Anthropic => Some("ANTHROPIC_API_KEY"),
+        ModelProviderKind::OpenAI => Some("OPENAI_API_KEY"),
+        ModelProviderKind::OpenRouter => Some("OPENROUTER_API_KEY"),
+        _ => None,
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PortableConfig {
+    #[serde(default = "portable_version")]
+    version: u32,
+    #[serde(default)]
+    defaults: PortableDefaults,
+    #[serde(default)]
+    runtimes: Vec<PortableRuntime>,
+    #[serde(default)]
+    agents: Vec<AgentTemplate>,
+    #[serde(default)]
+    mcp_servers: Vec<McpServerSpec>,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableDefaults {
+    #[serde(default)]
+    runtime: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    permission_mode: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PortableRuntime {
+    id: String,
+    name: String,
+    provider: String,
+    location: String,
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    model: String,
+    #[serde(default = "portable_true")]
+    supports_tools: bool,
+    #[serde(default)]
+    supports_embeddings: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model_base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_window: Option<u32>,
+    /// The env var the API key is read from — a hint; the key is never exported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_env: Option<String>,
+}
+
+/// Serialize the current runtime/agent/MCP setup + defaults to portable TOML.
+#[tauri::command]
+fn export_config(state: State<AppState>) -> Result<String, String> {
+    let runtimes: Vec<PortableRuntime> = state
+        .combined_runtimes()
+        .iter()
+        .map(|rt| PortableRuntime {
+            id: rt.id.clone(),
+            name: rt.name.clone(),
+            provider: provider_config_name(rt.provider_kind).to_string(),
+            location: format!("{:?}", rt.location).to_lowercase(),
+            endpoint: rt.endpoint.clone(),
+            model: rt.model_id.clone(),
+            supports_tools: rt.capabilities.supports_tools,
+            supports_embeddings: rt.capabilities.supports_embeddings,
+            model_base_url: rt.model_base_url.clone(),
+            context_window: rt.capabilities.context_window_tokens,
+            key_env: provider_key_env(rt.provider_kind).map(str::to_string),
+        })
+        .collect();
+    // MCP: strip the bearer token (auth) — it's a secret; the importer re-auths.
+    let mcp_servers: Vec<McpServerSpec> = state
+        .combined_mcp_servers()
+        .into_iter()
+        .map(|mut m| {
+            m.auth = None;
+            m
+        })
+        .collect();
+    let (default_model, permission_mode, agents) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.default_model.clone().unwrap_or_default(),
+            s.claude_permission_mode.clone(),
+            s.agent_templates.clone(),
+        )
+    };
+    let cfg = PortableConfig {
+        version: portable_version(),
+        defaults: PortableDefaults {
+            runtime: state.current_default_runtime_id(),
+            model: default_model,
+            permission_mode,
+        },
+        runtimes,
+        agents,
+        mcp_servers,
+    };
+    let header = "# Hive portable config. Version-control this to stamp a setup across machines.\n\
+                  # Secrets are NEVER stored here: a runtime records only `keyEnv` (the env var\n\
+                  # its API key is read from). Set those env vars / provider keys on each machine.\n\n";
+    toml::to_string_pretty(&cfg)
+        .map(|body| format!("{header}{body}"))
+        .map_err(|e| e.to_string())
+}
+
+/// Apply a portable TOML config: add its runtimes/agents/MCP servers and set
+/// defaults. Additive + idempotent (upserts by id); never deletes existing
+/// setup. Returns a human summary; individual failures are collected, not fatal.
+#[tauri::command]
+fn import_config(state: State<AppState>, toml_text: String) -> Result<String, String> {
+    let cfg: PortableConfig =
+        toml::from_str(&toml_text).map_err(|e| format!("Invalid config: {e}"))?;
+    if cfg.version != portable_version() {
+        return Err(format!(
+            "Unsupported config version {} (this build understands {}).",
+            cfg.version,
+            portable_version()
+        ));
+    }
+    let mut runtimes = 0usize;
+    let mut agents = 0usize;
+    let mut mcp = 0usize;
+    let mut warnings: Vec<String> = Vec::new();
+
+    for r in cfg.runtimes {
+        match add_runtime(
+            state.clone(),
+            r.id.clone(),
+            r.name,
+            r.provider,
+            r.location,
+            r.endpoint,
+            r.model,
+            r.supports_tools,
+            r.supports_embeddings,
+            r.model_base_url,
+            None,
+            r.context_window,
+        ) {
+            Ok(()) => runtimes += 1,
+            Err(e) => warnings.push(format!("runtime {}: {e}", r.id)),
+        }
+    }
+    for a in cfg.agents {
+        match add_agent_template(state.clone(), a.name.clone(), a.runtime_id, a.role, a.instructions) {
+            Ok(()) => agents += 1,
+            Err(e) => warnings.push(format!("agent {}: {e}", a.name)),
+        }
+    }
+    for m in cfg.mcp_servers {
+        if let McpTransport::Http { url } = &m.transport {
+            match add_remote_mcp_server(state.clone(), m.id.clone(), url.clone()) {
+                Ok(()) => mcp += 1,
+                Err(e) => warnings.push(format!("mcp {}: {e}", m.id)),
+            }
+        } else {
+            warnings.push(format!("mcp {}: only HTTP servers can be imported", m.id));
+        }
+    }
+    if !cfg.defaults.runtime.trim().is_empty() {
+        let _ = set_default_runtime(state.clone(), cfg.defaults.runtime);
+    }
+    if !cfg.defaults.model.trim().is_empty() {
+        let _ = set_default_model(state.clone(), cfg.defaults.model);
+    }
+    if !cfg.defaults.permission_mode.trim().is_empty() {
+        let mut s = state.settings.lock().unwrap();
+        s.claude_permission_mode = cfg.defaults.permission_mode;
+        save_settings(&state.data_dir, &s);
+    }
+
+    let mut summary = format!("Imported {runtimes} runtime(s), {agents} agent(s), {mcp} MCP server(s).");
+    if !warnings.is_empty() {
+        summary.push_str(&format!(" Skipped {}: {}", warnings.len(), warnings.join("; ")));
+    }
+    Ok(summary)
+}
+
 #[tauri::command]
 fn github_logout(state: State<AppState>) -> Result<(), String> {
     let mut s = state.settings.lock().unwrap();
@@ -9874,6 +10076,8 @@ pub fn run() {
             list_dms,
             detect_environment,
             detect_providers,
+            export_config,
+            import_config,
             list_providers,
             list_provider_presets,
             set_provider_key,
