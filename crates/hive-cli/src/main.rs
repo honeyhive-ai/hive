@@ -26,7 +26,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use hive_core::{
     derive_workspace_key, workspace_config_session_id, HostKind, MessageRole, ModelProviderKind,
     Timestamp, WorkspaceAgent, WorkspaceCredential, WorkspaceHost, WorkspaceRuntime,
@@ -289,6 +289,117 @@ fn cmd_rm_runtime(cfg: &Config, id: &str) -> Result<()> {
     let mut svc = open_service(cfg)?;
     svc.remove_workspace_runtime(uuid_of_room(&cfg.room), id)?;
     println!("removed.");
+    Ok(())
+}
+
+/// Is `bin` an executable on PATH? (headless detection for `hive setup`).
+fn on_path(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+        .unwrap_or(false)
+}
+
+/// `hive setup` — headless detect + configure. Reports what this box can already
+/// reach and (with --apply) defines workspace runtimes for the *keyless* ones
+/// (Ollama, claude/codex CLIs). Key-backed providers are printed as ready-to-run
+/// commands rather than auto-wired, so a personal key is never inlined onto the
+/// shared config log (workspace credentials use a secretRef the worker holds).
+fn cmd_setup(cfg: &Config, apply: bool) -> Result<()> {
+    let ollama = "127.0.0.1:11434"
+        .parse()
+        .ok()
+        .map(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
+        })
+        .unwrap_or(false);
+    let claude = on_path("claude");
+    let codex = on_path("codex");
+
+    println!("Detected on this box:");
+    for (env_var, provider, model) in [
+        ("ANTHROPIC_API_KEY", "anthropic", "claude-sonnet-4-6"),
+        ("OPENAI_API_KEY", "openai", "gpt-4o"),
+        ("OPENROUTER_API_KEY", "openrouter", "openai/gpt-4o-mini"),
+    ] {
+        if std::env::var(env_var).map(|v| !v.is_empty()).unwrap_or(false) {
+            println!("  ✓ {env_var} present (key-backed)");
+            println!(
+                "      → hive add-runtime {provider} \"{provider}\" {provider} {model} --secret-ref {provider}   (worker sets HIVE_WS_SECRET_{provider})"
+            );
+        }
+    }
+    if ollama {
+        println!("  ✓ Ollama (local, keyless)");
+    }
+    if claude {
+        println!("  ✓ claude CLI (keyless)");
+    }
+    if codex {
+        println!("  ✓ codex CLI (keyless)");
+    }
+
+    if apply {
+        let mut svc = open_service(cfg)?;
+        let ws = uuid_of_room(&cfg.room);
+        let mut n = 0;
+        if ollama {
+            let mut wr = WorkspaceRuntime::new("ollama", "Ollama (local)", ModelProviderKind::Ollama, "llama3.2");
+            wr.endpoint = "http://localhost:11434".to_string();
+            svc.add_workspace_runtime(ws, wr)?;
+            n += 1;
+        }
+        if claude {
+            svc.add_workspace_runtime(ws, WorkspaceRuntime::new("claude-code", "Claude Code", ModelProviderKind::ClaudeCode, ""))?;
+            n += 1;
+        }
+        if codex {
+            svc.add_workspace_runtime(ws, WorkspaceRuntime::new("codex", "Codex", ModelProviderKind::Codex, ""))?;
+            n += 1;
+        }
+        println!("\nDefined {n} keyless runtime(s). Run the add-runtime line(s) above for key-backed providers, then `hive sync` to share.");
+    } else {
+        println!("\nRe-run `hive setup --apply` to define the keyless runtimes automatically.");
+    }
+    Ok(())
+}
+
+/// TOML wrapper for `hive config export/import` — the workspace's runtime set.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct WorkspaceRuntimesToml {
+    #[serde(default, rename = "runtime")]
+    runtimes: Vec<WorkspaceRuntime>,
+}
+
+/// `hive config export` — print the workspace runtimes as portable TOML. Inline
+/// secrets are NEVER exported: they're downgraded to a secretRef the importer
+/// resolves from HIVE_WS_SECRET_<ref>.
+fn cmd_config_export(cfg: &Config) -> Result<()> {
+    let svc = open_service(cfg)?;
+    let mut runtimes = svc.list_workspace_runtimes(uuid_of_room(&cfg.room))?;
+    for r in &mut runtimes {
+        if matches!(r.credential, WorkspaceCredential::Inline { .. }) {
+            r.credential = WorkspaceCredential::SecretRef { secret_ref: r.id.clone() };
+        }
+    }
+    print!("{}", toml::to_string_pretty(&WorkspaceRuntimesToml { runtimes })?);
+    Ok(())
+}
+
+/// `hive config import <file>` — define workspace runtimes from a TOML file
+/// (additive; upserts by id). `hive sync` to share them with the team.
+fn cmd_config_import(cfg: &Config, path: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {path}"))?;
+    let doc: WorkspaceRuntimesToml = toml::from_str(&text).context("parsing config TOML")?;
+    let mut svc = open_service(cfg)?;
+    let ws = uuid_of_room(&cfg.room);
+    let mut n = 0;
+    for wr in doc.runtimes {
+        let id = wr.id.clone();
+        svc.add_workspace_runtime(ws, wr)?;
+        println!("+ runtime {id}");
+        n += 1;
+    }
+    println!("Imported {n} workspace runtime(s). `hive sync` to share.");
     Ok(())
 }
 
@@ -987,6 +1098,17 @@ fn run() -> Result<()> {
             let id = positional.first().ok_or_else(|| anyhow!("usage: hive rm-runtime <id>"))?;
             cmd_rm_runtime(&cfg, id)
         }
+        "setup" => cmd_setup(&cfg, has("--apply")),
+        "config" => match positional.first().map(|s| s.as_str()) {
+            Some("export") => cmd_config_export(&cfg),
+            Some("import") => {
+                let path = positional
+                    .get(1)
+                    .ok_or_else(|| anyhow!("usage: hive config import <file.toml>"))?;
+                cmd_config_import(&cfg, path)
+            }
+            _ => bail!("usage: hive config <export|import <file.toml>>"),
+        },
         "agents" => cmd_agents(&cfg),
         "add-agent" => {
             if positional.len() < 2 {
