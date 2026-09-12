@@ -202,23 +202,23 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
   // warm charcoal (darker than the other darks) with an amber pop — pairs the
   // sleek flat-turn treatment in light and a dense developer-dark at night.
   obsidian: {
-    // Light is a crisp, cool near-white graphite (deliberately NOT pollen's warm
-    // honey) — the "Refined" daytime look; dark is a deep warm charcoal with an
-    // amber pop (Midnight). Rail is a near-black graphite in both, so the theme
-    // reads as the sleek/dark family at a glance whichever mode you're in.
+    // A TRUE dark theme (not a light/dark pair): both variants are the same deep
+    // warm charcoal Midnight with an amber pop, so Obsidian stays dark whatever
+    // the Appearance toggle is set to. `scheme: "dark"` in both drives the
+    // dark status/chat tokens either way.
     light: {
-      canvas: "rgb(247,248,249)",
-      ink: "rgb(24,26,29)",
-      panel: "rgb(255,255,255)",
-      mist: "rgb(238,240,242)",
-      line: "rgba(24,26,29,0.09)",
-      accentWarm: "rgb(196,124,70)",
-      accentCool: "rgb(90,104,120)",
-      sidebarTop: "rgb(30,32,36)",
-      sidebarBottom: "rgb(20,22,25)",
-      sidebarInk: "rgb(236,238,241)",
-      sidebarInkMuted: "rgb(158,164,172)",
-      scheme: "light",
+      canvas: "rgb(23,20,16)",
+      ink: "rgb(233,226,214)",
+      panel: "rgb(30,26,20)",
+      mist: "rgb(37,32,25)",
+      line: "rgba(236,226,210,0.09)",
+      accentWarm: "rgb(224,150,86)",
+      accentCool: "rgb(232,184,104)",
+      sidebarTop: "rgb(15,13,10)",
+      sidebarBottom: "rgb(23,20,15)",
+      sidebarInk: "rgb(233,226,214)",
+      sidebarInkMuted: "rgb(150,140,124)",
+      scheme: "dark",
     },
     dark: {
       canvas: "rgb(23,20,16)",
