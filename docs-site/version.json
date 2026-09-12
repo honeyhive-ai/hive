@@ -1,6 +1,6 @@
 {
-  "tag": "v1.8.0",
-  "name": "Hive 1.8.0",
+  "tag": "v1.9.0",
+  "name": "Hive 1.9.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Seamless remote agents. Standing up a headless agent on another machine is now one copy-paste line: an admin generates it from the People pane (Remote agents — enter a GitHub handle + role) or via hive-relay bootstrap-agent, and the developer runs 'brew install honeyhive-ai/hive/hive-cli && hive enroll … --token … && hive worker'. New CLI commands: hive enroll (decode a workspace invite → save config) and hive join (redeem an invite code). The issuer key that mints agent tokens stays local (Settings → Team sync); only the minted token travels. Builds on 1.7.0's automated setup + relay-managed teams."
+  "notes": "A modern UI pass. The new Refined look replaces tinted turn cards with flat, hairline-separated turns, carried through the shared cards, the right rail, and the workflow views. New Obsidian theme — a true dark, monochrome near-black glass with a silver accent that stays dark in both Light and Dark modes; the old cool-blue 'midnight' is renamed 'slate'. Workflows gain iterate-until-good loops: a review gate can route back to an earlier stage so you can cycle fix → recheck until you approve, and @hive can author these loops when you ask. Docs now cover every Settings section — Detect/Test/Add-model and portable hive.toml, the relay issuer key, a Diagnostics section, the searchable nav, and the People-pane remote-agent generator."
 }
