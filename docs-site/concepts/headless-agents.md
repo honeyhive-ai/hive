@@ -90,9 +90,32 @@ but it can be **self-hosted**. This is the setup that lets an agent keep working
 while your laptop is closed: the relay's **store-and-forward** holds the agent's
 events, and your app catches up when it next comes online.
 
-**One-command connect.** Instead of hand-exporting four env vars, paste the
-workspace's `hivews1:` invite (the same one the app shares) — `hive enroll`
-decodes the relay URL, room, and E2EE key and saves them to
+**The easy path — generate the whole command.** On the machine that holds the
+relay issuer key (where you ran `hive-relay keygen`), one command mints the
+agent's token, enrolls it in the workspace roster, and prints the exact line the
+developer pastes on the remote box:
+
+```sh
+hive-relay bootstrap-agent --key "$(cat ~/.hive/issuer_ed25519.key)" \
+  --relay https://your-relay --room acme --ws-key <e2ee-passphrase> \
+  --sub github:<agent-id> --admin-sub github:<your-id> --label prod-box
+```
+
+It outputs a single copy-paste line — the developer runs it verbatim and the
+agent is live:
+
+```sh
+brew install honeyhive-ai/hive/hive-cli && \
+  hive enroll "hivews1:…" --token "hrt1.…" && \
+  hive worker --label prod-box
+```
+
+(The issuer private key never leaves your machine — only the minted agent token
+travels in the generated line.)
+
+**Manual path.** Or wire it by hand. Instead of hand-exporting four env vars,
+paste the workspace's `hivews1:` invite (the same one the app shares) —
+`hive enroll` decodes the relay URL, room, and E2EE key and saves them to
 `$HIVE_DATA_DIR/config.toml`:
 
 ```sh
