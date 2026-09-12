@@ -11,7 +11,7 @@
 import { useSyncExternalStore } from "react";
 import { setTitlebarColor } from "@/lib/ipc";
 
-export type ThemeName = "pollen" | "studio" | "harbor" | "meadow" | "midnight" | "obsidian";
+export type ThemeName = "pollen" | "studio" | "harbor" | "meadow" | "slate" | "obsidian";
 export type AppearanceMode = "auto" | "light" | "dark";
 
 export interface Palette {
@@ -132,9 +132,9 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
   },
 
   // Midnight — neutral blue-grey dark (the chat-redesign base). A genuinely
-  // cool, low-chroma dark with a blue agent accent; light variant is a clean
-  // cool-white for daytime.
-  midnight: {
+  // Slate — cool, low-chroma blue-grey; a blue agent accent, with a clean
+  // cool-white light variant for daytime.
+  slate: {
     light: {
       canvas: "rgb(243,246,249)",
       ink: "rgb(29,39,49)",
@@ -240,6 +240,9 @@ const DEFAULT_THEME: ThemeName = "pollen";
 /// The user's preferred accent family (independent of light/dark mode).
 export function loadTheme(): ThemeName {
   const stored = localStorage.getItem(STORAGE_KEY);
+  // Migration: the cool-blue theme was renamed midnight → slate (the name now
+  // belongs conceptually to the warm Obsidian dark). Remap a saved value.
+  if (stored === "midnight") return "slate";
   if (stored && stored in THEMES) return stored as ThemeName;
   return DEFAULT_THEME;
 }
