@@ -113,6 +113,13 @@ brew install honeyhive-ai/hive/hive-cli && \
 (The issuer private key never leaves your machine — only the minted agent token
 travels in the generated line.)
 
+**…or from the app (no CLI).** If you run the issuer alongside the desktop app,
+paste the Ed25519 seed once under **Settings → Team sync → Advanced → Relay
+issuer key** (local-only, never synced). Then the **People pane → Remote
+agents** section takes an agent's GitHub handle + role, enrolls it, and shows the
+same copy-paste command in a box — no terminal needed on the admin side. See
+[Right Rail — People](../features/right-rail.md).
+
 **Manual path.** Or wire it by hand. Instead of hand-exporting four env vars,
 paste the workspace's `hivews1:` invite (the same one the app shares) —
 `hive enroll` decodes the relay URL, room, and E2EE key and saves them to

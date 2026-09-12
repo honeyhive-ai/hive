@@ -43,7 +43,11 @@ pane header to close the rail entirely.
   so the backlog drains without waiting for that laptop to wake. See
   [Headless agents](../concepts/headless-agents.md).
 - **People**: members, online status, invites, cross-network
-  rendezvous status, nearby-on-LAN peers.
+  rendezvous status, nearby-on-LAN peers. On a membership-enforcing relay it also
+  manages the server-side roster + issues join codes, and — for an admin with a
+  relay issuer key (Settings → Team sync) — a **Remote agents** section that
+  enrolls a headless agent and generates the one copy-paste command to run on its
+  box. See [Headless agents](../concepts/headless-agents.md).
 
 ## Why a single rail
 
