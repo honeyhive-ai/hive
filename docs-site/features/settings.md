@@ -1,13 +1,18 @@
 # Settings
 
-Hive's Settings view is organized into **tabs**, so the page isn't one
-overwhelming scroll — only the active tab mounts. The tabs are
-**Account**, **Appearance**, **Folder & Git**, **Team sync**,
-**Schedules**, **Models & runtimes**, **Tools & MCP**, **Permissions**,
-**Updates & data**, and **Danger zone**. Workspace-scoped config
-(runtimes, MCP servers) is written back to `hive.config.toml`; connection
-settings persist to a `settings.json` in the app data dir; the theme is
-stored locally per device.
+Hive's Settings view has a **grouped, searchable sidebar** so the page
+isn't one overwhelming scroll — only the active section mounts. The
+groups are **You** (Account, Appearance), **This workspace** (Folder &
+Git, Team sync, Schedules), **Agents** (Models & runtimes, Tools & MCP,
+Permissions), and **Advanced** (Updates & data, Diagnostics, Danger
+zone). A **Search settings** box at the top filters the nav by section
+name *and* by the controls a section contains — typing `api key`,
+`dark mode`, `relay`, or `bypass` jumps you to the right place.
+
+Every section **applies its changes immediately** (no Save button).
+Workspace-scoped config (runtimes, MCP servers) is written back to
+`hive.config.toml`; connection settings persist to a `settings.json` in
+the app data dir; the theme is stored locally per device.
 
 ![Settings — Account tab](../images/settings-general.png){ width="900" }
 
@@ -26,19 +31,22 @@ stored locally per device.
 
 ## Appearance
 
-
 - **Mode** — `Auto` (follows your OS light/dark setting, any platform),
   `Light`, or `Dark`.
 - **Theme** — the accent family: **pollen** (the honey-gold default),
   **studio** (neutral graphite), **harbor** (ocean blue), **meadow**
-  (green), or **midnight** (deep indigo). Each has a light and a dark
-  variant; the mode picks which.
+  (green), **slate** (cool, low-chroma blue-grey), or **obsidian**. Most
+  themes have a light and a dark variant and the mode picks which;
+  **obsidian is a true dark theme** — a deep warm charcoal with an
+  amber accent that stays dark regardless of the Mode toggle.
 
 ## Folder & Git
 
-The workspace **root path** (drives the Diff canvas + git integration),
-a one-line git status (current **branch** + **changed-file count**), and
-an **Open in editor** shortcut. See [Git integration](git.md).
+The workspace **root path** drives the Diff canvas + git integration.
+Set it with the **Choose folder…** button (a native OS directory
+picker) or by typing/pasting a path. The section also shows a one-line
+git status (current **branch** + **changed-file count**) and an **Open
+in editor** shortcut. See [Git integration](git.md).
 
 ## Team sync
 
@@ -60,9 +68,17 @@ relay configuration:
   **Connected**, **Unauthorized** (reached it, token rejected), or
   **Unreachable**. The status card above it only means a URL is
   *configured*; the probe is the source of truth for whether it works.
-- **Room** + **Workspace key** (under *Advanced*) — the room id and the
-  shared passphrase → end-to-end encryption; the relay sees only
-  ciphertext (status shows `🔒 encrypted`).
+
+Under **Advanced — set room & key by hand**:
+
+- **Room** + **Workspace key** — the room id and the shared passphrase
+  → end-to-end encryption; the relay sees only ciphertext (status shows
+  `🔒 encrypted`).
+- **Relay issuer key** — an Ed25519 seed (64-hex) that lets you **mint
+  agent identity tokens locally** for the People pane's *Add a remote
+  agent* flow. It's stored on this device only and never leaves it; the
+  field shows `✓ set` once configured (enter a new value to replace it).
+  See [Remote agents](#remote-agents-people-pane).
 
 See [Self-hosting a relay](../networking/self-host.md), the
 [small-team deployment guide](../ops/deployment.md), and the
@@ -98,7 +114,10 @@ instead. Managing members needs you signed in to GitHub
 ## Schedules
 
 Define **scheduled agents** — recurring runs that kick off a chat turn
-on a cron-like schedule without you present. See
+on a cron-like schedule without you present. Each schedule has a
+**label**, the **prompt** to send each run, a cadence (**Every**
+interval or **Daily at** a time), and an optional runtime to pin it to
+(defaults to the chat's primary runtime). See
 [Scheduled agents](scheduling.md) for the full walkthrough.
 
 ## Models & runtimes
@@ -124,6 +143,30 @@ The default runtime is the **`claude` CLI** — no API key needed, it uses
 your Claude subscription. See
 [Configuring a runtime](../getting-started/configuring-a-runtime.md).
 
+### Detect my setup
+
+**Detect** (then **Re-scan**) sweeps the machine for providers that
+would answer right now — a running Ollama, CLI agents already on your
+`PATH` (`claude`, `codex`, `aider`, …), and API keys present in the
+environment — and offers to add each with one click, so a fresh install
+is usable without hand-typing config.
+
+### Testing a provider or model
+
+- On a provider row, **Test** makes a real call and reports whether the
+  stored key/endpoint actually works.
+- In the add-model form, **Test** validates the just-typed key/base URL
+  *before* you save, and **Add model** then registers a ready-to-use
+  runtime for that model.
+
+### Portable config
+
+**Export** dumps this machine's runtimes + MCP setup as a `hive.toml`
+you can copy to another device or share with a teammate; **Import**
+stamps a pasted `hive.toml` onto this machine (**additive** — it adds
+what's missing and never deletes what you already have). API keys travel
+with the export, so treat it like a secret.
+
 ### Context commands
 
 The instructions behind `/summarize` and `/compact` are editable here —
@@ -146,10 +189,12 @@ How agents are allowed to touch files — and this differs **per agent
 type** (Claude Code is not the only agent that edits files):
 
 - **`claude` permission mode** — `Read-only` (default; proposes edits
-  but blocks writes), `Accept edits` (can write files), or `Bypass all`
-  (also runs shell commands). Injected as `--permission-mode` into the
-  `claude` CLI, which runs headless and can't show an interactive
-  prompt.
+  but blocks writes), `Accept edits` (can write files), or **Bypass all
+  permissions** (also runs shell commands). Injected as
+  `--permission-mode` into the `claude` CLI, which runs headless and
+  can't show an interactive prompt. Because bypass mode grants
+  unattended file **and** shell execution, switching into it pops a
+  **confirmation dialog** first — the same friction a data reset gets.
 - **aider / pi** gate via their own flags.
 - **API/MCP-backed agents** can only call the MCP tools you've
   **enabled** on the Tools & MCP tab — an installed-but-disabled server
@@ -157,11 +202,18 @@ type** (Claude Code is not the only agent that edits files):
 
 ## Updates & data
 
-- **Check for updates** — the auto-updater is scaffolded and activates
-  at public launch (for signed builds); on current unsigned dists it's
-  inert. A lightweight version check still notifies you when a newer
-  release is published.
+- **Check for updates** — reports the version you're on and checks
+  whether a newer **signed** build is available, then installs it. The
+  auto-updater activates for signed builds; on current unsigned dists a
+  lightweight version check still notifies you when a newer release is
+  published.
 - **Export data** — download a copy of this device's local data.
+
+## Diagnostics
+
+Open the **log file** (structured logs plus panics) — useful when
+something misbehaves silently. Set `HIVE_LOG=debug` in the environment
+before launching for verbose output while you're chasing an issue.
 
 ## Danger zone
 
@@ -170,6 +222,17 @@ settings, and workspaces, then relaunches Hive fresh. It's the supported
 way to start over — uninstalling leaves data behind. See
 [Reset local data](../getting-started/first-launch.md#reset-local-data)
 for the per-OS data directories.
+
+## Remote agents (People pane)
+
+Not a Settings tab, but the counterpart to the **Relay issuer key**
+above: the right rail's **People** pane has a **Remote agents** section
+(shown once a relay is connected). Enroll a remote agent by handle and
+Hive **generates the exact command** — with the relay URL, room, a
+minted agent token, and workspace credentials filled in — for a
+developer to copy and run on the agent's box. Detached agents run on
+**workspace credentials**, never a personal API key. See
+[Headless agents](../concepts/headless-agents.md).
 
 ## Notes
 
