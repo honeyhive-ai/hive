@@ -100,7 +100,7 @@ export function Section({
   return (
     <section className={`mb-5 ${className}`}>
       <div className="mb-2 flex items-center justify-between gap-2">
-        <h2 className="text-xs font-semibold uppercase tracking-[0.16em] opacity-60">{title}</h2>
+        <h2 className="text-[13px] font-semibold tracking-[-0.01em] opacity-90">{title}</h2>
         {action}
       </div>
       <div className="space-y-2.5">{children}</div>
@@ -232,8 +232,8 @@ export function Card({
 }) {
   return (
     <div
-      className={`rounded-2xl border ${className}`}
-      style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)", ...style }}
+      className={`rounded-xl border ${className}`}
+      style={{ borderColor: "var(--hive-line)", background: "var(--hive-panel)", ...style }}
     >
       {children}
     </div>
