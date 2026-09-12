@@ -202,36 +202,37 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
   // warm charcoal (darker than the other darks) with an amber pop — pairs the
   // sleek flat-turn treatment in light and a dense developer-dark at night.
   obsidian: {
-    // A TRUE dark theme (not a light/dark pair): both variants are the same deep
-    // warm charcoal Midnight with an amber pop, so Obsidian stays dark whatever
-    // the Appearance toggle is set to. `scheme: "dark"` in both drives the
-    // dark status/chat tokens either way.
+    // A TRUE dark theme (not a light/dark pair): both variants are the same neutral,
+    // faintly cool near-black — like volcanic glass — with a cool steel-blue accent
+    // (and a muted violet for human turns). No amber/gold anywhere. Obsidian stays
+    // dark whatever the Appearance toggle is set to; `scheme: "dark"` in both drives
+    // the dark status/chat tokens either way.
     light: {
-      canvas: "rgb(23,20,16)",
-      ink: "rgb(233,226,214)",
-      panel: "rgb(30,26,20)",
-      mist: "rgb(37,32,25)",
-      line: "rgba(236,226,210,0.09)",
-      accentWarm: "rgb(224,150,86)",
-      accentCool: "rgb(232,184,104)",
-      sidebarTop: "rgb(15,13,10)",
-      sidebarBottom: "rgb(23,20,15)",
-      sidebarInk: "rgb(233,226,214)",
-      sidebarInkMuted: "rgb(150,140,124)",
+      canvas: "rgb(18,19,22)",
+      ink: "rgb(228,230,235)",
+      panel: "rgb(24,26,30)",
+      mist: "rgb(30,33,38)",
+      line: "rgba(230,234,242,0.09)",
+      accentWarm: "rgb(168,140,214)",
+      accentCool: "rgb(96,158,232)",
+      sidebarTop: "rgb(12,13,16)",
+      sidebarBottom: "rgb(18,19,23)",
+      sidebarInk: "rgb(228,230,235)",
+      sidebarInkMuted: "rgb(140,145,156)",
       scheme: "dark",
     },
     dark: {
-      canvas: "rgb(23,20,16)",
-      ink: "rgb(233,226,214)",
-      panel: "rgb(30,26,20)",
-      mist: "rgb(37,32,25)",
-      line: "rgba(236,226,210,0.09)",
-      accentWarm: "rgb(224,150,86)",
-      accentCool: "rgb(232,184,104)",
-      sidebarTop: "rgb(15,13,10)",
-      sidebarBottom: "rgb(23,20,15)",
-      sidebarInk: "rgb(233,226,214)",
-      sidebarInkMuted: "rgb(150,140,124)",
+      canvas: "rgb(18,19,22)",
+      ink: "rgb(228,230,235)",
+      panel: "rgb(24,26,30)",
+      mist: "rgb(30,33,38)",
+      line: "rgba(230,234,242,0.09)",
+      accentWarm: "rgb(168,140,214)",
+      accentCool: "rgb(96,158,232)",
+      sidebarTop: "rgb(12,13,16)",
+      sidebarBottom: "rgb(18,19,23)",
+      sidebarInk: "rgb(228,230,235)",
+      sidebarInkMuted: "rgb(140,145,156)",
       scheme: "dark",
     },
   },

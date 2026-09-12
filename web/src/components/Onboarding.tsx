@@ -48,7 +48,7 @@ type RuntimeChoice = "claudeCode" | "codex" | "openai" | "anthropic" | "ollama";
 // Onboarding's appearance step. Order + labels for the accent-family picker.
 const THEME_CHOICES: { name: ThemeName; label: string; blurb: string }[] = [
   { name: "pollen", label: "Pollen", blurb: "Warm honey — the Hive default" },
-  { name: "obsidian", label: "Obsidian", blurb: "Refined light · deep amber-on-charcoal dark" },
+  { name: "obsidian", label: "Obsidian", blurb: "True dark — near-black glass, cool steel-blue accent" },
   { name: "slate", label: "Slate", blurb: "Cool blue-grey" },
   { name: "studio", label: "Studio", blurb: "Neutral graphite" },
   { name: "harbor", label: "Harbor", blurb: "Ocean blue" },
