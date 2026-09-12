@@ -202,18 +202,22 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
   // warm charcoal (darker than the other darks) with an amber pop — pairs the
   // sleek flat-turn treatment in light and a dense developer-dark at night.
   obsidian: {
+    // Light is a crisp, cool near-white graphite (deliberately NOT pollen's warm
+    // honey) — the "Refined" daytime look; dark is a deep warm charcoal with an
+    // amber pop (Midnight). Rail is a near-black graphite in both, so the theme
+    // reads as the sleek/dark family at a glance whichever mode you're in.
     light: {
-      canvas: "rgb(250,249,247)",
-      ink: "rgb(30,27,22)",
+      canvas: "rgb(247,248,249)",
+      ink: "rgb(24,26,29)",
       panel: "rgb(255,255,255)",
-      mist: "rgb(243,241,237)",
-      line: "rgba(30,27,22,0.08)",
-      accentWarm: "rgb(191,120,66)",
-      accentCool: "rgb(168,138,86)",
-      sidebarTop: "rgb(40,36,31)",
-      sidebarBottom: "rgb(30,27,23)",
-      sidebarInk: "rgb(240,236,229)",
-      sidebarInkMuted: "rgb(168,160,148)",
+      mist: "rgb(238,240,242)",
+      line: "rgba(24,26,29,0.09)",
+      accentWarm: "rgb(196,124,70)",
+      accentCool: "rgb(90,104,120)",
+      sidebarTop: "rgb(30,32,36)",
+      sidebarBottom: "rgb(20,22,25)",
+      sidebarInk: "rgb(236,238,241)",
+      sidebarInkMuted: "rgb(158,164,172)",
       scheme: "light",
     },
     dark: {
