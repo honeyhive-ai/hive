@@ -179,6 +179,11 @@ struct LiveSettings {
     /// "configured" and re-derive; never synced/committed.
     #[serde(default)]
     workspace_passphrase: Option<String>,
+    /// Ed25519 issuer seed (64-hex), for a relay admin who mints agent identity
+    /// tokens locally (the "Add a remote agent" generator). Local-only, NEVER
+    /// synced/committed — the public half is what the relay holds.
+    #[serde(default)]
+    relay_issuer_key: Option<String>,
     /// Optional API key for an Anthropic/OpenAI runtime (claude-code needs none).
     #[serde(default)]
     api_key: Option<String>,
@@ -355,6 +360,7 @@ impl Default for LiveSettings {
             relay_access_token: None,
             sync_room: default_sync_room(),
             workspace_passphrase: None,
+            relay_issuer_key: None,
             api_key: None,
             claude_permission_mode: default_permission_mode(),
             claude_code_model: String::new(),
@@ -6690,6 +6696,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         workspace_passphrase: std::env::var("HIVE_WORKSPACE_KEY")
             .ok()
             .filter(|s| !s.is_empty()),
+        relay_issuer_key: std::env::var("HIVE_RELAY_ISSUER_KEY").ok().filter(|s| !s.is_empty()),
         api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty()),
         claude_permission_mode: default_permission_mode(),
             claude_code_model: String::new(),
@@ -9586,6 +9593,151 @@ fn import_config(state: State<AppState>, toml_text: String) -> Result<String, St
     Ok(summary)
 }
 
+// ---------------------------------------------------------------------------
+// Remote-agent bootstrap — the "Add a remote agent" generator. A relay admin
+// who holds the Ed25519 issuer key (Settings → Team sync) can mint an agent
+// identity token locally, enroll it in the workspace roster, and produce the
+// single copy-paste line a developer runs on the remote box. Mirrors the
+// `hive-relay bootstrap-agent` CLI; the issuer PRIVATE key never leaves here.
+// ---------------------------------------------------------------------------
+
+/// Mint an `hrt1` token signed by the issuer seed, byte-compatible with the Go
+/// relay's verifier (sign "hrt1.<b64url(claims)>", append b64url(sig)).
+fn mint_hrt1_token(seed_hex: &str, sub: &str, exp_days: i64) -> Result<String, String> {
+    use base64::Engine;
+    let raw = hex_decode_32(seed_hex).ok_or("issuer key must be a 64-hex Ed25519 seed")?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&raw);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let exp = if exp_days >= 0 { now + (exp_days as u64) * 86_400 } else { 0 };
+    let claims = serde_json::json!({ "sub": sub, "plan": "agent", "exp": exp, "caps": [] });
+    let claims_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&claims).map_err(map_err)?);
+    let body = format!("hrt1.{claims_b64}");
+    use ed25519_dalek::Signer;
+    let sig = signing.sign(body.as_bytes());
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig.to_bytes());
+    Ok(format!("{body}.{sig_b64}"))
+}
+
+/// Decode a 64-char hex Ed25519 seed to 32 bytes.
+fn hex_decode_32(h: &str) -> Option<[u8; 32]> {
+    let h = h.trim();
+    if h.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&h[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Encode a `hivews1:` connection invite from the active workspace's relay/room/
+/// key (snake_case, matching decode_workspace_invite / the CLI).
+fn encode_hivews_conn(relay_url: &str, room: &str, key: Option<&str>) -> String {
+    use base64::Engine;
+    let mut obj = serde_json::Map::new();
+    obj.insert("relay_url".into(), relay_url.into());
+    obj.insert("room".into(), room.into());
+    if let Some(k) = key.filter(|s| !s.is_empty()) {
+        obj.insert("key".into(), k.into());
+    }
+    let json = serde_json::to_vec(&serde_json::Value::Object(obj)).unwrap_or_default();
+    format!("hivews1:{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json))
+}
+
+/// Whether an issuer key is configured (drives the "Add a remote agent" UI).
+#[tauri::command]
+fn has_issuer_key(state: State<AppState>) -> bool {
+    state
+        .settings
+        .lock()
+        .unwrap()
+        .relay_issuer_key
+        .as_ref()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// Store (or clear) the Ed25519 issuer seed. Local-only; validated as 64-hex.
+#[tauri::command]
+fn set_relay_issuer_key(state: State<AppState>, key: String) -> Result<(), String> {
+    let k = key.trim();
+    if !k.is_empty() && hex_decode_32(k).is_none() {
+        return Err("Issuer key must be a 64-character hex Ed25519 seed (from `hive-relay keygen`).".to_string());
+    }
+    let mut s = state.settings.lock().unwrap();
+    s.relay_issuer_key = if k.is_empty() { None } else { Some(k.to_string()) };
+    save_settings(&state.data_dir, &s);
+    Ok(())
+}
+
+/// Generate the remote-agent bootstrap: enroll the agent (by GitHub handle) in
+/// the roster, mint its identity token, and return the copy-paste command block.
+/// Requires an issuer key + a GitHub sign-in (for the directory lookup + admin
+/// authorization on the relay).
+#[tauri::command]
+async fn generate_agent_bootstrap(
+    state: State<'_, AppState>,
+    handle: String,
+    role: String,
+    label: String,
+    exp_days: i64,
+) -> Result<String, String> {
+    let (relay, room, key, issuer) = {
+        let s = state.settings.lock().unwrap();
+        (
+            s.relay_url.clone(),
+            s.sync_room.clone(),
+            s.workspace_passphrase.clone(),
+            s.relay_issuer_key.clone(),
+        )
+    };
+    let issuer = issuer
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("No issuer key set — add it in Settings → Team sync first.")?;
+    let relay = relay
+        .filter(|s| !s.trim().is_empty())
+        .ok_or("Connect a relay first (Settings → Team sync).")?;
+    if state.github_token().is_none() {
+        return Err("Sign in with GitHub first (Settings → Account).".to_string());
+    }
+
+    let client = state.relay_client(&configured_relay(&state)?);
+    // Resolve the handle → github account (so the token subject + roster entry match).
+    let entry = client
+        .directory_lookup(&handle)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("@{} isn't on Hive yet.", handle.trim().trim_start_matches('@')))?;
+    let sub = format!("github:{}", entry.github_id);
+    let role = if role.trim().is_empty() { "contributor".to_string() } else { role };
+
+    // Best-effort enroll in the roster (the admin's own token authorizes it).
+    let enrolled = client.upsert_member(&room, &sub, &entry.login, &role).await.is_ok();
+
+    let token = mint_hrt1_token(&issuer, &sub, exp_days)?;
+    let invite = encode_hivews_conn(&relay, &room, key.as_deref());
+    let label = if label.trim().is_empty() { entry.login.clone() } else { label };
+
+    let mut block = String::new();
+    block.push_str("# Run on the remote agent box:\n");
+    block.push_str("brew install honeyhive-ai/hive/hive-cli && \\\n");
+    block.push_str(&format!("  hive enroll \"{invite}\" --token \"{token}\" && \\\n"));
+    block.push_str(&format!("  hive worker --label {label}\n"));
+    if !enrolled {
+        block.push_str(&format!(
+            "\n# NOTE: couldn't auto-enroll {sub} in the roster (are you the workspace owner/admin \
+             and has it been claimed?). Add @{} in People, or the agent can `hive join <code>`.\n",
+            entry.login
+        ));
+    }
+    Ok(block)
+}
+
 #[tauri::command]
 fn github_logout(state: State<AppState>) -> Result<(), String> {
     let mut s = state.settings.lock().unwrap();
@@ -10144,6 +10296,9 @@ pub fn run() {
             list_dms,
             detect_environment,
             detect_providers,
+            has_issuer_key,
+            set_relay_issuer_key,
+            generate_agent_bootstrap,
             export_config,
             import_config,
             list_providers,

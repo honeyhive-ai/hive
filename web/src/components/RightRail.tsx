@@ -18,6 +18,8 @@ import {
   workspaceCreateInvite,
   workspaceRevokeInvite,
   workspaceJoinViaInvite,
+  hasIssuerKey,
+  generateAgentBootstrap,
   type InviteEntry,
   addVault,
   getContextTelemetry,
@@ -1471,6 +1473,24 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
     onError: (e) => toast.error(`Couldn't join: ${errMsg(e)}`),
   });
 
+  // Remote-agent bootstrap generator (relay admins with an issuer key).
+  const issuerKey = useQuery({ queryKey: ["has-issuer-key"], queryFn: hasIssuerKey, enabled: relayOn });
+  const [agentHandle, setAgentHandle] = useState("");
+  const [agentRole, setAgentRole] = useState("contributor");
+  const [agentLabel, setAgentLabel] = useState("");
+  const [agentBlock, setAgentBlock] = useState<string | null>(null);
+  const bootstrapMutation = useMutation({
+    mutationFn: () =>
+      generateAgentBootstrap(agentHandle.trim().replace(/^@/, ""), agentRole, agentLabel.trim(), 365),
+    onSuccess: (block) => {
+      setAgentBlock(block);
+      refreshSrv();
+      void navigator.clipboard.writeText(block).catch(() => {});
+      toast.success("Bootstrap command generated + copied. Paste it on the agent box.");
+    },
+    onError: (e) => toast.error(`Couldn't generate: ${errMsg(e)}`),
+  });
+
   return (
     <RailFrame title="People" subtitle="Workspace members and governance roles for this chat.">
       <Section title="Members">
@@ -1778,6 +1798,75 @@ function PeoplePane({ sessionId }: { sessionId: string }) {
                 Join
               </Button>
             </div>
+          </>
+        )}
+      </Section>
+
+      <Section title="Remote agents">
+        {!relayOn ? (
+          <EmptyHint text="Connect a relay (Settings → Team sync) to add remote agents." />
+        ) : !issuerKey.data ? (
+          <p className="text-xs opacity-55">
+            To generate a one-paste command for a headless agent, add your relay issuer key in
+            Settings → Team sync (advanced). The key mints the agent's identity token locally; only
+            the token travels to the box.
+          </p>
+        ) : (
+          <>
+            <p className="text-xs opacity-55">
+              Enroll a remote agent and generate the exact command a developer runs on its box —
+              installs the CLI, connects to this workspace, and starts the worker.
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <input
+                value={agentHandle}
+                onChange={(e) => setAgentHandle(e.target.value)}
+                placeholder="agent GitHub handle"
+                className="flex-1 rounded-lg border px-2.5 py-1.5 text-sm"
+                style={fieldStyle}
+              />
+              <select
+                value={agentRole}
+                onChange={(e) => setAgentRole(e.target.value)}
+                className="rounded-lg border px-2 py-1.5 text-sm"
+                style={fieldStyle}
+              >
+                <option value="viewer">viewer</option>
+                <option value="contributor">contributor</option>
+                <option value="admin">admin</option>
+              </select>
+              <input
+                value={agentLabel}
+                onChange={(e) => setAgentLabel(e.target.value)}
+                placeholder="label (optional)"
+                className="w-28 rounded-lg border px-2.5 py-1.5 text-sm"
+                style={fieldStyle}
+              />
+              <Button
+                variant="primary"
+                disabled={!agentHandle.trim() || bootstrapMutation.isPending}
+                onClick={() => bootstrapMutation.mutate()}
+              >
+                Generate
+              </Button>
+            </div>
+            {agentBlock && (
+              <div className="mt-2">
+                <textarea
+                  readOnly
+                  value={agentBlock}
+                  spellCheck={false}
+                  className="h-28 w-full rounded-lg border p-2 font-mono text-[11px]"
+                  style={fieldStyle}
+                />
+                <button
+                  className="mt-1 text-xs underline opacity-70 hover:opacity-100"
+                  onClick={() => void navigator.clipboard.writeText(agentBlock).catch(() => {})}
+                >
+                  Copy again
+                </button>
+              </div>
+            )}
           </>
         )}
       </Section>

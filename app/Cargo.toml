@@ -41,6 +41,7 @@ tauri-plugin-updater = "2"
 rfd = "0.15"
 toml = "0.8"
 base64 = "0.22"
+ed25519-dalek = "2"
 # Like std::fs::canonicalize but strips Windows's `\\?\` verbatim prefix for
 # normal drive paths (keeps it only for genuinely long/UNC paths) — so the
 # workspace root shows as `C:\…`, not `\\?\C:\…`. Already in the tree.

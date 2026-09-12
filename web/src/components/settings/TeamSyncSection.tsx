@@ -18,6 +18,8 @@ import {
   issueRelayToken,
   revokeRelayToken,
   setRelayUserDisabled,
+  hasIssuerKey,
+  setRelayIssuerKey,
   type RelayUserDto,
 } from "@/lib/ipc";
 import {
@@ -72,6 +74,19 @@ function SyncSection() {
   const [workspaceKey, setWorkspaceKey] = useState("");
   const [relayAccessToken, setRelayAccessToken] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  // Relay issuer key — mints agent identity tokens for the "Add a remote agent"
+  // generator (People pane). Local-only; only the public half sits on the relay.
+  const [issuerKey, setIssuerKey] = useState("");
+  const issuerSet = useQuery({ queryKey: ["has-issuer-key"], queryFn: hasIssuerKey });
+  const saveIssuer = useMutation({
+    mutationFn: (k: string) => setRelayIssuerKey(k),
+    onSuccess: () => {
+      setIssuerKey("");
+      qc.invalidateQueries({ queryKey: ["has-issuer-key"] });
+      toast.success("Issuer key saved.");
+    },
+    onError: (e) => toast.error(errMsg(e)),
+  });
   const [probe, setProbe] = useState<RelayProbeDto | null>(null);
 
   // Live reachability + auth check (distinct from the config-only sync status).
@@ -290,6 +305,37 @@ function SyncSection() {
                 className="text-xs hover:opacity-80"
                 style={{ color: "var(--hive-danger)" }}
                 onClick={() => clearSecret.mutate("workspaceKey")}
+              >
+                clear
+              </button>
+            )}
+          </div>
+
+          <label className="block text-sm opacity-70">
+            Relay issuer key {issuerSet.data ? "✓ set" : "(for adding remote agents)"}
+          </label>
+          <p className="text-xs opacity-50">
+            The Ed25519 seed from <code>hive-relay keygen</code> (whose public half is on the relay).
+            Lets you mint agent tokens locally for the People pane’s “Add a remote agent”. Stays on
+            this device — never synced.
+          </p>
+          <div className="flex items-center gap-2">
+            <input
+              type="password"
+              value={issuerKey}
+              onChange={(e) => setIssuerKey(e.target.value)}
+              placeholder={issuerSet.data ? "configured — enter to replace" : "64-hex Ed25519 seed"}
+              className={"flex-1 " + inputClass}
+              style={fieldStyle}
+            />
+            <Button size="sm" onClick={() => saveIssuer.mutate(issuerKey.trim())} disabled={!issuerKey.trim()}>
+              Save
+            </Button>
+            {issuerSet.data && (
+              <button
+                className="text-xs hover:opacity-80"
+                style={{ color: "var(--hive-danger)" }}
+                onClick={() => saveIssuer.mutate("")}
               >
                 clear
               </button>

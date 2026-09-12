@@ -537,6 +537,19 @@ export const workspaceRevokeInvite = (inviteId: string) =>
 export const workspaceJoinViaInvite = (code: string) =>
   invoke<string | null>("workspace_join_via_invite", { code });
 
+/// Remote-agent bootstrap (relay admins with an issuer key). `hasIssuerKey`
+/// gates the UI; `setRelayIssuerKey` stores the local Ed25519 seed;
+/// `generateAgentBootstrap` enrolls the agent + returns the copy-paste command.
+export const hasIssuerKey = () => invoke<boolean>("has_issuer_key");
+export const setRelayIssuerKey = (key: string) =>
+  invoke<void>("set_relay_issuer_key", { key });
+export const generateAgentBootstrap = (
+  handle: string,
+  role: string,
+  label: string,
+  expDays: number,
+) => invoke<string>("generate_agent_bootstrap", { handle, role, label, expDays });
+
 // ── Social graph: friends + presence ───────────────────────────────────────
 
 export type Presence = "online" | "away" | "offline";
