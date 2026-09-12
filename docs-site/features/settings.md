@@ -37,8 +37,9 @@ the app data dir; the theme is stored locally per device.
   **studio** (neutral graphite), **harbor** (ocean blue), **meadow**
   (green), **slate** (cool, low-chroma blue-grey), or **obsidian**. Most
   themes have a light and a dark variant and the mode picks which;
-  **obsidian is a true dark theme** — a neutral near-black glass with a
-  cool steel-blue accent that stays dark regardless of the Mode toggle.
+  **obsidian is a true dark, monochrome theme** — a neutral near-black
+  glass with an achromatic silver accent that stays dark regardless of
+  the Mode toggle.
 
 ## Folder & Git
 

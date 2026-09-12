@@ -202,19 +202,20 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
   // warm charcoal (darker than the other darks) with an amber pop — pairs the
   // sleek flat-turn treatment in light and a dense developer-dark at night.
   obsidian: {
-    // A TRUE dark theme (not a light/dark pair): both variants are the same neutral,
-    // faintly cool near-black — like volcanic glass — with a cool steel-blue accent
-    // (and a muted violet for human turns). No amber/gold anywhere. Obsidian stays
-    // dark whatever the Appearance toggle is set to; `scheme: "dark"` in both drives
-    // the dark status/chat tokens either way.
+    // A TRUE dark, MONOCHROME theme (not a light/dark pair): both variants are the
+    // same neutral, faintly cool near-black — like volcanic glass — with achromatic
+    // silver-grey accents (a bright silver drives the UI accent; a dimmer grey marks
+    // human turns, so the two still read apart by lightness). No hue anywhere.
+    // Obsidian stays dark whatever the Appearance toggle is set to; `scheme: "dark"`
+    // in both drives the dark status/chat tokens either way.
     light: {
       canvas: "rgb(18,19,22)",
       ink: "rgb(228,230,235)",
       panel: "rgb(24,26,30)",
       mist: "rgb(30,33,38)",
       line: "rgba(230,234,242,0.09)",
-      accentWarm: "rgb(168,140,214)",
-      accentCool: "rgb(96,158,232)",
+      accentWarm: "rgb(148,150,156)",
+      accentCool: "rgb(212,214,219)",
       sidebarTop: "rgb(12,13,16)",
       sidebarBottom: "rgb(18,19,23)",
       sidebarInk: "rgb(228,230,235)",
@@ -227,8 +228,8 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
       panel: "rgb(24,26,30)",
       mist: "rgb(30,33,38)",
       line: "rgba(230,234,242,0.09)",
-      accentWarm: "rgb(168,140,214)",
-      accentCool: "rgb(96,158,232)",
+      accentWarm: "rgb(148,150,156)",
+      accentCool: "rgb(212,214,219)",
       sidebarTop: "rgb(12,13,16)",
       sidebarBottom: "rgb(18,19,23)",
       sidebarInk: "rgb(228,230,235)",
