@@ -60,6 +60,24 @@ both edit the working tree need serializing, and a cheap check can
 short-circuit an expensive stage (a failed dependency skips everything
 downstream).
 
+## Loops (iterate until good)
+
+Workflows are DAGs, but a **gate that routes back** gives you a controlled loop.
+Set a review gate's rejection policy to **route to an earlier stage** instead of
+_halt_: rejecting then re-runs that stage (and everything after it) and pauses at
+the gate again, so you can cycle **fix → recheck** as many times as you need, and
+**approve** to move on. Because a person (or a quorum) decides each gate, the loop
+can't run away on its own — that approval is the exit.
+
+Author loops well: keep the loop body small (the stage to redo plus maybe one
+after it), and have the redo stage read the reviewer's notes
+(`{{nodes.review.output}}`) so each pass acts on the feedback rather than
+retrying blind. Prefer one loop per workflow and keep the rest linear.
+
+`@hive` knows this pattern — ask it to *"draft, have the reviewer critique, and
+loop until I approve"* and it authors the gate-routes-back workflow for you (see
+below).
+
 ## Agents can build workflows
 
 Ask any agent in the chat — *"build me a workflow that triages new issues,
