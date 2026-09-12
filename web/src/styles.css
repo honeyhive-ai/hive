@@ -31,6 +31,8 @@
   --hive-ink-soft: color-mix(in srgb, var(--hive-ink) 55%, transparent);
   --hive-ink-faint: color-mix(in srgb, var(--hive-ink) 42%, transparent);
   --hive-hover: color-mix(in srgb, var(--hive-ink) 6%, transparent);
+  /* Faint separator between flat turns (redesign) — softer than --hive-line. */
+  --hive-hairline: color-mix(in srgb, var(--hive-ink) 7%, transparent);
   --tint-cool: color-mix(in srgb, var(--hive-accent-cool) 14%, transparent);
   --tint-cool-line: color-mix(in srgb, var(--hive-accent-cool) 38%, transparent);
   --tint-warm: color-mix(in srgb, var(--hive-accent-warm) 13%, transparent);
@@ -73,24 +75,23 @@
    the theme owns fill/rail/name lightness via the scheme-derived numbers. So
    the same rules stay legible across Studio / Harbor / Midnight, light+dark. */
 .tt {
+  /* Redesign — "Refined" flat turns. Identity reads from the avatar + the
+     coloured @handle (--tn), NOT a tinted card + left rail: turns sit flat on
+     the canvas, separated by a hairline, with a rounded hover highlight. This
+     is token-driven, so every palette (light + the darker Obsidian) inherits
+     it unchanged. --tn (name/handle colour) is the only per-identity accent. */
   --turn-accent: var(--hive-accent-cool);
-  /* Fill is a *whisper* — ~8% accent (guide §5.3). Mixed in sRGB, not OKLCH:
-     OKLCH preserves chroma, so an 8% amber over a dark panel reads as a
-     saturated 30–40% card. sRGB keeps the tint a hint of identity, never a
-     selected-row highlight. Rail + name stay OKLCH so they hold hue+contrast. */
-  --tf: color-mix(in srgb, var(--hive-panel) 92%, var(--turn-accent));
   --tr: oklch(from var(--turn-accent) var(--hive-turn-rail-l) c h);
   --tn: oklch(from var(--turn-accent) var(--hive-turn-name-l) c h);
-  display: flex; gap: 10px; padding: 6px 12px; border-radius: 8px; position: relative;
-  background: var(--tf); border-inline-start: 2px solid var(--tr); outline: none;
+  display: flex; gap: 11px; padding: 9px 12px; border-radius: 8px; position: relative; outline: none;
 }
-.tt + .tt { margin-top: 2px; }
-.tt:hover { background: color-mix(in srgb, var(--hive-panel) 88%, var(--turn-accent)); }
-.tt:focus-visible { outline: 2px solid var(--tr); outline-offset: 2px; }
+/* Hairline between consecutive turns (a quiet divider, not a card edge). */
+.tt + .tt { border-top: 1px solid var(--hive-hairline); }
+.tt:hover { background: var(--hive-hover); }
+.tt:focus-visible { outline: 2px solid var(--tr); outline-offset: -2px; }
 .tt.human { --turn-accent: var(--hive-accent-warm); }
 .tt.agent { --turn-accent: var(--hive-accent-cool); }
-.tt.shared { --turn-accent: var(--hive-accent-muted); background: var(--hive-mist); border-inline-start-color: transparent; }
-.tt.shared:hover { background: color-mix(in srgb, var(--hive-mist) 90%, var(--hive-ink)); }
+.tt.shared { --turn-accent: var(--hive-accent-muted); }
 .tt.shared .tt-handle, .tt.shared .tt-name { color: var(--hive-ink-soft); }
 .tt.shared .tt-text { color: var(--hive-ink-soft); }
 .tt.is-stale { opacity: 0.6; }

@@ -11,7 +11,7 @@
 import { useSyncExternalStore } from "react";
 import { setTitlebarColor } from "@/lib/ipc";
 
-export type ThemeName = "pollen" | "studio" | "harbor" | "meadow" | "midnight";
+export type ThemeName = "pollen" | "studio" | "harbor" | "meadow" | "slate" | "obsidian";
 export type AppearanceMode = "auto" | "light" | "dark";
 
 export interface Palette {
@@ -132,9 +132,9 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
   },
 
   // Midnight — neutral blue-grey dark (the chat-redesign base). A genuinely
-  // cool, low-chroma dark with a blue agent accent; light variant is a clean
-  // cool-white for daytime.
-  midnight: {
+  // Slate — cool, low-chroma blue-grey; a blue agent accent, with a clean
+  // cool-white light variant for daytime.
+  slate: {
     light: {
       canvas: "rgb(243,246,249)",
       ink: "rgb(29,39,49)",
@@ -196,6 +196,47 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
       scheme: "dark",
     },
   },
+
+  // Obsidian — the "Refined / Midnight" redesign direction. Light is a clean,
+  // near-white warm neutral with restrained amber accents; dark is a deep,
+  // warm charcoal (darker than the other darks) with an amber pop — pairs the
+  // sleek flat-turn treatment in light and a dense developer-dark at night.
+  obsidian: {
+    // A TRUE dark, MONOCHROME theme (not a light/dark pair): both variants are the
+    // same neutral, faintly cool near-black — like volcanic glass — with achromatic
+    // silver-grey accents (a bright silver drives the UI accent; a dimmer grey marks
+    // human turns, so the two still read apart by lightness). No hue anywhere.
+    // Obsidian stays dark whatever the Appearance toggle is set to; `scheme: "dark"`
+    // in both drives the dark status/chat tokens either way.
+    light: {
+      canvas: "rgb(18,19,22)",
+      ink: "rgb(228,230,235)",
+      panel: "rgb(24,26,30)",
+      mist: "rgb(30,33,38)",
+      line: "rgba(230,234,242,0.09)",
+      accentWarm: "rgb(148,150,156)",
+      accentCool: "rgb(212,214,219)",
+      sidebarTop: "rgb(12,13,16)",
+      sidebarBottom: "rgb(18,19,23)",
+      sidebarInk: "rgb(228,230,235)",
+      sidebarInkMuted: "rgb(140,145,156)",
+      scheme: "dark",
+    },
+    dark: {
+      canvas: "rgb(18,19,22)",
+      ink: "rgb(228,230,235)",
+      panel: "rgb(24,26,30)",
+      mist: "rgb(30,33,38)",
+      line: "rgba(230,234,242,0.09)",
+      accentWarm: "rgb(148,150,156)",
+      accentCool: "rgb(212,214,219)",
+      sidebarTop: "rgb(12,13,16)",
+      sidebarBottom: "rgb(18,19,23)",
+      sidebarInk: "rgb(228,230,235)",
+      sidebarInkMuted: "rgb(140,145,156)",
+      scheme: "dark",
+    },
+  },
 };
 
 const STORAGE_KEY = "hive.theme";
@@ -205,6 +246,9 @@ const DEFAULT_THEME: ThemeName = "pollen";
 /// The user's preferred accent family (independent of light/dark mode).
 export function loadTheme(): ThemeName {
   const stored = localStorage.getItem(STORAGE_KEY);
+  // Migration: the cool-blue theme was renamed midnight → slate (the name now
+  // belongs conceptually to the warm Obsidian dark). Remap a saved value.
+  if (stored === "midnight") return "slate";
   if (stored && stored in THEMES) return stored as ThemeName;
   return DEFAULT_THEME;
 }

@@ -2464,7 +2464,7 @@ export function Stack({ children }: { children: ReactNode }) {
 
 export const panelStyle = {
   borderColor: "var(--hive-line)",
-  background: "var(--hive-mist)",
+  background: "var(--hive-panel)",
 } as const;
 
 export const fieldStyle = {
