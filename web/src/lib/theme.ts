@@ -11,7 +11,7 @@
 import { useSyncExternalStore } from "react";
 import { setTitlebarColor } from "@/lib/ipc";
 
-export type ThemeName = "pollen" | "studio" | "harbor" | "meadow" | "midnight";
+export type ThemeName = "pollen" | "studio" | "harbor" | "meadow" | "midnight" | "obsidian";
 export type AppearanceMode = "auto" | "light" | "dark";
 
 export interface Palette {
@@ -193,6 +193,41 @@ export const THEMES: Record<ThemeName, ThemeVariants> = {
       sidebarBottom: "rgb(26,44,26)",
       sidebarInk: "rgb(232,244,224)",
       sidebarInkMuted: "rgb(160,190,150)",
+      scheme: "dark",
+    },
+  },
+
+  // Obsidian — the "Refined / Midnight" redesign direction. Light is a clean,
+  // near-white warm neutral with restrained amber accents; dark is a deep,
+  // warm charcoal (darker than the other darks) with an amber pop — pairs the
+  // sleek flat-turn treatment in light and a dense developer-dark at night.
+  obsidian: {
+    light: {
+      canvas: "rgb(250,249,247)",
+      ink: "rgb(30,27,22)",
+      panel: "rgb(255,255,255)",
+      mist: "rgb(243,241,237)",
+      line: "rgba(30,27,22,0.08)",
+      accentWarm: "rgb(191,120,66)",
+      accentCool: "rgb(168,138,86)",
+      sidebarTop: "rgb(40,36,31)",
+      sidebarBottom: "rgb(30,27,23)",
+      sidebarInk: "rgb(240,236,229)",
+      sidebarInkMuted: "rgb(168,160,148)",
+      scheme: "light",
+    },
+    dark: {
+      canvas: "rgb(23,20,16)",
+      ink: "rgb(233,226,214)",
+      panel: "rgb(30,26,20)",
+      mist: "rgb(37,32,25)",
+      line: "rgba(236,226,210,0.09)",
+      accentWarm: "rgb(224,150,86)",
+      accentCool: "rgb(232,184,104)",
+      sidebarTop: "rgb(15,13,10)",
+      sidebarBottom: "rgb(23,20,15)",
+      sidebarInk: "rgb(233,226,214)",
+      sidebarInkMuted: "rgb(150,140,124)",
       scheme: "dark",
     },
   },
