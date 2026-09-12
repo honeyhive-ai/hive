@@ -75,12 +75,23 @@ mention someone when you need their input."
 }
 
 fn workflow_guidance() -> &'static str {
-    r#"When asked to set up a multi-stage pipeline, you can author a workflow by ending a reply with a [[workflow: {…}]] directive. Authoring saves it — a human then launches the run from the Workflows pane (workflows do execute: their stages run as the DAG's ready-set clears). Format:
+    r#"When asked to set up a multi-stage pipeline OR a loop, author a workflow by ending a reply with a [[workflow: {…}]] directive. Authoring saves it; a human launches the run from the Workflows pane, and stages execute as the DAG's ready-set clears. Format:
 [[workflow: {"name": "…", "description": "…", "inputLabel": "…", "stages": [
   {"id": "slug", "name": "…", "kind": "agent", "agent": "<roster agent name, omit for primary>", "prompt": "… {{input}} … {{nodes.<id>.output}} …", "after": ["<upstream ids>"]},
   {"id": "check", "kind": "gate", "title": "…", "body": "…", "approvals": 1, "onReject": "halt", "after": ["slug"]}
 ]}]]
-Rules: stage ids are slugs; "after" edges must form a DAG (stages whose deps are all done run in parallel); {{nodes.<id>.output}} may only reference upstream stages; gates pause for human approval — "onReject" is "halt" or {"retryFrom": "<upstream id>"}."#
+Rules: stage ids are slugs; "after" edges must form a DAG (stages whose deps are all done run in parallel); a stage's prompt may reference {{input}} and {{nodes.<id>.output}} of UPSTREAM stages only; every agent stage names the agent to run it ("agent"; omit for the primary @hive).
+
+LOOPS (iterate until good). The loop primitive is a gate that routes back: give a review gate "onReject": {"retryFrom": "<id of the stage to redo>"}. A reject re-runs that stage and everything after it, then pauses at the gate again — so a reviewer can cycle "fix → recheck" as many times as needed; approving moves on. Because a human (or quorum) decides each gate, the loop can't run away on its own — that human decision IS the exit condition, so there is no separate "max iterations" to set. Author loops well:
+- Keep the loop body small (the stage to redo + at most a couple after it).
+- Make the redo stage's prompt read {{nodes.<review-or-gate>.output}} so it sees WHY it was sent back and can act on the feedback, not just retry blind.
+- Always leave a clean exit (approve) and prefer one loop per workflow; keep everything outside the loop linear.
+Example — draft, then loop until a reviewer is satisfied:
+[[workflow: {"name": "Draft & revise", "inputLabel": "Topic", "stages": [
+  {"id": "draft", "name": "Draft", "kind": "agent", "prompt": "Write a first draft about {{input}}. If revising, address: {{nodes.review.output}}"},
+  {"id": "review", "name": "Review", "kind": "agent", "agent": "reviewer", "prompt": "Review this draft and list concrete fixes, or reply LGTM:\n{{nodes.draft.output}}", "after": ["draft"]},
+  {"id": "ok", "name": "Approve?", "kind": "gate", "title": "Ship the draft?", "body": "Approve to finish, reject to send back for another pass.", "approvals": 1, "onReject": {"retryFrom": "draft"}, "after": ["review"]}
+]}]]"#
 }
 
 fn transcript_guidance() -> &'static str {

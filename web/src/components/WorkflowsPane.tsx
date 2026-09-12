@@ -155,7 +155,7 @@ export function WorkflowsPane({
       <Section title="Definitions">
         <Stack>
           {(workflows.data ?? []).map((wf) => (
-            <div key={wf.id} className="rounded-2xl border px-4 py-3" style={panelStyle}>
+            <div key={wf.id} className="rounded-xl border px-4 py-3" style={panelStyle}>
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
                   <div className="truncate font-semibold">{wf.name}</div>
@@ -250,7 +250,7 @@ function RunCard({ sessionId, run }: { sessionId: string; run: WorkflowRunDto })
   }
 
   return (
-    <div className="rounded-2xl border px-4 py-3" style={panelStyle}>
+    <div className="rounded-xl border px-4 py-3" style={panelStyle}>
       <div className="flex items-center justify-between gap-2">
         <div className="min-w-0">
           <div className="truncate font-semibold">{run.definitionName}</div>

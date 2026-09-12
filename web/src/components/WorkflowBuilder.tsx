@@ -45,7 +45,7 @@ function StageNode({ data, selected }: NodeProps<StageFlowNode>) {
   };
   return (
     <div
-      className="rounded-2xl border px-3 py-2 shadow-sm"
+      className="rounded-xl border px-3 py-2 shadow-sm"
       style={{
         width: NODE_W,
         background: "var(--hive-panel)",
