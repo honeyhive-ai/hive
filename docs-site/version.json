@@ -1,6 +1,6 @@
 {
-  "tag": "v1.10.4",
-  "name": "Hive 1.10.4",
+  "tag": "v1.10.5",
+  "name": "Hive 1.10.5",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes the default-view behavior added in 1.10.3: switching workspaces now reliably lands you on that workspace's most-recent chat (so People, Agents & tools, Review and the other panels populate) instead of intermittently not sticking. Includes 1.10.3's workspace improvements — remembered folder, and Code/Diff reachable without opening a chat."
+  "notes": "Reliable workspace navigation. Returning to a workspace now restores the exact chat and channel you had open there — it no longer resets to the empty 'select a chat' placeholder or jumps to a different channel. This fixes the intermittent behavior from 1.10.3/1.10.4. Includes the earlier workspace improvements: remembered project folder, and Code/Diff reachable without opening a chat."
 }
