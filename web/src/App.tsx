@@ -511,56 +511,49 @@ export function App() {
   // "workspaces") — and keeps a still-valid manual selection, so it never yanks you
   // out of a no-chat Code/Diff view.
   const lastAutoSelectWs = useRef<string | null>(null);
-  // Remembers the chat you last had open in each workspace (keyed by workspace id),
-  // so returning restores THAT chat (and thus its channel) instead of most-recent.
+  // Remembers the chat you last had open in each workspace (keyed by workspace id).
   const lastChatByWs = useRef<Map<string, string>>(new Map());
-  // Drive selection off the workspace-KEYED chats query (the key the sidebar uses),
-  // not a one-shot listChats(): keying by workspace id ties the data to the
-  // workspace, and a refetch corrects the transient "chats: 0" seen right after a
-  // team-workspace switch (the bug that left the empty placeholder).
-  const workspaceChats = useQuery({
-    queryKey: ["chats", activeWorkspaceId],
-    queryFn: listChats,
-    enabled: Boolean(activeWorkspaceId),
-  });
+  // Default view on workspace open/switch. Returning to a workspace RESTORES the chat
+  // you last had there (and thus its channel) DIRECTLY - without validating it against
+  // list_chats, which returns a transient empty set right after a team-workspace switch
+  // (the bug that reset to the placeholder). list_chats is consulted only for a genuine
+  // first visit (no remembered chat), to land on the most-recent one.
   useEffect(() => {
     if (!activeWorkspaceId || view !== "workspace") return;
-    // Context = workspace id + folder, so a sidebar folder switch (same id) re-fires.
     const wsCtx = `${activeWorkspaceId}::${workspaceRoot}`;
     if (lastAutoSelectWs.current === wsCtx) return;
-    const data = workspaceChats.data;
-    if (data === undefined) return; // chats for this workspace not loaded yet
-    const live = data.filter((c) => !c.archived);
-    const isLive = (id: string | null | undefined) => id != null && live.some((c) => c.id === id);
+    lastAutoSelectWs.current = wsCtx;
     const wsId = activeWorkspaceId;
     const remembered = lastChatByWs.current.get(wsId);
-    const pick = isLive(remembered)
-      ? remembered!
-      : live.length
-        ? [...live].sort(
-            (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
-          )[0].id
-        : null;
-    console.debug("[default-view]", {
-      wsId,
-      workspaceRoot,
-      chats: live.length,
-      fetching: workspaceChats.isFetching,
-      remembered,
-      pick,
-    });
-    if (pick == null) {
-      // No chats. An empty result while still fetching is the switch race (chats
-      // momentarily 0) - wait for the refetch. Only a settled-empty result clears to
-      // the placeholder, and we DON'T consume the guard, so a later refetch that
-      // brings the real chats can still select.
-      if (!workspaceChats.isFetching) setSelectedId((prev) => (isLive(prev) ? prev : null));
+    if (remembered) {
+      console.debug("[default-view] restore", { wsId, remembered });
+      setSelectedId(remembered);
       return;
     }
-    lastAutoSelectWs.current = wsCtx; // consume only after a real selection
-    lastChatByWs.current.set(wsId, pick);
-    setSelectedId((prev) => (isLive(prev) ? prev : pick));
-  }, [activeWorkspaceId, workspaceRoot, view, workspaceChats.data, workspaceChats.isFetching]);
+    let cancelled = false;
+    void listChats()
+      .then((all) => {
+        if (cancelled) return;
+        const live = all.filter((c) => !c.archived);
+        const mostRecent = live.length
+          ? [...live].sort(
+              (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
+            )[0]
+          : null;
+        console.debug("[default-view] first-visit", {
+          wsId,
+          chats: live.length,
+          mostRecent: mostRecent?.id ?? null,
+        });
+        if (!mostRecent) return; // no chats (or transient empty) - leave as-is
+        lastChatByWs.current.set(wsId, mostRecent.id);
+        setSelectedId((prev) => (prev && live.some((c) => c.id === prev) ? prev : mostRecent.id));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspaceId, workspaceRoot, view]);
   // Record a deliberate chat selection against the active workspace so it can be
   // restored on return. Called from the select handlers below.
   const rememberChat = useCallback(
