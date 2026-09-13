@@ -1,6 +1,6 @@
 {
-  "tag": "v1.10.1",
-  "name": "Hive 1.10.1",
+  "tag": "v1.10.2",
+  "name": "Hive 1.10.2",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes a finished chat reply sometimes showing a false \"Still working…\" banner. Auto-titling a new chat now runs in the background instead of holding the turn open, and the stall watchdog reconciles against the delivered transcript and self-heals rather than trusting the request lifetime — while a genuine slow start or login wait still surfaces the warning. Patch on 1.10.0's built-in code editor."
+  "notes": "Critical fix: 1.10.1 could freeze on launch. When Hive was opened from Finder or by the auto-updater, it mistook the launch directory for your project folder and tried to watch the entire disk, hanging the app. Hive now only treats a directory as your workspace when it's clearly a project (and never the whole disk), so it launches cleanly and you pick your folder as usual. If 1.10.1 left your app unresponsive, install 1.10.2 to recover. Patch on 1.10.0's built-in code editor."
 }
