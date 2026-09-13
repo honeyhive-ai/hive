@@ -1,6 +1,6 @@
 {
-  "tag": "v1.10.2",
-  "name": "Hive 1.10.2",
+  "tag": "v1.10.3",
+  "name": "Hive 1.10.3",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Critical fix: 1.10.1 could freeze on launch. When Hive was opened from Finder or by the auto-updater, it mistook the launch directory for your project folder and tried to watch the entire disk, hanging the app. Hive now only treats a directory as your workspace when it's clearly a project (and never the whole disk), so it launches cleanly and you pick your folder as usual. If 1.10.1 left your app unresponsive, install 1.10.2 to recover. Patch on 1.10.0's built-in code editor."
+  "notes": "Workspace experience improvements. Hive now remembers the folder you chose and reopens it on launch instead of starting empty. The Code view (editor + terminal + file tree) and the Diff view are reachable without first opening a chat, since they work on the whole workspace. And opening or switching a workspace lands you on its most-recent chat, so People, Agents & tools, Review and the other panels are populated instead of showing an empty shell. Builds on 1.10.2's launch-hang fix and 1.10.0's built-in code editor."
 }

@@ -1,6 +1,6 @@
 [package]
 name = "hive-cli"
-version = "1.10.2"
+version = "1.10.3"
 edition.workspace = true
 license.workspace = true
 
