@@ -824,6 +824,35 @@ fn resolve_workspace_root(path: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+/// True for the filesystem root, `$HOME`, and shallow system directories that must
+/// NEVER be a workspace root — recursively watching one walks the whole disk and
+/// hangs the app. "Shallow" = ≤ 2 path components (`/`, `/Users`, `/Applications`, …).
+fn is_shallow_or_system_dir(p: &std::path::Path) -> bool {
+    if p.components().count() <= 2 {
+        return true;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if p == std::path::Path::new(&home) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether to auto-adopt the process's current directory as the workspace root.
+/// Only when it's clearly a project we were launched from (a `.git`/`.hive`
+/// marker) and not a system/shallow dir. This is what separates a dev launch
+/// (cwd = your repo) from a GUI/updater launch (cwd = `/`, no marker): the latter
+/// must NOT be adopted, or the file watcher recursively walks the entire disk and
+/// freezes launch (the v1.10.1 regression).
+fn is_auto_adoptable_workspace(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    if is_shallow_or_system_dir(p) {
+        return false;
+    }
+    p.join(".git").exists() || p.join(".hive").exists()
+}
+
 /// Max size of a file referenced into a chat via `@file` (keeps context sane).
 const MAX_REF_FILE_BYTES: u64 = 256 * 1024;
 
@@ -2502,6 +2531,16 @@ impl AppState {
         let Ok(root_path) = dunce::canonicalize(root) else {
             return;
         };
+        // Defense-in-depth: never recursively watch the filesystem root, $HOME, or
+        // a shallow system dir — that walks the whole disk and hangs the app. A
+        // deliberately-picked deep folder is fine.
+        if is_shallow_or_system_dir(&root_path) {
+            tracing::warn!(
+                "fs watcher: refusing to watch too-broad root {}",
+                root_path.display()
+            );
+            return;
+        }
         let app = self.app_handle.clone();
         let handler_root = root_path.clone();
         let debouncer = notify_debouncer_full::new_debouncer(
@@ -7502,9 +7541,14 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
     // the events table on every launch and blocked first paint.
     let service = ChatService::new(store, stored.device.id, device_kp, account_kp, stored.account.actor());
 
+    // Adopt the process cwd as the workspace ONLY when it's clearly a project we
+    // were launched from (see `is_auto_adoptable_workspace`). A GUI/updater launch
+    // has cwd `/` with no project marker → empty root → the app starts with no
+    // workspace instead of recursively watching the whole disk and hanging.
     let workspace_root = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
         .ok()
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| is_auto_adoptable_workspace(p))
         .and_then(|path| resolve_workspace_root(&path).ok())
         .unwrap_or_default();
     let _ = remember_workspace(&data_dir, &workspace_root);
@@ -11212,6 +11256,28 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Hive");
+}
+
+#[cfg(test)]
+mod workspace_root_guard_tests {
+    use super::is_shallow_or_system_dir;
+    use std::path::Path;
+
+    #[test]
+    fn rejects_root_and_shallow_system_dirs() {
+        // The v1.10.1 launch-hang: a GUI/updater launch has cwd `/`; watching it
+        // recursively walks the whole disk. These must all be refused.
+        assert!(is_shallow_or_system_dir(Path::new("/")));
+        assert!(is_shallow_or_system_dir(Path::new("/Users")));
+        assert!(is_shallow_or_system_dir(Path::new("/Applications")));
+        assert!(is_shallow_or_system_dir(Path::new("/opt")));
+    }
+
+    #[test]
+    fn allows_a_real_project_dir() {
+        assert!(!is_shallow_or_system_dir(Path::new("/Users/someone/projects/app")));
+        assert!(!is_shallow_or_system_dir(Path::new("/Users/someone/code")));
+    }
 }
 
 #[cfg(test)]
