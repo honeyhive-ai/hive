@@ -504,30 +504,35 @@ export function App() {
   const activeWorkspaceName = activeWorkspace?.name?.trim();
 
   // Default view on workspace open/switch: land on the workspace's most-recent
-  // chat so the chat-scoped panes (People, Agents, Review, …) populate instead
-  // of showing an empty shell. Same key/scoping as the sidebar's chat list.
-  const workspaceChats = useQuery({
-    queryKey: ["chats", activeWorkspaceId],
-    queryFn: listChats,
-    enabled: Boolean(activeWorkspaceId),
-  });
-  // Fires once per workspace (tracked by `lastAutoSelectWs`, reset on an explicit
-  // switch below). It only picks a default when the current selection isn't valid
-  // for this workspace — a manual deselect (e.g. to view Code with no chat) is
-  // left alone, so it never fights the workspace-scoped Code/Diff views.
+  // chat so the chat-scoped panes (People, Agents, Review, …) populate instead of
+  // an empty shell. Keyed on the active workspace id so it fires once per switch
+  // (rail, palette, or initial load). Fetches chats FRESH via listChats — not from
+  // a cache the switch path may not have invalidated (the rail only invalidates
+  // "workspaces") — and keeps a still-valid manual selection, so it never yanks you
+  // out of a no-chat Code/Diff view.
   const lastAutoSelectWs = useRef<string | null>(null);
   useEffect(() => {
-    if (!activeWorkspaceId || view !== "workspace" || workspaceChats.data === undefined) return;
+    if (!activeWorkspaceId || view !== "workspace") return;
     if (lastAutoSelectWs.current === activeWorkspaceId) return;
     lastAutoSelectWs.current = activeWorkspaceId;
-    const live = workspaceChats.data.filter((c) => !c.archived);
-    const stillValid = selectedId != null && live.some((c) => c.id === selectedId);
-    if (stillValid) return;
-    const mostRecent = [...live].sort(
-      (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
-    )[0];
-    setSelectedId(mostRecent ? mostRecent.id : null);
-  }, [activeWorkspaceId, view, workspaceChats.data, selectedId]);
+    let cancelled = false;
+    void listChats()
+      .then((all) => {
+        if (cancelled) return;
+        const live = all.filter((c) => !c.archived);
+        setSelectedId((prev) => {
+          if (prev != null && live.some((c) => c.id === prev)) return prev;
+          const mostRecent = [...live].sort(
+            (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
+          )[0];
+          return mostRecent ? mostRecent.id : null;
+        });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspaceId, view]);
   const workspaceLabel = useMemo(() => {
     // Prefer the workspace's own name (what you named the team/room); fall back
     // to the project-folder basename only when it has none.
@@ -723,7 +728,6 @@ export function App() {
             setView("workspace");
           },
           selectWorkspace: async (id) => {
-            lastAutoSelectWs.current = null; // re-arm default-view auto-select
             await setActiveWorkspace(id);
             await qc.invalidateQueries({ queryKey: ["workspaces"] });
             await qc.invalidateQueries({ queryKey: ["chats"] });
@@ -793,7 +797,6 @@ export function App() {
           await qc.invalidateQueries({ queryKey: ["settings"] });
         }}
         onSwitchWorkspace={async (path) => {
-          lastAutoSelectWs.current = null; // re-arm default-view auto-select
           await setWorkspaceRoot(path);
           setSelectedId(null);
           setMode("chat");
