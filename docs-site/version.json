@@ -1,6 +1,6 @@
 {
-  "tag": "v1.10.3",
-  "name": "Hive 1.10.3",
+  "tag": "v1.10.4",
+  "name": "Hive 1.10.4",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Workspace experience improvements. Hive now remembers the folder you chose and reopens it on launch instead of starting empty. The Code view (editor + terminal + file tree) and the Diff view are reachable without first opening a chat, since they work on the whole workspace. And opening or switching a workspace lands you on its most-recent chat, so People, Agents & tools, Review and the other panels are populated instead of showing an empty shell. Builds on 1.10.2's launch-hang fix and 1.10.0's built-in code editor."
+  "notes": "Fixes the default-view behavior added in 1.10.3: switching workspaces now reliably lands you on that workspace's most-recent chat (so People, Agents & tools, Review and the other panels populate) instead of intermittently not sticking. Includes 1.10.3's workspace improvements — remembered folder, and Code/Diff reachable without opening a chat."
 }
