@@ -1,6 +1,6 @@
 {
-  "tag": "v1.10.0",
-  "name": "Hive 1.10.0",
+  "tag": "v1.10.1",
+  "name": "Hive 1.10.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "A built-in code editor. The new Code view puts a file tree, a tabbed Monaco editor, and an integrated terminal right in Hive — open a workspace file, edit it (edits save straight to your local working tree), and run commands in a real shell without leaving the app. A git-changed gutter marks lines that differ from HEAD, quick-open (Cmd/Ctrl+P) jumps to any file, and you can pivot a file between the editor and the Diff view, click an @file mention to open it, or send a selection to chat. Language intelligence is on by default for TypeScript/JavaScript/JSON/CSS/HTML (hover, go-to-definition, completion, diagnostics) with no setup, and Rust/Python/Go light up when their language server is installed — a small status pill shows whether a server is starting, indexing, ready, or not found. Syntax highlighting spans ~30 languages including Terraform/HCL, protobuf, LaTeX, reStructuredText, and Scala. Builds on 1.9.0's Refined UI + monochrome Obsidian theme."
+  "notes": "Fixes a finished chat reply sometimes showing a false \"Still working…\" banner. Auto-titling a new chat now runs in the background instead of holding the turn open, and the stall watchdog reconciles against the delivered transcript and self-heals rather than trusting the request lifetime — while a genuine slow start or login wait still surfaces the warning. Patch on 1.10.0's built-in code editor."
 }
