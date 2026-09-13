@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addWorkspaceToList,
@@ -511,28 +511,51 @@ export function App() {
   // "workspaces") — and keeps a still-valid manual selection, so it never yanks you
   // out of a no-chat Code/Diff view.
   const lastAutoSelectWs = useRef<string | null>(null);
+  // Remembers the chat you last had open in each workspace, so returning to a
+  // workspace restores THAT chat (and thus its channel) instead of jumping to the
+  // most-recent one. Updated by the select handlers below and by this effect.
+  const lastChatByWs = useRef<Map<string, string>>(new Map());
   useEffect(() => {
     if (!activeWorkspaceId || view !== "workspace") return;
     if (lastAutoSelectWs.current === activeWorkspaceId) return;
     lastAutoSelectWs.current = activeWorkspaceId;
+    const wsId = activeWorkspaceId;
     let cancelled = false;
     void listChats()
       .then((all) => {
         if (cancelled) return;
         const live = all.filter((c) => !c.archived);
-        setSelectedId((prev) => {
-          if (prev != null && live.some((c) => c.id === prev)) return prev;
+        const isLive = (id: string | null | undefined) =>
+          id != null && live.some((c) => c.id === id);
+        const remembered = lastChatByWs.current.get(wsId);
+        let pick: string | null;
+        if (isLive(remembered)) {
+          pick = remembered!;
+        } else {
           const mostRecent = [...live].sort(
             (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
           )[0];
-          return mostRecent ? mostRecent.id : null;
-        });
+          pick = mostRecent ? mostRecent.id : null;
+        }
+        if (pick) lastChatByWs.current.set(wsId, pick);
+        else lastChatByWs.current.delete(wsId);
+        // Keep a still-valid current selection (e.g. a manual pick that raced the
+        // switch); otherwise land on the remembered/most-recent chat.
+        setSelectedId((prev) => (isLive(prev) ? prev : pick));
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, [activeWorkspaceId, view]);
+  // Record a deliberate chat selection against the active workspace so it can be
+  // restored on return. Called from the select handlers below.
+  const rememberChat = useCallback(
+    (id: string) => {
+      if (activeWorkspaceId) lastChatByWs.current.set(activeWorkspaceId, id);
+    },
+    [activeWorkspaceId],
+  );
   const workspaceLabel = useMemo(() => {
     // Prefer the workspace's own name (what you named the team/room); fall back
     // to the project-folder basename only when it has none.
@@ -716,6 +739,7 @@ export function App() {
             try {
               const created = await createChat("");
               await qc.invalidateQueries({ queryKey: ["chats"] });
+              rememberChat(created.id);
               setSelectedId(created.id);
               setView("workspace");
             } catch (e) {
@@ -724,6 +748,7 @@ export function App() {
           },
           openSettings: () => openSettings(),
           selectChat: (id) => {
+            rememberChat(id);
             setSelectedId(id);
             setView("workspace");
           },
@@ -781,6 +806,7 @@ export function App() {
         displayName={settings.data?.displayName ?? "You"}
         utilityPane={utilityPane}
         onSelect={(id) => {
+          rememberChat(id);
           setSelectedId(id);
           setView("workspace");
           setMode("chat");
