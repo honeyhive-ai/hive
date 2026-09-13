@@ -8,6 +8,7 @@ import {
   getAppSettings,
   listWorkspaces,
   getChat,
+  listChats,
   getContextTelemetry,
   listAgents,
   listRuntimes,
@@ -501,6 +502,32 @@ export function App() {
   const activeWorkspace = workspaceList.data?.find((w) => w.active);
   const activeWorkspaceId = activeWorkspace?.id ?? "";
   const activeWorkspaceName = activeWorkspace?.name?.trim();
+
+  // Default view on workspace open/switch: land on the workspace's most-recent
+  // chat so the chat-scoped panes (People, Agents, Review, …) populate instead
+  // of showing an empty shell. Same key/scoping as the sidebar's chat list.
+  const workspaceChats = useQuery({
+    queryKey: ["chats", activeWorkspaceId],
+    queryFn: listChats,
+    enabled: Boolean(activeWorkspaceId),
+  });
+  // Fires once per workspace (tracked by `lastAutoSelectWs`, reset on an explicit
+  // switch below). It only picks a default when the current selection isn't valid
+  // for this workspace — a manual deselect (e.g. to view Code with no chat) is
+  // left alone, so it never fights the workspace-scoped Code/Diff views.
+  const lastAutoSelectWs = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeWorkspaceId || view !== "workspace" || workspaceChats.data === undefined) return;
+    if (lastAutoSelectWs.current === activeWorkspaceId) return;
+    lastAutoSelectWs.current = activeWorkspaceId;
+    const live = workspaceChats.data.filter((c) => !c.archived);
+    const stillValid = selectedId != null && live.some((c) => c.id === selectedId);
+    if (stillValid) return;
+    const mostRecent = [...live].sort(
+      (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
+    )[0];
+    setSelectedId(mostRecent ? mostRecent.id : null);
+  }, [activeWorkspaceId, view, workspaceChats.data, selectedId]);
   const workspaceLabel = useMemo(() => {
     // Prefer the workspace's own name (what you named the team/room); fall back
     // to the project-folder basename only when it has none.
@@ -696,6 +723,7 @@ export function App() {
             setView("workspace");
           },
           selectWorkspace: async (id) => {
+            lastAutoSelectWs.current = null; // re-arm default-view auto-select
             await setActiveWorkspace(id);
             await qc.invalidateQueries({ queryKey: ["workspaces"] });
             await qc.invalidateQueries({ queryKey: ["chats"] });
@@ -765,6 +793,7 @@ export function App() {
           await qc.invalidateQueries({ queryKey: ["settings"] });
         }}
         onSwitchWorkspace={async (path) => {
+          lastAutoSelectWs.current = null; // re-arm default-view auto-select
           await setWorkspaceRoot(path);
           setSelectedId(null);
           setMode("chat");
@@ -796,9 +825,60 @@ export function App() {
             />
           </PaneErrorBoundary>
         ) : !selectedId ? (
-          <div className="flex flex-1 items-center justify-center opacity-60">
-            Select or create a chat to begin.
-          </div>
+          <>
+            {/* No chat selected, but Diff and Code are workspace-scoped, so the
+                canvas stays reachable. A minimal header carries the mode tabs
+                (and the workspace crumb); Chat falls back to the placeholder. */}
+            <div
+              className="flex items-center gap-3 border-b px-4 py-2"
+              style={{ borderColor: "var(--hive-line)" }}
+            >
+              <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                <span className="truncate text-base font-semibold tracking-tight opacity-70">
+                  {workspaceLabel}
+                </span>
+              </div>
+              <CanvasModeTabs mode={mode} onChangeMode={setMode} />
+            </div>
+
+            <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
+              <div className="min-w-0 flex-1">
+                <PaneErrorBoundary label="This view">
+                  {mode === "diff" ? (
+                    <Suspense
+                      fallback={
+                        <div className="flex h-full items-center justify-center opacity-50">
+                          Loading diff editor…
+                        </div>
+                      }
+                    >
+                      <DiffView
+                        pendingPath={pendingDiffPath}
+                        onConsumePendingPath={() => setPendingDiffPath(null)}
+                      />
+                    </Suspense>
+                  ) : mode === "code" ? (
+                    <Suspense
+                      fallback={
+                        <div className="flex h-full items-center justify-center opacity-50">
+                          Loading code editor…
+                        </div>
+                      }
+                    >
+                      <CodeView
+                        pending={codePending}
+                        onConsumePending={() => setCodePending(null)}
+                      />
+                    </Suspense>
+                  ) : (
+                    <div className="flex h-full items-center justify-center opacity-60">
+                      Select or create a chat to begin.
+                    </div>
+                  )}
+                </PaneErrorBoundary>
+              </div>
+            </div>
+          </>
         ) : (
           <>
             <ChatHeaderBar
@@ -1061,6 +1141,50 @@ function SyncPillChip({ pill, onFix }: { pill: SyncPill; onFix?: () => void }) {
   );
 }
 
+/// The Chat / Diff / Code canvas-mode switch. Extracted so both the chat header
+/// and the no-chat workspace header render the same control (single tabs array).
+/// Diff and Code are workspace-scoped, so this stays meaningful with no chat
+/// selected.
+function CanvasModeTabs({
+  mode,
+  onChangeMode,
+}: {
+  mode: CanvasMode;
+  onChangeMode: (m: CanvasMode) => void;
+}) {
+  const tabs: { id: CanvasMode; label: string }[] = [
+    { id: "chat", label: "Chat" },
+    { id: "diff", label: "Diff" },
+    { id: "code", label: "Code" },
+  ];
+  return (
+    <div
+      className="flex shrink-0 items-center gap-0.5 rounded-xl border p-0.5"
+      style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+      role="tablist"
+      aria-label="Canvas mode"
+    >
+      {tabs.map((t) => (
+        <button
+          key={t.id}
+          role="tab"
+          aria-selected={mode === t.id}
+          onClick={() => onChangeMode(t.id)}
+          className="rounded-[10px] px-3 py-1 text-sm font-medium transition-colors"
+          style={{
+            background: mode === t.id ? "var(--hive-panel)" : "transparent",
+            color: "var(--hive-ink)",
+            opacity: mode === t.id ? 1 : 0.55,
+            boxShadow: mode === t.id ? "0 1px 2px color-mix(in srgb, var(--hive-ink) 12%, transparent)" : undefined,
+          }}
+        >
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function ChatHeaderBar({
   title,
   syncPill,
@@ -1092,11 +1216,6 @@ function ChatHeaderBar({
   /// button that takes the user to the fix.
   onFixSync?: () => void;
 }) {
-  const tabs: { id: CanvasMode; label: string }[] = [
-    { id: "chat", label: "Chat" },
-    { id: "diff", label: "Diff" },
-    { id: "code", label: "Code" },
-  ];
   return (
     <div
       className="flex items-center gap-3 border-b px-4 py-2"
@@ -1140,30 +1259,7 @@ function ChatHeaderBar({
         </button>
       )}
 
-      <div
-        className="flex shrink-0 items-center gap-0.5 rounded-xl border p-0.5"
-        style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
-        role="tablist"
-        aria-label="Canvas mode"
-      >
-        {tabs.map((t) => (
-          <button
-            key={t.id}
-            role="tab"
-            aria-selected={mode === t.id}
-            onClick={() => onChangeMode(t.id)}
-            className="rounded-[10px] px-3 py-1 text-sm font-medium transition-colors"
-            style={{
-              background: mode === t.id ? "var(--hive-panel)" : "transparent",
-              color: "var(--hive-ink)",
-              opacity: mode === t.id ? 1 : 0.55,
-              boxShadow: mode === t.id ? "0 1px 2px color-mix(in srgb, var(--hive-ink) 12%, transparent)" : undefined,
-            }}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      <CanvasModeTabs mode={mode} onChangeMode={onChangeMode} />
 
       <button
         onClick={onToggleTools}
