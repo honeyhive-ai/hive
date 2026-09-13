@@ -6084,22 +6084,38 @@ async fn send_message(
 
     // Auto-title a still-unnamed chat from its opening exchange, using the
     // session's primary runtime. Best-effort: failures leave the title as-is.
+    // Auto-title OFF the critical path. Title generation is a whole extra runtime
+    // call; awaiting it here kept `send_message` (and therefore the UI's `sending`
+    // state) pending long after the reply was delivered — so a finished turn showed
+    // a false "Still working…" banner, and a stalled title call made a done reply
+    // look hung forever. Spawn it so the command returns as soon as the reply
+    // cascade is done; the new title lands in the UI via a `workspace://synced` nudge.
     if let Some(reply) = first_reply {
-        let (needs_title, primary_runtime) = {
-            let svc = state.service.lock().unwrap();
-            match svc.load(sid).map_err(map_err)? {
-                Some(s) if is_default_title(&s.title) => {
-                    (true, state.resolve_runtime(&s.runtime_id))
+        let app = app.clone();
+        let user_body = body.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
+            let (needs_title, primary_runtime) = {
+                let svc = state.service.lock().unwrap();
+                match svc.load(sid) {
+                    Ok(Some(s)) if is_default_title(&s.title) => {
+                        (true, state.resolve_runtime(&s.runtime_id))
+                    }
+                    _ => (false, state.resolve_runtime("")),
                 }
-                _ => (false, state.resolve_runtime("")),
+            };
+            if needs_title {
+                if let Some(title) =
+                    generate_title(&state, &primary_runtime, &user_body, &reply).await
+                {
+                    {
+                        let mut svc = state.service.lock().unwrap();
+                        let _ = svc.set_title(sid, workspace_id, title);
+                    }
+                    let _ = app.emit("workspace://synced", 1);
+                }
             }
-        };
-        if needs_title {
-            if let Some(title) = generate_title(&state, &primary_runtime, &body, &reply).await {
-                let mut svc = state.service.lock().unwrap();
-                let _ = svc.set_title(sid, workspace_id, title);
-            }
-        }
+        });
     }
 
     Ok(())

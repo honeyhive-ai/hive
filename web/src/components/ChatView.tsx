@@ -705,16 +705,34 @@ export function ChatView({
   // A turn is in flight whenever we're sending or a stream is live.
   const busy = sending || streams.size > 0;
 
-  // Stall watchdog: while a turn is in flight, flag it `stalled` if no delta has
-  // arrived for ~40s. Cleared automatically when the turn ends (busy → false) or
-  // resumes (a delta bumps lastActivityRef and clears the flag).
+  // Mirrored into refs so the stall watchdog (deps: [busy]) reads fresh transcript
+  // state without re-subscribing on every token. Assigned once `messages` is
+  // derived, below.
+  const streamsSizeRef = useRef(0);
+  const anyStreamingRef = useRef(false);
+  const replyDeliveredRef = useRef(false);
+
+  // Stall watchdog: while a turn is in flight, once ~40s pass with no delta,
+  // reconcile against the authoritative transcript. If a reply was actually
+  // delivered (persisted, not streaming) and nothing is live, the turn finished
+  // but its terminal `completed` event was missed or late — self-heal the stuck
+  // `sending` state rather than show a false "Still working…" on a done reply.
+  // Otherwise (a genuine slow start / login wait, or a live-but-silent stream)
+  // surface the stall as before.
   useEffect(() => {
     if (!busy) {
       setStalled(false);
       return;
     }
     const id = window.setInterval(() => {
-      if (Date.now() - lastActivityRef.current > 40_000) setStalled(true);
+      if (Date.now() - lastActivityRef.current <= 40_000) return;
+      if (streamsSizeRef.current === 0 && !anyStreamingRef.current && replyDeliveredRef.current) {
+        setSending(false);
+        setOptimisticUser(null);
+        setStalled(false);
+      } else {
+        setStalled(true);
+      }
     }, 4000);
     return () => window.clearInterval(id);
   }, [busy]);
@@ -731,6 +749,15 @@ export function ChatView({
   }, [busy, queued]);
 
   const messages: ChatMessageDto[] = chat.data?.messages ?? [];
+  // Feed the stall watchdog's refs from the authoritative transcript.
+  streamsSizeRef.current = streams.size;
+  anyStreamingRef.current = messages.some((m) => m.isStreaming);
+  {
+    const lastUserIdx = messages.map((m) => m.role).lastIndexOf("user");
+    replyDeliveredRef.current = messages
+      .slice(lastUserIdx + 1)
+      .some((m) => (m.role === "assistant" || m.role === "agent") && !m.isStreaming);
+  }
   // Retire the optimistic echo the moment the persisted user message lands in
   // the transcript — don't wait for the agent's stream to retire. Waiting made
   // the sent message double-render (persisted copy + optimistic bubble) for the
