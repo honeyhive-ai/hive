@@ -526,7 +526,6 @@ export function App() {
     const wsId = activeWorkspaceId;
     const remembered = lastChatByWs.current.get(wsId);
     if (remembered) {
-      console.debug("[default-view] restore", { wsId, remembered });
       setSelectedId(remembered);
       return;
     }
@@ -540,11 +539,6 @@ export function App() {
               (a, b) => new Date(b.lastActivityAt).getTime() - new Date(a.lastActivityAt).getTime(),
             )[0]
           : null;
-        console.debug("[default-view] first-visit", {
-          wsId,
-          chats: live.length,
-          mostRecent: mostRecent?.id ?? null,
-        });
         if (!mostRecent) return; // no chats (or transient empty) - leave as-is
         lastChatByWs.current.set(wsId, mostRecent.id);
         setSelectedId((prev) => (prev && live.some((c) => c.id === prev) ? prev : mostRecent.id));
@@ -558,7 +552,6 @@ export function App() {
   // restored on return. Called from the select handlers below.
   const rememberChat = useCallback(
     (id: string) => {
-      console.debug("[default-view] remember", { ws: activeWorkspaceId, id });
       if (activeWorkspaceId) lastChatByWs.current.set(activeWorkspaceId, id);
     },
     [activeWorkspaceId],
