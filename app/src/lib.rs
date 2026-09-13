@@ -319,6 +319,11 @@ struct LiveSettings {
     /// Injected as the bearer when assembling the registry; refreshed on expiry.
     #[serde(default)]
     mcp_oauth: std::collections::HashMap<String, McpOAuthEntry>,
+    /// The workspace folder the user last chose (via `set_workspace_root`), so a
+    /// GUI launch reopens it instead of starting with no workspace. `None` = never
+    /// chosen; restored only if still a valid, non-shallow/-system dir at launch.
+    #[serde(default)]
+    workspace_root: Option<String>,
 }
 
 /// Persisted OAuth state for one remote MCP server (see [`mcp_oauth`] +
@@ -428,6 +433,7 @@ impl Default for LiveSettings {
             local_workspace_icon: None,
             schedules: Vec::new(),
             mcp_oauth: std::collections::HashMap::new(),
+            workspace_root: None,
         }
     }
 }
@@ -851,6 +857,45 @@ fn is_auto_adoptable_workspace(path: &str) -> bool {
         return false;
     }
     p.join(".git").exists() || p.join(".hive").exists()
+}
+
+/// Choose the workspace root at launch. A still-valid persisted root the user
+/// explicitly chose wins; else auto-adopt the process cwd only when it's clearly
+/// a project we were launched from; else empty (a GUI/updater launch with no
+/// workspace). The persisted root is still subject to the shallow/system-dir
+/// guard, so a stale `/` (or a since-deleted folder) can never re-arm the
+/// whole-disk file watcher that hung launch in v1.10.1.
+fn initial_workspace_root(persisted: Option<&str>, cwd_candidate: Option<&str>) -> String {
+    // (a) The folder the user last chose, if it's still a valid, non-shallow dir.
+    if let Some(p) = persisted.map(str::trim).filter(|p| !p.is_empty()) {
+        if !is_shallow_or_system_dir(std::path::Path::new(p)) {
+            if let Ok(resolved) = resolve_workspace_root(p) {
+                return resolved;
+            }
+        }
+    }
+    // (b) Auto-adopt the cwd for a dev launch (cwd = a repo with a `.git`/`.hive`).
+    if let Some(cwd) = cwd_candidate {
+        if is_auto_adoptable_workspace(cwd) {
+            if let Ok(resolved) = resolve_workspace_root(cwd) {
+                return resolved;
+            }
+        }
+    }
+    // (c) No workspace.
+    String::new()
+}
+
+/// Peek the persisted workspace root from `settings.json` up front, before the
+/// full settings load — the root feeds the config/catalog paths, so it must be
+/// known first. Returns `None` if the file is absent/unreadable/unparseable.
+fn persisted_workspace_root(data_dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(settings_file(data_dir)).ok()?;
+    serde_json::from_str::<LiveSettings>(&text)
+        .ok()
+        .and_then(|s| s.workspace_root)
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
 }
 
 /// Max size of a file referenced into a chat via `@file` (keeps context sane).
@@ -7077,6 +7122,13 @@ fn set_workspace_root(state: State<AppState>, path: String) -> Result<(), String
     let normalized = resolve_workspace_root(&path)?;
     *state.workspace_root.lock().unwrap() = normalized.clone();
     remember_workspace(&state.data_dir, &normalized)?;
+    // Persist the *current* root (not just the recent-list entry) so a GUI launch
+    // reopens this folder instead of starting with no workspace (see build_state).
+    {
+        let mut s = state.settings.lock().unwrap();
+        s.workspace_root = Some(normalized.clone());
+        save_settings(&state.data_dir, &s);
+    }
     state.reload_workspace_catalogs(&normalized);
     // Re-arm the file watcher on the new root so `workspace://fs-changed` events
     // track the workspace the editor/tree is now showing.
@@ -7541,16 +7593,18 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
     // the events table on every launch and blocked first paint.
     let service = ChatService::new(store, stored.device.id, device_kp, account_kp, stored.account.actor());
 
-    // Adopt the process cwd as the workspace ONLY when it's clearly a project we
-    // were launched from (see `is_auto_adoptable_workspace`). A GUI/updater launch
-    // has cwd `/` with no project marker → empty root → the app starts with no
+    // Restore the folder the user last chose (persisted by `set_workspace_root`);
+    // failing that, adopt the process cwd ONLY when it's clearly a project we were
+    // launched from (see `is_auto_adoptable_workspace`). A GUI/updater launch has
+    // cwd `/` with no project marker → empty root → the app starts with no
     // workspace instead of recursively watching the whole disk and hanging.
-    let workspace_root = std::env::current_dir()
+    let cwd = std::env::current_dir()
         .ok()
-        .map(|p| p.to_string_lossy().to_string())
-        .filter(|p| is_auto_adoptable_workspace(p))
-        .and_then(|path| resolve_workspace_root(&path).ok())
-        .unwrap_or_default();
+        .map(|p| p.to_string_lossy().to_string());
+    let workspace_root = initial_workspace_root(
+        persisted_workspace_root(&data_dir).as_deref(),
+        cwd.as_deref(),
+    );
     let _ = remember_workspace(&data_dir, &workspace_root);
 
     let mut config_relay_endpoint: Option<String> = None;
@@ -7617,6 +7671,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         local_workspace_icon: None,
         schedules: Vec::new(),
         mcp_oauth: std::collections::HashMap::new(),
+        workspace_root: None,
     };
     let settings = Arc::new(Mutex::new(load_or_seed_settings(&data_dir, env_seed)));
 
@@ -11277,6 +11332,49 @@ mod workspace_root_guard_tests {
     fn allows_a_real_project_dir() {
         assert!(!is_shallow_or_system_dir(Path::new("/Users/someone/projects/app")));
         assert!(!is_shallow_or_system_dir(Path::new("/Users/someone/code")));
+    }
+
+    use super::initial_workspace_root;
+
+    #[test]
+    fn persisted_root_wins_over_cwd() {
+        // A valid, non-shallow persisted folder is restored even when the cwd is
+        // itself an auto-adoptable project — the user's choice takes precedence.
+        let dir = std::env::temp_dir().join("hive_ws_persist_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dunce::canonicalize(&dir).unwrap();
+        let dir_str = dir.to_string_lossy().to_string();
+
+        let chosen = initial_workspace_root(Some(&dir_str), Some("."));
+        assert_eq!(chosen, dir_str);
+    }
+
+    #[test]
+    fn persisted_system_or_root_dir_is_rejected() {
+        // A stale `/` (or other shallow/system dir) must never be restored — it
+        // would re-arm the whole-disk watcher that hung launch in v1.10.1. With no
+        // adoptable cwd fallback, the result is empty (no workspace).
+        assert_eq!(initial_workspace_root(Some("/"), None), "");
+        assert_eq!(initial_workspace_root(Some("/Users"), None), "");
+        // A since-deleted / nonexistent persisted path also falls through to empty.
+        assert_eq!(
+            initial_workspace_root(Some("/Users/nobody/gone-42a9f"), None),
+            ""
+        );
+    }
+
+    #[test]
+    fn cwd_is_adopted_when_no_valid_persisted_root() {
+        // No persisted root: a cwd that's clearly a project (has `.git`/`.hive`) is
+        // adopted, while a non-project/system cwd is not.
+        let repo = std::env::temp_dir().join("hive_ws_cwd_adopt_test");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo = dunce::canonicalize(&repo).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+
+        assert_eq!(initial_workspace_root(None, Some(&repo_str)), repo_str);
+        // A plain (marker-less) or system cwd is not adopted → empty.
+        assert_eq!(initial_workspace_root(None, Some("/")), "");
     }
 }
 
