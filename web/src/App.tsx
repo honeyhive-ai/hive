@@ -30,8 +30,12 @@ import {
 } from "@/lib/ipc";
 import { Sidebar } from "@/components/Sidebar";
 import { ChatView } from "@/components/ChatView";
+import { editorStore } from "@/state/editorStore";
 // Lazy so Monaco (the bulk of the bundle) only loads when the Diff view opens.
 const DiffView = lazy(() => import("@/components/DiffView").then((m) => ({ default: m.DiffView })));
+// Lazy so Monaco + xterm (the code view's heavy deps) only load when it opens.
+const CodeView = lazy(() => import("@/components/editor/CodeView").then((m) => ({ default: m.CodeView })));
+import type { CodeViewIntent } from "@/components/editor/CodeView";
 // Lazy so react-flow only loads when the workflow editor opens.
 const WorkflowBuilder = lazy(() =>
   import("@/components/WorkflowBuilder").then((m) => ({ default: m.WorkflowBuilder })),
@@ -62,7 +66,7 @@ import {
 } from "@/lib/theme";
 
 type View = "workspace" | "friends";
-type CanvasMode = "chat" | "diff";
+type CanvasMode = "chat" | "diff" | "code";
 type UtilityPane =
   | "tools"
   | "review"
@@ -130,6 +134,20 @@ export function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [addWsOpen, setAddWsOpen] = useState(false);
   const [mode, setMode] = useState<CanvasMode>("chat");
+  // Live mirror of `mode` for non-React callbacks (the editorStore subscription
+  // below) so they read the current canvas mode without re-subscribing.
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  // One-shot request handed to the code view (⌘P / New terminal from the
+  // palette); CodeView consumes it and calls back to clear it.
+  const [codePending, setCodePending] = useState<CodeViewIntent | null>(null);
+  // Wedge plumbing (P2): the editor and diff/chat views can't reach each other
+  // directly (CodeView sits between App and EditorView), so cross-view requests
+  // ride window events into App and are handed back down as one-shot props.
+  // A file the editor asked the Diff view to select ("Open in Diff").
+  const [pendingDiffPath, setPendingDiffPath] = useState<string | null>(null);
+  // A snippet the editor asked to drop into the chat composer ("Send selection").
+  const [composerSeed, setComposerSeed] = useState<string | null>(null);
   // Workflow-editor takeover of the main canvas. Keyed to its chat so
   // switching chats hides (not destroys) an in-progress draft.
   const [workflowDraft, setWorkflowDraft] = useState<
@@ -304,6 +322,50 @@ export function App() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
+  }, []);
+
+  // Wedge: when any view asks the editor to open a file (editorStore.requestOpen
+  // from the Diff view, an @file chip in chat, a proposal, …), reveal the code
+  // canvas so the request isn't lost behind another mode. We only READ
+  // pendingOpen to decide whether to switch — CodeView still owns consuming and
+  // clearing it, so we never double-clear. Subscribing imperatively (rather than
+  // via useEditorStore) keeps App from re-rendering on every editor keystroke.
+  useEffect(() => {
+    const unsub = editorStore.subscribe(() => {
+      if (editorStore.getState().pendingOpen && modeRef.current !== "code") {
+        setView("workspace");
+        setMode("code");
+      }
+    });
+    return () => {
+      unsub();
+    };
+  }, []);
+
+  // Wedge: the editor is nested under CodeView (which App can't pass props to),
+  // so its "Open in Diff" / "Send selection to chat" controls emit window events
+  // App turns into a mode switch plus a one-shot prop for the target view.
+  useEffect(() => {
+    const onOpenInDiff = (e: Event) => {
+      const path = (e as CustomEvent<{ path?: string }>).detail?.path;
+      if (!path) return;
+      setView("workspace");
+      setMode("diff");
+      setPendingDiffPath(path);
+    };
+    const onSendToChat = (e: Event) => {
+      const text = (e as CustomEvent<{ text?: string }>).detail?.text;
+      if (!text) return;
+      setView("workspace");
+      setMode("chat");
+      setComposerSeed(text);
+    };
+    window.addEventListener("hive:editor-open-in-diff", onOpenInDiff);
+    window.addEventListener("hive:editor-send-to-chat", onSendToChat);
+    return () => {
+      window.removeEventListener("hive:editor-open-in-diff", onOpenInDiff);
+      window.removeEventListener("hive:editor-send-to-chat", onSendToChat);
+    };
   }, []);
 
   useEffect(() => {
@@ -645,6 +707,16 @@ export function App() {
             setView("workspace");
             setMode(m);
           },
+          quickOpenFile: () => {
+            setView("workspace");
+            setMode("code");
+            setCodePending("quick-open");
+          },
+          newTerminal: () => {
+            setView("workspace");
+            setMode("code");
+            setCodePending("new-terminal");
+          },
           openFriends: () => setView("friends"),
           openPane: (pane) => {
             setView("workspace");
@@ -803,6 +875,8 @@ export function App() {
                     runtimes={runtimeItems}
                     currentRuntimeId={activeChat.data?.runtimeId ?? currentRuntime?.id ?? ""}
                     onOpenTools={() => openUtilityPane("tools")}
+                    pendingInsert={composerSeed}
+                    onConsumePendingInsert={() => setComposerSeed(null)}
                   />
                 )}
                 {mode === "diff" && (
@@ -813,7 +887,24 @@ export function App() {
                       </div>
                     }
                   >
-                    <DiffView />
+                    <DiffView
+                      pendingPath={pendingDiffPath}
+                      onConsumePendingPath={() => setPendingDiffPath(null)}
+                    />
+                  </Suspense>
+                )}
+                {mode === "code" && (
+                  <Suspense
+                    fallback={
+                      <div className="flex h-full items-center justify-center opacity-50">
+                        Loading code editor…
+                      </div>
+                    }
+                  >
+                    <CodeView
+                      pending={codePending}
+                      onConsumePending={() => setCodePending(null)}
+                    />
                   </Suspense>
                 )}
                   </>
@@ -1004,6 +1095,7 @@ function ChatHeaderBar({
   const tabs: { id: CanvasMode; label: string }[] = [
     { id: "chat", label: "Chat" },
     { id: "diff", label: "Diff" },
+    { id: "code", label: "Code" },
   ];
   return (
     <div

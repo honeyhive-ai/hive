@@ -21,7 +21,7 @@ use hive_core::{
 use hive_core::{ActorIdentity, ActorKind, MountedVault, VaultSource, WorkspaceMember};
 use hive_proto::{
     ApprovalDto, AppInfo, AppSettingsDto, ChannelDto, ChatMessageDto, ChatSessionDto,
-    ChatStreamEvent, ChatSummaryDto, ContextTelemetryDto, GitFileDiffDto, McpServerDto, ProposalDto,
+    ChatStreamEvent, ChatSummaryDto, ContextTelemetryDto, FsEntryDto, GitFileDiffDto, LspServerDto, McpServerDto, ProposalDto,
     IssuedRelayTokenDto, MentionStateDto, QueuedWorkDto, ReactionDto, RelayTokenDto, RelayUserDto,
     RuntimeSummaryDto, SkillDto, VaultSourceDto, WorkspaceAgentDto, WorkspaceHostDto,
     WorkspaceInfoDto, WorkspaceMemberDto,
@@ -144,6 +144,50 @@ struct AppState {
     /// removed you). Keyed by workspace so switching workspaces re-baselines
     /// instead of false-firing.
     active_membership: Mutex<Option<(Uuid, bool)>>,
+    /// App handle, kept so background helpers (the fs watcher, PTY reader
+    /// threads) can emit Tauri events without threading it through every call.
+    app_handle: AppHandle,
+    /// Debounced workspace file watcher. Re-armed whenever the workspace root
+    /// changes; dropping the old debouncer stops its watch thread.
+    fs_watcher: Mutex<Option<FsWatcher>>,
+    /// Live embedded terminals (PTYs), keyed by the uuid returned from
+    /// `terminal_open`.
+    terminals: Mutex<HashMap<String, TerminalHandle>>,
+    /// Live LSP language-server sessions, keyed by the sessionId returned from
+    /// `lsp_start`. Each holds the child's stdin (for `lsp_send`) and a shared
+    /// handle to the child (for killing on `lsp_stop`).
+    lsp_sessions: Mutex<HashMap<String, LspSession>>,
+    /// serverId → sessionId reuse map, so a second `lsp_start` for a server
+    /// that's already running returns the existing session instead of spawning
+    /// a duplicate.
+    lsp_by_server: Mutex<HashMap<String, String>>,
+}
+
+/// The concrete debounced-watcher type held alive in `AppState`.
+type FsWatcher = notify_debouncer_full::Debouncer<
+    notify::RecommendedWatcher,
+    notify_debouncer_full::FileIdMap,
+>;
+
+/// A live embedded terminal. `writer` feeds keystrokes to the PTY master;
+/// `master` is kept alive (dropping it closes the PTY) and used for resize;
+/// `killer` terminates the child shell on `terminal_close`. The reader thread
+/// owns the child + master reader: it streams `terminal://output` until EOF,
+/// then waits the child and emits `terminal://exit`.
+struct TerminalHandle {
+    writer: Box<dyn std::io::Write + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+}
+
+/// A live LSP language-server session. `stdin` writes framed JSON-RPC to the
+/// server; `child` is shared with the stdout reader thread so `lsp_stop` can
+/// kill the process and the reader can reap it to report the exit code.
+/// `server_id` records which registry entry spawned it (for reuse cleanup).
+struct LspSession {
+    server_id: String,
+    stdin: std::process::ChildStdin,
+    child: Arc<Mutex<std::process::Child>>,
 }
 
 /// Coarse connection health for the active relay, surfaced via `sync_status`.
@@ -843,6 +887,737 @@ fn list_workspace_files(state: State<AppState>) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .take(MAX_FILES)
         .collect()
+}
+
+/// Max size of a file written back through the editor (8 MiB) — a guard so a
+/// runaway `write_workspace_file` can't dump an arbitrarily huge blob.
+const MAX_WRITE_FILE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Resolve a repo-relative (or absolute-under-root) `path` against the workspace
+/// `root`, returning `(canonical_root, resolved_target)`. Unlike
+/// `read_workspace_file`, the target need NOT exist yet (for create/write), so
+/// we canonicalize its nearest existing ancestor and re-append the missing tail
+/// — that resolves any symlink in the existing part. `..` components are
+/// rejected outright, and the final path must sit within the root, so neither a
+/// `../` escape nor a symlinked-out ancestor can leave the workspace.
+fn resolve_workspace_target(root: &str, path: &str) -> Result<(PathBuf, PathBuf), String> {
+    if root.trim().is_empty() {
+        return Err("Set a workspace root first (Settings → Workspace).".to_string());
+    }
+    let root_path =
+        dunce::canonicalize(root).map_err(|_| "workspace root is unavailable".to_string())?;
+    let trimmed = path.trim();
+    let req = std::path::Path::new(trimmed);
+    if req
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err("path may not contain `..`".to_string());
+    }
+    if trimmed.is_empty() || req == std::path::Path::new(".") {
+        return Ok((root_path.clone(), root_path));
+    }
+    let joined = if req.is_absolute() {
+        req.to_path_buf()
+    } else {
+        root_path.join(req)
+    };
+    let target = resolve_existing_ancestor(&joined);
+    if !is_within(&root_path, &target) {
+        return Err("that path is outside the workspace".to_string());
+    }
+    Ok((root_path, target))
+}
+
+/// Canonicalize the nearest existing ancestor of `path`, then re-append the
+/// not-yet-existing tail. So a target that doesn't exist still resolves symlinks
+/// (and `.`) in its existing prefix, giving an absolute path safe to range-check.
+fn resolve_existing_ancestor(path: &std::path::Path) -> PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if existing.exists() {
+            let mut base = dunce::canonicalize(&existing).unwrap_or_else(|_| existing.clone());
+            for comp in tail.iter().rev() {
+                base.push(comp);
+            }
+            return base;
+        }
+        match existing.file_name() {
+            Some(name) => tail.push(name.to_os_string()),
+            None => return path.to_path_buf(),
+        }
+        if !existing.pop() {
+            return path.to_path_buf();
+        }
+    }
+}
+
+/// Repo-relative POSIX-style path of `target` under `root` (stable tree key).
+fn repo_relative(root: &std::path::Path, target: &std::path::Path) -> String {
+    target
+        .strip_prefix(root)
+        .unwrap_or(target)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// One directory level of the workspace tree (lazy file tree). `rel_dir`
+/// None/"" is the root. Skips `.git`; returns directories first, then files,
+/// each group name-sorted (case-insensitive).
+#[tauri::command]
+fn list_workspace_tree(
+    state: State<AppState>,
+    rel_dir: Option<String>,
+) -> Result<Vec<FsEntryDto>, String> {
+    let root = state.workspace_root.lock().unwrap().clone();
+    list_workspace_tree_at(&root, &rel_dir.unwrap_or_default())
+}
+
+/// Core of `list_workspace_tree`, split out so it's unit-testable without an
+/// `AppState`.
+fn list_workspace_tree_at(root: &str, rel: &str) -> Result<Vec<FsEntryDto>, String> {
+    let (root_path, dir) = resolve_workspace_target(root, rel)?;
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {}", rel.trim()));
+    }
+    let mut dirs: Vec<FsEntryDto> = Vec::new();
+    let mut files: Vec<FsEntryDto> = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(map_err)? {
+        let entry = entry.map_err(map_err)?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name == ".git" {
+            continue;
+        }
+        // Classify by symlink-following metadata, but keep the entry itself
+        // inside the root (never traverse a symlink that points out).
+        let path = entry.path();
+        let is_dir = entry
+            .file_type()
+            .map(|t| {
+                if t.is_symlink() {
+                    std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false)
+                } else {
+                    t.is_dir()
+                }
+            })
+            .unwrap_or(false);
+        let dto = FsEntryDto {
+            name,
+            path: repo_relative(&root_path, &path),
+            is_dir,
+        };
+        if is_dir {
+            dirs.push(dto);
+        } else {
+            files.push(dto);
+        }
+    }
+    let by_name = |a: &FsEntryDto, b: &FsEntryDto| a.name.to_lowercase().cmp(&b.name.to_lowercase());
+    dirs.sort_by(by_name);
+    files.sort_by(by_name);
+    dirs.append(&mut files);
+    Ok(dirs)
+}
+
+/// Write `contents` to a workspace file, creating parent dirs and the file if
+/// missing. Overwrites in place. Path-traversal-safe; size-capped.
+#[tauri::command]
+fn write_workspace_file(state: State<AppState>, path: String, contents: String) -> Result<(), String> {
+    let root = state.workspace_root.lock().unwrap().clone();
+    let (_root, target) = resolve_workspace_target(&root, &path)?;
+    if contents.len() > MAX_WRITE_FILE_BYTES {
+        return Err(format!(
+            "file too large ({} KB; max {} KB)",
+            contents.len() / 1024,
+            MAX_WRITE_FILE_BYTES / 1024
+        ));
+    }
+    if target.is_dir() {
+        return Err("that path is a directory".to_string());
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(map_err)?;
+    }
+    std::fs::write(&target, contents).map_err(map_err)
+}
+
+/// Create a new empty file or directory within the workspace. Errors if it
+/// already exists.
+#[tauri::command]
+fn create_workspace_entry(state: State<AppState>, path: String, is_dir: bool) -> Result<(), String> {
+    let root = state.workspace_root.lock().unwrap().clone();
+    let (_root, target) = resolve_workspace_target(&root, &path)?;
+    if target.exists() {
+        return Err("that path already exists".to_string());
+    }
+    if is_dir {
+        std::fs::create_dir_all(&target).map_err(map_err)
+    } else {
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).map_err(map_err)?;
+        }
+        std::fs::File::create(&target).map(|_| ()).map_err(map_err)
+    }
+}
+
+/// Rename/move a workspace entry. Both endpoints must resolve within the root.
+#[tauri::command]
+fn rename_workspace_entry(state: State<AppState>, from: String, to: String) -> Result<(), String> {
+    let root = state.workspace_root.lock().unwrap().clone();
+    let (_r1, src) = resolve_workspace_target(&root, &from)?;
+    let (_r2, dst) = resolve_workspace_target(&root, &to)?;
+    if !src.exists() {
+        return Err(format!("no such entry: {}", from.trim()));
+    }
+    if dst.exists() {
+        return Err("the destination already exists".to_string());
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(map_err)?;
+    }
+    std::fs::rename(&src, &dst).map_err(map_err)
+}
+
+/// Delete a workspace entry (a file, or a directory recursively). Within-root
+/// only, and never the root itself.
+#[tauri::command]
+fn delete_workspace_entry(state: State<AppState>, path: String) -> Result<(), String> {
+    let root = state.workspace_root.lock().unwrap().clone();
+    let (root_path, target) = resolve_workspace_target(&root, &path)?;
+    if target == root_path {
+        return Err("refusing to delete the workspace root".to_string());
+    }
+    if !target.exists() {
+        return Err(format!("no such entry: {}", path.trim()));
+    }
+    if target.is_dir() {
+        std::fs::remove_dir_all(&target).map_err(map_err)
+    } else {
+        std::fs::remove_file(&target).map_err(map_err)
+    }
+}
+
+/// The interactive shell for a new embedded terminal: `$SHELL` (unix) /
+/// `%COMSPEC%` (windows) if set, else a sane default.
+fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
+    }
+}
+
+/// Open a new embedded terminal: spawn the user's shell via a PTY in `cwd`
+/// (default = workspace root), returning an opaque id. A reader thread streams
+/// `terminal://output` `{ id, data }` until EOF, then emits `terminal://exit`
+/// `{ id, code }`.
+#[tauri::command]
+fn terminal_open(
+    state: State<AppState>,
+    cwd: Option<String>,
+    cols: u16,
+    rows: u16,
+) -> Result<String, String> {
+    let root = state.workspace_root.lock().unwrap().clone();
+    // Resolve the working dir within the workspace (default = root). An empty or
+    // absent workspace root falls back to the process cwd so a terminal still
+    // opens before a workspace is chosen.
+    let dir: PathBuf = match cwd {
+        Some(rel) if !rel.trim().is_empty() => {
+            let (_root, target) = resolve_workspace_target(&root, &rel)?;
+            target
+        }
+        _ => {
+            if root.trim().is_empty() {
+                std::env::current_dir().map_err(map_err)?
+            } else {
+                dunce::canonicalize(&root).map_err(|_| "workspace root is unavailable".to_string())?
+            }
+        }
+    };
+
+    let cols = cols.max(1);
+    let rows = rows.max(1);
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut cmd = portable_pty::CommandBuilder::new(default_shell());
+    cmd.cwd(&dir);
+    cmd.env("PATH", augmented_path());
+    let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
+    // Drop the slave so the master sees EOF when the shell exits.
+    drop(pair.slave);
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| e.to_string())?;
+    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let killer = child.clone_killer();
+
+    let id = Uuid::new_v4().to_string();
+    state.terminals.lock().unwrap().insert(
+        id.clone(),
+        TerminalHandle {
+            writer,
+            master: pair.master,
+            killer,
+        },
+    );
+
+    // Reader thread: owns the child + master reader. Streams output as UTF-8
+    // (lossy) chunks, then reports the exit code on EOF.
+    let app = state.app_handle.clone();
+    let reader_id = id.clone();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut reader = reader;
+        let mut child = child;
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let data = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let _ = app.emit(
+                        "terminal://output",
+                        json!({ "id": reader_id, "data": data }),
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+        let code = child.wait().ok().map(|status| status.exit_code() as i64);
+        let _ = app.emit("terminal://exit", json!({ "id": reader_id, "code": code }));
+    });
+
+    Ok(id)
+}
+
+/// Feed input bytes (UTF-8) to a terminal's PTY master.
+#[tauri::command]
+fn terminal_write(state: State<AppState>, id: String, data: String) -> Result<(), String> {
+    use std::io::Write;
+    let mut map = state.terminals.lock().unwrap();
+    let handle = map.get_mut(&id).ok_or("no such terminal")?;
+    handle.writer.write_all(data.as_bytes()).map_err(map_err)?;
+    handle.writer.flush().map_err(map_err)
+}
+
+/// Resize a terminal's PTY.
+#[tauri::command]
+fn terminal_resize(state: State<AppState>, id: String, cols: u16, rows: u16) -> Result<(), String> {
+    let map = state.terminals.lock().unwrap();
+    let handle = map.get(&id).ok_or("no such terminal")?;
+    handle
+        .master
+        .resize(portable_pty::PtySize {
+            rows: rows.max(1),
+            cols: cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Kill a terminal's child shell and drop it from the map. The reader thread
+/// sees EOF and emits `terminal://exit`.
+#[tauri::command]
+fn terminal_close(state: State<AppState>, id: String) -> Result<(), String> {
+    let handle = state.terminals.lock().unwrap().remove(&id);
+    match handle {
+        Some(mut h) => {
+            let _ = h.killer.kill();
+            Ok(())
+        }
+        None => Ok(()),
+    }
+}
+
+// ------------------------------ LSP bridge --------------------------------
+//
+// A thin process bridge for the code editor's hand-rolled LSP client. The
+// backend owns the language-server child processes: it spawns them with cwd =
+// workspace root, forwards `lsp_send` bodies to stdin with `Content-Length`
+// framing, de-frames stdout into one `lsp://message` event per JSON-RPC
+// message, and emits `lsp://exit` when a server dies. Servers are the user's
+// own binaries discovered on PATH — we bundle none, and a missing server is
+// simply reported `available: false` (no error surfaced).
+
+/// One entry in the fixed language-server registry: (id, language label, the
+/// binary to look up on PATH, its stdio args).
+struct LspServerSpec {
+    id: &'static str,
+    language: &'static str,
+    bin: &'static str,
+    args: &'static [&'static str],
+}
+
+/// The language servers the editor knows how to attach. css/html/json are
+/// handled by Monaco's built-ins and are intentionally absent.
+const LSP_REGISTRY: &[LspServerSpec] = &[
+    LspServerSpec {
+        id: "typescript",
+        language: "typescript/javascript",
+        bin: "typescript-language-server",
+        args: &["--stdio"],
+    },
+    LspServerSpec {
+        id: "rust-analyzer",
+        language: "rust",
+        bin: "rust-analyzer",
+        args: &[],
+    },
+    LspServerSpec {
+        id: "pyright",
+        language: "python",
+        bin: "pyright-langserver",
+        args: &["--stdio"],
+    },
+    LspServerSpec {
+        id: "gopls",
+        language: "go",
+        bin: "gopls",
+        args: &[],
+    },
+];
+
+impl LspServerSpec {
+    /// The display command line ("binary --arg ...").
+    fn command(&self) -> String {
+        if self.args.is_empty() {
+            self.bin.to_string()
+        } else {
+            format!("{} {}", self.bin, self.args.join(" "))
+        }
+    }
+}
+
+/// Resolve a bare binary name against `PATH`, cross-platform. Returns the first
+/// existing candidate. On Windows, `PATHEXT` extensions (`.exe`, `.cmd`, …) are
+/// tried when the name has no extension. Hand-rolled to avoid adding a network
+/// dependency; behaves like the `which` crate for our needs.
+/// The process `PATH`, augmented with common user tool directories a GUI- or
+/// `cargo`-launched app on macOS/Linux typically does NOT inherit from the login
+/// shell (`~/.cargo/bin`, Homebrew, `~/go/bin`, …). Cached once. Used both to
+/// DISCOVER language servers / CLI tools and as the `PATH` we hand to spawned
+/// children (so e.g. rust-analyzer can find `cargo`, and the embedded terminal
+/// finds the user's toolchains). Not a login-shell resolve — bins managed by
+/// nvm/asdf/etc. may still need their manager's dir added to the list below.
+fn augmented_path() -> std::ffi::OsString {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<std::ffi::OsString> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let mut candidates: Vec<PathBuf> = Vec::new();
+            if let Some(p) = std::env::var_os("PATH") {
+                candidates.extend(std::env::split_paths(&p));
+            }
+            for d in [
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/usr/local/bin",
+                "/usr/local/sbin",
+                "/opt/local/bin",
+                "/usr/bin",
+                "/bin",
+            ] {
+                candidates.push(PathBuf::from(d));
+            }
+            if let Some(home) = std::env::var_os("HOME") {
+                let home = PathBuf::from(home);
+                for rel in [
+                    ".cargo/bin",
+                    ".local/bin",
+                    "go/bin",
+                    ".bun/bin",
+                    ".deno/bin",
+                    ".volta/bin",
+                    ".asdf/shims",
+                ] {
+                    candidates.push(home.join(rel));
+                }
+            }
+            let mut seen: HashSet<PathBuf> = HashSet::new();
+            let mut dirs: Vec<PathBuf> = Vec::new();
+            for d in candidates {
+                if !d.as_os_str().is_empty() && seen.insert(d.clone()) {
+                    dirs.push(d);
+                }
+            }
+            std::env::join_paths(dirs).unwrap_or_default()
+        })
+        .clone()
+}
+
+fn resolve_on_path(bin: &str) -> Option<PathBuf> {
+    // An explicit path (contains a separator) is used as-is if it exists.
+    if bin.contains('/') || bin.contains('\\') {
+        let p = PathBuf::from(bin);
+        return if p.is_file() { Some(p) } else { None };
+    }
+    let path_var = augmented_path();
+    #[cfg(windows)]
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    for dir in std::env::split_paths(&path_var) {
+        let direct = dir.join(bin);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        #[cfg(windows)]
+        {
+            // If the name has no extension, try each PATHEXT candidate.
+            if PathBuf::from(bin).extension().is_none() {
+                for ext in &exts {
+                    let cand = dir.join(format!("{bin}{ext}"));
+                    if cand.is_file() {
+                        return Some(cand);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Incremental parser for LSP's `Content-Length`-framed JSON-RPC stream. Bytes
+/// arrive in arbitrary chunks (a partial header, a partial body, or several
+/// whole messages at once); `push` buffers them and returns every complete
+/// message body it can now decode, leaving any partial remainder buffered.
+#[derive(Default)]
+struct LspFrameParser {
+    buf: Vec<u8>,
+}
+
+impl LspFrameParser {
+    /// Feed a chunk of raw stdout bytes; returns the JSON bodies of every
+    /// complete message that is now available (in order).
+    fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        loop {
+            // Locate the header/body separator.
+            let Some(header_end) = find_subslice(&self.buf, b"\r\n\r\n") else {
+                break; // header not fully arrived yet
+            };
+            let content_length = parse_content_length(&self.buf[..header_end]);
+            let Some(len) = content_length else {
+                // Malformed header (no Content-Length). Skip past it so we don't
+                // spin forever; the next resync point is after the separator.
+                self.buf.drain(..header_end + 4);
+                continue;
+            };
+            let body_start = header_end + 4;
+            if self.buf.len() < body_start + len {
+                break; // body not fully arrived yet
+            }
+            let body = self.buf[body_start..body_start + len].to_vec();
+            out.push(String::from_utf8_lossy(&body).into_owned());
+            self.buf.drain(..body_start + len);
+        }
+        out
+    }
+}
+
+/// Find the first index of `needle` in `haystack`.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+/// Parse the `Content-Length` value out of a header block (bytes before the
+/// blank line). Header field names are case-insensitive.
+fn parse_content_length(header: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(header).ok()?;
+    for line in text.split("\r\n") {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("content-length") {
+            return value.trim().parse::<usize>().ok();
+        }
+    }
+    None
+}
+
+/// The language-server registry with live PATH availability.
+#[tauri::command]
+fn lsp_servers() -> Result<Vec<LspServerDto>, String> {
+    Ok(LSP_REGISTRY
+        .iter()
+        .map(|spec| LspServerDto {
+            id: spec.id.to_string(),
+            language: spec.language.to_string(),
+            command: spec.command(),
+            available: resolve_on_path(spec.bin).is_some(),
+        })
+        .collect())
+}
+
+/// Start (or reuse) a language server. If a session for `server_id` is already
+/// running, its existing sessionId is returned. Otherwise the server's command
+/// is spawned with cwd = workspace root and stdio piped; a reader thread
+/// de-frames stdout into `lsp://message` events and emits `lsp://exit` on
+/// death. Errors if the server isn't in the registry or isn't on PATH.
+#[tauri::command]
+fn lsp_start(state: State<AppState>, server_id: String) -> Result<String, String> {
+    // Reuse a live session for this server if one exists.
+    if let Some(existing) = state.lsp_by_server.lock().unwrap().get(&server_id).cloned() {
+        if state.lsp_sessions.lock().unwrap().contains_key(&existing) {
+            return Ok(existing);
+        }
+    }
+
+    let spec = LSP_REGISTRY
+        .iter()
+        .find(|s| s.id == server_id)
+        .ok_or_else(|| format!("unknown language server: {server_id}"))?;
+    let bin = resolve_on_path(spec.bin)
+        .ok_or_else(|| format!("{} is not installed (not on PATH)", spec.bin))?;
+
+    let root = state.workspace_root.lock().unwrap().clone();
+    let cwd: PathBuf = if root.trim().is_empty() {
+        std::env::current_dir().map_err(map_err)?
+    } else {
+        dunce::canonicalize(&root)
+            .map_err(|_| "workspace root is unavailable".to_string())?
+    };
+
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.args(spec.args)
+        .current_dir(&cwd)
+        .env("PATH", augmented_path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        // Don't flash a console window when spawning on Windows.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn {}: {e}", spec.bin))?;
+
+    let stdin = child.stdin.take().ok_or("failed to capture stdin")?;
+    let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
+
+    let session_id = Uuid::new_v4().to_string();
+    let child = Arc::new(Mutex::new(child));
+
+    // Reader thread: de-frame stdout into one event per JSON-RPC message, then
+    // reap the child on EOF and emit the exit code.
+    let app = state.app_handle.clone();
+    let reader_session = session_id.clone();
+    let reader_server = server_id.clone();
+    let reader_child = child.clone();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut stdout = stdout;
+        let mut parser = LspFrameParser::default();
+        let mut buf = [0u8; 8192];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    for body in parser.push(&buf[..n]) {
+                        let _ = app.emit(
+                            "lsp://message",
+                            json!({ "sessionId": reader_session, "body": body }),
+                        );
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let code = reader_child
+            .lock()
+            .unwrap()
+            .wait()
+            .ok()
+            .and_then(|status| status.code())
+            .map(|c| c as i64);
+        // Best-effort cleanup so a crashed server doesn't linger in the maps.
+        if let Some(app_state) = app.try_state::<AppState>() {
+            app_state.lsp_sessions.lock().unwrap().remove(&reader_session);
+            let mut by_server = app_state.lsp_by_server.lock().unwrap();
+            if by_server.get(&reader_server) == Some(&reader_session) {
+                by_server.remove(&reader_server);
+            }
+        }
+        let _ = app.emit(
+            "lsp://exit",
+            json!({ "sessionId": reader_session, "code": code }),
+        );
+    });
+
+    state.lsp_sessions.lock().unwrap().insert(
+        session_id.clone(),
+        LspSession {
+            server_id: server_id.clone(),
+            stdin,
+            child,
+        },
+    );
+    state
+        .lsp_by_server
+        .lock()
+        .unwrap()
+        .insert(server_id, session_id.clone());
+
+    Ok(session_id)
+}
+
+/// Frame one complete JSON-RPC message with `Content-Length` and write it to
+/// the server's stdin. `body` is a single JSON-RPC message as a string.
+#[tauri::command]
+fn lsp_send(state: State<AppState>, session_id: String, body: String) -> Result<(), String> {
+    use std::io::Write;
+    let mut map = state.lsp_sessions.lock().unwrap();
+    let session = map.get_mut(&session_id).ok_or("no such lsp session")?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    session.stdin.write_all(header.as_bytes()).map_err(map_err)?;
+    session.stdin.write_all(body.as_bytes()).map_err(map_err)?;
+    session.stdin.flush().map_err(map_err)
+}
+
+/// Kill a language server and drop its session. The reader thread sees stdout
+/// EOF and emits `lsp://exit`.
+#[tauri::command]
+fn lsp_stop(state: State<AppState>, session_id: String) -> Result<(), String> {
+    let session = state.lsp_sessions.lock().unwrap().remove(&session_id);
+    if let Some(session) = session {
+        let mut by_server = state.lsp_by_server.lock().unwrap();
+        if by_server.get(&session.server_id) == Some(&session_id) {
+            by_server.remove(&session.server_id);
+        }
+        drop(by_server);
+        let _ = session.child.lock().unwrap().kill();
+    }
+    Ok(())
 }
 
 fn workspace_paths_match(candidate: &str, target: &str) -> bool {
@@ -1710,6 +2485,65 @@ impl AppState {
         *self.base_mcp.lock().unwrap() = base_mcp;
         *self.managed_runtimes.lock().unwrap() = managed_runtimes;
         *self.managed_mcp.lock().unwrap() = managed_mcp;
+    }
+
+    /// (Re)arm the debounced workspace file watcher on `root`, emitting
+    /// `workspace://fs-changed` `{ paths: [repo-relative…] }` on changes. Any
+    /// prior watcher is dropped first (which stops its thread), so this both
+    /// arms the initial root and re-arms when the root changes. `.git` churn is
+    /// filtered out. A missing/invalid root just leaves the watcher disarmed.
+    fn arm_fs_watcher(&self, root: &str) {
+        let mut slot = self.fs_watcher.lock().unwrap();
+        *slot = None; // drop the previous watcher → stops the old watch thread
+        let root = root.trim();
+        if root.is_empty() {
+            return;
+        }
+        let Ok(root_path) = dunce::canonicalize(root) else {
+            return;
+        };
+        let app = self.app_handle.clone();
+        let handler_root = root_path.clone();
+        let debouncer = notify_debouncer_full::new_debouncer(
+            std::time::Duration::from_millis(300),
+            None,
+            move |res: notify_debouncer_full::DebounceEventResult| {
+                let Ok(events) = res else { return };
+                let mut paths: Vec<String> = Vec::new();
+                for event in events {
+                    for p in event.paths.iter() {
+                        let rel = p.strip_prefix(&handler_root).unwrap_or(p.as_path());
+                        // Skip the whole `.git` subtree — it churns constantly.
+                        if rel
+                            .components()
+                            .any(|c| c.as_os_str() == std::ffi::OsStr::new(".git"))
+                        {
+                            continue;
+                        }
+                        let rel_str = rel.to_string_lossy().replace('\\', "/");
+                        if !rel_str.is_empty() && !paths.contains(&rel_str) {
+                            paths.push(rel_str);
+                        }
+                    }
+                }
+                if !paths.is_empty() {
+                    let _ = app.emit("workspace://fs-changed", json!({ "paths": paths }));
+                }
+            },
+        );
+        match debouncer {
+            Ok(mut d) => {
+                use notify::Watcher;
+                d.cache()
+                    .add_root(&root_path, notify::RecursiveMode::Recursive);
+                if let Err(e) = d.watcher().watch(&root_path, notify::RecursiveMode::Recursive) {
+                    tracing::warn!("fs watcher failed to watch {root}: {e}");
+                } else {
+                    *slot = Some(d);
+                }
+            }
+            Err(e) => tracing::warn!("fs watcher init failed: {e}"),
+        }
     }
 
     /// Resolve a runtime id to an executable runtime. Unknown ids fall back to
@@ -6189,6 +7023,9 @@ fn set_workspace_root(state: State<AppState>, path: String) -> Result<(), String
     *state.workspace_root.lock().unwrap() = normalized.clone();
     remember_workspace(&state.data_dir, &normalized)?;
     state.reload_workspace_catalogs(&normalized);
+    // Re-arm the file watcher on the new root so `workspace://fs-changed` events
+    // track the workspace the editor/tree is now showing.
+    state.arm_fs_watcher(&normalized);
     Ok(())
 }
 
@@ -6831,6 +7668,11 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         turn_stops: Mutex::new(HashMap::new()),
         conn_health: Mutex::new(ConnHealth::default()),
         active_membership: Mutex::new(None),
+        app_handle: app.clone(),
+        fs_watcher: Mutex::new(None),
+        terminals: Mutex::new(HashMap::new()),
+        lsp_sessions: Mutex::new(HashMap::new()),
+        lsp_by_server: Mutex::new(HashMap::new()),
     })
 }
 
@@ -10072,6 +10914,14 @@ pub fn run() {
             let p2p = (ensure_p2p_secret(&state), state.data_dir.clone(), state.db_path.clone());
             app.manage(state);
 
+            // Arm the workspace file watcher on the initial root (re-armed later
+            // whenever `set_workspace_root` changes it).
+            {
+                let st = app.state::<AppState>();
+                let root = st.workspace_root.lock().unwrap().clone();
+                st.arm_fs_watcher(&root);
+            }
+
             // Deferred one-time DB maintenance (chunk-row shrink). Kept off the
             // launch path entirely: we wait a few seconds so first paint and the
             // frontend's initial queries finish, then prune during idle. This is
@@ -10223,6 +11073,19 @@ pub fn run() {
             pick_workspace_folder,
             read_workspace_file,
             list_workspace_files,
+            list_workspace_tree,
+            write_workspace_file,
+            create_workspace_entry,
+            rename_workspace_entry,
+            delete_workspace_entry,
+            terminal_open,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
+            lsp_servers,
+            lsp_start,
+            lsp_send,
+            lsp_stop,
             remove_workspace_from_list,
             set_display_name,
             set_avatar,
@@ -10930,5 +11793,164 @@ mod workspace_scope_tests {
         assert!(!session_in_workspace(other_room, "teammate", room, me, &rooms));
         // A local chat → not shown in a room scope.
         assert!(!session_in_workspace(local, me, room, me, &rooms));
+    }
+}
+
+#[cfg(test)]
+mod editor_fs_tests {
+    use super::*;
+
+    /// A throwaway temp dir under the OS temp root, removed on drop.
+    struct TmpDir(PathBuf);
+    impl TmpDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("hive-editor-test-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&p).unwrap();
+            // Canonicalize so comparisons match the command's canonicalized root
+            // (macOS /var → /private/var).
+            TmpDir(dunce::canonicalize(&p).unwrap())
+        }
+        fn root(&self) -> String {
+            self.0.to_string_lossy().to_string()
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn path_escape_is_rejected() {
+        let tmp = TmpDir::new();
+        // `..` component escapes are rejected outright.
+        assert!(resolve_workspace_target(&tmp.root(), "../secret.txt").is_err());
+        assert!(resolve_workspace_target(&tmp.root(), "a/../../secret.txt").is_err());
+        // An absolute path outside the root is rejected by the range check.
+        assert!(resolve_workspace_target(&tmp.root(), "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn within_root_is_allowed() {
+        let tmp = TmpDir::new();
+        // A not-yet-existing nested file resolves and lands within the root.
+        let (root, target) =
+            resolve_workspace_target(&tmp.root(), "src/new/file.rs").unwrap();
+        assert!(is_within(&root, &target));
+        assert!(target.starts_with(&tmp.0));
+        // The empty path resolves to the root itself.
+        let (_r, root_target) = resolve_workspace_target(&tmp.root(), "").unwrap();
+        assert_eq!(root_target, tmp.0);
+    }
+
+    #[test]
+    fn empty_root_is_rejected() {
+        assert!(resolve_workspace_target("", "file.txt").is_err());
+    }
+
+    #[test]
+    fn tree_skips_git_and_lists_dirs_first() {
+        let tmp = TmpDir::new();
+        let root = tmp.root();
+        std::fs::create_dir_all(tmp.0.join(".git")).unwrap();
+        std::fs::write(tmp.0.join(".git").join("HEAD"), "ref: x").unwrap();
+        std::fs::create_dir_all(tmp.0.join("zeta")).unwrap();
+        std::fs::create_dir_all(tmp.0.join("alpha")).unwrap();
+        std::fs::write(tmp.0.join("readme.md"), "hi").unwrap();
+        std::fs::write(tmp.0.join("Cargo.toml"), "[package]").unwrap();
+
+        let entries = list_workspace_tree_at(&root, "").unwrap();
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        // `.git` is skipped entirely.
+        assert!(!names.contains(&".git"), "`.git` must be skipped: {names:?}");
+        // Dirs first (name-sorted), then files (name-sorted, case-insensitive).
+        assert_eq!(names, vec!["alpha", "zeta", "Cargo.toml", "readme.md"]);
+        // Directories are flagged; paths are repo-relative.
+        let alpha = entries.iter().find(|e| e.name == "alpha").unwrap();
+        assert!(alpha.is_dir);
+        assert_eq!(alpha.path, "alpha");
+        let readme = entries.iter().find(|e| e.name == "readme.md").unwrap();
+        assert!(!readme.is_dir);
+        assert_eq!(readme.path, "readme.md");
+    }
+
+    #[test]
+    fn write_create_rename_delete_roundtrip() {
+        let tmp = TmpDir::new();
+        let root = tmp.root();
+        // resolve + write creates parent dirs.
+        let (_r, target) = resolve_workspace_target(&root, "nested/dir/a.txt").unwrap();
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "hello").unwrap();
+        assert!(target.exists());
+        // A directory listing of the nested dir sees the file.
+        let entries = list_workspace_tree_at(&root, "nested/dir").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "nested/dir/a.txt");
+    }
+}
+
+#[cfg(test)]
+mod lsp_frame_tests {
+    use super::*;
+
+    /// Build a Content-Length frame for a JSON body.
+    fn frame(body: &str) -> Vec<u8> {
+        format!("Content-Length: {}\r\n\r\n{}", body.len(), body).into_bytes()
+    }
+
+    #[test]
+    fn parses_single_whole_message() {
+        let mut p = LspFrameParser::default();
+        let out = p.push(&frame(r#"{"jsonrpc":"2.0","id":1}"#));
+        assert_eq!(out, vec![r#"{"jsonrpc":"2.0","id":1}"#.to_string()]);
+    }
+
+    #[test]
+    fn reassembles_a_partial_read() {
+        // A message split across three reads (mid-header and mid-body) yields
+        // nothing until the final byte arrives.
+        let full = frame(r#"{"method":"initialized"}"#);
+        let (a, rest) = full.split_at(10); // partway through the header
+        let (b, c) = rest.split_at(12); // partway through the body
+        let mut p = LspFrameParser::default();
+        assert!(p.push(a).is_empty());
+        assert!(p.push(b).is_empty());
+        let out = p.push(c);
+        assert_eq!(out, vec![r#"{"method":"initialized"}"#.to_string()]);
+    }
+
+    #[test]
+    fn splits_multiple_messages_in_one_chunk() {
+        // Two full messages plus the leading bytes of a third arrive together:
+        // both complete messages come out, the partial stays buffered.
+        let mut chunk = frame(r#"{"id":1}"#);
+        chunk.extend_from_slice(&frame(r#"{"id":2}"#));
+        chunk.extend_from_slice(b"Content-Length: 8\r\n\r\n{\"id"); // partial third
+        let mut p = LspFrameParser::default();
+        let out = p.push(&chunk);
+        assert_eq!(
+            out,
+            vec![r#"{"id":1}"#.to_string(), r#"{"id":2}"#.to_string()]
+        );
+        // The tail of the third message completes it (body is 8 bytes: {"id":3}).
+        let out2 = p.push(b"\":3}");
+        assert_eq!(out2, vec![r#"{"id":3}"#.to_string()]);
+    }
+
+    #[test]
+    fn content_length_header_is_case_insensitive() {
+        let mut p = LspFrameParser::default();
+        let raw = b"content-length: 2\r\n\r\n{}";
+        assert_eq!(p.push(raw), vec!["{}".to_string()]);
+    }
+
+    #[test]
+    fn registry_has_the_four_servers() {
+        let ids: Vec<&str> = LSP_REGISTRY.iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec!["typescript", "rust-analyzer", "pyright", "gopls"]);
+        // The typescript command line includes its stdio flag.
+        let ts = LSP_REGISTRY.iter().find(|s| s.id == "typescript").unwrap();
+        assert_eq!(ts.command(), "typescript-language-server --stdio");
     }
 }

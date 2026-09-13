@@ -63,6 +63,7 @@ import { Avatar } from "@/components/Avatar";
 import { Modal, Popover, PopoverItem, candidateKey, ErrorState } from "@/components/ui";
 import { Markdown } from "@/components/Markdown";
 import { detectMention, filterMentions } from "@/lib/mentions";
+import { editorStore } from "@/state/editorStore";
 import { applyStreamDelta, handleTerminal } from "@/lib/streams";
 import { pinToBottom, pinAfterScroll, jumpHint } from "@/lib/autoscroll";
 import { detectSlash } from "@/lib/slash";
@@ -94,12 +95,18 @@ export function ChatView({
   currentRuntimeId,
   onOpenTools,
   embedded = false,
+  pendingInsert,
+  onConsumePendingInsert,
 }: {
   sessionId: string;
   runtimes: RuntimeSummaryDto[];
   currentRuntimeId: string;
   onOpenTools?: () => void;
   embedded?: boolean;
+  /// A one-shot snippet the editor asked to drop into the composer ("Send
+  /// selection to chat"). Appended to the draft, then cleared via the callback.
+  pendingInsert?: string | null;
+  onConsumePendingInsert?: () => void;
 }) {
   const qc = useQueryClient();
   const [input, setInput] = useState("");
@@ -518,6 +525,19 @@ export function ChatView({
       toast.error(`Couldn't reference file: ${errMsg(e)}`);
     }
   }
+
+  // Consume a snippet the editor sent over ("Send selection to chat"): append it
+  // to the current draft (blank line between, like @file) and focus the composer.
+  useEffect(() => {
+    if (!pendingInsert) return;
+    setInput((cur) => (cur ? `${cur}\n\n${pendingInsert}` : pendingInsert));
+    onConsumePendingInsert?.();
+    requestAnimationFrame(() => {
+      taRef.current?.focus();
+      autoGrow();
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingInsert]);
 
   // Stable so the memoized last-assistant Bubble doesn't re-render every render
   // (e.g. on each composer keystroke).
@@ -1430,15 +1450,78 @@ function DaySeparator({ label }: { label: string }) {
   );
 }
 
+/// Does a fenced-code info string look like a workspace-relative file path
+/// (as `@file` inserts, e.g. ```` ```src/foo.ts ````) rather than a plain
+/// language id (```` ```ts ````)? Heuristic: no spaces, and either a path
+/// separator or a `name.ext` shape. This can't tell a real path from a coincidental
+/// dotted "language", and it misses extensionless root files (e.g. `Dockerfile`) —
+/// acceptable for a click-to-open affordance (a bad path just toasts on open).
+function looksLikeFilePath(info: string): boolean {
+  const s = info.trim();
+  if (!s || /\s/.test(s)) return false;
+  return s.includes("/") || /\.[A-Za-z0-9]+$/.test(s);
+}
+
+/// Collect file paths referenced as fenced-code info strings in a message body
+/// — the `@file` mention shape (and any agent code block labelled with a path).
+/// Deduped, order-preserved. A tiny line scanner (not regex) so nested/unclosed
+/// fences during streaming don't misparse.
+export function extractFileRefs(body: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let fence: string | null = null; // the open fence marker (``` or ~~~ run)
+  for (const line of body.split("\n")) {
+    const m = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (!m) continue;
+    const marker = m[1][0].repeat(3);
+    if (fence) {
+      // Inside a fence: a run of the same char closes it; ignore anything else.
+      if (m[1][0] === fence[0]) fence = null;
+      continue;
+    }
+    // Opening fence — its info string may name a file.
+    fence = marker;
+    const info = m[2].trim();
+    if (looksLikeFilePath(info) && !seen.has(info)) {
+      seen.add(info);
+      out.push(info);
+    }
+  }
+  return out;
+}
+
 /// Renders a message: markdown text plus previews/chips for any `[Attached: …]`
-/// paths. Image attachments show an inline thumbnail (loaded from the local
-/// file as a data URL); non-images — and images whose bytes aren't on this
-/// device — show a filename chip.
+/// paths, and click-to-open chips for any `@file`-style path references. Image
+/// attachments show an inline thumbnail (loaded from the local file as a data
+/// URL); non-images — and images whose bytes aren't on this device — show a
+/// filename chip.
 function MessageBody({ body }: { body: string }) {
   const { text, paths } = splitAttachments(body);
+  const fileRefs = extractFileRefs(text);
   return (
     <>
       {text && <Markdown content={text} />}
+      {fileRefs.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {fileRefs.map((p) => (
+            <button
+              key={p}
+              type="button"
+              // Open in Hive's editor; App's editorStore subscription reveals the
+              // code canvas. A path that no longer exists just toasts on open.
+              onClick={() => editorStore.requestOpen(p)}
+              className="inline-flex items-center gap-1.5 rounded-lg border px-2 py-0.5 font-mono text-xs transition-colors hover:border-[color:var(--hive-accent-cool)]"
+              style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)", color: "var(--hive-ink)" }}
+              title={`Open ${p} in the editor`}
+            >
+              <span aria-hidden className="opacity-60">
+                <IconFile size={12} />
+              </span>
+              <span className="max-w-[16rem] truncate">{p}</span>
+            </button>
+          ))}
+        </div>
+      )}
       {paths.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-2">
           {paths.map((p, i) =>

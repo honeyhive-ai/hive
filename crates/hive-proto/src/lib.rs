@@ -194,6 +194,17 @@ pub struct GitFileDiffDto {
     pub removed_lines: u32,
 }
 
+/// One entry in a workspace directory listing (the lazy file tree). `path` is
+/// repo-relative (POSIX `/` separators, so the key is stable across platforms).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct FsEntryDto {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+}
+
 /// A workspace agent in the roster (a named participant on a runtime).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -586,6 +597,23 @@ pub struct MentionStateDto {
     pub message_count: u32,
 }
 
+/// One entry in the LSP language-server registry, surfaced to the editor so it
+/// can attach language intelligence only for servers the user actually has.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct LspServerDto {
+    /// Stable registry id (e.g. "typescript", "rust-analyzer", "pyright", "gopls").
+    pub id: String,
+    /// Human-readable language(s) the server serves (e.g. "typescript/javascript").
+    pub language: String,
+    /// The command line the backend would spawn (binary + args), for display.
+    pub command: String,
+    /// Whether the server's binary is resolvable on the current PATH. When false
+    /// the editor attaches nothing for this language and degrades silently.
+    pub available: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,6 +635,7 @@ mod tests {
         ChatSessionDto::export_all(&cfg).unwrap();
         ChatStreamEvent::export_all(&cfg).unwrap();
         GitFileDiffDto::export_all(&cfg).unwrap();
+        FsEntryDto::export_all(&cfg).unwrap();
         AppSettingsDto::export_all(&cfg).unwrap();
         RuntimeSummaryDto::export_all(&cfg).unwrap();
         ContextTelemetryDto::export_all(&cfg).unwrap();
@@ -630,5 +659,6 @@ mod tests {
         QueuedWorkDto::export_all(&cfg).unwrap();
         WorkspaceHostDto::export_all(&cfg).unwrap();
         MentionStateDto::export_all(&cfg).unwrap();
+        LspServerDto::export_all(&cfg).unwrap();
     }
 }
