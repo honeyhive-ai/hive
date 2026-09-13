@@ -39,6 +39,12 @@ tauri-plugin-notification = "2"
 # are enabled at public launch — see #144).
 tauri-plugin-updater = "2"
 rfd = "0.15"
+# Embedded terminal: a real PTY spawning the user's shell in the workspace root.
+portable-pty = "0.8"
+# Debounced workspace file watcher → `workspace://fs-changed` events, so the
+# editor/file-tree refresh when files change on disk (git ops, agent edits).
+notify = "6"
+notify-debouncer-full = "0.3"
 toml = "0.8"
 base64 = "0.22"
 ed25519-dalek = "2"

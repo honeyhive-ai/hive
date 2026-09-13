@@ -14,7 +14,11 @@ export interface PaletteActions {
   toggleSidebar?: () => void;
   toggleTools?: () => void;
   /// Navigation + actions (all optional so the palette degrades gracefully).
-  setCanvasMode?: (m: "chat" | "diff") => void;
+  setCanvasMode?: (m: "chat" | "diff" | "code") => void;
+  /// Jump to the code view and open the ⌘P quick-open modal.
+  quickOpenFile?: () => void;
+  /// Jump to the code view and reveal the integrated terminal.
+  newTerminal?: () => void;
   openFriends?: () => void;
   openPane?: (pane: UtilityPane) => void;
   openSettingsTab?: (tab: string) => void;
@@ -66,7 +70,14 @@ export function CommandPalette({
       items.push(
         { id: "view-chat", label: "View: Chat", hint: "Go", run: run(() => actions.setCanvasMode!("chat")) },
         { id: "view-diff", label: "View: Diff", hint: "Go", run: run(() => actions.setCanvasMode!("diff")) },
+        { id: "view-code", label: "View: Code", hint: "Go", run: run(() => actions.setCanvasMode!("code")) },
       );
+      if (actions.quickOpenFile) {
+        items.push({ id: "quick-open", label: "Quick open file", hint: "Code · ⌘P", run: run(actions.quickOpenFile) });
+      }
+      if (actions.newTerminal) {
+        items.push({ id: "new-terminal", label: "New terminal", hint: "Code", run: run(actions.newTerminal) });
+      }
     }
     if (actions.openFriends) {
       items.push({ id: "friends", label: "Open Friends & DMs", hint: "Go", run: run(actions.openFriends) });

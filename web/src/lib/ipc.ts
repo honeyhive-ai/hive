@@ -1083,3 +1083,133 @@ export const revokeRelayToken = (tokenId: string) =>
 
 export const setRelayUserDisabled = (userId: string, disabled: boolean) =>
   invoke<void>("set_relay_user_disabled", { userId, disabled });
+
+// ── Code editor + embedded terminal (feat/editor-view) ───────────────────────
+// DTOs are declared inline here (not imported from @/bindings) to avoid a race
+// with the backend package that generates those bindings; shapes match the
+// IPC contract exactly.
+
+/// One directory entry in the lazy workspace tree (`path` is repo-relative).
+export interface FsEntryDto {
+  name: string;
+  path: string;
+  isDir: boolean;
+}
+/// A chunk of PTY output for terminal `id` (UTF-8, lossy-decoded on the backend).
+export interface TerminalOutput {
+  id: string;
+  data: string;
+}
+/// A terminal's child process exited; `code` is null when killed by a signal.
+export interface TerminalExit {
+  id: string;
+  code: number | null;
+}
+/// Debounced batch of repo-relative paths the workspace watcher saw change.
+export interface FsChanged {
+  paths: string[];
+}
+
+/// One directory level of the workspace tree (lazy). `relDir` null/"" = root;
+/// returns dirs-first, name-sorted, with `.git` skipped.
+export const listWorkspaceTree = (relDir?: string | null) =>
+  invoke<FsEntryDto[]>("list_workspace_tree", { relDir: relDir ?? null });
+
+/// Overwrite or create a file (within root; parent dirs created as needed).
+export const writeWorkspaceFile = (path: string, contents: string) =>
+  invoke<void>("write_workspace_file", { path, contents });
+
+/// Create a new file (`isDir=false`) or directory (`isDir=true`) within root.
+export const createWorkspaceEntry = (path: string, isDir: boolean) =>
+  invoke<void>("create_workspace_entry", { path, isDir });
+
+/// Rename/move an entry within root.
+export const renameWorkspaceEntry = (from: string, to: string) =>
+  invoke<void>("rename_workspace_entry", { from, to });
+
+/// Remove a file, or a directory recursively (within root only).
+export const deleteWorkspaceEntry = (path: string) =>
+  invoke<void>("delete_workspace_entry", { path });
+
+/// Spawn a shell in a PTY (default cwd = workspace root); resolves to its id.
+export const terminalOpen = (cwd: string | null, cols: number, rows: number) =>
+  invoke<string>("terminal_open", { cwd: cwd ?? null, cols, rows });
+
+/// Write bytes (as a string) to the PTY master.
+export const terminalWrite = (id: string, data: string) =>
+  invoke<void>("terminal_write", { id, data });
+
+/// Resize the PTY viewport.
+export const terminalResize = (id: string, cols: number, rows: number) =>
+  invoke<void>("terminal_resize", { id, cols, rows });
+
+/// Kill the child and drop the terminal.
+export const terminalClose = (id: string) =>
+  invoke<void>("terminal_close", { id });
+
+/// Fires (debounced) when files under the workspace root change on disk.
+export const onFsChanged = (cb: (e: FsChanged) => void): Promise<UnlistenFn> =>
+  listen<FsChanged>("workspace://fs-changed", (evt) => cb(evt.payload));
+
+/// Streaming PTY output for any open terminal (filter by `id` on the frontend).
+export const onTerminalOutput = (
+  cb: (e: TerminalOutput) => void,
+): Promise<UnlistenFn> =>
+  listen<TerminalOutput>("terminal://output", (evt) => cb(evt.payload));
+
+/// Fires when a terminal's child process exits.
+export const onTerminalExit = (cb: (e: TerminalExit) => void): Promise<UnlistenFn> =>
+  listen<TerminalExit>("terminal://exit", (evt) => cb(evt.payload));
+
+// ── Language servers (LSP) ───────────────────────────────────────────────────
+// A thin bridge to the backend's LSP process manager. The backend owns the
+// child processes + Content-Length framing; the frontend speaks JSON-RPC over
+// these wrappers (see `@/lib/lsp`). DTOs are declared inline (not imported from
+// `@/bindings`) to avoid a race with the backend package that generates them;
+// the shapes match the IPC contract exactly.
+
+/// One entry in the language-server registry. `available` is whether the
+/// server's command was resolvable on PATH at discovery time.
+export interface LspServerDto {
+  id: string;
+  language: string;
+  command: string;
+  available: boolean;
+}
+
+/// The registry of known language servers with their PATH availability.
+export const lspServers = () => invoke<LspServerDto[]>("lsp_servers");
+
+/// Start (or reuse a running) session for a server id; resolves to its session
+/// id. Rejects if the server isn't available.
+export const lspStart = (serverId: string) =>
+  invoke<string>("lsp_start", { serverId });
+
+/// Send one complete JSON-RPC message string to a session's stdin (the backend
+/// prepends the Content-Length framing).
+export const lspSend = (sessionId: string, body: string) =>
+  invoke<void>("lsp_send", { sessionId, body });
+
+/// Kill a session's child process and drop it.
+export const lspStop = (sessionId: string) =>
+  invoke<void>("lsp_stop", { sessionId });
+
+/// One inbound JSON-RPC message (raw JSON string) from a language server.
+export interface LspMessage {
+  sessionId: string;
+  body: string;
+}
+/// A language-server process exited; `code` is null when killed by a signal.
+export interface LspExit {
+  sessionId: string;
+  code: number | null;
+}
+
+/// Subscribe to inbound JSON-RPC messages from any language server (filter by
+/// `sessionId` on the frontend). Returns an unlisten function.
+export const onLspMessage = (cb: (e: LspMessage) => void): Promise<UnlistenFn> =>
+  listen<LspMessage>("lsp://message", (evt) => cb(evt.payload));
+
+/// Subscribe to language-server process exits. Returns an unlisten function.
+export const onLspExit = (cb: (e: LspExit) => void): Promise<UnlistenFn> =>
+  listen<LspExit>("lsp://exit", (evt) => cb(evt.payload));

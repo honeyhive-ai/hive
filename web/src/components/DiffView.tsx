@@ -12,6 +12,7 @@ import {
   type GitFileDiffDto,
 } from "@/lib/ipc";
 import { useColorScheme } from "@/lib/theme";
+import { editorStore } from "@/state/editorStore";
 import { toast, errMsg } from "@/components/Toast";
 import { Button, IconButton } from "@/components/ui";
 import { IconRegenerate, IconChevronDown } from "@/lib/icons";
@@ -91,7 +92,16 @@ function loadListWidth(): number {
 /// The Diff canvas: uncommitted changes on the left (resizable); the selected
 /// file as a syntax-highlighted side-by-side/inline Monaco diff on the right,
 /// with an "Open in <installed editor>" escape hatch.
-export function DiffView() {
+export function DiffView({
+  pendingPath,
+  onConsumePendingPath,
+}: {
+  /// A file another view (the editor's "Open in Diff") asked us to focus. It's
+  /// selected when it has uncommitted changes; a clean file has no diff to show,
+  /// so the list falls back to the first changed file (documented limitation).
+  pendingPath?: string | null;
+  onConsumePendingPath?: () => void;
+} = {}) {
   const diffs = useQuery({ queryKey: ["diffs"], queryFn: getWorkspaceDiffs });
   const editors = useQuery({ queryKey: ["editors"], queryFn: detectEditors, staleTime: Infinity });
   const [selected, setSelected] = useState<string | null>(null);
@@ -113,6 +123,14 @@ export function DiffView() {
       useInlineViewWhenSpaceIsLimited: false,
     });
   }, [sideBySide]);
+
+  // Honor an "Open in Diff" request from the editor: select that path (it shows
+  // if it has uncommitted changes) and clear the one-shot request.
+  useEffect(() => {
+    if (!pendingPath) return;
+    setSelected(pendingPath);
+    onConsumePendingPath?.();
+  }, [pendingPath, onConsumePendingPath]);
 
   const files: GitFileDiffDto[] = diffs.data ?? [];
   const active = files.find((f) => f.path === selected) ?? files[0];
@@ -254,6 +272,17 @@ export function DiffView() {
                   </button>
                 ))}
               </div>
+
+              {/* Open the selected file in Hive's own editor (the code canvas),
+                  distinct from the external-editor escape hatch below. Routes
+                  through editorStore; App's subscription flips to the code view. */}
+              <Button
+                size="sm"
+                className="shrink-0"
+                onClick={() => active && editorStore.requestOpen(active.path)}
+              >
+                Open in editor
+              </Button>
 
               {preferred && (
                 <div className="relative flex shrink-0">
