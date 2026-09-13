@@ -517,8 +517,12 @@ export function App() {
   const lastChatByWs = useRef<Map<string, string>>(new Map());
   useEffect(() => {
     if (!activeWorkspaceId || view !== "workspace") return;
-    if (lastAutoSelectWs.current === activeWorkspaceId) return;
-    lastAutoSelectWs.current = activeWorkspaceId;
+    // Track the combined context: the workspace id AND the folder. Switching the
+    // folder (sidebar) keeps the same workspace id, so keying on id alone missed
+    // that path — and its setSelectedId(null) then left the empty placeholder.
+    const wsCtx = `${activeWorkspaceId} ${workspaceRoot}`;
+    if (lastAutoSelectWs.current === wsCtx) return;
+    lastAutoSelectWs.current = wsCtx;
     const wsId = activeWorkspaceId;
     let cancelled = false;
     void listChats()
@@ -541,17 +545,30 @@ export function App() {
         else lastChatByWs.current.delete(wsId);
         // Keep a still-valid current selection (e.g. a manual pick that raced the
         // switch); otherwise land on the remembered/most-recent chat.
-        setSelectedId((prev) => (isLive(prev) ? prev : pick));
+        setSelectedId((prev) => {
+          const next = isLive(prev) ? prev : pick;
+          console.debug("[default-view]", {
+            wsId,
+            workspaceRoot,
+            chats: live.length,
+            remembered,
+            prev,
+            pick,
+            next,
+          });
+          return next;
+        });
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [activeWorkspaceId, view]);
+  }, [activeWorkspaceId, workspaceRoot, view]);
   // Record a deliberate chat selection against the active workspace so it can be
   // restored on return. Called from the select handlers below.
   const rememberChat = useCallback(
     (id: string) => {
+      console.debug("[default-view] remember", { ws: activeWorkspaceId, id });
       if (activeWorkspaceId) lastChatByWs.current.set(activeWorkspaceId, id);
     },
     [activeWorkspaceId],
@@ -824,7 +841,8 @@ export function App() {
         }}
         onSwitchWorkspace={async (path) => {
           await setWorkspaceRoot(path);
-          setSelectedId(null);
+          // Don't blank the selection — the default-view effect restores the chat
+          // (and channel) you last had open in this workspace once it re-fires.
           setMode("chat");
           setUtilityPane("tools");
           await refreshWorkspaceShell();
