@@ -324,6 +324,16 @@ struct LiveSettings {
     /// chosen; restored only if still a valid, non-shallow/-system dir at launch.
     #[serde(default)]
     workspace_root: Option<String>,
+    /// Device-LOCAL per-workspace code-directory bindings: workspace UUID
+    /// (string) → local folder on THIS machine. The effective `workspace_root`
+    /// follows the active workspace by swapping in its binding on
+    /// `set_active_workspace`, so each workspace can point at its own folder.
+    /// NEVER synced (paths differ per device); persisted in settings.json only.
+    /// The legacy `workspace_root` above is migrated into this map (keyed by the
+    /// local workspace id) on load so existing single-workspace users keep their
+    /// folder.
+    #[serde(default)]
+    workspace_dirs: std::collections::HashMap<String, String>,
 }
 
 /// Persisted OAuth state for one remote MCP server (see [`mcp_oauth`] +
@@ -434,6 +444,7 @@ impl Default for LiveSettings {
             schedules: Vec::new(),
             mcp_oauth: std::collections::HashMap::new(),
             workspace_root: None,
+            workspace_dirs: std::collections::HashMap::new(),
         }
     }
 }
@@ -896,6 +907,31 @@ fn persisted_workspace_root(data_dir: &std::path::Path) -> Option<String> {
         .and_then(|s| s.workspace_root)
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
+}
+
+/// Resolve a workspace's device-local folder binding from the `workspace_dirs`
+/// map (keyed by workspace UUID string). Returns an empty string when the
+/// workspace has no folder bound on this device — the effective `workspace_root`
+/// for an unbound workspace, which `arm_fs_watcher` treats as a safe no-op.
+fn workspace_dir_for(dirs: &std::collections::HashMap<String, String>, id: &str) -> String {
+    dirs.get(id).cloned().unwrap_or_default()
+}
+
+/// One-time migration: seed the local workspace's device-local folder binding
+/// from the legacy single `workspace_root`, so existing single-workspace users
+/// keep their folder when the effective root starts following the active
+/// workspace. No-ops when a binding already exists or the legacy root is empty.
+/// Returns `true` if a binding was inserted (so the caller can persist).
+fn migrate_local_workspace_dir(
+    dirs: &mut std::collections::HashMap<String, String>,
+    local_id: &str,
+    legacy_root: &str,
+) -> bool {
+    if !dirs.contains_key(local_id) && !legacy_root.trim().is_empty() {
+        dirs.insert(local_id.to_string(), legacy_root.to_string());
+        return true;
+    }
+    false
 }
 
 /// Max size of a file referenced into a chat via `@file` (keeps context sane).
@@ -4677,6 +4713,22 @@ impl AppState {
         *self.active_workspace.lock().unwrap()
     }
 
+    /// Point the effective `workspace_root` at `id`'s device-local folder binding
+    /// (empty string if the workspace has no folder bound on this device), and
+    /// mirror `set_workspace_root`'s side effects so the catalogs and file watcher
+    /// track the newly-active workspace's folder. `arm_fs_watcher` already no-ops
+    /// on an empty / shallow / system root, so an unbound workspace safely leaves
+    /// the watcher disarmed. Called on every workspace switch.
+    fn apply_workspace_dir(&self, id: Uuid) {
+        let bound = workspace_dir_for(
+            &self.settings.lock().unwrap().workspace_dirs,
+            &id.to_string(),
+        );
+        *self.workspace_root.lock().unwrap() = bound.clone();
+        self.reload_workspace_catalogs(&bound);
+        self.arm_fs_watcher(&bound);
+    }
+
     /// No relay configured → a purely local install: nothing ever syncs to another
     /// device, so this device is the only one that can answer a turn. Used to
     /// bypass the cross-device ownership deferral (which would otherwise be
@@ -7120,6 +7172,7 @@ fn set_chat_runtime(
 #[tauri::command]
 fn set_workspace_root(state: State<AppState>, path: String) -> Result<(), String> {
     let normalized = resolve_workspace_root(&path)?;
+    let active_id = state.active_workspace_id().to_string();
     *state.workspace_root.lock().unwrap() = normalized.clone();
     remember_workspace(&state.data_dir, &normalized)?;
     // Persist the *current* root (not just the recent-list entry) so a GUI launch
@@ -7127,6 +7180,11 @@ fn set_workspace_root(state: State<AppState>, path: String) -> Result<(), String
     {
         let mut s = state.settings.lock().unwrap();
         s.workspace_root = Some(normalized.clone());
+        // Bind this folder to the ACTIVE workspace (device-local, keyed by
+        // workspace UUID) so the effective root follows the workspace when
+        // switching between them. `workspace_root` above stays the legacy
+        // single-folder field (migration source / GUI-relaunch fallback).
+        s.workspace_dirs.insert(active_id, normalized.clone());
         save_settings(&state.data_dir, &s);
     }
     state.reload_workspace_catalogs(&normalized);
@@ -7601,7 +7659,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
-    let workspace_root = initial_workspace_root(
+    let mut workspace_root = initial_workspace_root(
         persisted_workspace_root(&data_dir).as_deref(),
         cwd.as_deref(),
     );
@@ -7672,6 +7730,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         schedules: Vec::new(),
         mcp_oauth: std::collections::HashMap::new(),
         workspace_root: None,
+        workspace_dirs: std::collections::HashMap::new(),
     };
     let settings = Arc::new(Mutex::new(load_or_seed_settings(&data_dir, env_seed)));
 
@@ -7756,6 +7815,27 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         save_settings(&data_dir, &s);
         id
     };
+
+    // MIGRATION (per-workspace code dir): the effective `workspace_root` now
+    // follows the active workspace via device-local `workspace_dirs` bindings.
+    // Existing users only have the single legacy `workspace_root` (surfaced above
+    // as the launch-computed, guard-validated `workspace_root`), so seed the LOCAL
+    // workspace's binding from it — that way they keep their folder. Then the
+    // initial effective root follows the (always-local at launch) active
+    // workspace's binding, falling back to the launch-computed root so first-launch
+    // behavior is unchanged. Bindings are device-local; persist the migrated map.
+    {
+        let mut s = settings.lock().unwrap();
+        let local_key = local_workspace_id.to_string();
+        if migrate_local_workspace_dir(&mut s.workspace_dirs, &local_key, &workspace_root) {
+            save_settings(&data_dir, &s);
+        }
+        // Active workspace at launch is always the local one → honor its binding
+        // if present, else keep the launch-computed root.
+        if let Some(bound) = s.workspace_dirs.get(&local_key).cloned() {
+            workspace_root = bound;
+        }
+    }
 
     Ok(AppState {
         service: Mutex::new(service),
@@ -8507,6 +8587,9 @@ fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<
         // Every workspace gets a #general so the channel tree is never empty
         // (idempotent — no-op once any channel exists).
         let _ = svc.ensure_default_channel(state.local_workspace_id, &default_rt);
+        drop(svc);
+        // Make the effective code dir follow the (now local) active workspace.
+        state.apply_workspace_dir(state.local_workspace_id);
         return Ok(());
     }
     // Selecting a team workspace points the live sync fields (relay/room/key) at
@@ -8546,6 +8629,10 @@ fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<
         drop(s);
         *state.active_workspace.lock().unwrap() = state.local_workspace_id;
     }
+    // Make the effective code dir follow the now-active workspace (its
+    // device-local folder binding, or empty/no-watch if unbound). Mirrors
+    // set_workspace_root's catalog + fs-watcher side effects.
+    state.apply_workspace_dir(state.active_workspace_id());
     Ok(())
 }
 
@@ -11375,6 +11462,73 @@ mod workspace_root_guard_tests {
         assert_eq!(initial_workspace_root(None, Some(&repo_str)), repo_str);
         // A plain (marker-less) or system cwd is not adopted → empty.
         assert_eq!(initial_workspace_root(None, Some("/")), "");
+    }
+}
+
+#[cfg(test)]
+mod per_workspace_dir_tests {
+    use super::{
+        is_shallow_or_system_dir, migrate_local_workspace_dir, workspace_dir_for,
+    };
+    use std::collections::HashMap;
+    use std::path::Path;
+    use uuid::Uuid;
+
+    /// The core swap `set_active_workspace` performs: the effective root follows
+    /// the active workspace's device-local binding, and an unbound workspace
+    /// resolves to empty (so the file watcher stays disarmed — no whole-disk walk).
+    #[test]
+    fn active_switch_swaps_root_to_bound_dir_and_unbound_is_empty() {
+        let local = Uuid::new_v4().to_string();
+        let team = Uuid::new_v4().to_string();
+        let unbound = Uuid::new_v4().to_string();
+
+        let mut dirs: HashMap<String, String> = HashMap::new();
+        dirs.insert(local.clone(), "/Users/me/projects/app".to_string());
+        dirs.insert(team.clone(), "/Users/me/work/service".to_string());
+
+        // Switching between two bound workspaces swaps the effective root.
+        assert_eq!(workspace_dir_for(&dirs, &local), "/Users/me/projects/app");
+        assert_eq!(workspace_dir_for(&dirs, &team), "/Users/me/work/service");
+        // A workspace with no binding on this device → empty (arm_fs_watcher no-op).
+        assert_eq!(workspace_dir_for(&dirs, &unbound), "");
+    }
+
+    /// Migration seeds the LOCAL workspace's binding from the legacy single
+    /// `workspace_root`, so an existing single-workspace user keeps their folder
+    /// and behaves exactly as before (effective root == their old root).
+    #[test]
+    fn migration_seeds_local_binding_from_legacy_root() {
+        let local = Uuid::new_v4().to_string();
+        let mut dirs: HashMap<String, String> = HashMap::new();
+
+        // First load: no binding yet, a legacy root exists → seed it, report change.
+        let legacy = "/Users/me/projects/app";
+        assert!(migrate_local_workspace_dir(&mut dirs, &local, legacy));
+        assert_eq!(workspace_dir_for(&dirs, &local), legacy);
+
+        // Idempotent: a second load must not overwrite or re-report a change.
+        assert!(!migrate_local_workspace_dir(&mut dirs, &local, "/some/other/dir"));
+        assert_eq!(workspace_dir_for(&dirs, &local), legacy);
+    }
+
+    /// A fresh install (no legacy root) seeds nothing → the local workspace is
+    /// unbound, preserving first-launch behavior (empty effective root).
+    #[test]
+    fn migration_noop_without_legacy_root() {
+        let local = Uuid::new_v4().to_string();
+        let mut dirs: HashMap<String, String> = HashMap::new();
+        assert!(!migrate_local_workspace_dir(&mut dirs, &local, ""));
+        assert!(!migrate_local_workspace_dir(&mut dirs, &local, "   "));
+        assert_eq!(workspace_dir_for(&dirs, &local), "");
+    }
+
+    /// The launch-hang guard is unchanged: `/` (and shallow/system dirs) can
+    /// never be watched, whatever a binding might point at.
+    #[test]
+    fn shallow_and_system_dirs_still_rejected() {
+        assert!(is_shallow_or_system_dir(Path::new("/")));
+        assert!(is_shallow_or_system_dir(Path::new("/Users")));
     }
 }
 

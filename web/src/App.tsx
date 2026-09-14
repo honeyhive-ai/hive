@@ -53,6 +53,7 @@ import { CommandPalette } from "@/components/CommandPalette";
 import { WorkspaceRail } from "@/components/WorkspaceRail";
 import { FriendsView } from "@/components/FriendsView";
 import { AddWorkspaceModal } from "@/components/AddWorkspaceModal";
+import { BindWorkspacePrompt } from "@/components/BindWorkspacePrompt";
 import { PaneErrorBoundary } from "@/components/ErrorBoundary";
 import {
   applyTheme,
@@ -756,6 +757,9 @@ export function App() {
             await setActiveWorkspace(id);
             await qc.invalidateQueries({ queryKey: ["workspaces"] });
             await qc.invalidateQueries({ queryKey: ["chats"] });
+            // The code dir follows the active workspace — refetch settings so the
+            // editor/tree/diff/terminal pick up the new (or empty) workspaceRoot.
+            await qc.invalidateQueries({ queryKey: ["settings"] });
             setView("workspace");
           },
           toggleSidebar: () => setSidebarVisible((v) => !v),
@@ -874,7 +878,9 @@ export function App() {
             <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
               <div className="min-w-0 flex-1">
                 <PaneErrorBoundary label="This view">
-                  {mode === "diff" ? (
+                  {(mode === "diff" || mode === "code") && !workspaceRoot ? (
+                    <BindWorkspacePrompt />
+                  ) : mode === "diff" ? (
                     <Suspense
                       fallback={
                         <div className="flex h-full items-center justify-center opacity-50">
@@ -989,7 +995,10 @@ export function App() {
                     onConsumePendingInsert={() => setComposerSeed(null)}
                   />
                 )}
-                {mode === "diff" && (
+                {(mode === "diff" || mode === "code") && !workspaceRoot && (
+                  <BindWorkspacePrompt />
+                )}
+                {mode === "diff" && !!workspaceRoot && (
                   <Suspense
                     fallback={
                       <div className="flex h-full items-center justify-center opacity-50">
@@ -1003,7 +1012,7 @@ export function App() {
                     />
                   </Suspense>
                 )}
-                {mode === "code" && (
+                {mode === "code" && !!workspaceRoot && (
                   <Suspense
                     fallback={
                       <div className="flex h-full items-center justify-center opacity-50">
