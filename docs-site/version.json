@@ -1,6 +1,6 @@
 {
-  "tag": "v1.11.0",
-  "name": "Hive 1.11.0",
+  "tag": "v1.11.1",
+  "name": "Hive 1.11.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Per-workspace code directories, per-chat isolation, and clearer agents. Each workspace now links to its own folder on your device (the link is local and never synced, so teammates each point at their own clone), and switching workspaces switches what the editor, terminal, Diff view, and agents operate on. In a git workspace, each chat runs in its own isolated worktree (a hive/chat/<id> branch) so parallel chats don't clobber each other — write turns still surface as reviewable proposals, and approving one commits onto that chat's branch rather than your main tree. Agents now show where they run: a badge for This device vs a headless worker (with online status), plus a Runs-on picker when you create one. Non-git folders behave exactly as before. Note: this is an early cut of the per-chat git isolation — feedback welcome."
+  "notes": "Quieter, better-behaved agents. Agents no longer try to author a workflow during ordinary replies (a question, a code review, or a single edit isn't a workflow request) — they only do so when you explicitly ask for a pipeline or loop. When one is authored, the parser now tolerates a common near-miss (a trailing comma) instead of rejecting it, and if a suggested workflow still can't be added the note is calm and informational rather than an alarming warning. Patch on 1.11.0's per-workspace directories and per-chat worktrees."
 }
