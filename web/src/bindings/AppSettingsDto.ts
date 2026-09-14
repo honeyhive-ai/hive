@@ -7,7 +7,18 @@ export type AppSettingsDto = { displayName: string,
 /**
  * Git email used to attribute commits agents make on this user's behalf.
  */
-gitEmail: string, deviceName: string, workspaceRoot: string, knownWorkspaces: Array<string>, model: string, gitBranch: string | null, gitDirtyCount: number, 
+gitEmail: string, deviceName: string, 
+/**
+ * The effective code dir — the active chat's isolated worktree when one is
+ * active, else the workspace folder. Drives the Code view / terminal / diff.
+ */
+workspaceRoot: string, 
+/**
+ * The active workspace's linked folder on this device (the git repo root),
+ * independent of any chat worktree. Use this for workspace display (the
+ * crumb, Folder & Git) so a chat's worktree path never shows as "the folder".
+ */
+workspaceFolder: string, knownWorkspaces: Array<string>, model: string, gitBranch: string | null, gitDirtyCount: number, 
 /**
  * The local user's chosen avatar (`data:` URL), or None for initials.
  */

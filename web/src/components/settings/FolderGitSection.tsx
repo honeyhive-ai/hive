@@ -21,11 +21,11 @@ export function FolderGitSection() {
   const [root, setRoot] = useState("");
 
   useEffect(() => {
-    if (settings.data) setRoot(settings.data.workspaceRoot);
+    if (settings.data) setRoot(settings.data.workspaceFolder);
   }, [settings.data]);
 
   async function applyRoot(next: string) {
-    if (next === (settings.data?.workspaceRoot ?? "")) return;
+    if (next === (settings.data?.workspaceFolder ?? "")) return;
     try {
       await setWorkspaceRoot(next);
       qc.invalidateQueries({ queryKey: ["settings"] });

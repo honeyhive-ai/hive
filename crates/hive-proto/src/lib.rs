@@ -366,7 +366,13 @@ pub struct AppSettingsDto {
     /// Git email used to attribute commits agents make on this user's behalf.
     pub git_email: String,
     pub device_name: String,
+    /// The effective code dir — the active chat's isolated worktree when one is
+    /// active, else the workspace folder. Drives the Code view / terminal / diff.
     pub workspace_root: String,
+    /// The active workspace's linked folder on this device (the git repo root),
+    /// independent of any chat worktree. Use this for workspace display (the
+    /// crumb, Folder & Git) so a chat's worktree path never shows as "the folder".
+    pub workspace_folder: String,
     pub known_workspaces: Vec<String>,
     pub model: String,
     pub git_branch: Option<String>,

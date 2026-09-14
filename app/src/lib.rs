@@ -6863,6 +6863,19 @@ fn open_path_in_editor(
 #[tauri::command]
 fn get_app_settings(state: State<AppState>) -> Result<AppSettingsDto, String> {
     let root = state.workspace_root.lock().unwrap().clone();
+    // The active workspace's linked folder (the repo), independent of any chat
+    // worktree that may currently be swapped into `workspace_root`.
+    let workspace_folder = {
+        let active_id = state.active_workspace_id().to_string();
+        state
+            .settings
+            .lock()
+            .unwrap()
+            .workspace_dirs
+            .get(&active_id)
+            .cloned()
+            .unwrap_or_default()
+    };
     let known_workspaces = load_workspace_index(&state.data_dir);
     let loaded = state.identity.load().map_err(map_err)?;
     let display_name = loaded
@@ -6881,6 +6894,7 @@ fn get_app_settings(state: State<AppState>) -> Result<AppSettingsDto, String> {
         git_email,
         device_name: state.device_name.clone(),
         workspace_root: root,
+        workspace_folder,
         known_workspaces,
         model: state.fallback_model.lock().unwrap().clone(),
         git_branch: None,

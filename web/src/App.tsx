@@ -514,7 +514,11 @@ export function App() {
     previousOverflowCount.current = overflowCount;
   }, [contextTelemetry.data?.overflowMessageCount, showUtilityPane]);
 
-  const workspaceRoot = settings.data?.workspaceRoot ?? "";
+  // The workspace's linked folder (the repo) — independent of the active chat's
+  // worktree that the backend swaps into the effective `workspaceRoot`. Use this
+  // for workspace display (crumb, label) and link-state gating so a chat's worktree
+  // path (`…/.hive/worktrees/chat-<id>`) never shows as "the folder".
+  const workspaceFolder = settings.data?.workspaceFolder ?? "";
   const activeWorkspace = workspaceList.data?.find((w) => w.active);
   const activeWorkspaceId = activeWorkspace?.id ?? "";
   const activeWorkspaceName = activeWorkspace?.name?.trim();
@@ -536,7 +540,7 @@ export function App() {
   // first visit (no remembered chat), to land on the most-recent one.
   useEffect(() => {
     if (!activeWorkspaceId || view !== "workspace") return;
-    const wsCtx = `${activeWorkspaceId}::${workspaceRoot}`;
+    const wsCtx = `${activeWorkspaceId}::${workspaceFolder}`;
     if (lastAutoSelectWs.current === wsCtx) return;
     lastAutoSelectWs.current = wsCtx;
     const wsId = activeWorkspaceId;
@@ -563,7 +567,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeWorkspaceId, workspaceRoot, view]);
+  }, [activeWorkspaceId, workspaceFolder, view]);
   // Record a deliberate chat selection against the active workspace so it can be
   // restored on return. Called from the select handlers below.
   const rememberChat = useCallback(
@@ -576,11 +580,11 @@ export function App() {
     // Prefer the workspace's own name (what you named the team/room); fall back
     // to the project-folder basename only when it has none.
     if (activeWorkspaceName) return activeWorkspaceName;
-    const trimmed = workspaceRoot.replace(/[\\/]+$/, "");
+    const trimmed = workspaceFolder.replace(/[\\/]+$/, "");
     if (!trimmed) return "Hive Workspace";
     const parts = trimmed.split(/[\\/]/);
     return parts[parts.length - 1] || "Hive Workspace";
-  }, [activeWorkspaceName, workspaceRoot]);
+  }, [activeWorkspaceName, workspaceFolder]);
 
   const runtimeItems = runtimes.data ?? [];
   const currentRuntime =
@@ -819,7 +823,7 @@ export function App() {
         sessionId={selectedId}
         view={view}
         workspaceLabel={workspaceLabel}
-        workspacePath={workspaceRoot}
+        workspacePath={workspaceFolder}
         activeWorkspaceId={activeWorkspaceId}
         knownWorkspaces={settings.data?.knownWorkspaces ?? []}
         displayName={settings.data?.displayName ?? "You"}
@@ -893,7 +897,7 @@ export function App() {
             <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
               <div className="min-w-0 flex-1">
                 <PaneErrorBoundary label="This view">
-                  {(mode === "diff" || mode === "code") && !workspaceRoot ? (
+                  {(mode === "diff" || mode === "code") && !workspaceFolder ? (
                     <BindWorkspacePrompt />
                   ) : mode === "diff" ? (
                     <Suspense
@@ -1010,10 +1014,10 @@ export function App() {
                     onConsumePendingInsert={() => setComposerSeed(null)}
                   />
                 )}
-                {(mode === "diff" || mode === "code") && !workspaceRoot && (
+                {(mode === "diff" || mode === "code") && !workspaceFolder && (
                   <BindWorkspacePrompt />
                 )}
-                {mode === "diff" && !!workspaceRoot && (
+                {mode === "diff" && !!workspaceFolder && (
                   <Suspense
                     fallback={
                       <div className="flex h-full items-center justify-center opacity-50">
@@ -1027,7 +1031,7 @@ export function App() {
                     />
                   </Suspense>
                 )}
-                {mode === "code" && !!workspaceRoot && (
+                {mode === "code" && !!workspaceFolder && (
                   <Suspense
                     fallback={
                       <div className="flex h-full items-center justify-center opacity-50">
