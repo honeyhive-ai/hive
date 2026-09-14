@@ -2039,6 +2039,7 @@ fn agent_dto(a: &WorkspaceAgent) -> WorkspaceAgentDto {
         runtime_id: a.runtime_id.clone(),
         role: a.role.clone(),
         owner_actor_id: a.owner_actor_id.clone(),
+        host_id: a.host_id.clone(),
         avatar_url: a.avatar_url.clone(),
         avatar_color_hex: a.avatar_color_hex.clone(),
     }

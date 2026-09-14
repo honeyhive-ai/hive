@@ -10,6 +10,11 @@ export type WorkspaceAgentDto = { id: string, name: string, runtimeId: string, r
  */
 ownerActorId: string, 
 /**
+ * Id of the host this agent runs on. Empty means the owner's own device
+ * (a local persona); a Worker id means it is headless (worker-hosted).
+ */
+hostId: string, 
+/**
  * Optional avatar image (`data:` URL); falls back to the color, then to
  * initials-on-color when absent.
  */

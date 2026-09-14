@@ -217,6 +217,9 @@ pub struct WorkspaceAgentDto {
     /// Actor id of the member who owns this agent (empty if unowned). Only the
     /// owner may edit the agent's avatar.
     pub owner_actor_id: String,
+    /// Id of the host this agent runs on. Empty means the owner's own device
+    /// (a local persona); a Worker id means it is headless (worker-hosted).
+    pub host_id: String,
     /// Optional avatar image (`data:` URL); falls back to the color, then to
     /// initials-on-color when absent.
     pub avatar_url: Option<String>,
