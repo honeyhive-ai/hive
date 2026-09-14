@@ -3146,8 +3146,25 @@ fn rename_chat(state: State<AppState>, session_id: String, title: String) -> Res
 #[tauri::command]
 fn delete_chat(state: State<AppState>, session_id: String) -> Result<(), String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let mut svc = state.service.lock().unwrap();
-    svc.delete_chat(id).map_err(map_err)
+    {
+        let mut svc = state.service.lock().unwrap();
+        svc.delete_chat(id).map_err(map_err)?;
+    }
+    // Phase 2a: best-effort teardown of the chat's persistent base worktree and
+    // its `hive/chat/<id>` branch. Only meaningful in a git workspace; a failure
+    // (or non-git root) just leaves a stale entry a later same-id ensure clears.
+    let repo_root = state.workspace_repo_root();
+    if !repo_root.trim().is_empty()
+        && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&repo_root))
+    {
+        if let Err(e) = hive_runtime::git_worktree::remove_chat_worktree(
+            std::path::Path::new(&repo_root),
+            &id.to_string(),
+        ) {
+            tracing::warn!(target: "worktree", "chat worktree cleanup failed: {e}");
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -4489,6 +4506,38 @@ fn apply_patch(workspace_root: &str, diff: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Stage everything and commit in `worktree` (Phase 2a: advance a chat's base
+/// branch after applying an approved proposal into its persistent worktree). A
+/// no-op tree (nothing staged) is treated as success so a re-apply doesn't
+/// error. Errors surface so the caller doesn't leave a half-applied state.
+fn commit_worktree(worktree: &str, message: &str) -> Result<(), String> {
+    let add = hive_core::process_util::command("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["add", "-A"])
+        .output()
+        .map_err(|e| format!("git add: {e}"))?;
+    if !add.status.success() {
+        return Err(format!("git add: {}", String::from_utf8_lossy(&add.stderr).trim()));
+    }
+    let out = hive_core::process_util::command("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["commit", "-m", message])
+        .output()
+        .map_err(|e| format!("git commit: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // "nothing to commit" isn't a failure — the patch may have been a no-op.
+        if stdout.contains("nothing to commit") || stderr.contains("nothing to commit") {
+            return Ok(());
+        }
+        return Err(format!("git commit: {}", stderr.trim()));
+    }
+    Ok(())
+}
+
 /// Agreement-gated execution: carry out an **approved** proposal. The gate is
 /// that this only runs once quorum is met (status Approved) *and* a human
 /// explicitly invokes it — agents never auto-execute. A fileDiff proposal's
@@ -4530,8 +4579,43 @@ async fn implement_proposal(
     // and we surface that rather than half-applying.
     if proposal.kind == ProposalKind::FileDiff {
         if let Some(diff) = proposal.diff.clone() {
-            let root = state.workspace_root.lock().unwrap().clone();
-            apply_patch(&root, &diff)?;
+            // Phase 2a: apply into the proposal's chat base worktree and commit,
+            // so the chat branch `hive/chat/<sessionid>` advances (and only that
+            // chat's dir changes). Resolve the chat worktree from the *main* repo
+            // root, not the possibly-swapped `workspace_root`. If the root isn't a
+            // git repo, or its chat worktree can't be ensured, fall back to
+            // today's behavior: apply straight to `workspace_root`. An apply/commit
+            // failure surfaces (no half-apply) rather than silently falling back.
+            let repo_root = state.workspace_repo_root();
+            let chat_id = sid.to_string();
+            let applied_to_chat = if !repo_root.trim().is_empty()
+                && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&repo_root))
+            {
+                match hive_runtime::git_worktree::chat_worktree(
+                    std::path::Path::new(&repo_root),
+                    &chat_id,
+                ) {
+                    Ok(wt_path) => {
+                        let wt = wt_path.to_string_lossy().into_owned();
+                        apply_patch(&wt, &diff)?;
+                        commit_worktree(&wt, &format!("Apply proposal: {}", proposal.title))?;
+                        true
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "worktree",
+                            "chat worktree unavailable, applying to workspace root: {e}"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !applied_to_chat {
+                let root = state.workspace_root.lock().unwrap().clone();
+                apply_patch(&root, &diff)?;
+            }
             {
                 let mut svc = state.service.lock().unwrap();
                 let mut applied = proposal;
@@ -4727,6 +4811,52 @@ impl AppState {
         *self.workspace_root.lock().unwrap() = bound.clone();
         self.reload_workspace_catalogs(&bound);
         self.arm_fs_watcher(&bound);
+    }
+
+    /// The active workspace's bound *main* repo folder — the true repo root, NOT
+    /// a chat worktree that `set_active_chat` may have swapped `workspace_root`
+    /// to. Chat worktrees live under this folder's `.hive/worktrees/`, so both
+    /// ensuring a chat worktree and applying a proposal into one resolve from
+    /// here rather than from a possibly-swapped `workspace_root`.
+    fn workspace_repo_root(&self) -> String {
+        workspace_dir_for(
+            &self.settings.lock().unwrap().workspace_dirs,
+            &self.active_workspace_id().to_string(),
+        )
+    }
+
+    /// Point `workspace_root` at a chat's persistent base worktree (Phase 2a),
+    /// so the effective code dir follows the active chat. When `session_id` is
+    /// `None` — or the workspace root isn't a git repo, or ensuring the chat
+    /// worktree fails — fall back to the active workspace's bound folder (the
+    /// chat still works, just not isolated). Mirrors `apply_workspace_dir`'s
+    /// side effects (catalogs + fs watcher, which already guard bad roots).
+    fn apply_chat_dir(&self, session_id: Option<Uuid>) {
+        let repo_root = self.workspace_repo_root();
+        let dir = match session_id {
+            Some(sid) if !repo_root.trim().is_empty()
+                && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&repo_root)) =>
+            {
+                match hive_runtime::git_worktree::chat_worktree(
+                    std::path::Path::new(&repo_root),
+                    &sid.to_string(),
+                ) {
+                    Ok(path) => path.to_string_lossy().into_owned(),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "worktree",
+                            "chat worktree unavailable, using workspace folder: {e}"
+                        );
+                        repo_root
+                    }
+                }
+            }
+            // No chat selected, or non-git root → the workspace folder as-is.
+            _ => repo_root,
+        };
+        *self.workspace_root.lock().unwrap() = dir.clone();
+        self.reload_workspace_catalogs(&dir);
+        self.arm_fs_watcher(&dir);
     }
 
     /// No relay configured → a purely local install: nothing ever syncs to another
@@ -5736,10 +5866,29 @@ async fn run_prepared_turn(
         && write_capable
         && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root))
     {
-        match hive_runtime::git_worktree::Worktree::create(
-            std::path::Path::new(&workspace_root),
-            &session_id.to_string(),
-        ) {
+        let root = std::path::Path::new(&workspace_root);
+        let chat_id = session_id.to_string();
+        // Phase 2a: cut the ephemeral turn worktree from the chat's persistent
+        // base branch `hive/chat/<sessionid>` (so the captured diff is vs the
+        // chat branch, and applying advances only that chat) — not global HEAD.
+        // Ensure the chat's base worktree exists first. If that fails (e.g. a
+        // repo with no HEAD), fall back to cutting from HEAD as before; if THAT
+        // also fails, fall back to running in place.
+        let cut = match hive_runtime::git_worktree::chat_worktree(root, &chat_id) {
+            Ok(_) => hive_runtime::git_worktree::Worktree::create_from(
+                root,
+                &chat_id,
+                &format!("hive/chat/{chat_id}"),
+            ),
+            Err(e) => {
+                tracing::warn!(
+                    target: "worktree",
+                    "chat base worktree unavailable, cutting turn from HEAD: {e}"
+                );
+                hive_runtime::git_worktree::Worktree::create(root, &chat_id)
+            }
+        };
+        match cut {
             Ok(wt) => Some(wt),
             Err(e) => {
                 tracing::warn!(target: "worktree", "isolation unavailable, running in place: {e}");
@@ -8636,6 +8785,26 @@ fn set_active_workspace(state: State<AppState>, workspace_id: String) -> Result<
     Ok(())
 }
 
+/// Phase 2a: make the effective code dir follow the *active chat*. When a chat
+/// is opened, `session_id` is its id and `workspace_root` swaps to that chat's
+/// persistent base worktree (`hive/chat/<sessionid>`), so edits, catalogs, and
+/// the file watcher all track the chat's isolated dir. Passing `None` (no chat
+/// selected) reverts to the active workspace's bound folder.
+///
+/// Strictly additive: if the workspace root isn't a git repo, or the chat
+/// worktree can't be created, `workspace_root` falls back to the workspace
+/// folder — the chat still works, just without per-chat isolation. Mirrors
+/// `apply_workspace_dir`'s side effects (both guard bad/empty roots).
+#[tauri::command]
+fn set_active_chat(state: State<AppState>, session_id: Option<String>) -> Result<(), String> {
+    let sid = match session_id {
+        Some(ref s) if !s.trim().is_empty() => Some(Uuid::parse_str(s).map_err(map_err)?),
+        _ => None,
+    };
+    state.apply_chat_dir(sid);
+    Ok(())
+}
+
 /// Set (or clear, with `None`) a workspace's icon. `icon` must be a small
 /// `data:image/…` URL; pass `None` to revert to the default mark/initials.
 ///
@@ -11375,6 +11544,7 @@ pub fn run() {
             remove_agent_template,
             list_workspaces,
             set_active_workspace,
+            set_active_chat,
             set_workspace_icon,
             create_workspace,
             join_workspace,

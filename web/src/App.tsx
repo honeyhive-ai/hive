@@ -25,6 +25,7 @@ import {
   removeWorkspaceFromList,
   renameChat,
   setActiveWorkspace,
+  setActiveChat,
   setWorkspaceRoot,
   syncStatus,
   type SyncStatusDto,
@@ -460,6 +461,20 @@ export function App() {
       .then(() => qc.invalidateQueries({ queryKey: ["members", selectedId] }))
       .catch(() => {});
   }, [qc, selectedId]);
+
+  // Point the backend's effective code dir at the active chat's isolated worktree
+  // so the editor/terminal/diff operate on that chat's tree; refetch settings +
+  // diffs so workspaceRoot-derived views follow. No-op fallback on a non-git or
+  // unbound workspace (the backend reverts to the workspace folder).
+  useEffect(() => {
+    if (view !== "workspace") return;
+    void setActiveChat(selectedId)
+      .then(() => {
+        qc.invalidateQueries({ queryKey: ["settings"] });
+        qc.invalidateQueries({ queryKey: ["diffs"] });
+      })
+      .catch(() => {});
+  }, [qc, selectedId, view]);
 
   useEffect(() => {
     const unlisten = onChatStream((event) => {

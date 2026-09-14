@@ -807,6 +807,11 @@ export const listWorkspaces = () => invoke<WorkspaceInfoDto[]>("list_workspaces"
 export const setActiveWorkspace = (workspaceId: string) =>
   invoke<void>("set_active_workspace", { workspaceId });
 
+/// Point the effective code dir at a chat's isolated worktree (or `null` to
+/// revert to the active workspace's folder). No-op fallback on a non-git root.
+export const setActiveChat = (sessionId: string | null) =>
+  invoke<void>("set_active_chat", { sessionId });
+
 /// Set a workspace icon (a `data:image/…` URL), or clear it with `null`.
 export const setWorkspaceIcon = (workspaceId: string, icon: string | null) =>
   invoke<void>("set_workspace_icon", { workspaceId, icon });

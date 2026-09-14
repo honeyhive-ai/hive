@@ -62,6 +62,88 @@ fn slug(turn_id: &str) -> String {
         .collect()
 }
 
+/// Whether a local branch of exactly this name exists in `repo_root`. Used to
+/// make [`chat_worktree`] idempotent (reuse an existing chat branch) without
+/// treating a plain `git` failure as "exists".
+fn branch_exists(repo_root: &Path, branch: &str) -> bool {
+    command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify", "--quiet"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// The branch name backing a chat's persistent worktree.
+fn chat_branch(chat_id: &str) -> String {
+    format!("hive/chat/{}", slug(chat_id))
+}
+
+/// The checkout path of a chat's persistent worktree.
+fn chat_worktree_path(repo_root: &Path, chat_id: &str) -> PathBuf {
+    repo_root
+        .join(".hive")
+        .join("worktrees")
+        .join(format!("chat-{}", slug(chat_id)))
+}
+
+/// Ensure a chat's **persistent** base worktree exists and return its path.
+///
+/// Each chat gets a base branch `hive/chat/<chatid>` and a long-lived checkout
+/// at `<repo>/.hive/worktrees/chat-<chatid>` that is the chat's effective code
+/// dir. Idempotent: if the branch already exists it is reused (never removed
+/// between turns); a missing checkout for an existing branch is re-added. A
+/// fresh chat cuts the branch off `HEAD`.
+///
+/// Assumes `repo_root` is a git repo with a commit (guard with [`is_git_repo`]
+/// first). A repo with no `HEAD` has nothing to branch from and returns `Err` —
+/// callers treat that as "run in the workspace root", exactly as for [`create`].
+pub fn chat_worktree(repo_root: &Path, chat_id: &str) -> io::Result<PathBuf> {
+    let branch = chat_branch(chat_id);
+    let path = chat_worktree_path(repo_root, chat_id);
+    let path_str = path.to_string_lossy().into_owned();
+    let existed = branch_exists(repo_root, &branch);
+
+    // A registered checkout that's already present for this branch is reused
+    // as-is — the whole point of a persistent worktree is to survive turns.
+    if existed && path.exists() {
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Clear any stale worktree registration at this path (e.g. the checkout dir
+    // was deleted out from under git) so `worktree add` doesn't refuse.
+    let _ = command("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "remove", "--force"])
+        .arg(&path)
+        .output();
+    if existed {
+        // Branch survives; re-attach a checkout for it without moving its tip.
+        git(repo_root, &["worktree", "add", &path_str, &branch])?;
+    } else {
+        // Fresh chat: cut the base branch off HEAD.
+        git(repo_root, &["worktree", "add", "-b", &branch, &path_str, "HEAD"])?;
+    }
+    Ok(path)
+}
+
+/// Best-effort teardown of a chat's persistent worktree and its base branch.
+/// Called when a chat is deleted. A failure just leaves a stale entry that a
+/// later same-id [`chat_worktree`] clears anyway.
+pub fn remove_chat_worktree(repo_root: &Path, chat_id: &str) -> io::Result<()> {
+    let branch = chat_branch(chat_id);
+    let path = chat_worktree_path(repo_root, chat_id);
+    let path_str = path.to_string_lossy().into_owned();
+    let _ = git(repo_root, &["worktree", "remove", "--force", &path_str]);
+    let _ = git(repo_root, &["branch", "-D", &branch]);
+    Ok(())
+}
+
 impl Worktree {
     /// Create an isolated worktree for `turn_id`: a fresh branch `hive/turn-<id>`
     /// off the current `HEAD`, checked out at `<repo>/.hive/worktrees/<id>`.
@@ -70,6 +152,16 @@ impl Worktree {
     /// repo with no commits yet has no `HEAD` to branch from — callers should
     /// treat that as "run in place" rather than isolate.
     pub fn create(repo_root: &Path, turn_id: &str) -> io::Result<Worktree> {
+        Self::create_from(repo_root, turn_id, "HEAD")
+    }
+
+    /// Like [`create`], but cuts the ephemeral turn branch from an arbitrary
+    /// `base_ref` (a commit, branch, or `HEAD`) instead of always `HEAD`. This
+    /// is how a turn isolates from its chat's base branch (`hive/chat/<id>`)
+    /// rather than the global HEAD, so the captured diff is vs the chat branch.
+    /// If `base_ref` doesn't resolve, `worktree add` fails and the caller falls
+    /// back (to HEAD, then in-place).
+    pub fn create_from(repo_root: &Path, turn_id: &str, base_ref: &str) -> io::Result<Worktree> {
         let slug = slug(turn_id);
         let branch = format!("hive/turn-{slug}");
         let path = repo_root.join(".hive").join("worktrees").join(&slug);
@@ -89,7 +181,7 @@ impl Worktree {
         let path_str = path.to_string_lossy().into_owned();
         git(
             repo_root,
-            &["worktree", "add", "-b", &branch, &path_str, "HEAD"],
+            &["worktree", "add", "-b", &branch, &path_str, base_ref],
         )?;
         Ok(Worktree { path, branch, repo_root: repo_root.to_path_buf() })
     }
@@ -236,5 +328,110 @@ mod tests {
         assert!(second.path.exists());
         second.remove().unwrap();
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn create_from_cuts_from_the_given_base() {
+        // A turn cut from a chat branch must start from that branch's tip, not
+        // HEAD: content committed on the base ref appears in the turn worktree.
+        let repo = temp_repo();
+        let chat = chat_worktree(&repo, "chatA").unwrap();
+        // Advance the chat branch with a commit the main HEAD doesn't have.
+        std::fs::write(chat.join("a.txt"), "hello\nfrom-chat\n").unwrap();
+        run(&chat, "git", &["add", "-A"]);
+        run(&chat, "git", &["commit", "-qm", "chat commit"]);
+
+        let wt = Worktree::create_from(&repo, "turn-x", "hive/chat/chatA").unwrap();
+        // The turn worktree sees the chat branch's content, not the base commit's.
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("a.txt")).unwrap(),
+            "hello\nfrom-chat\n"
+        );
+        // And its diff is empty until it edits (i.e. base is the chat tip).
+        assert!(wt.diff().unwrap().trim().is_empty(), "no diff vs chat tip yet");
+        wt.remove().unwrap();
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn chat_worktree_is_idempotent_and_creates_the_branch() {
+        let repo = temp_repo();
+        let p1 = chat_worktree(&repo, "chatB").unwrap();
+        assert!(p1.exists());
+        // The base branch now exists.
+        let branches = git(&repo, &["branch", "--list", "hive/chat/chatB"]).unwrap();
+        assert!(!branches.trim().is_empty(), "chat base branch created");
+
+        // A second call returns the SAME path and does NOT wipe committed work.
+        std::fs::write(p1.join("persist.txt"), "keep me\n").unwrap();
+        run(&p1, "git", &["add", "-A"]);
+        run(&p1, "git", &["commit", "-qm", "persisted"]);
+        let p2 = chat_worktree(&repo, "chatB").unwrap();
+        assert_eq!(p1, p2, "same persistent path");
+        assert_eq!(
+            std::fs::read_to_string(p2.join("persist.txt")).unwrap(),
+            "keep me\n",
+            "persistent worktree survives a re-ensure"
+        );
+
+        remove_chat_worktree(&repo, "chatB").unwrap();
+        let gone = git(&repo, &["branch", "--list", "hive/chat/chatB"]).unwrap();
+        assert!(gone.trim().is_empty(), "chat branch pruned on removal");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn apply_and_commit_advances_the_chat_branch() {
+        // Mirrors the implement-proposal path: apply a captured diff INTO the
+        // chat worktree and commit, so the chat branch advances and its checkout
+        // reflects it — while the main tree stays untouched.
+        use std::io::Write;
+        use std::process::Stdio;
+        let repo = temp_repo();
+        let chat = chat_worktree(&repo, "chatC").unwrap();
+
+        // Produce a diff from an ephemeral turn cut off the chat branch.
+        let wt = Worktree::create_from(&repo, "turn-c", "hive/chat/chatC").unwrap();
+        std::fs::write(wt.path.join("a.txt"), "hello\nworld\n").unwrap();
+        let diff = wt.diff().unwrap();
+        wt.remove().unwrap();
+
+        // Apply into the chat worktree.
+        let mut child = command("git")
+            .arg("-C")
+            .arg(&chat)
+            .args(["apply", "--whitespace=nowarn"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(diff.as_bytes()).unwrap();
+        assert!(child.wait().unwrap().success(), "diff applies into chat worktree");
+        run(&chat, "git", &["add", "-A"]);
+        run(&chat, "git", &["commit", "-qm", "apply proposal"]);
+
+        // The chat branch advanced and its checkout reflects the change.
+        assert_eq!(
+            std::fs::read_to_string(chat.join("a.txt")).unwrap(),
+            "hello\nworld\n"
+        );
+        // The main tree is untouched.
+        assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "hello\n");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn chat_helpers_err_or_noop_on_a_non_git_dir() {
+        let plain = std::env::temp_dir().join(format!("hive-nogit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!is_git_repo(&plain));
+        // chat_worktree must fail cleanly (no panic) on a non-repo — the caller
+        // guards with is_git_repo and falls back to the workspace root.
+        assert!(chat_worktree(&plain, "x").is_err());
+        // remove is best-effort and never errors.
+        assert!(remove_chat_worktree(&plain, "x").is_ok());
+        // create_from likewise fails cleanly rather than panicking.
+        assert!(Worktree::create_from(&plain, "t", "HEAD").is_err());
+        let _ = std::fs::remove_dir_all(&plain);
     }
 }
