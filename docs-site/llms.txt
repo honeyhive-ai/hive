@@ -1,0 +1,70 @@
+# Hive
+
+> Hive is a local-first, end-to-end-encrypted desktop app for collaborating with AI agents. Workspaces and chats sync over an E2EE relay (or peer-to-peer); each device holds its own copy of the data and its own local code folder. Agents run on a host (your device or a headless worker), edit an isolated per-chat git worktree, and surface changes as reviewable proposals.
+
+Documentation site: https://docs.apiaryhq.ai/ — pages below are the canonical reference.
+
+## Start here (for agents)
+
+- [For agents: operating in Hive](https://docs.apiaryhq.ai/concepts/for-agents/): The operating rules an AI agent should assume — where you run and which files you can touch, that edits are reviewable proposals (not live changes), repo-relative-path rules, and how @mentions route work.
+
+## Getting started
+
+- [Install with Homebrew](https://docs.apiaryhq.ai/getting-started/homebrew/): Installing the Hive desktop app and CLI.
+- [First launch](https://docs.apiaryhq.ai/getting-started/first-launch/): First run, data directories, and resetting local data.
+- [Configuring a runtime](https://docs.apiaryhq.ai/getting-started/configuring-a-runtime/): Setting up LLM providers and CLI coding agents (claude, aider, pi, codex).
+- [Your first chat](https://docs.apiaryhq.ai/getting-started/first-chat/): Sending a message and getting a first agent reply.
+
+## Concepts
+
+- [Workspaces & chats](https://docs.apiaryhq.ai/concepts/workspaces/): The event-sourced workspace model, multiple workspaces, per-workspace device-local code directories, and per-chat isolated worktrees.
+- [Agents (built-in vs BYO)](https://docs.apiaryhq.ai/concepts/agents/): What a workspace agent is, the dispatch model, and an agent's host (this device vs a worker).
+- [Headless agents & setups](https://docs.apiaryhq.ai/concepts/headless-agents/): Enrolling a headless agent/worker on a remote box via the CLI.
+- [Tools & permissions](https://docs.apiaryhq.ai/concepts/tools-and-consent/): How tool access and file/command permissions are gated.
+- [Vaults & knowledge sources](https://docs.apiaryhq.ai/concepts/vaults/): Attaching knowledge to a workspace.
+- [Identity & devices](https://docs.apiaryhq.ai/concepts/identity/): GitHub-based identity, one member across multiple devices.
+- [Security & trust](https://docs.apiaryhq.ai/concepts/security/): The E2EE model, what the relay can and cannot see.
+
+## Features
+
+- [Settings](https://docs.apiaryhq.ai/features/settings/): Every settings section — Account, Appearance, Folder & Git (per-workspace folder), Team sync, Schedules, Models & runtimes, Tools & MCP, Permissions, Updates, Diagnostics.
+- [Right Rail](https://docs.apiaryhq.ai/features/right-rail/): The tools/review/people/context panes.
+- [Multi-agent collaboration](https://docs.apiaryhq.ai/features/multi-agent/): Multiple agents in one chat and how they interact.
+- [Mentions & notifications](https://docs.apiaryhq.ai/features/mentions-and-notifications/): Addressing participants and how notifications work.
+- [Agentic workflows](https://docs.apiaryhq.ai/features/workflows/): Multi-stage agent pipelines and human-approval gates, including gate-routes-back loops.
+- [Scheduled agents](https://docs.apiaryhq.ai/features/scheduling/): Recurring, cron-like agent runs.
+- [Managing context](https://docs.apiaryhq.ai/features/voice-and-slash/): /summarize, /compact, and the context planner.
+- [Git integration](https://docs.apiaryhq.ai/features/git/): The Diff canvas, worktree isolation, and applying proposals.
+- [Invites & joining](https://docs.apiaryhq.ai/features/invites/): Inviting teammates and joining a workspace.
+- [Collaborators, presence & DMs](https://docs.apiaryhq.ai/features/collaborators/): Members, presence, and direct messages.
+- [Collaborative editing](https://docs.apiaryhq.ai/features/collaboration/): Real-time collaboration behavior.
+- [Onboarding](https://docs.apiaryhq.ai/features/onboarding/): The first-run onboarding flow.
+
+## Add-ons
+
+- [Bring-your-own agents](https://docs.apiaryhq.ai/addons/byo-agents/): Wiring any stdin-driven CLI as a Hive runtime.
+- [Skills](https://docs.apiaryhq.ai/addons/skills/): Reusable instruction sets applied to agents.
+- [MCP servers](https://docs.apiaryhq.ai/addons/mcp/): Installing and enabling Model Context Protocol servers.
+- [Linear & remote MCP (OAuth)](https://docs.apiaryhq.ai/addons/linear/): Connecting OAuth-based remote MCP servers.
+
+## Networking
+
+- [LAN discovery](https://docs.apiaryhq.ai/networking/lan/): Peer discovery on a local network.
+- [Rendezvous relay](https://docs.apiaryhq.ai/networking/rendezvous/): How peers find each other over the internet.
+- [Self-hosting a relay](https://docs.apiaryhq.ai/networking/self-host/): Running your own relay, and managing relay access.
+- [TURN fallback](https://docs.apiaryhq.ai/networking/turn/): Relayed connectivity when P2P fails.
+
+## Operations
+
+- [Building the dist](https://docs.apiaryhq.ai/ops/build/): Building the desktop app.
+- [Deploying for a small team](https://docs.apiaryhq.ai/ops/deployment/): Standing up Hive for a team.
+- [Pricing tiers](https://docs.apiaryhq.ai/ops/pricing/) and [Tiering (open-core)](https://docs.apiaryhq.ai/ops/tiering/): The open-core model.
+- [Managed service plan](https://docs.apiaryhq.ai/ops/managed-service/): The hosted option.
+- [Server-side membership](https://docs.apiaryhq.ai/ops/server-side-membership/): Relay-managed team membership.
+- [Troubleshooting](https://docs.apiaryhq.ai/ops/troubleshooting/): Common problems and fixes.
+
+## Reference
+
+- [Configuration (TOML)](https://docs.apiaryhq.ai/reference/config-toml/): The `hive.config.toml` reference.
+- [Invite payload format](https://docs.apiaryhq.ai/reference/invite-payload/): The invite/enroll payload structure.
+- [Wire protocols](https://docs.apiaryhq.ai/reference/wire-protocols/): The `/v1` relay wire contract and token format.
