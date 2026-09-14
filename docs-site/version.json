@@ -1,6 +1,6 @@
 {
-  "tag": "v1.10.5",
-  "name": "Hive 1.10.5",
+  "tag": "v1.11.0",
+  "name": "Hive 1.11.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Reliable workspace navigation. Returning to a workspace now restores the exact chat and channel you had open there — it no longer resets to the empty 'select a chat' placeholder or jumps to a different channel. This fixes the intermittent behavior from 1.10.3/1.10.4. Includes the earlier workspace improvements: remembered project folder, and Code/Diff reachable without opening a chat."
+  "notes": "Per-workspace code directories, per-chat isolation, and clearer agents. Each workspace now links to its own folder on your device (the link is local and never synced, so teammates each point at their own clone), and switching workspaces switches what the editor, terminal, Diff view, and agents operate on. In a git workspace, each chat runs in its own isolated worktree (a hive/chat/<id> branch) so parallel chats don't clobber each other — write turns still surface as reviewable proposals, and approving one commits onto that chat's branch rather than your main tree. Agents now show where they run: a badge for This device vs a headless worker (with online status), plus a Runs-on picker when you create one. Non-git folders behave exactly as before. Note: this is an early cut of the per-chat git isolation — feedback welcome."
 }
