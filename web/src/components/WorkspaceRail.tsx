@@ -108,6 +108,9 @@ export function WorkspaceRail({
       await qc.invalidateQueries({ queryKey: ["workspaces"] });
       await qc.invalidateQueries({ queryKey: ["chats"] });
       await qc.invalidateQueries({ queryKey: ["all-mention-states"] });
+      // The code dir follows the active workspace — refetch settings so the
+      // editor/tree/diff/terminal pick up the new (or empty) workspaceRoot.
+      await qc.invalidateQueries({ queryKey: ["settings"] });
     } catch (e) {
       toast.error(errMsg(e));
     }

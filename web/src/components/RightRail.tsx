@@ -249,10 +249,14 @@ function ToolsPane({
   const agentTemplates = useQuery({ queryKey: ["agent-templates"], queryFn: listAgentTemplates });
   const agents = useQuery({ queryKey: ["agents", sessionId], queryFn: () => listAgents(sessionId) });
   const mcp = useQuery({ queryKey: ["mcp"], queryFn: listMcpServers });
+  const hosts = useQuery({ queryKey: ["workspace-hosts"], queryFn: listWorkspaceHosts });
+  const hostList = hosts.data ?? [];
+  const workerHosts = hostList.filter((h) => h.kind === "worker");
   const [scope, setScope] = useState<ToolsScope>("chat");
   const [agentName, setAgentName] = useState("");
   const [agentRole, setAgentRole] = useState("");
   const [agentRuntimeId, setAgentRuntimeId] = useState(activeRuntimeId);
+  const [agentHostId, setAgentHostId] = useState("");
   const [showAddAgent, setShowAddAgent] = useState(false);
   const [mcpSource, setMcpSource] = useState("");
   const [mcpError, setMcpError] = useState<string | null>(null);
@@ -265,12 +269,25 @@ function ToolsPane({
   }, [activeRuntimeId, agentRuntimeId, runtimes.data]);
 
   const addAgentMutation = useMutation({
-    mutationFn: () => addAgent(sessionId, agentName.trim(), agentRuntimeId, agentRole.trim()),
+    mutationFn: async () => {
+      const name = agentName.trim();
+      await addAgent(sessionId, name, agentRuntimeId, agentRole.trim());
+      // `add_agent` doesn't return the new id, and agent names are enforced
+      // unique — so to bind the persona to a worker we refetch the roster and
+      // match by name, then reassign its host via the existing path.
+      if (agentHostId) {
+        const list = await listAgents(sessionId);
+        const created = list.find((a) => a.name.toLowerCase() === name.toLowerCase());
+        if (created) await setAgentHost(created.id, agentHostId);
+      }
+    },
     onSuccess: () => {
       setAgentName("");
       setAgentRole("");
+      setAgentHostId("");
       setShowAddAgent(false);
       qc.invalidateQueries({ queryKey: ["agents", sessionId] });
+      qc.invalidateQueries({ queryKey: ["workspace-hosts"] });
       toast.success("Agent added.");
     },
     onError: (e) => toast.error(`Couldn't add agent: ${errMsg(e)}`),
@@ -397,6 +414,9 @@ function ToolsPane({
                   <div className="truncate text-[11.5px]" style={{ color: "var(--hive-ink-soft)" }}>
                     {agent.runtimeId} · {agent.role || "agent"}
                   </div>
+                  <div className="mt-0.5">
+                    <AgentHostBadge hostId={agent.hostId} hosts={hostList} />
+                  </div>
                 </div>
               </Card>
             ))}
@@ -415,6 +435,11 @@ function ToolsPane({
       ) : (
         <>
           <Section title="Agent roster">
+            <p className="px-1 pb-1 text-[11.5px] leading-snug" style={{ color: "var(--hive-ink-soft)" }}>
+              Agents are personas you @mention — each bound to a host. Their host
+              is where they run: this device, or a Worker (a headless box you
+              enroll under People → Remote agents).
+            </p>
             {agentList.length === 0 ? (
               <EmptyHint text="No workspace agents yet. Add one below." />
             ) : (
@@ -423,6 +448,7 @@ function ToolsPane({
                   key={agent.id}
                   sessionId={sessionId}
                   agent={agent}
+                  hosts={hostList}
                   onRemove={() =>
                     confirmThen("Remove this agent?", () => removeAgentMutation.mutate(agent.id))
                   }
@@ -478,6 +504,17 @@ function ToolsPane({
                     {runtimeList.map((runtime) => (
                       <option key={runtime.id} value={runtime.id}>
                         {runtimePickerLabel(runtime)}
+                      </option>
+                    ))}
+                  </SelectField>
+                </Field>
+                <Field label="Runs on">
+                  <SelectField value={agentHostId} onChange={setAgentHostId} ariaLabel="Agent host">
+                    <option value="">This device</option>
+                    {workerHosts.map((host) => (
+                      <option key={host.id} value={host.id}>
+                        {host.label || host.id}
+                        {host.online ? "" : " (offline)"}
                       </option>
                     ))}
                   </SelectField>
@@ -686,15 +723,57 @@ function McpServerCard({
   );
 }
 
-/// Editable agent row (Workspace scope): avatar upload + remove.
+/// Host badge shown on every agent card. Resolves an agent's `hostId` against
+/// the workspace host roster: empty ⇒ the owner's own device (a local persona),
+/// a worker id ⇒ a headless, worker-hosted agent. Always visible so the two
+/// kinds are never confused.
+function AgentHostBadge({ hostId, hosts }: { hostId: string; hosts: WorkspaceHostDto[] }) {
+  if (!hostId) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 text-[11px]"
+        style={{ color: "var(--hive-ink-soft)" }}
+        title="Runs on this device — a local persona"
+      >
+        <span className="h-2 w-2 rounded-full" style={{ background: "var(--hive-line)" }} aria-hidden />
+        This device
+      </span>
+    );
+  }
+  const host = hosts.find((h) => h.id === hostId);
+  const label = host?.label || `${hostId.slice(0, 8)}…`;
+  const online = host?.online ?? false;
+  return (
+    <span
+      className="inline-flex items-center gap-1 text-[11px]"
+      style={{ color: "var(--hive-ink-soft)" }}
+      title={
+        online
+          ? `Headless — runs on worker “${label}”`
+          : `Worker “${label}” is offline; queued work waits until it reconnects`
+      }
+    >
+      <span aria-hidden>🖥</span>
+      <span className="truncate">{label}</span>
+      <span aria-hidden>·</span>
+      <span style={{ color: online ? "var(--hive-success-ink)" : "var(--hive-warn-ink)" }}>
+        {online ? "online" : "offline"}
+      </span>
+    </span>
+  );
+}
+
+/// Editable agent row (Workspace scope): avatar upload + host badge + remove.
 function AgentRosterRow({
   sessionId,
   agent,
+  hosts,
   onRemove,
   onChanged,
 }: {
   sessionId: string;
   agent: import("@/lib/ipc").WorkspaceAgentDto;
+  hosts: WorkspaceHostDto[];
   onRemove: () => void;
   onChanged: () => void;
 }) {
@@ -742,6 +821,9 @@ function AgentRosterRow({
             <div className="font-medium">@{agent.name}</div>
             <div className="mt-1 text-xs opacity-60">
               {agent.runtimeId} · {agent.role || "agent"}
+            </div>
+            <div className="mt-1">
+              <AgentHostBadge hostId={agent.hostId} hosts={hosts} />
             </div>
             {agent.avatarUrl && (
               <button
