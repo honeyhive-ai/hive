@@ -95,6 +95,15 @@ This is the same path whether the peer is on your LAN, across the
 internet via the rendezvous relay, or via the relay-forwarded
 fallback path.
 
+Every agent has a **host** — the device its turns run on — shown as a
+badge on the agent: **This device** (a local persona) or a named
+**worker** (a headless box enrolled under People → Remote agents, with
+online status). You pick the host when creating an agent, and can
+reassign it later. The host determines which machine — and therefore
+which code directory — the agent's turns touch, so routing code work to a
+specific tree is a matter of `@mention`-ing the agent on the right host.
+See [Headless agents](headless-agents.md).
+
 ## Reviewing agent changes
 
 Hive has no inline per-tool consent prompt of its own. Trust is enforced at

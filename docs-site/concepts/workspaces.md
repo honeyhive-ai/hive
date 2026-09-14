@@ -90,6 +90,23 @@ switches between them — the local "My workspace" and any team rooms
 you've joined; the ＋ at the bottom creates a new team room or joins one
 by invite code. The chat list is scoped to whichever workspace is active.
 
+## Code directories & per-chat worktrees
+
+Each workspace links to a **folder on your device** — its code directory. The
+mapping is **local to each device and never synced**: teammates in the same
+workspace each point it at their own clone (paths differ per machine, and Hive
+never puts a local path on the wire). Switching workspaces switches the folder
+the editor, terminal, Diff view, and agents operate on; a workspace you haven't
+linked on this device shows a *link-a-folder* prompt (you can still chat, review,
+and drive remote agents while it's unlinked).
+
+Within a **git** workspace, **each chat gets its own isolated worktree** — a
+branch `hive/chat/<id>` — so parallel chats can't clobber each other's edits. A
+write-capable agent turn is cut from the chat's branch and still surfaces as a
+**reviewable proposal**; approving it commits onto that chat's branch (not your
+main tree), so a chat accumulates work only through changes you've approved.
+Non-git folders fall back to editing in place, exactly as before.
+
 ## Permissions & review
 
 Hive doesn't have an inline per-tool consent prompt of its own. Trust is

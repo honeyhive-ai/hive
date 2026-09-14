@@ -43,11 +43,21 @@ the app data dir; the theme is stored locally per device.
 
 ## Folder & Git
 
-The workspace **root path** drives the Diff canvas + git integration.
-Set it with the **Choose folder…** button (a native OS directory
-picker) or by typing/pasting a path. The section also shows a one-line
-git status (current **branch** + **changed-file count**) and an **Open
-in editor** shortcut. See [Git integration](git.md).
+Each workspace links to a **folder on this device** — its code directory,
+which drives the Code view, the Diff canvas, and git integration. Set it
+with the **Choose folder…** button (a native OS directory picker) or by
+typing/pasting a path. The section also shows a one-line git status
+(current **branch** + **changed-file count**) and an **Open in editor**
+shortcut.
+
+The folder link is **per workspace and local to this device** — it's
+never synced, so teammates in the same workspace each point it at their
+own clone. Switching workspaces switches the folder the editor/terminal/
+Diff and agents operate on; a workspace you haven't linked yet shows a
+**link-a-folder** prompt in the Code/Diff canvas (you can still chat,
+review, and drive remote agents while it's unlinked). See
+[Workspaces](../concepts/workspaces.md#code-directories--per-chat-worktrees)
+and [Git integration](git.md).
 
 ## Team sync
 
