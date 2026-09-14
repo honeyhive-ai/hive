@@ -1,6 +1,6 @@
 {
-  "tag": "v1.11.1",
-  "name": "Hive 1.11.1",
+  "tag": "v1.11.2",
+  "name": "Hive 1.11.2",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Quieter, better-behaved agents. Agents no longer try to author a workflow during ordinary replies (a question, a code review, or a single edit isn't a workflow request) — they only do so when you explicitly ask for a pipeline or loop. When one is authored, the parser now tolerates a common near-miss (a trailing comma) instead of rejecting it, and if a suggested workflow still can't be added the note is calm and informational rather than an alarming warning. Patch on 1.11.0's per-workspace directories and per-chat worktrees."
+  "notes": "Fixes the workspace label showing a chat's internal worktree path (chat-<hash>) instead of your project folder when switching between workspaces. The editor, terminal, and Diff still operate on the active chat's isolated worktree; the workspace name/folder shown in the UI now always reflects your linked folder. Patch on 1.11.0's per-workspace directories and per-chat worktrees."
 }
