@@ -5728,7 +5728,7 @@ fn finalize_reply(
                 let _ = svc.post_system_note(
                     session_id,
                     workspace_id,
-                    format!("⚠️ {author} proposed a workflow that was rejected: {e}"),
+                    format!("{author} suggested a workflow, but it couldn't be added ({e}) — no changes were made."),
                 );
             }
         }

@@ -788,6 +788,50 @@ enum DirectiveReject {
     Retry { retry_from: String },
 }
 
+/// Relax the near-miss JSON LLMs emit: drop a trailing comma sitting just before
+/// a `}` or `]` (respecting string literals + escapes). Structural only — never
+/// touches commas inside strings, so it can't corrupt content.
+fn relax_json(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let (mut in_str, mut esc) = (false, false);
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_str {
+            out.push(c);
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_str = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ',' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_whitespace() {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                i += 1; // drop the trailing comma
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
 /// Parse an agent's `[[workflow: …]]` payload into a validated definition.
 /// Agent names resolve against the session roster; everything else goes
 /// through the same `validate()` the builder uses.
@@ -795,8 +839,11 @@ pub(crate) fn definition_from_directive(
     json: &str,
     session: &ChatSession,
 ) -> Result<wf::WorkflowDefinition, String> {
-    let dw: DirectiveWorkflow =
-        serde_json::from_str(json).map_err(|e| format!("invalid workflow JSON: {e}"))?;
+    // Tolerate the near-miss JSON LLMs commonly emit (a trailing comma before a
+    // `}`/`]`): try strict first, then a relaxed pass, before rejecting.
+    let dw: DirectiveWorkflow = serde_json::from_str(json)
+        .or_else(|_| serde_json::from_str(&relax_json(json)))
+        .map_err(|e| format!("invalid workflow JSON: {e}"))?;
     let mut nodes = Vec::with_capacity(dw.stages.len());
     for (i, s) in dw.stages.iter().enumerate() {
         let name = s
@@ -1288,6 +1335,25 @@ fn ensure_stages_runnable(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod relax_json_tests {
+    use super::relax_json;
+
+    #[test]
+    fn drops_trailing_commas_before_close() {
+        assert_eq!(relax_json(r#"{"a":1,}"#), r#"{"a":1}"#);
+        assert_eq!(relax_json(r#"{"s":[1,2,],}"#), r#"{"s":[1,2]}"#);
+        assert_eq!(relax_json("{\"a\":1,\n}"), "{\"a\":1\n}");
+    }
+
+    #[test]
+    fn leaves_valid_json_and_string_commas_intact() {
+        assert_eq!(relax_json(r#"{"a":1,"b":2}"#), r#"{"a":1,"b":2}"#);
+        // A comma inside a string (even before a brace char) must survive.
+        assert_eq!(relax_json(r#"{"t":"a,}"}"#), r#"{"t":"a,}"}"#);
+    }
 }
 
 #[cfg(test)]

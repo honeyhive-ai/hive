@@ -75,7 +75,8 @@ mention someone when you need their input."
 }
 
 fn workflow_guidance() -> &'static str {
-    r#"When asked to set up a multi-stage pipeline OR a loop, author a workflow by ending a reply with a [[workflow: {…}]] directive. Authoring saves it; a human launches the run from the Workflows pane, and stages execute as the DAG's ready-set clears. Format:
+    r#"Author a workflow ONLY when the user EXPLICITLY asks to set up a multi-stage pipeline or a loop (e.g. "build a workflow", "set up a pipeline", "loop until…"). An ordinary question, a code review, an explanation, or a single edit is NOT a workflow request — do NOT emit a [[workflow:]] directive for those; when in doubt, don't. If you do emit one, it MUST be a single, strictly-valid JSON object (double-quoted keys/strings, NO trailing commas, NO comments), or it will be rejected.
+When the user does ask for one, author it by ending a reply with a [[workflow: {…}]] directive. Authoring saves it; a human launches the run from the Workflows pane, and stages execute as the DAG's ready-set clears. Format:
 [[workflow: {"name": "…", "description": "…", "inputLabel": "…", "stages": [
   {"id": "slug", "name": "…", "kind": "agent", "agent": "<roster agent name, omit for primary>", "prompt": "… {{input}} … {{nodes.<id>.output}} …", "after": ["<upstream ids>"]},
   {"id": "check", "kind": "gate", "title": "…", "body": "…", "approvals": 1, "onReject": "halt", "after": ["slug"]}
