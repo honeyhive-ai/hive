@@ -420,7 +420,7 @@ export function Sidebar({
   };
 
   return (
-    <aside className="flex shrink-0 flex-col border-r" style={asideStyle as CSSProperties}>
+    <aside data-tour="sidebar" className="flex shrink-0 flex-col border-r" style={asideStyle as CSSProperties}>
       {/* 1 — Workspace header: one identity row (spec §6.2). */}
       <div className="px-2.5 pt-3 pb-1.5">
         <button

@@ -79,7 +79,9 @@ pub async fn generate_reply(
     }
     // working_dir is the subprocess agent's cwd — an isolated worktree when the
     // worker is isolating this turn, else the plain workspace root.
-    dispatch::stream(rt, Some(system), turns, working_dir, &[], MAX_TOKENS, |_| {})
+    // The CLI is headless — it prints the final reply, so tool/thinking activity
+    // (the second callback) is dropped; only the desktop UI renders it live.
+    dispatch::stream(rt, Some(system), turns, working_dir, &[], MAX_TOKENS, |_| {}, |_| {})
         .await
         .map_err(|e| anyhow!("provider: {e}"))
 }

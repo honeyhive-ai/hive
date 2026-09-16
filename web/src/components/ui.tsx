@@ -253,7 +253,9 @@ export const panelStyle: CSSProperties = {
 };
 export const fieldStyle: CSSProperties = {
   borderColor: "var(--hive-line)",
-  background: "var(--hive-mist)",
+  // backgroundColor (not the `background` shorthand) so the global `select`
+  // rule's chevron background-image isn't wiped on dropdowns using this style.
+  backgroundColor: "var(--hive-mist)",
   color: "var(--hive-ink)",
 };
 /// Cool selection tint + border (the exact §2 recipe), reused by active rows.
@@ -538,12 +540,14 @@ export function SelectField({
   ariaLabel?: string;
 }) {
   return (
+    // Native chrome-stripping + the chevron come from the global `select` rule in
+    // styles.css, so every dropdown in the app (this and the raw ones) matches.
     <select
       value={value}
       aria-label={ariaLabel}
       disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
-      className="w-full rounded-xl border px-3 py-2 text-sm outline-none focus:border-[color:var(--hive-accent-cool)]"
+      className="w-full cursor-pointer rounded-xl border px-3 py-2 text-sm outline-none transition-colors focus:border-[color:var(--hive-accent-cool)] disabled:cursor-default disabled:opacity-50"
       style={fieldStyle}
     >
       {children}

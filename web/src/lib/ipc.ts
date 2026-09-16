@@ -9,6 +9,7 @@ import type { ChatSummaryDto } from "@/bindings/ChatSummaryDto";
 import type { ChannelDto } from "@/bindings/ChannelDto";
 import type { ChatSessionDto } from "@/bindings/ChatSessionDto";
 import type { ChatStreamEvent } from "@/bindings/ChatStreamEvent";
+import type { ChatActivityEvent } from "@/bindings/ChatActivityEvent";
 import type { GitFileDiffDto } from "@/bindings/GitFileDiffDto";
 import type { AppSettingsDto } from "@/bindings/AppSettingsDto";
 import type { WorkspaceAgentDto } from "@/bindings/WorkspaceAgentDto";
@@ -750,6 +751,15 @@ export const onChatStream = (
   cb: (e: ChatStreamEvent) => void,
 ): Promise<UnlistenFn> =>
   listen<ChatStreamEvent>("chat://stream", (evt) => cb(evt.payload));
+
+/// Subscribe to live background-activity (tool calls, results, thinking) for a
+/// running subprocess-agent turn. Ephemeral — shown under the generating bubble.
+export const onChatActivity = (
+  cb: (e: ChatActivityEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<ChatActivityEvent>("chat://activity", (evt) => cb(evt.payload));
+
+export type { ChatActivityEvent };
 
 /// Real connection health for the relay sync loop, updated on every sync
 /// attempt: `live` (last sync ok), `error` (last sync failed — see `lastError`),

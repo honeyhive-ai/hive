@@ -55,7 +55,9 @@ const THEME_CHOICES: { name: ThemeName; label: string; blurb: string }[] = [
   { name: "meadow", label: "Meadow", blurb: "Botanical green" },
 ];
 
-const inputStyle = { borderColor: "var(--hive-line)", background: "var(--hive-panel)" };
+// backgroundColor (not the `background` shorthand) so the global `select` rule's
+// chevron background-image survives on the runtime/model dropdowns.
+const inputStyle = { borderColor: "var(--hive-line)", backgroundColor: "var(--hive-panel)" };
 const field = "w-full rounded-xl border px-3 py-2.5 text-sm outline-none";
 
 // The Claude Code `--model` value can be a short alias (opus) or a full id
@@ -530,7 +532,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
                 <button
                   type="button"
                   className="w-full rounded-lg px-3 py-2 text-xs font-semibold text-white hover:brightness-110"
-                  style={{ background: "var(--hive-accent-cool)" }}
+                  style={{ background: "var(--hive-accent-cool)", color: "var(--hive-on-accent)" }}
                   onClick={() => void copyCodeAndOpenGithub(ghFlow.userCode, ghFlow.verificationUri)}
                 >
                   Copy code &amp; open GitHub ↗
@@ -578,7 +580,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
                         <input value={clientId} onChange={(e) => setClientId(e.target.value)} placeholder="Iv1.…" className={field + " font-mono text-xs"} style={inputStyle} />
                         <button
                           className="shrink-0 rounded-lg px-3 text-sm font-semibold text-white disabled:opacity-40"
-                          style={{ background: "var(--hive-accent-cool)" }}
+                          style={{ background: "var(--hive-accent-cool)", color: "var(--hive-on-accent)" }}
                           disabled={!clientId.trim()}
                           onClick={async () => {
                             await setGithubClientId(clientId.trim());
@@ -604,7 +606,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
           <div className="space-y-3">
             <div className="text-sm font-medium">Open your project</div>
             <div className="text-xs opacity-50">Pick the folder agents should work in (a git repo is ideal).</div>
-            <button className="rounded-xl px-3 py-2.5 text-sm font-semibold text-white" style={{ background: "var(--hive-accent-cool)" }} onClick={pickFolder}>
+            <button className="rounded-xl px-3 py-2.5 text-sm font-semibold text-white" style={{ background: "var(--hive-accent-cool)", color: "var(--hive-on-accent)" }} onClick={pickFolder}>
               {folder ? "Choose a different folder…" : "Choose folder…"}
             </button>
             {folder && <div className="truncate rounded-lg border px-3 py-2 font-mono text-xs" style={inputStyle}>✓ {folder}</div>}
@@ -897,7 +899,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
               onClick={next}
               disabled={!canNext || busy}
               className="rounded-xl px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
-              style={{ background: "var(--hive-accent-cool)" }}
+              style={{ background: "var(--hive-accent-cool)", color: "var(--hive-on-accent)" }}
             >
               {busy ? "…" : step === 5 ? "Finish" : "Next"}
             </button>

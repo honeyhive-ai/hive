@@ -23,6 +23,8 @@ export interface PaletteActions {
   openPane?: (pane: UtilityPane) => void;
   openSettingsTab?: (tab: string) => void;
   cycleAppearance?: () => void;
+  /// Relaunch the spotlight feature tour.
+  takeTour?: () => void;
 }
 
 interface Cmd {
@@ -94,6 +96,9 @@ export function CommandPalette({
     }
     if (actions.cycleAppearance) {
       items.push({ id: "appearance", label: "Toggle light / dark", hint: "Action", run: run(actions.cycleAppearance) });
+    }
+    if (actions.takeTour) {
+      items.push({ id: "take-tour", label: "Take the tour", hint: "Help", run: run(actions.takeTour) });
     }
     if (actions.openSettingsTab) {
       for (const t of SETTINGS_TABS) {

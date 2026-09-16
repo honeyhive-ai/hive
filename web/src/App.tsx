@@ -45,6 +45,7 @@ const WorkflowBuilder = lazy(() =>
 import { SettingsView, parseSettingsTab, type SettingsTab } from "@/components/SettingsView";
 import { RightRail } from "@/components/RightRail";
 import { Onboarding } from "@/components/Onboarding";
+import { Tour, type TourStep } from "@/components/Tour";
 import { ToastHost, toast, errMsg } from "@/components/Toast";
 import { UpdateBanner } from "@/components/UpdateBanner";
 import { PendingInvitesBanner } from "@/components/PendingInvitesBanner";
@@ -207,6 +208,40 @@ export function App() {
     !onboarded &&
     settings.data != null &&
     (settings.data.displayName.trim() === "" || settings.data.displayName.trim() === "You");
+
+  // Feature tour: a spotlight walk through the shell that DRIVES the UI (it flips
+  // the canvas mode and reveals panes as it goes). It's non-destructive — the
+  // layout it rearranges is snapshotted on start and restored on close, so the
+  // tour never leaves the app in a different state than it found it.
+  const [tourOpen, setTourOpen] = useState(false);
+  const tourSnapshot = useRef<{ mode: CanvasMode; utility: boolean; view: View } | null>(null);
+  function startTour() {
+    tourSnapshot.current = { mode, utility: showUtilityPane, view };
+    setSettingsOpen(false);
+    setWorkflowDraft(null);
+    setView("workspace");
+    setTourOpen(true);
+  }
+  function endTour() {
+    setTourOpen(false);
+    window.localStorage.setItem("hive.tourSeen", "1");
+    const snap = tourSnapshot.current;
+    if (snap) {
+      setMode(snap.mode);
+      setShowUtilityPane(snap.utility);
+      setView(snap.view);
+    }
+    tourSnapshot.current = null;
+  }
+  // Auto-run once — right after setup, and one time for existing users who
+  // predate the tour (they carry `hive.onboarded` but no `hive.tourSeen`).
+  useEffect(() => {
+    if (needsOnboarding || !onboarded || settings.data == null) return;
+    if (tourOpen || window.localStorage.getItem("hive.tourSeen") === "1") return;
+    const t = window.setTimeout(() => startTour(), 450);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [needsOnboarding, onboarded, settings.data]);
   const sync = useQuery({ queryKey: ["sync-status"], queryFn: syncStatus });
   const activeChat = useQuery({
     queryKey: ["chat", selectedId],
@@ -742,11 +777,77 @@ export function App() {
     );
   }
 
+  const tourSteps: TourStep[] = [
+    {
+      title: "Welcome to Hive",
+      body: "A 30-second tour of the workspace. Skip anytime — you can reopen this from the ⓘ button in the left rail, or ⌘K → “Take the tour.”",
+    },
+    {
+      anchor: "workspaces",
+      placement: "right",
+      title: "Your workspaces",
+      body: "Each workspace is a project — and, once you connect a relay, a team. Switch between them here, or use + to create or join one.",
+      before: () => setView("workspace"),
+    },
+    {
+      anchor: "sidebar",
+      placement: "right",
+      title: "Chats & agents",
+      body: "Your chats live here. Start one, then @-mention agents to bring them in — @hive always answers, and you can add your own agents on this or another machine.",
+      before: () => setSidebarVisible(true),
+    },
+    {
+      anchor: "canvas",
+      placement: "bottom",
+      title: "Talk to your agents",
+      body: "This is the chat canvas. Ask @hive to explain, review, or change code; it replies with proposed edits you stay in control of.",
+      before: () => setMode("chat"),
+    },
+    {
+      anchor: "canvas-tabs",
+      placement: "bottom",
+      title: "Chat · Diff · Code",
+      body: "Switch the canvas between the conversation, a per-file review of proposed changes, and a full code editor.",
+    },
+    {
+      anchor: "canvas",
+      placement: "bottom",
+      title: "Review changes",
+      body: "The Diff tab shows every proposed file change PR-style. Approve to commit it onto this chat’s own branch — nothing touches your files until you say so.",
+      before: () => setMode("diff"),
+    },
+    {
+      anchor: "canvas",
+      placement: "bottom",
+      title: "A real code editor",
+      body: "The Code tab is a full editor — file tree, integrated terminal, and language intelligence (hover, go-to-definition). Link a folder to a workspace to use it.",
+      before: () => setMode("code"),
+    },
+    {
+      anchor: "right-rail",
+      placement: "left",
+      title: "Tools, workflows & context",
+      body: "The right rail carries the agent roster and their hosts, multi-stage workflows, live context usage, and logs.",
+      before: () => {
+        setMode("chat");
+        setShowUtilityPane(true);
+      },
+    },
+    {
+      anchor: "help",
+      placement: "right",
+      title: "You’re all set",
+      body: "That’s the tour. Reopen it anytime from this ⓘ button, or press ⌘K and search “tour.” Happy building.",
+      before: () => setShowUtilityPane(tourSnapshot.current?.utility ?? false),
+    },
+  ];
+
   return (
     <div
       className="flex h-full min-w-0 overflow-hidden"
       style={{ background: "var(--hive-canvas)", color: "var(--hive-ink)" }}
     >
+      {tourOpen && <Tour steps={tourSteps} onClose={() => endTour()} />}
       <ToastHost />
       <DialogHost />
       <UpdateBanner />
@@ -805,6 +906,7 @@ export function App() {
           openSettingsTab: (tab) => openSettings(tab),
           cycleAppearance: () =>
             setAppearanceMode(appearanceMode === "dark" ? "light" : "dark"),
+          takeTour: () => startTour(),
         }}
       />
       <WorkspaceRail
@@ -813,6 +915,7 @@ export function App() {
         sidebarVisible={sidebarVisible}
         onToggleSidebar={() => setSidebarVisible((v) => !v)}
         onOpenSettings={() => openSettings()}
+        onOpenHelp={() => startTour()}
         settingsActive={settingsOpen}
       />
       <AddWorkspaceModal open={addWsOpen} onClose={() => setAddWsOpen(false)} />
@@ -865,7 +968,7 @@ export function App() {
         <PaneResizeHandle onPointerDown={startMenuResize} ariaLabel="Resize menu and chat panes" />
       )}
 
-      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main data-tour="canvas" className="flex min-w-0 flex-1 flex-col overflow-hidden">
         {view === "friends" ? (
           <PaneErrorBoundary label="Friends">
             <FriendsView
@@ -1217,6 +1320,7 @@ function CanvasModeTabs({
   ];
   return (
     <div
+      data-tour="canvas-tabs"
       className="flex shrink-0 items-center gap-0.5 rounded-xl border p-0.5"
       style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
       role="tablist"

@@ -21,7 +21,7 @@ use hive_core::{
 use hive_core::{ActorIdentity, ActorKind, MountedVault, VaultSource, WorkspaceMember};
 use hive_proto::{
     ApprovalDto, AppInfo, AppSettingsDto, ChannelDto, ChatMessageDto, ChatSessionDto,
-    ChatStreamEvent, ChatSummaryDto, ContextTelemetryDto, FsEntryDto, GitFileDiffDto, LspServerDto, McpServerDto, ProposalDto,
+    ChatActivityEvent, ChatStreamEvent, ChatSummaryDto, ContextTelemetryDto, FsEntryDto, GitFileDiffDto, LspServerDto, McpServerDto, ProposalDto,
     IssuedRelayTokenDto, MentionStateDto, QueuedWorkDto, ReactionDto, RelayTokenDto, RelayUserDto,
     RuntimeSummaryDto, SkillDto, VaultSourceDto, WorkspaceAgentDto, WorkspaceHostDto,
     WorkspaceInfoDto, WorkspaceMemberDto,
@@ -5356,7 +5356,7 @@ async fn summarize(
     }
     let turns = vec![ChatTurn::user(body)];
     let workspace_root = state.workspace_root.lock().unwrap().clone();
-    dispatch::stream(runtime, Some(instruction), &turns, Some(&workspace_root), &[], 512, |_| {})
+    dispatch::stream(runtime, Some(instruction), &turns, Some(&workspace_root), &[], 512, |_| {}, |_| {})
         .await
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -5514,7 +5514,7 @@ Reply with ONLY the title — no quotes, no surrounding punctuation, no trailing
 Title Case.";
     let turns = vec![ChatTurn::user(body)];
     let workspace_root = state.workspace_root.lock().unwrap().clone();
-    let raw = dispatch::stream(runtime, Some(system), &turns, Some(&workspace_root), &[], 32, |_| {})
+    let raw = dispatch::stream(runtime, Some(system), &turns, Some(&workspace_root), &[], 32, |_| {}, |_| {})
         .await
         .ok()?;
     let title = sanitize_title(&raw);
@@ -5998,6 +5998,44 @@ async fn run_prepared_turn(
                 let _ = svc.append_chunk(session_id, workspace_id, message_id, chunk);
                 last_flush = std::time::Instant::now();
             }
+        },
+        // Live "background processing" for the UI: the tool calls the agent makes,
+        // their results, and thinking. Pushed as a separate Tauri event and shown
+        // under the generating bubble; ephemeral (never persisted to the log).
+        |act| {
+            let ev = match act {
+                dispatch::StreamActivity::Tool { id, name, input_json } => ChatActivityEvent {
+                    session_id: session_id.to_string(),
+                    message_id: message_id.to_string(),
+                    kind: "tool".into(),
+                    id,
+                    name,
+                    input_json,
+                    content: String::new(),
+                    is_error: false,
+                },
+                dispatch::StreamActivity::ToolResult { call_id, is_error, content } => ChatActivityEvent {
+                    session_id: session_id.to_string(),
+                    message_id: message_id.to_string(),
+                    kind: "result".into(),
+                    id: call_id,
+                    name: String::new(),
+                    input_json: String::new(),
+                    content,
+                    is_error,
+                },
+                dispatch::StreamActivity::Thinking => ChatActivityEvent {
+                    session_id: session_id.to_string(),
+                    message_id: message_id.to_string(),
+                    kind: "thinking".into(),
+                    id: String::new(),
+                    name: String::new(),
+                    input_json: String::new(),
+                    content: String::new(),
+                    is_error: false,
+                },
+            };
+            let _ = app.emit(ChatActivityEvent::EVENT, ev);
         },
     );
     let result = tokio::select! {
@@ -6994,6 +7032,7 @@ async fn ping_runtime(runtime: ResolvedRuntime, workspace_root: Option<String>) 
         workspace_root.as_deref(),
         &[],
         32,
+        |_| {},
         |_| {},
     );
     let outcome = tokio::time::timeout(timeout, fut).await;

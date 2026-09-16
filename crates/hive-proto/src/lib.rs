@@ -410,6 +410,31 @@ impl ChatStreamEvent {
     pub const EVENT: &'static str = "chat://stream";
 }
 
+/// Ephemeral background-activity for a running subprocess-agent turn (Claude
+/// Code today): the tool calls it makes, their results, and a thinking marker.
+/// Pushed live and NOT persisted — the UI shows it under the generating bubble
+/// while the turn runs, then it's dropped when the turn completes. `kind` is
+/// "tool" (a tool call — `id`/`name`/`inputJson`), "result" (its output — `id`
+/// is the matching call id, `content`/`isError`), or "thinking".
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct ChatActivityEvent {
+    pub session_id: String,
+    pub message_id: String,
+    pub kind: String,
+    pub id: String,
+    pub name: String,
+    pub input_json: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+impl ChatActivityEvent {
+    /// The Tauri event name the frontend listens on.
+    pub const EVENT: &'static str = "chat://activity";
+}
+
 /// One stage of a workflow definition, flattened for the wire: `kind` is
 /// "agent" | "gate" and only that kind's optionals are populated.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -643,6 +668,7 @@ mod tests {
         ChannelDto::export_all(&cfg).unwrap();
         ChatSessionDto::export_all(&cfg).unwrap();
         ChatStreamEvent::export_all(&cfg).unwrap();
+        ChatActivityEvent::export_all(&cfg).unwrap();
         GitFileDiffDto::export_all(&cfg).unwrap();
         FsEntryDto::export_all(&cfg).unwrap();
         AppSettingsDto::export_all(&cfg).unwrap();

@@ -14,7 +14,7 @@ import {
 import { HiveBrandMark } from "@/components/HiveBrand";
 import { toast, errMsg } from "@/components/Toast";
 import { confirmThen } from "@/lib/confirm";
-import { IconPlus, IconUsers, IconPanelLeft, IconGear } from "@/lib/icons";
+import { IconPlus, IconUsers, IconPanelLeft, IconGear, IconInfo } from "@/lib/icons";
 
 /// Discord-style rail of workspace "servers": Personal (local) pinned at top,
 /// then each joined team room, then a ＋ to create/join one. Click selects
@@ -25,6 +25,7 @@ export function WorkspaceRail({
   sidebarVisible,
   onToggleSidebar,
   onOpenSettings,
+  onOpenHelp,
   settingsActive,
 }: {
   onJoinRoom: () => void;
@@ -35,6 +36,8 @@ export function WorkspaceRail({
   /// Settings lives at the rail's bottom (VS Code's activity-bar pattern) so
   /// it stays reachable when the sidebar is dismissed.
   onOpenSettings?: () => void;
+  /// Relaunch the product tour (also the tour's own final-step anchor).
+  onOpenHelp?: () => void;
   settingsActive?: boolean;
 }) {
   const qc = useQueryClient();
@@ -153,6 +156,7 @@ export function WorkspaceRail({
 
   return (
     <div
+      data-tour="workspaces"
       className="flex w-14 shrink-0 flex-col items-center gap-2 border-r py-3"
       style={{ background: "var(--hive-sidebar-bottom)", borderColor: "var(--hive-line)" }}
     >
@@ -251,13 +255,26 @@ export function WorkspaceRail({
         </button>
       )}
 
+      {onOpenHelp && (
+        <button
+          data-tour="help"
+          onClick={onOpenHelp}
+          title="Take the tour — a quick walk through Hive"
+          aria-label="Take the tour"
+          className={`flex h-10 w-10 items-center justify-center rounded-2xl transition-all hover:brightness-110 ${onOpenFriends || onToggleSidebar ? "" : "mt-auto"}`}
+          style={{ background: "var(--hive-panel)", color: "var(--hive-ink)", border: "1px solid var(--hive-line)", opacity: 0.85 }}
+        >
+          <IconInfo size={17} />
+        </button>
+      )}
+
       {onOpenSettings && (
         <button
           onClick={onOpenSettings}
           title="Settings"
           aria-label="Settings"
           aria-pressed={settingsActive}
-          className={`flex h-10 w-10 items-center justify-center rounded-2xl transition-all hover:brightness-110 ${onOpenFriends || onToggleSidebar ? "" : "mt-auto"}`}
+          className={`flex h-10 w-10 items-center justify-center rounded-2xl transition-all hover:brightness-110 ${onOpenFriends || onToggleSidebar || onOpenHelp ? "" : "mt-auto"}`}
           style={{
             background: settingsActive ? "var(--hive-accent-cool)" : "var(--hive-panel)",
             color: settingsActive ? "#fff" : "var(--hive-ink)",

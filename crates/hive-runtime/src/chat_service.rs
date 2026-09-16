@@ -544,7 +544,20 @@ impl ChatService {
     pub fn clear_stale_streaming(&mut self) -> Result<usize> {
         let mut cleared = 0usize;
         for session_id in self.store.list_session_ids()? {
-            let Some(session) = self.load(session_id)? else { continue };
+            // Isolate per-session failures. `load` projects the workspace config
+            // log on every call, so a single un-projectable session (e.g. leftover
+            // events from a since-rotated device/founder identity) would otherwise
+            // `?`-abort the whole sweep and strand ghosts in EVERY other session —
+            // the exact way an own-device stream stayed "generating" forever. Skip
+            // a session we can't load and keep going.
+            let session = match self.load(session_id) {
+                Ok(Some(s)) => s,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("clear stale streaming: skipping session {session_id}: {e}");
+                    continue;
+                }
+            };
             let workspace_id = session.workspace_id;
             let stale: Vec<(Uuid, String)> = session
                 .messages
@@ -559,12 +572,18 @@ impl ChatService {
                 .map(|m| (m.id, m.body.clone()))
                 .collect();
             for (message_id, body) in stale {
-                self.append_signed(
+                // Likewise isolate a failed completion: one bad append must not
+                // strand the remaining ghosts in this or later sessions.
+                match self.append_signed(
                     session_id,
                     workspace_id,
                     SessionEvent::MessageCompleted { message_id, body },
-                )?;
-                cleared += 1;
+                ) {
+                    Ok(_) => cleared += 1,
+                    Err(e) => {
+                        eprintln!("clear stale streaming: completing {message_id} failed: {e}");
+                    }
+                }
             }
         }
         Ok(cleared)
@@ -2621,6 +2640,28 @@ mod tests {
 
         // Idempotent: a second sweep finds nothing to clear.
         assert_eq!(svc.clear_stale_streaming().unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_stale_streaming_sweeps_every_session_not_just_the_first() {
+        // Regression: the sweep must not stop at the first session. A ghost left in
+        // a *later* session (as in the real report, where an earlier session's
+        // projection had aborted the whole `?`-chained sweep) has to be cleared too.
+        let (mut svc, _) = service();
+        let a = svc.create_chat("A", Uuid::nil(), "anthropic").unwrap();
+        let b = svc.create_chat("B", Uuid::nil(), "anthropic").unwrap();
+
+        let ga = svc.begin_assistant_message(a.id, a.workspace_id, "Hive", "anthropic", None, None).unwrap();
+        let gb = svc.begin_assistant_message(b.id, b.workspace_id, "Hive", "anthropic", None, None).unwrap();
+
+        let swept = svc.clear_stale_streaming().unwrap();
+        assert_eq!(swept, 2, "both sessions' ghosts swept");
+
+        for (sid, mid) in [(a.id, ga), (b.id, gb)] {
+            let s = svc.load(sid).unwrap().unwrap();
+            let m = s.messages.iter().find(|m| m.id == mid).unwrap();
+            assert!(!m.is_streaming, "ghost cleared in every session");
+        }
     }
 
     #[test]

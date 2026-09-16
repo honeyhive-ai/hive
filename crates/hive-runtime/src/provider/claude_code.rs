@@ -20,6 +20,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
 use super::anthropic::{ChatTurn, ProviderError};
+use super::dispatch::StreamActivity;
+
+/// Cap on a tool result's text carried in a live activity event — the raw output
+/// (a full file read, a long build log) can be huge, and it's only a preview.
+const RESULT_PREVIEW_CAP: usize = 4000;
 
 /// Render the conversation for the CLI prompt (stdin). Unlike the generic
 /// bridge there's no `assistant:` trailer — `claude -p` treats the whole text
@@ -63,6 +68,69 @@ pub fn extract_result(line: &str) -> Option<String> {
     v.get("result")?.as_str().map(str::to_owned)
 }
 
+/// Background-activity signals from one non-text stream-json line: `tool_use`
+/// blocks on an `assistant` line, `tool_result` blocks on a `user` line, and a
+/// `thinking` block (either). Returns empty for text/delta/result/system lines.
+/// The CLI re-emits an assistant snapshot as blocks fill in, so the same
+/// `tool_use` id can appear more than once — the UI dedups by id.
+pub fn extract_activity(line: &str) -> Vec<StreamActivity> {
+    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+    let content = v
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array);
+    let Some(blocks) = content else {
+        return out;
+    };
+    for b in blocks {
+        match b.get("type").and_then(Value::as_str) {
+            Some("tool_use") if ty == "assistant" => out.push(StreamActivity::Tool {
+                id: b.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                name: b.get("name").and_then(Value::as_str).unwrap_or("tool").to_string(),
+                input_json: b.get("input").map(Value::to_string).unwrap_or_default(),
+            }),
+            Some("tool_result") if ty == "user" => {
+                let mut content = tool_result_text(b.get("content"));
+                if content.len() > RESULT_PREVIEW_CAP {
+                    content.truncate(RESULT_PREVIEW_CAP);
+                    content.push('…');
+                }
+                out.push(StreamActivity::ToolResult {
+                    call_id: b
+                        .get("tool_use_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    is_error: b.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                    content,
+                });
+            }
+            Some("thinking") => out.push(StreamActivity::Thinking),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A `tool_result` `content` is either a plain string or an array of blocks
+/// (`{type:"text", text:…}`); flatten either to text.
+fn tool_result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|x| x.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
 /// Stream a reply from the Claude Code CLI. `program` is the binary (default
 /// `claude`); `extra_args` are appended; `working_dir` is added via `--add-dir`
 /// and used as the process cwd.
@@ -74,6 +142,9 @@ pub async fn stream_reply(
     system: Option<&str>,
     turns: &[ChatTurn],
     mut on_delta: impl FnMut(String),
+    // Live tool/thinking activity parsed from the same stream (Read/Bash/Edit,
+    // their results, thinking). Ephemeral — surfaced under the generating bubble.
+    mut on_activity: impl FnMut(StreamActivity),
 ) -> Result<String, ProviderError> {
     let program = if program.is_empty() { "claude" } else { program };
 
@@ -176,6 +247,12 @@ pub async fn stream_reply(
             on_delta(text);
         } else if let Some(result) = extract_result(&line) {
             result_fallback = Some(result);
+        } else {
+            // Non-text line: surface any tool calls / results / thinking so the UI
+            // can show what the agent is doing while it works.
+            for act in extract_activity(&line) {
+                on_activity(act);
+            }
         }
     }
 
@@ -233,6 +310,52 @@ mod tests {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"result":"Hello there","session_id":"x"}"#;
         assert_eq!(extract_result(line).as_deref(), Some("Hello there"));
         assert!(extract_text_delta(line).is_none());
+    }
+
+    #[test]
+    fn extracts_tool_use_from_assistant_line() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Let me look"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"src/lib.rs"}}]}}"#;
+        let acts = extract_activity(line);
+        assert_eq!(acts.len(), 1, "text block ignored, tool_use captured");
+        match &acts[0] {
+            StreamActivity::Tool { id, name, input_json } => {
+                assert_eq!(id, "toolu_1");
+                assert_eq!(name, "Read");
+                assert!(input_json.contains("src/lib.rs"));
+            }
+            other => panic!("expected Tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extracts_tool_result_from_user_line_string_and_array() {
+        let s = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":"file contents"}]}}"#;
+        match &extract_activity(s)[0] {
+            StreamActivity::ToolResult { call_id, is_error, content } => {
+                assert_eq!(call_id, "toolu_1");
+                assert!(!is_error);
+                assert_eq!(content, "file contents");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+        let arr = r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":[{"type":"text","text":"boom"}]}]}}"#;
+        match &extract_activity(arr)[0] {
+            StreamActivity::ToolResult { is_error, content, .. } => {
+                assert!(is_error);
+                assert_eq!(content, "boom");
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn thinking_and_non_activity_lines() {
+        let think = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
+        assert!(matches!(extract_activity(think).as_slice(), [StreamActivity::Thinking]));
+        // Text deltas, result lines, and junk carry no activity.
+        assert!(extract_activity(r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#).is_empty());
+        assert!(extract_activity(r#"{"type":"result","result":"done"}"#).is_empty());
+        assert!(extract_activity("not json").is_empty());
     }
 
     #[test]

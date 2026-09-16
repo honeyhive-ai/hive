@@ -1,6 +1,6 @@
 {
-  "tag": "v1.11.2",
-  "name": "Hive 1.11.2",
+  "tag": "v1.12.0",
+  "name": "Hive 1.12.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes the workspace label showing a chat's internal worktree path (chat-<hash>) instead of your project folder when switching between workspaces. The editor, terminal, and Diff still operate on the active chat's isolated worktree; the workspace name/folder shown in the UI now always reflects your linked folder. Patch on 1.11.0's per-workspace directories and per-chat worktrees."
+  "notes": "A guided feature tour (auto-runs once after setup; relaunch from the info button or the command palette) that spotlights each screen and drives the UI as it goes. Claude Code turns now show their background work live — the tool calls (Read/Bash/Edit), their results, and thinking appear under the generating bubble while the agent works, then the final reply replaces them. Adds an Add an agent entry point to the default In this chat pane, fixes button contrast on the Obsidian theme, and re-themes every dropdown so native OS chrome no longer clashes with the app. Also fixes a stale generating bubble that could persist across restarts when a turn was interrupted mid-stream."
 }

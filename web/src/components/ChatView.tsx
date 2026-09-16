@@ -7,6 +7,7 @@ import {
   listAgents,
   listMembers,
   onChatStream,
+  onChatActivity,
   presenceList,
   presencePing,
   saveAttachment,
@@ -115,6 +116,16 @@ export function ChatView({
   // messageId → accumulated text. A Map (not a single slot) because workflow
   // fan-out streams several assistant messages into the chat concurrently.
   const [streams, setStreams] = useState<Map<string, string>>(new Map());
+  // Live, ephemeral "background processing" per streaming message: the tool
+  // calls the agent (Claude Code) is making, their results, and whether it's
+  // thinking. Fed into the generating bubble's tool cards; cleared when the turn
+  // retires (see the terminal handler) and on session switch. Never persisted.
+  type LiveActivity = {
+    calls: { id: string; name: string; inputJson: string; serverId: string | null }[];
+    results: { callId: string; content: string; isError: boolean }[];
+    thinking: boolean;
+  };
+  const [activity, setActivity] = useState<Map<string, LiveActivity>>(new Map());
   // Set when a turn dies mid-stream (phase "error") so a failed generation is
   // visibly distinct from a finished one; cleared on the next send / session.
   const [streamError, setStreamError] = useState<string | null>(null);
@@ -258,7 +269,15 @@ export function ChatView({
         // whether the LAST one is gone (→ clear sending/optimistic). Zero-delta
         // completions still clear when they're the only in-flight turn.
         if (retiredIdsRef.current.has(mid)) return;
-        const retire = () =>
+        const retire = () => {
+          // Drop the ephemeral activity strip — the persisted turn (final prose)
+          // now stands in the transcript.
+          setActivity((prev) => {
+            if (!prev.has(mid)) return prev;
+            const n = new Map(prev);
+            n.delete(mid);
+            return n;
+          });
           setStreams((prev) => {
             const t = handleTerminal(prev, retiredIdsRef.current, mid);
             retiredIdsRef.current = t.retired;
@@ -268,6 +287,7 @@ export function ChatView({
             }
             return t.streams;
           });
+        };
         void qc
           .invalidateQueries({ queryKey: ["chat", sessionRef.current] })
           .finally(() => {
@@ -281,8 +301,47 @@ export function ChatView({
     };
   }, [qc]);
 
+  // Live background-activity (Claude Code tool calls / results / thinking).
+  // Accumulates per streaming message; the generating bubble renders it as tool
+  // cards. Dedups tool calls by id (the CLI re-emits an assistant snapshot as the
+  // input fills in) and results by call id.
+  useEffect(() => {
+    const unlisten = onChatActivity((e) => {
+      if (e.sessionId !== sessionRef.current) return;
+      lastActivityRef.current = Date.now();
+      setStalled(false);
+      setActivity((prev) => {
+        const next = new Map(prev);
+        const cur = next.get(e.messageId) ?? { calls: [], results: [], thinking: false };
+        const calls = cur.calls.slice();
+        const results = cur.results.slice();
+        let thinking = cur.thinking;
+        if (e.kind === "tool") {
+          const call = { id: e.id, name: e.name, inputJson: e.inputJson, serverId: null };
+          const i = calls.findIndex((c) => c.id === e.id);
+          if (i >= 0) calls[i] = call;
+          else calls.push(call);
+          thinking = false; // a real tool call supersedes the thinking hint
+        } else if (e.kind === "result") {
+          const res = { callId: e.id, content: e.content, isError: e.isError };
+          const i = results.findIndex((r) => r.callId === e.id);
+          if (i >= 0) results[i] = res;
+          else results.push(res);
+        } else if (e.kind === "thinking") {
+          thinking = true;
+        }
+        next.set(e.messageId, { calls, results, thinking });
+        return next;
+      });
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
   useEffect(() => {
     setStreams(new Map());
+    setActivity(new Map());
     setStreamError(null);
     setStalled(false);
     setQueued(null);
@@ -697,13 +756,14 @@ export function ChatView({
       toast.error(`Couldn't stop: ${errMsg(e)}`);
     } finally {
       setStreams(new Map());
+      setActivity(new Map());
       setSending(false);
       setOptimisticUser(null);
       qc.invalidateQueries({ queryKey: ["chat", sessionId] });
     }
   }
   // A turn is in flight whenever we're sending or a stream is live.
-  const busy = sending || streams.size > 0;
+  const busy = sending || streams.size > 0 || activity.size > 0;
 
   // Mirrored into refs so the stall watchdog (deps: [busy]) reads fresh transcript
   // state without re-subscribing on every token. Assigned once `messages` is
@@ -928,7 +988,9 @@ export function ChatView({
             // handoff (we keep the bubble until the refetch lands, above). The
             // stream bubble is the single source until it retires, so this never
             // renders the turn twice, and the swap is seamless (no anchor jump).
-            .filter((m) => !streams.has(m.id))
+            // …and while its live activity strip stands (tool calls can arrive
+            // before the first text token, so a turn is "live" via activity too).
+            .filter((m) => !streams.has(m.id) && !activity.has(m.id))
             .map((m, idx, arr) => {
               // Day separator when the calendar day changes from the prior turn.
               const showDay =
@@ -985,9 +1047,25 @@ export function ChatView({
               );
             })}
           {optimisticUser && <Bubble role="user" author={selfName} body={optimisticUser} avatarUrl={selfAvatarUrl} />}
-          {[...streams.entries()].map(([id, text]) => (
-            <Bubble key={id} role="assistant" author={streamAuthor} handle={streamHandle} body={text} via={liveProvenance.via} model={liveProvenance.model} host={liveProvenance.host} streaming />
-          ))}
+          {[...new Set([...streams.keys(), ...activity.keys()])].map((id) => {
+            const act = activity.get(id);
+            return (
+              <Bubble
+                key={id}
+                role="assistant"
+                author={streamAuthor}
+                handle={streamHandle}
+                body={streams.get(id) ?? ""}
+                via={liveProvenance.via}
+                model={liveProvenance.model}
+                host={liveProvenance.host}
+                toolCalls={act?.calls}
+                toolResults={act?.results}
+                thinking={act?.thinking}
+                streaming
+              />
+            );
+          })}
           {queued != null && (
             <div className="flex items-start justify-end gap-2 py-1 pr-1 text-sm opacity-60" role="status">
               <span aria-hidden style={{ opacity: 0.7 }}>⏳</span>
@@ -1005,7 +1083,7 @@ export function ChatView({
               </button>
             </div>
           )}
-          {sending && streams.size === 0 && !stalled && <TypingDots label={`${streamAuthor} is thinking`} />}
+          {sending && streams.size === 0 && activity.size === 0 && !stalled && <TypingDots label={`${streamAuthor} is thinking`} />}
           {busy && stalled && (
             <div className="tt-note" role="status">
               <span aria-hidden className="shrink-0" style={{ flex: "0 0 auto" }}>
@@ -1700,6 +1778,7 @@ const Bubble = memo(function Bubble({
   reactions,
   toolCalls,
   toolResults,
+  thinking = false,
   onReact,
   onRegenerate,
 }: {
@@ -1725,6 +1804,9 @@ const Bubble = memo(function Bubble({
   reactions?: { emoji: string; actorId: string; actorDisplayName: string }[];
   toolCalls?: { id: string; name: string; inputJson: string; serverId: string | null }[];
   toolResults?: { callId: string; content: string; isError: boolean }[];
+  /// Live-only: the agent is thinking this step (shown as a dim marker while it
+  /// streams, before any tool call or text).
+  thinking?: boolean;
   onReact?: (messageId: string, emoji: string) => void;
   onRegenerate?: () => void;
 }) {
@@ -1854,6 +1936,12 @@ const Bubble = memo(function Bubble({
           {content}
           {toolCalls && toolCalls.length > 0 && (
             <ToolCallCards calls={toolCalls} results={toolResults ?? []} />
+          )}
+          {thinking && (!toolCalls || toolCalls.length === 0) && !body && (
+            <div className="tcall-h" style={{ opacity: 0.6 }} aria-label="thinking">
+              <span aria-hidden>💭</span>
+              <span className="tcall-n">thinking…</span>
+            </div>
           )}
         </div>
 

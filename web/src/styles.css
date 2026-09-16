@@ -269,6 +269,18 @@ option {
    it explicitly. */
 select {
   color: var(--hive-ink);
+  /* Strip the native OS chrome (macOS' blue double-arrow box that ignores the
+     theme) and draw our own chevron, so every dropdown matches the app in every
+     palette. The open option list stays OS-native — WebKit won't style that
+     popup — but the closed control (the eyesore) is now themed. The chevron is a
+     muted grey that reads on both light and dark fills; padding-right (important,
+     to beat utility `px-*`) reserves room for it. */
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='11' height='11' viewBox='0 0 24 24' fill='none' stroke='%238b8f99' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.7rem center;
+  padding-right: 1.9rem !important;
 }
 select option,
 select optgroup {

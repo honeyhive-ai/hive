@@ -83,6 +83,7 @@ import {
 import {
   IconX,
   IconChevronDown,
+  IconPlus,
 } from "@/lib/icons";
 import { PANES, type UtilityPane } from "@/lib/panes";
 import { WorkflowsPane } from "@/components/WorkflowsPane";
@@ -144,6 +145,7 @@ export function RightRail({
 
   return (
     <aside
+      data-tour="right-rail"
       className="relative flex shrink-0 overflow-hidden border-l"
       style={{ width, borderColor: "var(--hive-line)", background: "var(--hive-panel)" }}
     >
@@ -420,6 +422,20 @@ function ToolsPane({
                 </div>
               </Card>
             ))}
+            {/* Agents live on the workspace roster, so adding one happens in the
+                Workspace scope — but the chat view is the default, so surface a
+                one-click entry point here that jumps there with the form open,
+                instead of leaving "add an agent" undiscoverable behind the toggle. */}
+            <button
+              onClick={() => {
+                setScope("workspace");
+                setShowAddAgent(true);
+              }}
+              className="mt-1 flex w-full items-center justify-center gap-1.5 rounded-xl border border-dashed px-3 py-2 text-[12px] font-medium transition-colors hover:brightness-110"
+              style={{ borderColor: "var(--hive-line)", color: "var(--hive-ink-soft)" }}
+            >
+              <IconPlus size={13} /> Add an agent
+            </button>
           </Section>
 
           <Section title="Tools reachable">

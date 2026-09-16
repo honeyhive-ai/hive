@@ -36,6 +36,29 @@ impl ResolvedRuntime {
     }
 }
 
+/// A live "background processing" signal from a subprocess agent (Claude Code):
+/// the tool it's calling, a tool's result, or a thinking marker. Surfaced to the
+/// UI while the turn runs; ephemeral (never persisted). Only providers whose
+/// stream carries structured tool events emit these — HTTP providers don't.
+#[derive(Debug, Clone)]
+pub enum StreamActivity {
+    /// A tool the agent invoked (e.g. Read/Bash/Edit). `input_json` is the raw
+    /// arguments object.
+    Tool {
+        id: String,
+        name: String,
+        input_json: String,
+    },
+    /// The result of a prior [`StreamActivity::Tool`], matched by `call_id`.
+    ToolResult {
+        call_id: String,
+        is_error: bool,
+        content: String,
+    },
+    /// The agent produced extended-thinking content this step.
+    Thinking,
+}
+
 /// Stream a reply against `rt`, invoking `on_delta` for each fragment and
 /// returning the assembled body.
 pub async fn stream(
@@ -48,6 +71,9 @@ pub async fn stream(
     extra_env: &[(String, String)],
     max_tokens: u32,
     on_delta: impl FnMut(String),
+    // Live tool/thinking activity. Only the subprocess-agent arms emit it; HTTP
+    // providers ignore it (their stream carries no structured tool events).
+    on_activity: impl FnMut(StreamActivity),
 ) -> Result<String, ProviderError> {
     match rt.provider {
         ModelProviderKind::Anthropic => {
@@ -80,6 +106,7 @@ pub async fn stream(
                 system,
                 turns,
                 on_delta,
+                on_activity,
             )
             .await
         }
