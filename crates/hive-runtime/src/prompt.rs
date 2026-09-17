@@ -4,8 +4,72 @@
 //! participant aware of who else is in the workspace, their roles, and that
 //! they can reach them with `@mentions`.
 
-use hive_core::{ChatSession, WorkspaceAgent};
+use hive_core::{ChatSession, ModelProviderKind, WorkspaceAgent};
 use uuid::Uuid;
+
+use crate::provider::dispatch::ResolvedRuntime;
+use crate::provider::endpoint_host;
+
+/// Human-readable provider name for the identity block.
+fn provider_display(provider: ModelProviderKind) -> &'static str {
+    match provider {
+        ModelProviderKind::Anthropic => "Anthropic API",
+        ModelProviderKind::OpenAI => "OpenAI API",
+        ModelProviderKind::OpenRouter => "OpenRouter",
+        ModelProviderKind::Ollama => "Ollama (OpenAI-compatible endpoint)",
+        ModelProviderKind::Azure => "Azure OpenAI",
+        ModelProviderKind::Custom => "custom OpenAI-compatible endpoint",
+        ModelProviderKind::HiveDaemon => "Hive daemon (OpenAI-compatible endpoint)",
+        ModelProviderKind::ClaudeCode => "Claude Code CLI",
+        ModelProviderKind::Codex => "OpenAI Codex CLI",
+        ModelProviderKind::Aider => "aider CLI",
+        ModelProviderKind::Pi => "pi CLI",
+        ModelProviderKind::Hermes => "hermes CLI",
+    }
+}
+
+/// A short, authoritative statement of what the responder actually runs on.
+///
+/// Models — small local ones especially — have no visibility into their own
+/// runtime and will confabulate ("shared compute", made-up product names) when
+/// asked. This block gives them the true answer, and, for plain HTTP turns
+/// that carry no tool definitions, tells them they cannot act on files or run
+/// commands so they don't pretend to. `host` is the device label the request
+/// is made from.
+pub fn runtime_identity_block(rt: &ResolvedRuntime, host: &str) -> String {
+    let mut lines = vec![
+        "Your runtime (authoritative — when asked what model, provider, or \
+infrastructure you run on, answer from these facts; never guess or invent names):"
+            .to_string(),
+        format!("- provider: {}", provider_display(rt.provider)),
+    ];
+    let model = rt.model.trim();
+    if model.is_empty() {
+        lines.push("- model: chosen by the CLI (its default)".to_string());
+    } else {
+        lines.push(format!("- model: {model}"));
+    }
+    if rt.is_subprocess() || matches!(rt.provider, ModelProviderKind::Codex | ModelProviderKind::Hermes) {
+        let program = if rt.endpoint.trim().is_empty() { "(default)" } else { rt.endpoint.trim() };
+        lines.push(format!("- program: {program}"));
+    } else if rt.provider == ModelProviderKind::Anthropic {
+        lines.push("- endpoint: api.anthropic.com".to_string());
+    } else if !rt.endpoint.trim().is_empty() {
+        lines.push(format!("- endpoint: {}", endpoint_host(&rt.endpoint)));
+    }
+    if !host.trim().is_empty() {
+        lines.push(format!("- runs from: {}", host.trim()));
+    }
+    if rt.is_openai_wire() {
+        lines.push(
+            "This request carries no tool definitions: you cannot run commands, read \
+or edit files, browse, or call APIs — you can only reply with text. If asked to do \
+those, say so plainly rather than pretending you did."
+                .to_string(),
+        );
+    }
+    lines.join("\n")
+}
 
 /// A human-readable roster of everyone in the workspace and how to address them.
 pub fn workspace_roster(session: &ChatSession) -> String {
@@ -226,6 +290,45 @@ mod tests {
             assert!(p.contains("Review pane"));
             assert!(p.contains("NOT auto-executed"));
         }
+    }
+
+    fn ollama_rt() -> ResolvedRuntime {
+        ResolvedRuntime {
+            provider: ModelProviderKind::Ollama,
+            model: "qwen3.5".into(),
+            endpoint: "http://100.64.0.5:11434/v1/chat/completions".into(),
+            api_key: None,
+            args: vec![],
+            model_provider_id: None,
+            model_base_url: None,
+            context_window_tokens: None,
+        }
+    }
+
+    #[test]
+    fn identity_block_names_provider_model_host_and_no_tools_for_http() {
+        let b = runtime_identity_block(&ollama_rt(), "Michael's MacBook (this device)");
+        assert!(b.contains("provider: Ollama"), "{b}");
+        assert!(b.contains("model: qwen3.5"), "{b}");
+        assert!(b.contains("endpoint: 100.64.0.5:11434"), "{b}");
+        assert!(!b.contains("/v1/chat/completions"), "path must not leak: {b}");
+        assert!(b.contains("runs from: Michael's MacBook"), "{b}");
+        assert!(b.contains("no tool definitions"), "{b}");
+        assert!(b.contains("never guess"), "{b}");
+    }
+
+    #[test]
+    fn identity_block_for_claude_code_names_the_cli_and_omits_no_tools_line() {
+        let mut rt = ollama_rt();
+        rt.provider = ModelProviderKind::ClaudeCode;
+        rt.model = String::new();
+        rt.endpoint = "claude".into();
+        let b = runtime_identity_block(&rt, "");
+        assert!(b.contains("Claude Code CLI"), "{b}");
+        assert!(b.contains("chosen by the CLI"), "{b}");
+        assert!(b.contains("program: claude"), "{b}");
+        assert!(!b.contains("runs from"), "{b}");
+        assert!(!b.contains("no tool definitions"), "{b}");
     }
 
     #[test]

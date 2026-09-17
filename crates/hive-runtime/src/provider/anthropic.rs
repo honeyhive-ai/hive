@@ -29,6 +29,24 @@ pub enum ProviderError {
     Decode(String),
     #[error("subprocess error: {0}")]
     Subprocess(String),
+    /// The HTTP endpoint could not be reached (refused, no route, connect
+    /// timeout) — even after a reconnect attempt. Names the host so a
+    /// remote/Tailscale Ollama box that's asleep is obvious from the message.
+    #[error("{provider} at {host} is unreachable ({detail}) — check that the server is running and, if it's a remote or Tailscale host, that the tunnel is up")]
+    Unreachable {
+        provider: &'static str,
+        host: String,
+        detail: String,
+    },
+    /// The endpoint accepted the request but produced no bytes for the idle
+    /// window (headers or stream). Distinct from a wall-clock cap: a slow but
+    /// steadily streaming model never hits this.
+    #[error("{provider} at {host} produced no output for {secs}s — the server may still be loading the model, be wedged, or the link may have dropped; if it's just slow, raise HIVE_TURN_IDLE_TIMEOUT_SECS")]
+    Idle {
+        provider: &'static str,
+        host: String,
+        secs: u64,
+    },
 }
 
 /// One conversation turn in provider wire shape.

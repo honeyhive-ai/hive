@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use hive_core::context_budget::{model_context_window, token_estimator};
+use hive_core::context_budget::token_estimator;
 use hive_core::{
     ActionProposal, ChatMessage, ChatSession, GitContextReader, MessageRole, ModelProviderKind,
     ProposalKind, ProposalStatus, RuntimeTarget, SkillProfile, WorkspaceAgent, WorkspaceRole,
@@ -2779,6 +2779,10 @@ impl AppState {
                     // at it. (`endpoint` here is the executable path, not a URL.)
                     model_provider_id: rt.model_provider_id.clone(),
                     model_base_url: rt.model_base_url.clone().filter(|s| !s.is_empty()),
+                    // The user's explicit context-window setting (Settings →
+                    // Runtimes) — honored by the budget planner over the
+                    // model-name guess.
+                    context_window_tokens: rt.capabilities.context_window_tokens.filter(|w| *w > 0),
                 };
             }
         }
@@ -2793,6 +2797,7 @@ impl AppState {
             args: claude_args,
             model_provider_id: None,
             model_base_url: None,
+            context_window_tokens: None,
         }
     }
 }
@@ -5012,7 +5017,11 @@ fn context_snapshot(
     session: &ChatSession,
     responder: &Responder,
 ) -> ContextSnapshot {
-    let window_tokens = model_context_window::tokens_for_model(&responder.runtime.model) as i64;
+    // The runtime's explicit context-window setting wins over the model-name
+    // guess: an Ollama server defaults to a 4k window whatever the model could
+    // take, so the name-based 32k for "qwen" would over-send and get silently
+    // truncated server-side.
+    let window_tokens = responder.runtime.context_window() as i64;
     let system_prompt_tokens = token_estimator::estimate_text(&responder.system_base) as i64;
     let history_budget_tokens =
         (window_tokens - OUTPUT_RESERVE_TOKENS - system_prompt_tokens - SUMMARY_RESERVE_TOKENS)
@@ -5050,23 +5059,34 @@ fn context_snapshot(
 }
 
 fn responder_for(state: &AppState, session: &ChatSession, agent: Option<&WorkspaceAgent>) -> Responder {
+    // A turn built here is dispatched from this device, so "runs from" is us.
+    let host = format!("{} (this device)", state.device_name);
+    let with_identity = |base: String, runtime: &ResolvedRuntime| {
+        format!("{base}\n\n{}", prompt::runtime_identity_block(runtime, &host))
+    };
     match agent {
-        Some(a) => Responder {
-            system_base: prompt::agent_system_prompt(session, a),
-            agent_id: Some(a.id),
-            author: a.name.clone(),
-            runtime_id: a.runtime_id.clone(),
-            runtime: state.resolve_runtime(&a.runtime_id),
-            owner_actor_id: a.owner_actor_id.clone(),
-        },
-        None => Responder {
-            system_base: prompt::primary_system_prompt(session),
-            agent_id: None,
-            author: "Hive".to_string(),
-            runtime_id: session.runtime_id.clone(),
-            runtime: state.resolve_runtime(&session.runtime_id),
-            owner_actor_id: session.creator_actor_id.clone(),
-        },
+        Some(a) => {
+            let runtime = state.resolve_runtime(&a.runtime_id);
+            Responder {
+                system_base: with_identity(prompt::agent_system_prompt(session, a), &runtime),
+                agent_id: Some(a.id),
+                author: a.name.clone(),
+                runtime_id: a.runtime_id.clone(),
+                runtime,
+                owner_actor_id: a.owner_actor_id.clone(),
+            }
+        }
+        None => {
+            let runtime = state.resolve_runtime(&session.runtime_id);
+            Responder {
+                system_base: with_identity(prompt::primary_system_prompt(session), &runtime),
+                agent_id: None,
+                author: "Hive".to_string(),
+                runtime_id: session.runtime_id.clone(),
+                runtime,
+                owner_actor_id: session.creator_actor_id.clone(),
+            }
+        }
     }
 }
 
@@ -6393,14 +6413,17 @@ async fn run_prepared_turn(
                     content,
                     is_error,
                 },
-                dispatch::StreamActivity::Thinking => ChatActivityEvent {
+                // `content` carries a reasoning model's chain-of-thought fragment
+                // (empty for Claude Code's bare marker). Never persisted, never
+                // parsed for mentions/directives.
+                dispatch::StreamActivity::Thinking { text } => ChatActivityEvent {
                     session_id: session_id.to_string(),
                     message_id: message_id.to_string(),
                     kind: "thinking".into(),
                     id: String::new(),
                     name: String::new(),
                     input_json: String::new(),
-                    content: String::new(),
+                    content: text,
                     is_error: false,
                 },
             };
@@ -7526,6 +7549,7 @@ async fn probe_provider(
         args: if provider == ModelProviderKind::ClaudeCode { claude_args } else { Vec::new() },
         model_provider_id: None,
         model_base_url: base,
+        context_window_tokens: None,
     };
     let workspace_root = {
         let r = state.workspace_root.lock().unwrap().clone();

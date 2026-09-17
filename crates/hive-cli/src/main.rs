@@ -367,6 +367,7 @@ fn resolve_runtime_from_env() -> Result<(ResolvedRuntime, String)> {
         args: Vec::new(),
         model_provider_id: None,
         model_base_url: None,
+        context_window_tokens: None,
     };
     Ok((rt, format!("{provider_str}/{model}")))
 }
@@ -569,6 +570,7 @@ fn resolve_agent_runtime(cfg: &Config, runtime_id: Option<&str>) -> Result<(Reso
         args: Vec::new(),
         model_provider_id: None,
         model_base_url: None,
+        context_window_tokens: None,
     };
     Ok((rt, format!("workspace:{}", wr.name)))
 }
@@ -608,8 +610,10 @@ async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Re
         }
     }
     println!("agent @{name} online ({rt_label}); replying to @primary / un-mentioned turns. Ctrl-C to stop.");
+    let host_label = env_opt("HOSTNAME").unwrap_or_else(|| "this worker".into());
     let system = format!(
-        "You are @{name}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully."
+        "You are @{name}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.\n\n{}",
+        hive_runtime::prompt::runtime_identity_block(&rt, &host_label)
     );
     loop {
         if cfg.relay_url.is_some() {
@@ -785,6 +789,7 @@ fn agent_workspace_runtime(
         args,
         model_provider_id: None,
         model_base_url: None,
+        context_window_tokens: None,
     };
     Ok((rt, wr.id.clone()))
 }
@@ -797,6 +802,12 @@ fn agent_workspace_runtime(
 /// back. A failing turn is isolated and not retried in a tight loop.
 async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
     let ws = uuid_of_room(&cfg.room);
+    // Same label `cmd_register_worker` publishes, reused for the identity block
+    // so an agent can say which worker it runs on.
+    let host_label = label
+        .clone()
+        .or_else(|| env_opt("HOSTNAME"))
+        .unwrap_or_else(|| "worker".into());
     let my_host = cmd_register_worker(cfg, label)?;
     if cfg.relay_url.is_some() {
         let _ = sync_once(cfg).await;
@@ -822,7 +833,7 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
         }
         // A transient store/DB error inside a tick must NOT kill the daemon —
         // log it and retry on the next tick (bare `?` here used to abort the loop).
-        if let Err(e) = drain_worker_tick(cfg, ws, &my_host, &mut failed).await {
+        if let Err(e) = drain_worker_tick(cfg, ws, &my_host, &host_label, &mut failed).await {
             eprintln!("worker: tick failed (retrying): {e}");
         }
         if cfg.relay_url.is_some() {
@@ -873,6 +884,7 @@ async fn drain_worker_tick(
     cfg: &Config,
     ws: Uuid,
     my_host: &str,
+    host_label: &str,
     failed: &mut HashSet<Uuid>,
 ) -> Result<()> {
     let mut svc = open_service(cfg)?;
@@ -934,8 +946,9 @@ async fn drain_worker_tick(
             let mut turns = turns_for(&s, Some(agent.id), &agent.name);
             materialize_turns(cfg, &mut turns).await;
             let system = format!(
-                "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.",
-                agent.name
+                "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.\n\n{}",
+                agent.name,
+                hive_runtime::prompt::runtime_identity_block(&rt, &format!("worker {host_label}"))
             );
             print!("↳ @{} replying in {} … ", agent.name, s.id);
             // H1 gate: resolve the triggering message's author + role and only

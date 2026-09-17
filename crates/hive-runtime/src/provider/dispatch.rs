@@ -24,9 +24,36 @@ pub struct ResolvedRuntime {
     /// the pi bridge bootstraps a provider config pointing here.
     pub model_provider_id: Option<String>,
     pub model_base_url: Option<String>,
+    /// Explicit context-window override from the runtime's settings (tokens).
+    /// `None` ⇒ infer from the model name. Local servers (Ollama) default to a
+    /// small window regardless of what the model *could* take, so the user's
+    /// setting must win over the name-based guess.
+    pub context_window_tokens: Option<u32>,
 }
 
 impl ResolvedRuntime {
+    /// Effective context window: the explicit override, else the model-name
+    /// table in `hive_core::context_budget`.
+    pub fn context_window(&self) -> u32 {
+        match self.context_window_tokens {
+            Some(n) if n > 0 => n,
+            _ => hive_core::context_budget::model_context_window::tokens_for_model(&self.model),
+        }
+    }
+
+    /// True for runtimes reached over the OpenAI-compatible HTTP wire.
+    pub fn is_openai_wire(&self) -> bool {
+        matches!(
+            self.provider,
+            ModelProviderKind::OpenAI
+                | ModelProviderKind::OpenRouter
+                | ModelProviderKind::Ollama
+                | ModelProviderKind::Custom
+                | ModelProviderKind::HiveDaemon
+                | ModelProviderKind::Azure
+        )
+    }
+
     /// True for runtimes executed by spawning an external CLI.
     pub fn is_subprocess(&self) -> bool {
         matches!(
@@ -55,12 +82,34 @@ pub enum StreamActivity {
         is_error: bool,
         content: String,
     },
-    /// The agent produced extended-thinking content this step.
-    Thinking,
+    /// The agent produced reasoning this step. `text` is the fragment when
+    /// the provider streams it (OpenAI-wire `reasoning` deltas / `<think>`
+    /// blocks); empty for providers that only signal a marker (Claude Code).
+    Thinking { text: String },
+}
+
+/// Error-message label for an OpenAI-wire provider kind.
+pub fn provider_label(provider: ModelProviderKind) -> &'static str {
+    match provider {
+        ModelProviderKind::Anthropic => "anthropic",
+        ModelProviderKind::OpenAI => "openai",
+        ModelProviderKind::OpenRouter => "openrouter",
+        ModelProviderKind::Ollama => "ollama",
+        ModelProviderKind::Azure => "azure",
+        ModelProviderKind::Custom => "endpoint",
+        ModelProviderKind::HiveDaemon => "hive-daemon",
+        ModelProviderKind::Aider => "aider",
+        ModelProviderKind::Pi => "pi",
+        ModelProviderKind::ClaudeCode => "claude-code",
+        ModelProviderKind::Codex => "codex",
+        ModelProviderKind::Hermes => "hermes",
+    }
 }
 
 /// Stream a reply against `rt`, invoking `on_delta` for each fragment and
-/// returning the assembled body.
+/// returning the assembled body. A reasoning model's chain of thought (Ollama /
+/// OpenRouter `reasoning` deltas, or inline `<think>` blocks) is delivered as
+/// [`StreamActivity::Thinking`] and is never part of the returned body.
 pub async fn stream(
     rt: &ResolvedRuntime,
     system: Option<&str>,
@@ -71,9 +120,9 @@ pub async fn stream(
     extra_env: &[(String, String)],
     max_tokens: u32,
     on_delta: impl FnMut(String),
-    // Live tool/thinking activity. Only the subprocess-agent arms emit it; HTTP
-    // providers ignore it (their stream carries no structured tool events).
-    on_activity: impl FnMut(StreamActivity),
+    // Live tool/thinking activity: subprocess agents emit tool calls/results;
+    // OpenAI-wire providers emit reasoning fragments.
+    mut on_activity: impl FnMut(StreamActivity),
 ) -> Result<String, ProviderError> {
     match rt.provider {
         ModelProviderKind::Anthropic => {
@@ -92,7 +141,15 @@ pub async fn stream(
             // `api-key` header instead of a bearer token.
             OpenAiClient::new(&rt.endpoint)
                 .with_api_key_header(rt.provider == ModelProviderKind::Azure)
-                .stream_reply(rt.api_key.as_deref(), &rt.model, system, turns, on_delta)
+                .with_provider_label(provider_label(rt.provider))
+                .stream_reply_with_thinking(
+                    rt.api_key.as_deref(),
+                    &rt.model,
+                    system,
+                    turns,
+                    on_delta,
+                    |text| on_activity(StreamActivity::Thinking { text }),
+                )
                 .await
         }
         ModelProviderKind::ClaudeCode => {
@@ -277,10 +334,36 @@ mod tests {
             args: vec![],
             model_provider_id: None,
             model_base_url: None,
+            context_window_tokens: None,
         };
         assert!(rt.is_subprocess());
         rt.provider = ModelProviderKind::Anthropic;
         assert!(!rt.is_subprocess());
+        assert!(!rt.is_openai_wire());
+        rt.provider = ModelProviderKind::Ollama;
+        assert!(rt.is_openai_wire());
+    }
+
+    #[test]
+    fn context_window_override_beats_model_name_guess() {
+        let mut rt = ResolvedRuntime {
+            provider: ModelProviderKind::Ollama,
+            model: "qwen3.5".into(),
+            endpoint: "http://100.64.0.5:11434/v1/chat/completions".into(),
+            api_key: None,
+            args: vec![],
+            model_provider_id: None,
+            model_base_url: None,
+            context_window_tokens: None,
+        };
+        // Name-based guess for a qwen model.
+        assert_eq!(rt.context_window(), 32_768);
+        // The runtime's explicit setting wins (Ollama's real default is 4k).
+        rt.context_window_tokens = Some(4096);
+        assert_eq!(rt.context_window(), 4096);
+        // Zero is "unset".
+        rt.context_window_tokens = Some(0);
+        assert_eq!(rt.context_window(), 32_768);
     }
 
     #[test]

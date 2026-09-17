@@ -109,7 +109,7 @@ pub fn extract_activity(line: &str) -> Vec<StreamActivity> {
                     content,
                 });
             }
-            Some("thinking") => out.push(StreamActivity::Thinking),
+            Some("thinking") => out.push(StreamActivity::Thinking { text: String::new() }),
             _ => {}
         }
     }
@@ -218,14 +218,9 @@ pub async fn stream_reply(
     // ANY stream-json line (a text delta OR a tool_use/tool_result/system event)
     // resets it, so a long-but-active turn — e.g. a multi-minute `cargo test` tool
     // run that emits no text — won't trip it, while a truly silent CLI still does.
-    // Override with HIVE_TURN_IDLE_TIMEOUT_SECS. (#100)
-    let idle = std::time::Duration::from_secs(
-        std::env::var("HIVE_TURN_IDLE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&s| s > 0)
-            .unwrap_or(300),
-    );
+    // Override with HIVE_TURN_IDLE_TIMEOUT_SECS (shared with the HTTP
+    // providers via `provider::turn_idle_timeout`). (#100)
+    let idle = super::turn_idle_timeout();
     let mut assembled = String::new();
     let mut result_fallback: Option<String> = None;
     loop {
@@ -351,7 +346,7 @@ mod tests {
     #[test]
     fn thinking_and_non_activity_lines() {
         let think = r#"{"type":"assistant","message":{"content":[{"type":"thinking","thinking":"hmm"}]}}"#;
-        assert!(matches!(extract_activity(think).as_slice(), [StreamActivity::Thinking]));
+        assert!(matches!(extract_activity(think).as_slice(), [StreamActivity::Thinking { .. }]));
         // Text deltas, result lines, and junk carry no activity.
         assert!(extract_activity(r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#).is_empty());
         assert!(extract_activity(r#"{"type":"result","result":"done"}"#).is_empty());
