@@ -11,11 +11,14 @@ import {
   presenceList,
   presencePing,
   saveAttachment,
+  shareAttachment,
+  resolveAttachmentBlob,
   readImageDataUrl,
   readWorkspaceFile,
   listWorkspaceFiles,
   sendMessage,
   stopTurn,
+  resetChatDispatch,
   regenerate,
   summarizeChat,
   compactChat,
@@ -27,7 +30,7 @@ import {
   type RuntimeSummaryDto,
   type WorkspaceAgentDto,
 } from "@/lib/ipc";
-import { attachmentMarker, splitAttachments, fileBaseName, isImagePath } from "@/lib/attachments";
+import { splitAttachments, fileBaseName, isImagePath, isImageType, type BlobAttachmentRef } from "@/lib/attachments";
 import { relTime, absTime, clockTime, dayKey, dayLabel } from "@/lib/time";
 import { PRIMARY_NAME, PRIMARY_HANDLE } from "@/lib/agent";
 import {
@@ -721,13 +724,9 @@ export function ChatView({
     }
   }
 
-  function handleSend() {
+  async function handleSend() {
     const text = input.trim();
     if (!text && attachments.length === 0) return;
-    // Append attachment path markers; agents read the path, the API runtime
-    // inlines image markers as vision blocks.
-    const markers = attachments.map((a) => attachmentMarker(a.path)).join("\n");
-    const body = [text, markers].filter(Boolean).join("\n\n");
     const sentAttachments = attachments;
     setInput("");
     setAttachments([]);
@@ -735,6 +734,21 @@ export function ChatView({
     setSlash(null);
     clearTyping();
     if (taRef.current) taRef.current.style.height = "auto";
+    // Share each attachment: uploads to the relay's blob channel so other members
+    // receive the file (falls back to a local path marker when no relay is set).
+    // Agents read the resolved path; the API runtime inlines image markers.
+    let markers = "";
+    if (sentAttachments.length > 0) {
+      try {
+        const ms = await Promise.all(sentAttachments.map((a) => shareAttachment(sessionId, a.path)));
+        markers = ms.join("\n");
+      } catch (e) {
+        toast.error(`Couldn't share attachment: ${errMsg(e)}`);
+        setAttachments((cur) => (cur.length ? cur : sentAttachments));
+        return;
+      }
+    }
+    const body = [text, markers].filter(Boolean).join("\n\n");
     if (busy) {
       // A turn is in flight (#101): queue this as the next turn instead of blocking
       // the composer or racing a concurrent turn. The queue holds one message;
@@ -1095,13 +1109,35 @@ export function ChatView({
                   This is taking longer than usual — the runtime may be stalled or waiting to log in.
                 </div>
               </div>
-              <button
-                onClick={() => void handleStop()}
-                className="shrink-0 rounded-md px-2 py-0.5 text-xs font-semibold leading-none opacity-80 transition-opacity hover:opacity-100"
-                style={{ border: "1px solid var(--hive-line)" }}
-              >
-                Stop &amp; retry
-              </button>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <button
+                  onClick={() => void handleStop()}
+                  className="rounded-md px-2 py-0.5 text-xs font-semibold leading-none opacity-80 transition-opacity hover:opacity-100"
+                  style={{ border: "1px solid var(--hive-line)" }}
+                >
+                  Stop &amp; retry
+                </button>
+                {/* Escape hatch for a chat wedged "responding" (a turn that never
+                    released its slot): frees it so new messages send again. */}
+                <button
+                  onClick={() => {
+                    void resetChatDispatch(sessionId)
+                      .then(() => {
+                        setStreams(new Map());
+                        setActivity(new Map());
+                        setSending(false);
+                        setStalled(false);
+                        toast.success("Chat reset — you can send again.");
+                      })
+                      .catch((e) => toast.error(`Couldn't reset: ${errMsg(e)}`));
+                  }}
+                  className="rounded-md px-2 py-0.5 text-xs font-semibold leading-none opacity-80 transition-opacity hover:opacity-100"
+                  style={{ border: "1px solid var(--hive-line)" }}
+                  title="Force this chat out of a stuck state"
+                >
+                  Reset chat
+                </button>
+              </div>
             </div>
           )}
           {typingNames.length > 0 && <TypingDots label={typingLabel(typingNames)} />}
@@ -1601,7 +1637,7 @@ export function extractFileRefs(body: string): string[] {
 /// URL); non-images — and images whose bytes aren't on this device — show a
 /// filename chip.
 function MessageBody({ body }: { body: string }) {
-  const { text, paths } = splitAttachments(body);
+  const { text, paths, blobs } = splitAttachments(body);
   const fileRefs = extractFileRefs(text);
   return (
     <>
@@ -1627,7 +1663,7 @@ function MessageBody({ body }: { body: string }) {
           ))}
         </div>
       )}
-      {paths.length > 0 && (
+      {(paths.length > 0 || blobs.length > 0) && (
         <div className="mt-2 flex flex-wrap gap-2">
           {paths.map((p, i) =>
             isImagePath(p) ? (
@@ -1636,10 +1672,42 @@ function MessageBody({ body }: { body: string }) {
               <AttachmentChip key={`${p}-${i}`} path={p} />
             ),
           )}
+          {blobs.map((b) => (
+            <BlobAttachment key={b.id} blob={b} />
+          ))}
         </div>
       )}
     </>
   );
+}
+
+/// A relay-shared attachment: resolves the blob reference to a local file (cache
+/// hit or download+decrypt), then renders it like a local attachment. Falls back
+/// to a filename chip while resolving or if it can't be fetched.
+function BlobAttachment({ blob }: { blob: BlobAttachmentRef }) {
+  const resolved = useQuery({
+    queryKey: ["blob-attachment", blob.id],
+    queryFn: () => resolveAttachmentBlob(blob.id, blob.name),
+    staleTime: Infinity,
+    retry: false,
+  });
+  const isImage = isImageType(blob.contentType, blob.name);
+  if (resolved.isError) return <AttachmentChip path={blob.name} image={isImage} />;
+  if (!resolved.data) {
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs opacity-70"
+        style={{ borderColor: "var(--hive-line)", background: "var(--hive-mist)" }}
+        title={`Fetching ${blob.name}…`}
+      >
+        <span aria-hidden className="opacity-60">
+          {isImage ? <IconImage size={13} /> : <IconFile size={13} />}
+        </span>
+        <span className="max-w-[14rem] truncate">{blob.name}</span>
+      </span>
+    );
+  }
+  return isImage ? <ImageAttachment path={resolved.data} /> : <AttachmentChip path={resolved.data} />;
 }
 
 /// A filename chip for a non-image attachment (or an image not available locally).

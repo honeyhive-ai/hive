@@ -48,6 +48,8 @@ import {
   syncStatus,
   onChatStream,
   voteProposal,
+  refineProposal,
+  requestProposalChanges,
   dismissProposals,
   type ProposalDto,
   type RuntimeSummaryDto,
@@ -69,6 +71,7 @@ import {
   Button,
   IconButton,
   Card,
+  Modal,
   Section,
   Switch,
   Field,
@@ -1108,12 +1111,18 @@ function QueuedWorkSection() {
 /// Per-file, collapsible unified-diff view for a proposal — closer to a PR
 /// review than one flat block: each file has its own header (+adds/−removes) and
 /// its own horizontal scroll, with line numbers on the new side.
-function ProposalDiff({ diff }: { diff: string }) {
+function ProposalDiff({ diff, wide = false }: { diff: string; wide?: boolean }) {
   const files = parseUnifiedDiff(diff);
   return (
-    <div className="mt-3 space-y-2">
+    <div className={wide ? "space-y-3" : "mt-3 space-y-2"}>
       {files.map((f, fi) => (
-        <DiffFileBlock key={`${f.path}-${fi}`} file={f} defaultOpen={files.length <= 2} />
+        <DiffFileBlock
+          key={`${f.path}-${fi}`}
+          file={f}
+          // In the wide (modal) view every file opens — you came to read them.
+          defaultOpen={wide || files.length <= 2}
+          wide={wide}
+        />
       ))}
     </div>
   );
@@ -1122,11 +1131,16 @@ function ProposalDiff({ diff }: { diff: string }) {
 function DiffFileBlock({
   file,
   defaultOpen,
+  wide = false,
 }: {
   file: ReturnType<typeof parseUnifiedDiff>[number];
   defaultOpen: boolean;
+  wide?: boolean;
 }) {
   const [open, setOpen] = useState(defaultOpen);
+  // Roomier type in the full-diff modal, compact in the narrow pane.
+  const fontClass = wide ? "text-[13px] leading-[1.6]" : "text-[11px] leading-[1.5]";
+  const pathClass = wide ? "text-[13px]" : "text-[11px]";
   let newLine = 0;
   return (
     <div className="overflow-hidden rounded-lg border" style={{ borderColor: "var(--hive-line)" }}>
@@ -1136,12 +1150,12 @@ function DiffFileBlock({
         style={{ background: "var(--hive-mist)" }}
       >
         <span className="opacity-50" aria-hidden>{open ? "▾" : "▸"}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{file.path}</span>
-        {file.added > 0 && <span className="text-[11px]" style={{ color: "var(--hive-success)" }}>+{file.added}</span>}
-        {file.removed > 0 && <span className="text-[11px]" style={{ color: "var(--hive-danger)" }}>−{file.removed}</span>}
+        <span className={`min-w-0 flex-1 truncate font-mono ${pathClass}`}>{file.path}</span>
+        {file.added > 0 && <span className={pathClass} style={{ color: "var(--hive-success)" }}>+{file.added}</span>}
+        {file.removed > 0 && <span className={pathClass} style={{ color: "var(--hive-danger)" }}>−{file.removed}</span>}
       </button>
       {open && (
-        <div className="overflow-x-auto font-mono text-[11px] leading-[1.5]" style={{ background: "var(--hive-overlay)" }}>
+        <div className={`overflow-x-auto font-mono ${fontClass}`} style={{ background: "var(--hive-overlay)" }}>
           {file.lines.map((line, i) => {
             const isAdd = line.startsWith("+") && !line.startsWith("+++");
             const isDel = line.startsWith("-") && !line.startsWith("---");
@@ -1191,15 +1205,97 @@ function ProposalCard({
   onChanged: () => void;
   onDismiss: (dismissed: boolean) => void;
 }) {
+  const qc = useQueryClient();
   const settled = isSettled(proposal);
+  // Bulky detail (body + diff) collapses; active proposals open by default (you're
+  // reviewing them), settled ones start collapsed (they're history).
+  const [expanded, setExpanded] = useState(!settled);
+  const hasDetail = Boolean(proposal.body) || Boolean(proposal.diff);
+
+  // Write the freshly-projected proposal straight into the cache so the card
+  // reflects the new status/approvals the instant the vote returns — the old code
+  // discarded this DTO and waited on a refetch, which is why the buttons "didn't
+  // update after selection".
+  const applyUpdated = (updated: ProposalDto | null) => {
+    if (!updated) return;
+    qc.setQueryData<ProposalDto[]>(["proposals", sessionId], (prev) =>
+      prev ? prev.map((p) => (p.id === updated.id ? updated : p)) : prev,
+    );
+  };
+
+  const vote = useMutation({
+    mutationFn: (approved: boolean) => voteProposal(sessionId, proposal.id, approved),
+    onSuccess: (updated) => {
+      applyUpdated(updated);
+      onChanged();
+    },
+    onError: (e) => toast.error(`Couldn't record your vote: ${errMsg(e)}`),
+  });
+
+  const implement = useMutation({
+    mutationFn: () => implementProposal(sessionId, proposal.id),
+    onSuccess: () => {
+      onChanged();
+      toast.success("Sent to the agent to implement.");
+    },
+    onError: (e) => toast.error(`Couldn't implement: ${errMsg(e)}`),
+  });
+
+  // Full-width diff viewer — the per-file diff is cramped in this narrow pane.
+  const [diffOpen, setDiffOpen] = useState(false);
+
+  // Refinement thread: a note draft + whether it's a change request (vs. comment).
+  const [note, setNote] = useState("");
+  const [asChangeRequest, setAsChangeRequest] = useState(false);
+  const refine = useMutation({
+    mutationFn: () => refineProposal(sessionId, proposal.id, note.trim(), asChangeRequest),
+    onSuccess: (updated) => {
+      applyUpdated(updated);
+      setNote("");
+      setAsChangeRequest(false);
+      onChanged();
+    },
+    onError: (e) => toast.error(`Couldn't add your note: ${errMsg(e)}`),
+  });
+  const sendBack = useMutation({
+    mutationFn: () => requestProposalChanges(sessionId, proposal.id),
+    onSuccess: () => {
+      onChanged();
+      toast.success("Sent back to the agent to revise.");
+    },
+    onError: (e) => toast.error(`Couldn't send it back: ${errMsg(e)}`),
+  });
+
+  const superseded = Boolean(proposal.supersededBy);
+  const hasChangeRequests = proposal.refinements.some((r) => r.requestChanges);
+
+  // Any in-flight action disables the others so a card can't be double-driven.
+  const busy =
+    vote.isPending || implement.isPending || refine.isPending || sendBack.isPending;
+
   return (
     <Card className="px-4 py-4">
-      <div className="flex items-center justify-between gap-3">
-        <div className="font-semibold">{proposal.title}</div>
+      <div className="flex items-start justify-between gap-3">
+        <button
+          type="button"
+          className="flex min-w-0 items-start gap-1.5 text-left"
+          onClick={() => hasDetail && setExpanded((v) => !v)}
+          aria-expanded={hasDetail ? expanded : undefined}
+          disabled={!hasDetail}
+        >
+          {hasDetail && (
+            <span
+              aria-hidden
+              className="mt-0.5 shrink-0 transition-transform"
+              style={{ transform: expanded ? "rotate(0deg)" : "rotate(-90deg)", opacity: 0.5 }}
+            >
+              <IconChevronDown size={14} />
+            </span>
+          )}
+          <span className="min-w-0 font-semibold">{proposal.title}</span>
+        </button>
         <div className="flex shrink-0 items-center gap-2">
-          <div className="text-xs uppercase tracking-[0.16em] opacity-55">{proposal.status}</div>
-          {/* Dismiss is offered once a proposal is settled: before that it's
-              work, after that it's a paper trail taking up the pane. */}
+          <StatusPill status={proposal.status} />
           {settled && (
             <IconButton
               label={proposal.dismissed ? "Restore to the inbox" : "Dismiss"}
@@ -1210,79 +1306,277 @@ function ProposalCard({
           )}
         </div>
       </div>
-      <div className="mt-0.5 text-xs opacity-50">{relTime(proposal.createdAt)}</div>
-      {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
-      {/* A fileDiff proposal (from an agent's isolated worktree) carries a
-          unified diff — render it grouped per file so it's reviewable like a PR,
-          then Implement applies it to the workspace. */}
-      {proposal.diff && <ProposalDiff diff={proposal.diff} />}
+      <div className="mt-0.5 pl-[22px] text-xs opacity-50">{relTime(proposal.createdAt)}</div>
+
+      {superseded && (
+        <div
+          className="mt-2 rounded-lg px-2.5 py-1.5 text-xs"
+          style={{ background: "var(--hive-mist)", color: "var(--hive-ink-soft)" }}
+        >
+          Superseded by a newer revision.
+        </div>
+      )}
+
+      {expanded && (
+        <>
+          {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
+          {/* A fileDiff proposal (from an agent's isolated worktree) carries a
+              unified diff. It's cramped in this narrow pane, so offer opening it
+              full-width in the Diff canvas; the inline per-file view stays as a
+              quick glance. */}
+          {proposal.diff && (
+            <>
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <span className="text-xs opacity-55">
+                  {(proposal.changedFiles?.length ?? 0)} file
+                  {(proposal.changedFiles?.length ?? 0) === 1 ? "" : "s"} changed
+                </span>
+                <button
+                  type="button"
+                  className="rounded-md px-2 py-0.5 text-xs font-medium transition-colors hover:brightness-110"
+                  style={{ border: "1px solid var(--hive-line)", color: "var(--hive-accent-cool)" }}
+                  onClick={() => setDiffOpen(true)}
+                >
+                  View full diff ↗
+                </button>
+              </div>
+              <ProposalDiff diff={proposal.diff} />
+            </>
+          )}
+
+          {/* Refinement thread — comments + change requests from humans and
+              role-qualified agents. */}
+          <RefinementThread
+            proposal={proposal}
+            note={note}
+            setNote={setNote}
+            asChangeRequest={asChangeRequest}
+            setAsChangeRequest={setAsChangeRequest}
+            onSubmit={() => note.trim() && refine.mutate()}
+            submitting={refine.isPending}
+            disabled={busy || superseded}
+          />
+        </>
+      )}
+
       <div className="mt-3 text-xs opacity-60">
         {proposal.qualifyingApprovals}/{proposal.requiredApprovals} approvals
       </div>
+      {/* Who voted: tag each approver/rejecter by name + role. */}
+      {proposal.approvals.length > 0 && (
+        <div className="mt-1.5 flex flex-col gap-1">
+          {proposal.approvals.map((a) => (
+            <div key={a.actorId} className="flex items-center gap-1.5 text-xs">
+              <span
+                aria-hidden
+                style={{ color: a.approved ? "var(--hive-success)" : "var(--hive-danger)" }}
+              >
+                {a.approved ? "✓" : "✕"}
+              </span>
+              <span className="font-medium">{a.displayName}</span>
+              <span className="opacity-50">
+                {a.approved ? "approved" : "rejected"} · {a.role}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="mt-3 flex gap-2">
         {isVotable(proposal) && (
           <>
             <button
-              className="rounded-xl px-3 py-2 text-sm font-medium"
+              disabled={busy}
+              className="rounded-xl px-3 py-2 text-sm font-medium transition-opacity disabled:opacity-50"
               style={{
                 background: "color-mix(in srgb, var(--hive-success) 20%, transparent)",
                 color: "var(--hive-success)",
               }}
-              onClick={async () => {
-                try {
-                  await voteProposal(sessionId, proposal.id, true);
-                  onChanged();
-                } catch (e) {
-                  toast.error(`Couldn't approve: ${errMsg(e)}`);
-                }
-              }}
+              onClick={() => vote.mutate(true)}
             >
-              Approve
+              {vote.isPending && vote.variables === true ? "Approving…" : "Approve"}
             </button>
             <button
-              className="rounded-xl px-3 py-2 text-sm font-medium"
+              disabled={busy}
+              className="rounded-xl px-3 py-2 text-sm font-medium transition-opacity disabled:opacity-50"
               style={{
                 background: "color-mix(in srgb, var(--hive-danger) 18%, transparent)",
                 color: "var(--hive-danger)",
               }}
-              onClick={async () => {
-                try {
-                  await voteProposal(sessionId, proposal.id, false);
-                  onChanged();
-                } catch (e) {
-                  toast.error(`Couldn't reject: ${errMsg(e)}`);
-                }
-              }}
+              onClick={() => vote.mutate(false)}
             >
-              Reject
+              {vote.isPending && vote.variables === false ? "Rejecting…" : "Reject"}
             </button>
           </>
         )}
-        {/* Agreement gate: an approved proposal only runs when a human
-            explicitly implements it; the agent then carries it out.
-            (Ported from the retired standalone ReviewView.) */}
+        {/* Agreement gate: an approved proposal only runs when a human explicitly
+            implements it; the agent then carries it out. */}
         {proposal.quorumMet && proposal.status !== "applied" && (
           <Button
             variant="primary"
             className="ml-auto"
-            onClick={async () => {
-              try {
-                await implementProposal(sessionId, proposal.id);
-                onChanged();
-                toast.success("Sent to the agent to implement.");
-              } catch (e) {
-                toast.error(`Couldn't implement: ${errMsg(e)}`);
-              }
-            }}
+            disabled={busy}
+            onClick={() => implement.mutate()}
           >
-            Implement
+            {implement.isPending ? "Implementing…" : "Implement"}
           </Button>
         )}
         {proposal.status === "applied" && (
           <span className="ml-auto self-center text-xs opacity-60">Implemented</span>
         )}
       </div>
+
+      {/* Send-back-to-agent: available while the proposal is still live and there's
+          feedback to act on. The agent produces a linked new version. */}
+      {!superseded && proposal.status !== "applied" && hasChangeRequests && (
+        <button
+          disabled={busy}
+          className="mt-2 w-full rounded-xl px-3 py-2 text-sm font-medium transition-opacity disabled:opacity-50"
+          style={{ border: "1px dashed var(--hive-line)", color: "var(--hive-ink)" }}
+          onClick={() => sendBack.mutate()}
+        >
+          {sendBack.isPending ? "Sending to agent…" : "Send to agent to revise"}
+        </button>
+      )}
+
+      {diffOpen && proposal.diff && (
+        <Modal
+          onClose={() => setDiffOpen(false)}
+          panelClassName="flex max-h-[88vh] w-[min(96vw,1100px)] flex-col overflow-hidden rounded-2xl border"
+          panelStyle={{ background: "var(--hive-panel)", borderColor: "var(--hive-line)" }}
+        >
+          <div
+            className="flex items-center justify-between gap-3 border-b px-4 py-3"
+            style={{ borderColor: "var(--hive-line)" }}
+          >
+            <div className="min-w-0">
+              <div className="truncate font-semibold">{proposal.title}</div>
+              <div className="text-xs opacity-55">
+                {(proposal.changedFiles?.length ?? 0)} file
+                {(proposal.changedFiles?.length ?? 0) === 1 ? "" : "s"} changed
+              </div>
+            </div>
+            <IconButton label="Close" onClick={() => setDiffOpen(false)}>
+              <IconX size={14} />
+            </IconButton>
+          </div>
+          <div className="min-h-0 flex-1 overflow-auto p-4">
+            <ProposalDiff diff={proposal.diff} wide />
+          </div>
+        </Modal>
+      )}
     </Card>
+  );
+}
+
+/// The refinement discussion under a proposal: existing notes (tagged by author +
+/// role, change requests flagged), and an input to add a comment or change request.
+function RefinementThread({
+  proposal,
+  note,
+  setNote,
+  asChangeRequest,
+  setAsChangeRequest,
+  onSubmit,
+  submitting,
+  disabled,
+}: {
+  proposal: ProposalDto;
+  note: string;
+  setNote: (v: string) => void;
+  asChangeRequest: boolean;
+  setAsChangeRequest: (v: boolean) => void;
+  onSubmit: () => void;
+  submitting: boolean;
+  disabled: boolean;
+}) {
+  return (
+    <div className="mt-3 border-t pt-3" style={{ borderColor: "var(--hive-line)" }}>
+      <div className="text-xs font-medium opacity-60">Refinement</div>
+      {proposal.refinements.length > 0 && (
+        <div className="mt-2 flex flex-col gap-2">
+          {proposal.refinements.map((r) => (
+            <div key={r.id} className="text-xs">
+              <div className="flex items-center gap-1.5">
+                <span className="font-medium">{r.displayName}</span>
+                <span className="opacity-45">{r.role}</span>
+                {r.requestChanges && (
+                  <span
+                    className="rounded-full px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide"
+                    style={{
+                      color: "var(--hive-accent-warm)",
+                      background: "color-mix(in srgb, var(--hive-accent-warm) 15%, transparent)",
+                    }}
+                  >
+                    changes
+                  </span>
+                )}
+                <span className="opacity-40">· {relTime(r.createdAt)}</span>
+              </div>
+              <div className="mt-0.5 whitespace-pre-wrap break-words leading-5 opacity-80">
+                {r.text}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="mt-2 flex flex-col gap-1.5">
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="Comment or request a change…"
+          rows={2}
+          disabled={disabled}
+          className="w-full resize-y rounded-xl border px-3 py-2 text-sm outline-none focus:border-[color:var(--hive-accent-cool)] disabled:opacity-50"
+          style={fieldStyle}
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") onSubmit();
+          }}
+        />
+        <div className="flex items-center justify-between gap-2">
+          <label className="flex items-center gap-1.5 text-xs opacity-70">
+            <input
+              type="checkbox"
+              checked={asChangeRequest}
+              onChange={(e) => setAsChangeRequest(e.target.checked)}
+              disabled={disabled}
+            />
+            Request changes
+          </label>
+          <button
+            disabled={disabled || submitting || !note.trim()}
+            onClick={onSubmit}
+            className="rounded-lg px-3 py-1.5 text-xs font-semibold transition-opacity disabled:opacity-40"
+            style={{ background: "var(--hive-accent-cool)", color: "var(--hive-on-accent)" }}
+          >
+            {submitting ? "Adding…" : asChangeRequest ? "Request changes" : "Comment"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/// A colored status chip for a proposal, so state reads at a glance instead of as
+/// dim uppercase text (open = neutral, approved = success, rejected = danger,
+/// applied = accent).
+function StatusPill({ status }: { status: string }) {
+  const tone =
+    status === "approved" || status === "applied"
+      ? "var(--hive-success)"
+      : status === "rejected"
+        ? "var(--hive-danger)"
+        : "var(--hive-ink)";
+  return (
+    <span
+      className="rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.12em]"
+      style={{
+        color: tone,
+        background: `color-mix(in srgb, ${tone} 14%, transparent)`,
+      }}
+    >
+      {status}
+    </span>
   );
 }
 

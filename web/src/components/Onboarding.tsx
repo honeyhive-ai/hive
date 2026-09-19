@@ -361,7 +361,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
 
   async function applyRuntime() {
     const c = await getConnectionSettings();
-    const permissionMode: ClaudePermissionMode = letEdit ? "acceptEdits" : "default";
+    const permissionMode: ClaudePermissionMode = letEdit ? "runCommands" : "default";
     if (choice === "openai") {
       const id = `openai-${Date.now().toString(36)}`;
       await addRuntime(id, "OpenAI-compatible", "openAI", "remote", baseUrl.trim(), model.trim() || "gpt-4o", true, false);
@@ -395,7 +395,7 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
     });
   }
 
-  const permMode: ClaudePermissionMode = letEdit ? "acceptEdits" : "default";
+  const permMode: ClaudePermissionMode = letEdit ? "runCommands" : "default";
 
   /// Test the relay connection for the current mode, without finishing.
   /// - join: redeem the invite/short code (sets relay+room+key), apply any
@@ -741,10 +741,10 @@ export function Onboarding({ onComplete }: { onComplete: () => void }) {
 
             <label className="flex items-center gap-2 text-sm">
               <input type="checkbox" checked={letEdit} onChange={(e) => setLetEdit(e.target.checked)} />
-              Let agents edit files in my project
+              Let agents edit files and run commands (build, test)
             </label>
             <div className="text-xs opacity-50">
-              {letEdit ? "Agents can create/modify files (recommended)." : "Read-only — agents can't write files (you can change this later)."}
+              {letEdit ? "Agents can create/modify files and run shell commands like cargo/npm (recommended for coding). Web access stays gated — change any of this in Settings → Permissions." : "Read-only — agents can't write files (you can change this later)."}
             </div>
           </div>
         )}

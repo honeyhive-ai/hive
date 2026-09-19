@@ -15,6 +15,7 @@ function proposal(over: Partial<ProposalDto> & { id: string }): ProposalDto {
     approvals: [],
     createdAt: "2026-08-01T00:00:00Z",
     dismissed: false,
+    refinements: [],
     ...over,
   };
 }

@@ -559,15 +559,23 @@ impl ChatService {
                 }
             };
             let workspace_id = session.workspace_id;
+            let my_account = self.author.account_id;
             let stale: Vec<(Uuid, String)> = session
                 .messages
                 .iter()
-                // Only complete OUR own orphaned streams (or legacy ones with no
-                // device stamp). A message still streaming on a peer's device
-                // must not be swept here — that would truncate their live reply.
+                // Complete OUR OWN orphaned streams: this device, a legacy one with
+                // no device stamp, OR any device under our OWN ACCOUNT (so a ghost
+                // stamped with a since-rotated device id — same account, new device
+                // id after an identity reset — is still swept, not stranded forever).
+                // A stream on ANOTHER account's peer device is never swept here (that
+                // would truncate their live reply); and even for our own account, if
+                // a device is genuinely still live its later chunks/completion carry a
+                // higher lamport and win the fold, so completing here is safe.
                 .filter(|m| {
                     m.is_streaming
-                        && m.origin_device_id.map(|d| d == self.device_id).unwrap_or(true)
+                        && (m.origin_device_id.map(|d| d == self.device_id).unwrap_or(true)
+                            || (my_account.is_some()
+                                && m.actor_identity.as_ref().and_then(|a| a.account_id) == my_account))
                 })
                 .map(|m| (m.id, m.body.clone()))
                 .collect();
@@ -1409,6 +1417,45 @@ impl ChatService {
         )?;
         // Locally-projected result for immediate UI feedback.
         proposal.cast_vote(approval);
+        Ok(Some(proposal))
+    }
+
+    /// Append a refinement note (comment or change request) to a proposal, as a
+    /// delta so concurrent notes from different actors all survive. Returns the
+    /// locally-projected proposal for immediate UI feedback.
+    pub fn refine_proposal(
+        &mut self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        proposal_id: Uuid,
+        actor_id: impl Into<String>,
+        role: WorkspaceRole,
+        text: impl Into<String>,
+        request_changes: bool,
+    ) -> Result<Option<ActionProposal>> {
+        let Some(session) = self.load(session_id)? else {
+            return Ok(None);
+        };
+        let Some(mut proposal) = session.proposals.into_iter().find(|p| p.id == proposal_id) else {
+            return Ok(None);
+        };
+        let note = hive_core::proposals::ProposalRefinement {
+            id: Uuid::new_v4(),
+            actor_id: actor_id.into(),
+            role,
+            text: text.into(),
+            request_changes,
+            created_at: Timestamp::now(),
+        };
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::ProposalRefined {
+                proposal_id,
+                refinement: note.clone(),
+            },
+        )?;
+        proposal.add_refinement(note);
         Ok(Some(proposal))
     }
 
@@ -2640,6 +2687,27 @@ mod tests {
 
         // Idempotent: a second sweep finds nothing to clear.
         assert_eq!(svc.clear_stale_streaming().unwrap(), 0);
+    }
+
+    #[test]
+    fn clear_stale_streaming_with_account_stamped_author() {
+        // A signed-in author carries an account id, and a ghost is stamped with it
+        // (actor_identity). The sweep must still clear it — the same-account branch
+        // (which covers a since-rotated device id) doesn't regress own-device/own-
+        // account sweeping.
+        let store = EventStore::open_in_memory().unwrap();
+        let kp = SigningKeypair::generate().unwrap();
+        let account_kp = SigningKeypair::generate().unwrap();
+        let mut author = ActorIdentity::new("u1", "Mara", hive_core::ActorKind::Human);
+        author.account_id = Some(Uuid::new_v4());
+        let mut svc = ChatService::new(store, Uuid::new_v4(), kp, account_kp, author);
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let mid = svc
+            .begin_assistant_message(chat.id, chat.workspace_id, "Hive", "anthropic", None, None)
+            .unwrap();
+        assert_eq!(svc.clear_stale_streaming().unwrap(), 1, "account-stamped ghost swept");
+        let after = svc.load(chat.id).unwrap().unwrap();
+        assert!(!after.messages.iter().find(|m| m.id == mid).unwrap().is_streaming);
     }
 
     #[test]

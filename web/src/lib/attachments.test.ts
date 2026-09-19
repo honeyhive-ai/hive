@@ -17,7 +17,7 @@ describe("attachments", () => {
   });
 
   it("returns body unchanged when no markers", () => {
-    expect(splitAttachments("plain text")).toEqual({ text: "plain text", paths: [] });
+    expect(splitAttachments("plain text")).toEqual({ text: "plain text", paths: [], blobs: [] });
   });
 
   it("derives base name across separators", () => {

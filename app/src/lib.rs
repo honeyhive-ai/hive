@@ -709,6 +709,16 @@ impl LiveSettings {
     fn claude_args(&self) -> Vec<String> {
         let mut args = match self.claude_permission_mode.as_str() {
             "acceptEdits" => vec!["--permission-mode".into(), "acceptEdits".into()],
+            // Edits + shell, scoped: auto-accept file edits AND allow the Bash tool
+            // (so the agent can build/test/git), but leave other tools (WebFetch,
+            // etc.) gated — a middle ground below full bypass. This is the tier a
+            // coding agent needs to run `cargo`/`npm`/`pytest`.
+            "runCommands" => vec![
+                "--permission-mode".into(),
+                "acceptEdits".into(),
+                "--allowedTools".into(),
+                "Bash".into(),
+            ],
             "bypassPermissions" => vec!["--permission-mode".into(), "bypassPermissions".into()],
             _ => Vec::new(),
         };
@@ -1985,7 +1995,20 @@ fn message_dto(m: &ChatMessage, agents: &[WorkspaceAgent]) -> ChatMessageDto {
     }
 }
 
-fn proposal_dto(p: &ActionProposal) -> ProposalDto {
+fn proposal_dto(p: &ActionProposal, members: &[hive_core::identity::WorkspaceMember]) -> ProposalDto {
+    // Resolve a voter's actor id to a human-readable name from the roster, so the
+    // Review pane can tag who approved/rejected. Falls back to a short id.
+    let name_of = |actor_id: &str| -> String {
+        members
+            .iter()
+            .find(|m| m.id == actor_id)
+            .map(|m| m.actor.display_name.clone())
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| {
+                let short = actor_id.get(..8).unwrap_or(actor_id);
+                if short.is_empty() { "someone".to_string() } else { short.to_string() }
+            })
+    };
     let kind = match p.kind {
         ProposalKind::FileDiff => "fileDiff",
         ProposalKind::Command => "command",
@@ -2012,6 +2035,7 @@ fn proposal_dto(p: &ActionProposal) -> ProposalDto {
             .iter()
             .map(|a| ApprovalDto {
                 actor_id: a.actor_id.clone(),
+                display_name: name_of(&a.actor_id),
                 role: role_name(a.role).to_string(),
                 approved: a.approved,
             })
@@ -2020,6 +2044,21 @@ fn proposal_dto(p: &ActionProposal) -> ProposalDto {
         changed_files: p.changed_files.clone(),
         created_at: rfc3339(p.created_at),
         dismissed: p.dismissed,
+        refinements: p
+            .refinements
+            .iter()
+            .map(|r| hive_proto::RefinementDto {
+                id: r.id.to_string(),
+                actor_id: r.actor_id.clone(),
+                display_name: name_of(&r.actor_id),
+                role: role_name(r.role).to_string(),
+                text: r.text.clone(),
+                request_changes: r.request_changes,
+                created_at: rfc3339(r.created_at),
+            })
+            .collect(),
+        parent_id: p.parent_id.map(|id| id.to_string()),
+        superseded_by: p.superseded_by.map(|id| id.to_string()),
     }
 }
 
@@ -2938,6 +2977,118 @@ fn read_image_data_url(path: String) -> Result<String, String> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(format!("data:{mime};base64,{b64}"))
+}
+
+/// Where decrypted attachment blobs are cached locally, keyed by blob id.
+fn blob_cache_dir(data_dir: &std::path::Path) -> PathBuf {
+    attachments_dir(data_dir).join("blobs")
+}
+
+fn content_type_for(path: &std::path::Path) -> String {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "pdf" => "application/pdf",
+        "txt" | "md" | "log" => "text/plain",
+        "json" => "application/json",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// The relay room + workspace key needed for the blob channel. `None` when no
+/// relay is configured or no workspace key is set → attachments stay local-only.
+fn blob_transport(state: &AppState) -> Option<(String, String, [u8; 32])> {
+    let s = state.settings.lock().unwrap();
+    let url = s.relay_url.clone().filter(|u| !u.trim().is_empty())?;
+    let room = s.sync_room.clone();
+    let key = s.workspace_key()?;
+    Some((url, room, key))
+}
+
+/// Share a composer attachment so every workspace member can receive it: seal the
+/// file with the workspace key, upload the ciphertext to the relay's blob channel,
+/// and return the `[Attached-blob: …]` marker to embed in the message. When no
+/// relay is configured, falls back to today's local-only `[Attached: <path>]`
+/// marker (only this device can open it). The sender also caches the plaintext so
+/// its own view resolves the blob without a round-trip.
+#[tauri::command]
+async fn share_attachment(
+    state: State<'_, AppState>,
+    session_id: String,
+    path: String,
+) -> Result<String, String> {
+    let p = std::path::PathBuf::from(path.trim());
+    let bytes = std::fs::read(&p).map_err(|e| format!("read attachment: {e}"))?;
+    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+
+    // A chat in the device-local workspace never syncs, so there's no member to
+    // deliver to — keep the local path marker and skip the (pointless) upload,
+    // even when a relay is configured for the user's rooms.
+    if let Ok(sid) = Uuid::parse_str(&session_id) {
+        if let Ok(svc) = state.service.lock() {
+            if let Ok(Some(session)) = svc.load(sid) {
+                if state.is_local_only_ws(session.workspace_id) {
+                    return Ok(format!("[Attached: {}]", p.display()));
+                }
+            }
+        }
+    }
+
+    let Some((url, room, key)) = blob_transport(&state) else {
+        // Local-only: no relay, so keep the path marker (unchanged behavior).
+        return Ok(format!("[Attached: {}]", p.display()));
+    };
+    let content_type = content_type_for(&p);
+    let id = Uuid::new_v4().to_string();
+    let client = state.relay_client(&url);
+    let blob_ref =
+        hive_runtime::attachment_blob::upload(&client, &room, &key, &id, &name, &content_type, &bytes)
+            .await
+            .map_err(|e| format!("upload attachment: {e}"))?;
+    // Cache the plaintext locally so the sender resolves it with no download.
+    let cache = blob_cache_dir(&state.data_dir);
+    let _ = std::fs::create_dir_all(&cache);
+    let _ = std::fs::write(
+        cache.join(hive_runtime::attachment_blob::cache_filename(&id, &name)),
+        &bytes,
+    );
+    Ok(blob_ref.marker())
+}
+
+/// Resolve a blob reference to a local file path — cache hit, or download +
+/// decrypt into the cache. Used by the UI to preview a received attachment (and,
+/// on the agent side, materialized into the prompt). Errors if the blob can't be
+/// fetched/opened (e.g. no relay, aged out, wrong key).
+#[tauri::command]
+async fn resolve_attachment_blob(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<String, String> {
+    let cache = blob_cache_dir(&state.data_dir);
+    let path = cache.join(hive_runtime::attachment_blob::cache_filename(&id, &name));
+    if path.exists() {
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    let Some((url, room, key)) = blob_transport(&state) else {
+        return Err("no relay configured — this attachment is only on the sender's device".into());
+    };
+    let client = state.relay_client(&url);
+    match hive_runtime::attachment_blob::download(&client, &room, &key, &id).await {
+        Ok(Some(bytes)) => {
+            std::fs::create_dir_all(&cache).map_err(map_err)?;
+            std::fs::write(&path, &bytes).map_err(map_err)?;
+            Ok(path.to_string_lossy().into_owned())
+        }
+        Ok(None) => Err("attachment not found on the relay (it may have aged out)".into()),
+        Err(e) => Err(format!("fetch attachment: {e}")),
+    }
 }
 
 /// Read the tail of today's app log for the in-app Diagnostics view — the
@@ -4390,7 +4541,7 @@ fn list_proposals(state: State<AppState>, session_id: String) -> Result<Vec<Prop
     Ok(svc
         .load(id)
         .map_err(map_err)?
-        .map(|s| s.proposals.iter().map(proposal_dto).collect())
+        .map(|s| s.proposals.iter().map(|p| proposal_dto(p, &s.members)).collect())
         .unwrap_or_default())
 }
 
@@ -4431,11 +4582,11 @@ fn vote_proposal(
     // Cast the voter's real workspace role (from the projected roster) so the
     // proposal's `approval_role_floor` is actually enforced; non-members fall to
     // the Viewer floor via `role_of`.
-    let role = svc
+    let (role, members) = svc
         .load(sid)
         .map_err(map_err)?
-        .map(|s| s.role_of(&actor.id))
-        .unwrap_or(WorkspaceRole::Viewer);
+        .map(|s| (s.role_of(&actor.id), s.members.clone()))
+        .unwrap_or((WorkspaceRole::Viewer, Vec::new()));
     let updated = svc
         .vote_on_proposal(sid, state.active_workspace_id(), pid, actor.id, role, approved)
         .map_err(map_err)?;
@@ -4450,7 +4601,160 @@ fn vote_proposal(
             }
         }
     }
-    Ok(updated.as_ref().map(proposal_dto))
+    Ok(updated.as_ref().map(|p| proposal_dto(p, &members)))
+}
+
+/// Append a refinement note (a comment or an explicit change request) to a
+/// proposal's discussion thread. Available to any content-tier member — and to a
+/// role-qualified agent, since agents are roster actors too. Returns the updated
+/// proposal for immediate UI feedback.
+#[tauri::command]
+fn refine_proposal(
+    state: State<AppState>,
+    session_id: String,
+    proposal_id: String,
+    text: String,
+    request_changes: bool,
+) -> Result<Option<ProposalDto>, String> {
+    let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let pid = Uuid::parse_str(&proposal_id).map_err(map_err)?;
+    if text.trim().is_empty() {
+        return Err("a refinement note can't be empty".into());
+    }
+    let actor = local_actor(&state);
+    let mut svc = state.service.lock().unwrap();
+    let (role, members) = svc
+        .load(sid)
+        .map_err(map_err)?
+        .map(|s| (s.role_of(&actor.id), s.members.clone()))
+        .unwrap_or((WorkspaceRole::Viewer, Vec::new()));
+    let updated = svc
+        .refine_proposal(sid, state.active_workspace_id(), pid, actor.id, role, text.trim(), request_changes)
+        .map_err(map_err)?;
+    Ok(updated.as_ref().map(|p| proposal_dto(p, &members)))
+}
+
+/// Send a proposal back to the agent to revise, bundling the thread's change
+/// requests (and comments) into an instruction. The agent's turn produces a NEW
+/// proposal, linked to this one as its parent (a version chain); this one is
+/// marked superseded. Returns the ids of the newly-produced revision proposals.
+#[tauri::command]
+async fn request_proposal_changes(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    proposal_id: String,
+) -> Result<(), String> {
+    let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let pid = Uuid::parse_str(&proposal_id).map_err(map_err)?;
+
+    // Gather the proposal, its producing agent, and the feedback to forward.
+    let (instruction, producing_agent_id, before_ids) = {
+        let svc = state.service.lock().unwrap();
+        let session = svc.load(sid).map_err(map_err)?.ok_or("unknown session")?;
+        let proposal = session
+            .proposals
+            .iter()
+            .find(|p| p.id == pid)
+            .ok_or("unknown proposal")?
+            .clone();
+        // Prefer explicit change requests; fall back to all notes so a plain
+        // comment thread can still drive a revision.
+        let mut notes: Vec<&hive_core::proposals::ProposalRefinement> =
+            proposal.refinements.iter().filter(|r| r.request_changes).collect();
+        if notes.is_empty() {
+            notes = proposal.refinements.iter().collect();
+        }
+        if notes.is_empty() {
+            return Err("add a refinement note before sending it back to the agent".into());
+        }
+        let feedback = notes
+            .iter()
+            .map(|r| format!("- {}", r.text.trim()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let instruction = format!(
+            "Please revise your proposal \"{}\" based on this review feedback, then produce an updated proposal:\n\n{}",
+            proposal.title, feedback
+        );
+        let before_ids: std::collections::HashSet<Uuid> =
+            session.proposals.iter().map(|p| p.id).collect();
+        (instruction, proposal.producing_agent_id, before_ids)
+    };
+
+    // Record the request on the thread and post the instruction as a user message.
+    let workspace_id = state.active_workspace_id();
+    let actor = local_actor(&state);
+    {
+        let mut svc = state.service.lock().unwrap();
+        let role = svc
+            .load(sid)
+            .map_err(map_err)?
+            .map(|s| s.role_of(&actor.id))
+            .unwrap_or(WorkspaceRole::Viewer);
+        let _ = svc.refine_proposal(
+            sid, workspace_id, pid, actor.id.clone(), role,
+            "Sent to the agent to revise.", true,
+        );
+    }
+    let trigger = {
+        let mut svc = state.service.lock().unwrap();
+        svc.post_user_message(sid, workspace_id, &instruction).map_err(map_err)?
+    };
+
+    // Resolve the responder: the agent that produced the proposal, else the chat
+    // primary (@hive). Then run the revision turn (guarded like any dispatch).
+    let responder = {
+        let svc = state.service.lock().unwrap();
+        let session = svc.load(sid).map_err(map_err)?.ok_or("unknown session")?;
+        let agent = producing_agent_id
+            .and_then(|id| session.workspace_agents.iter().find(|a| a.id == id).cloned());
+        responder_for(&state, &session, agent.as_ref())
+    };
+    let _guard = match crate::workflows::SessionBusyGuard::acquire(&app, sid) {
+        Ok(g) => g,
+        Err(_) => return Err("this chat is busy — try again once the current turn finishes".into()),
+    };
+    {
+        let mut svc = state.service.lock().unwrap();
+        let _ = svc.claim_turn(sid, workspace_id, trigger.id);
+    }
+    run_turn(&app, &state, sid, workspace_id, &responder).await?;
+
+    // Link any proposal the revision turn produced to the original (version chain)
+    // and mark the original superseded, so the pane folds it under its successor.
+    let new_ids: Vec<Uuid> = {
+        let svc = state.service.lock().unwrap();
+        match svc.load(sid).map_err(map_err)? {
+            Some(s) => s
+                .proposals
+                .iter()
+                .filter(|p| !before_ids.contains(&p.id))
+                .map(|p| p.id)
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    if !new_ids.is_empty() {
+        let mut svc = state.service.lock().unwrap();
+        if let Some(session) = svc.load(sid).map_err(map_err)? {
+            // Link EVERY proposal the revision turn produced to the original (a
+            // multi-file revision can yield several), not just the first.
+            for new_id in &new_ids {
+                if let Some(mut child) = session.proposals.iter().find(|p| p.id == *new_id).cloned() {
+                    child.parent_id = Some(pid);
+                    let _ = svc.upsert_proposal(sid, workspace_id, child);
+                }
+            }
+            // The original is superseded by the newest revision (first in fold order).
+            if let Some(mut parent) = session.proposals.iter().find(|p| p.id == pid).cloned() {
+                parent.superseded_by = new_ids.first().copied();
+                let _ = svc.upsert_proposal(sid, workspace_id, parent);
+            }
+        }
+    }
+    let _ = app.emit("workspace://synced", 1);
+    Ok(())
 }
 
 /// Hide (or restore) proposals in the Review inbox. Takes a list so "Clear
@@ -4874,6 +5178,18 @@ impl AppState {
             .unwrap_or(true)
     }
 
+    /// Local-only *for a specific chat's workspace*. A chat in this device's own
+    /// local workspace (`local_workspace_id`) never syncs to another device — it
+    /// isn't in any relay room — so it must always answer here, EVEN when a relay
+    /// is configured for the user's *rooms*. Without this, setting up a room flips
+    /// the global `is_local_only()` to false and pushes the purely-local chats
+    /// through the cross-device deferral gate, where identity churn can defer
+    /// `@hive` to an owner no device matches → the chat goes silent. See the two
+    /// dispatch gates (send_message + maybe_respond).
+    fn is_local_only_ws(&self, workspace_id: Uuid) -> bool {
+        self.is_local_only() || workspace_id == self.local_workspace_id
+    }
+
     /// Workspace ids for every relay room this device knows about (joined set +
     /// the currently configured room). Chats with these ids belong to a room,
     /// not "My workspace".
@@ -5142,7 +5458,21 @@ async fn windowed_context(
 ) -> (String, Vec<ChatTurn>) {
     let snapshot = context_snapshot(state, session_id, session, responder);
     let plan = snapshot.plan;
-    let turns = turns_from(&plan.kept, responder.agent_id, &responder.author);
+    let mut turns = turns_from(&plan.kept, responder.agent_id, &responder.author);
+    // Materialize any `[Attached-blob: …]` references to local files so the agent
+    // (which reads paths) can open attachments other members shared over the relay.
+    // No-op for turns without blob markers, or when no relay/key is configured.
+    if let Some((url, room, key)) = blob_transport(state) {
+        let client = state.relay_client(&url);
+        let cache = blob_cache_dir(&state.data_dir);
+        for t in turns.iter_mut() {
+            if t.content.contains("[Attached-blob:") {
+                t.content =
+                    hive_runtime::attachment_blob::materialize_body(&t.content, &client, &room, &key, &cache)
+                        .await;
+            }
+        }
+    }
     // Reference vaults ride in the system prompt (capped; cached per app run).
     // Like the summary below, this is appended after the window plan — the
     // caps keep the skew small and the output/summary reserves absorb it.
@@ -5770,13 +6100,52 @@ async fn run_turn(
     workspace_id: Uuid,
     responder: &Responder,
 ) -> Result<TurnOutcome, String> {
-    let session = {
-        let svc = state.service.lock().unwrap();
-        svc.load(session_id).map_err(map_err)?.ok_or("unknown session")?
+    // Hard whole-turn backstop. `run_prepared_turn` already bounds the streaming
+    // phase (idle + wall-clock), but NOT the setup (context assembly, git worktree
+    // creation) or teardown (diff capture, worktree commit/remove) around it — a
+    // hang there returns from neither, so `run_turn` never resolves. Every caller
+    // (send_message, maybe_respond, deferred fallback) holds the per-chat
+    // SessionBusyGuard / turn-claim across this await and only releases it when we
+    // return, so a stuck setup/teardown pinned the chat as "already responding"
+    // until app restart (the exact wedge seen in the field). This outer bound
+    // guarantees we always return: on timeout the inner future is dropped (its
+    // kill_on_drop reaps any CLI subprocess) and the guard frees. It's a true
+    // backstop — a margin above the stream's own timeout, so it never pre-empts
+    // the finer-grained, better-messaged stream timeout on a legitimately long turn.
+    let hard = std::time::Duration::from_secs(
+        std::env::var("HIVE_TURN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&s| s > 0)
+            .unwrap_or(3600)
+            .saturating_add(300),
+    );
+    let run = async {
+        let session = {
+            let svc = state.service.lock().unwrap();
+            svc.load(session_id).map_err(map_err)?.ok_or("unknown session")?
+        };
+        let (system, turns) = windowed_context(state, session_id, &session, responder).await;
+        run_prepared_turn(app, state, session_id, workspace_id, responder, &session, system, turns)
+            .await
     };
-    let (system, turns) = windowed_context(state, session_id, &session, responder).await;
-    run_prepared_turn(app, state, session_id, workspace_id, responder, &session, system, turns)
-        .await
+    match tokio::time::timeout(hard, run).await {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::error!(
+                target: "dispatch",
+                session = %session_id,
+                secs = hard.as_secs(),
+                "turn exceeded the hard whole-turn timeout — aborting so the chat isn't wedged 'responding'"
+            );
+            // Retire the streaming placeholder if one is live, so the UI doesn't
+            // keep a perpetual "generating" bubble for the abandoned turn.
+            Err(format!(
+                "turn aborted after {}s — setup, generation, or teardown hung. The chat is free to accept a new message.",
+                hard.as_secs()
+            ))
+        }
+    }
 }
 
 /// The execution half of [`run_turn`], with the context already computed.
@@ -6080,7 +6449,10 @@ async fn run_prepared_turn(
                         // Authorless: the human reviewing can approve it (the
                         // self-approval guard excludes no one), so a solo user
                         // can review + implement their agent's work.
-                        let prop = hive_core::ActionProposal::file_diff(title, "", diff, files);
+                        let mut prop = hive_core::ActionProposal::file_diff(title, "", diff, files);
+                        // Record which agent produced it so "Send to agent to
+                        // revise" re-dispatches the right one (None = primary @hive).
+                        prop.producing_agent_id = responder.agent_id;
                         {
                             let mut svc = state.service.lock().unwrap();
                             let _ = svc.upsert_proposal(session_id, workspace_id, prop);
@@ -6172,6 +6544,31 @@ fn stop_turn(state: State<AppState>, session_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Manual escape hatch: force a chat out of a wedged "responding" state. The hard
+/// whole-turn timeout in [`run_turn`] already frees the busy slot on its own, but
+/// this gives the user an instant recovery instead of waiting it out, and repairs
+/// any residue: it aborts an in-flight turn (stop signal), clears this chat's
+/// `responding` slot (the guard a stuck turn couldn't drop), and sweeps a lingering
+/// "generating" placeholder so no ghost bubble is left. Idempotent; safe to call
+/// when nothing is stuck.
+#[tauri::command]
+fn reset_chat_dispatch(state: State<AppState>, session_id: String) -> Result<(), String> {
+    let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    // 1. Abort any turn still running for this chat.
+    if let Some(signal) = state.turn_stops.lock().unwrap().get(&sid) {
+        signal.notify_waiters();
+    }
+    // 2. Free the per-chat busy slot — the wedge itself: a stuck turn left this set,
+    //    so every later message was rejected as "already responding".
+    state.responding.lock().unwrap().remove(&sid);
+    // 3. Complete any dangling streaming placeholder so the UI drops the perpetual
+    //    "generating" bubble (idempotent; only touches our own-device streams).
+    if let Ok(mut svc) = state.service.lock() {
+        let _ = svc.clear_stale_streaming();
+    }
+    Ok(())
+}
+
 /// Arm the bounded-deferral fallback for a turn we just handed to another
 /// device: wait out [`DEFERRED_CLAIM_TIMEOUT`], then answer here if nothing
 /// claimed or answered the trigger in the meantime.
@@ -6216,7 +6613,7 @@ async fn run_deferred_claim_fallback(
     trigger_id: Uuid,
 ) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let local_only = state.is_local_only();
+    let local_only = state.is_local_only_ws(workspace_id);
     // Re-resolve rather than capture: over the timeout the relay may have been
     // cleared, the roster may have changed, and — the case this exists for — the
     // owner's device may have answered after all.
@@ -6278,8 +6675,6 @@ async fn send_message(
 ) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
     let local_actor_id = state.local_actor_id();
-    // Relay-less ⇒ every roster member was created here (nothing syncs in) ⇒ solo.
-    let local_only = state.is_local_only();
     // Stop signal for this session's turn(s): the Stop button fires it, breaking
     // the cascade loop and aborting the in-flight generation below.
     let stop = state.turn_stops.lock().unwrap().entry(sid).or_default().clone();
@@ -6289,6 +6684,9 @@ async fn send_message(
         let mut svc = state.service.lock().unwrap();
         let session = svc.load(sid).map_err(map_err)?.ok_or("unknown session")?;
         let workspace_id = session.workspace_id;
+        // Local-only for THIS chat's workspace: relay-less, or a chat in the
+        // device-local workspace (which never syncs), so it always answers here.
+        let local_only = state.is_local_only_ws(workspace_id);
         let posted = svc.post_user_message(sid, workspace_id, &body).map_err(map_err)?;
         // The session can be deleted mid-turn (normal use). Bail gracefully —
         // never `.unwrap()` under the `service` lock, or a None poisons the
@@ -6328,7 +6726,7 @@ async fn send_message(
         // id) makes the workspace look multi-human and the primary defers to a
         // stale self-identity no live device owns → "thinking…" forever, no
         // dispatch. Mirrors `maybe_respond`; both gates must use `turn_runs_here`.
-        let local_only = state.is_local_only();
+        let local_only = state.is_local_only_ws(workspace_id);
         let solo = human_member_count(&session) <= 1;
         if !turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id) {
             tracing::info!(
@@ -6512,7 +6910,7 @@ async fn maybe_respond(
         // longer matches `local_actor_id`: `owns_responder` returns false and the
         // primary silently never answers ("thinking…" forever, nothing logged).
         // The cross-device ownership split only matters in a real multi-human room.
-        let local_only = state.is_local_only();
+        let local_only = state.is_local_only_ws(session.workspace_id);
         let solo = human_member_count(&session) <= 1;
         let runs_here = |responder: &Responder| {
             turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id)
@@ -9086,6 +9484,7 @@ async fn update_connection_settings(
         }
         s.claude_permission_mode = match permission_mode.as_str() {
             "acceptEdits" => "acceptEdits".to_string(),
+            "runCommands" => "runCommands".to_string(),
             "bypassPermissions" => "bypassPermissions".to_string(),
             _ => "default".to_string(),
         };
@@ -11468,6 +11867,8 @@ pub fn run() {
             list_proposals,
             create_proposal,
             vote_proposal,
+            refine_proposal,
+            request_proposal_changes,
             dismiss_proposals,
             implement_proposal,
             toggle_reaction,
@@ -11484,6 +11885,7 @@ pub fn run() {
             preview_vault,
             send_message,
             stop_turn,
+            reset_chat_dispatch,
             get_workspace_diffs,
             get_app_settings,
             get_git_status,
@@ -11544,6 +11946,8 @@ pub fn run() {
             probe_relay_at,
             export_chat,
             save_attachment,
+            share_attachment,
+            resolve_attachment_blob,
             read_image_data_url,
             read_recent_logs,
             log_dir_path,

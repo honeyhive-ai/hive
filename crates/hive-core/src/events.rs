@@ -22,7 +22,7 @@ use crate::workspace_host::WorkspaceHost;
 use crate::workspace_runtime::WorkspaceRuntime;
 use crate::crypto::DeviceCertificate;
 use crate::identity::{ActorStamp, WorkspaceMember, WorkspaceRole};
-use crate::proposals::{ActionProposal, ProposalApproval};
+use crate::proposals::{ActionProposal, ProposalApproval, ProposalRefinement};
 use crate::session::ChatSession;
 use crate::skills::SkillProfile;
 use crate::time_util::Timestamp;
@@ -108,6 +108,14 @@ pub enum SessionEvent {
     /// delete: the session is an event-sourced log, so a delete wouldn't survive
     /// a re-fold and wouldn't replicate.
     ProposalDismissed { proposal_id: Uuid, dismissed: bool },
+    /// Append a note to a proposal's refinement thread (a comment or change
+    /// request) from a human member or role-qualified agent. A delta, like a vote
+    /// — it merges into the proposal's `refinements` (idempotent by note id) so
+    /// concurrent notes from different actors are all preserved.
+    ProposalRefined {
+        proposal_id: Uuid,
+        refinement: ProposalRefinement,
+    },
     /// Replace the session's vault source set.
     VaultSourcesUpdated { sources: Vec<MountedVault> },
     /// Replace the session's workflow definition set.
@@ -233,6 +241,7 @@ impl SessionEvent {
             SessionEvent::ProposalUpserted { .. } => "proposalUpserted",
             SessionEvent::ProposalVoteCast { .. } => "proposalVoteCast",
             SessionEvent::ProposalDismissed { .. } => "proposalDismissed",
+            SessionEvent::ProposalRefined { .. } => "proposalRefined",
             SessionEvent::VaultSourcesUpdated { .. } => "vaultSourcesUpdated",
             SessionEvent::WorkflowDefinitionsUpdated { .. } => "workflowDefinitionsUpdated",
             SessionEvent::WorkflowRunUpserted { .. } => "workflowRunUpserted",
@@ -451,6 +460,13 @@ impl ChatSession {
             SessionEvent::ProposalDismissed { proposal_id, dismissed } => {
                 if let Some(p) = self.proposals.iter_mut().find(|p| p.id == *proposal_id) {
                     p.dismissed = *dismissed;
+                }
+            }
+            SessionEvent::ProposalRefined { proposal_id, refinement } => {
+                if let Some(p) = self.proposals.iter_mut().find(|p| p.id == *proposal_id) {
+                    // Idempotent by note id (add_refinement dedups), so a re-folded
+                    // event from sync doesn't duplicate the note.
+                    p.add_refinement(refinement.clone());
                 }
             }
             SessionEvent::VaultSourcesUpdated { sources } => {

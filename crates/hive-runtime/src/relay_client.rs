@@ -24,6 +24,9 @@ pub enum RelayError {
     /// The relay returned an unexpected non-2xx status.
     #[error("relay returned HTTP {0}")]
     Status(u16),
+    /// A local error (e.g. sealing an attachment before upload).
+    #[error("{0}")]
+    Message(String),
 }
 
 /// Decode a JSON response, mapping non-2xx to a typed error *before* attempting
@@ -353,6 +356,43 @@ impl RelayClient {
         let resp = self.authed(self.http.post(url)).json(body).send().await?;
         let value: serde_json::Value = json_ok(resp).await?;
         Ok(value.get("seq").and_then(serde_json::Value::as_u64).unwrap_or(0))
+    }
+
+    /// Upload an opaque file blob (a sealed attachment) to a workspace. The relay
+    /// is content-blind: `bytes` is ciphertext the caller sealed with the
+    /// workspace key. `id` is a client-chosen opaque key (a UUID). Only the
+    /// enterprise relay serves this route; an open relay returns 404/405.
+    pub async fn put_blob(
+        &self,
+        workspace: &str,
+        id: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), RelayError> {
+        let url = format!("{}/v1/workspaces/{}/blobs/{}", self.base, workspace, id);
+        let resp = self
+            .authed(self.http.put(url))
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(bytes)
+            .send()
+            .await?;
+        resp.error_for_status()?; // non-2xx (401/403/413/404) → error
+        Ok(())
+    }
+
+    /// Fetch an opaque file blob's ciphertext. `Ok(None)` = the relay returned 404
+    /// (never uploaded, aged out, or an open relay without the blob route).
+    pub async fn get_blob(
+        &self,
+        workspace: &str,
+        id: &str,
+    ) -> Result<Option<Vec<u8>>, RelayError> {
+        let url = format!("{}/v1/workspaces/{}/blobs/{}", self.base, workspace, id);
+        let resp = self.authed(self.http.get(url)).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = resp.error_for_status()?;
+        Ok(Some(resp.bytes().await?.to_vec()))
     }
 
     /// Cheap connectivity + auth check: an authed GET of the envelope list.

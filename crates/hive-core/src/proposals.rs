@@ -39,6 +39,25 @@ pub struct ProposalApproval {
     pub created_at: Timestamp,
 }
 
+/// One note on a proposal's refinement thread — a comment or an explicit request
+/// for changes, from a human member or a role-qualified agent. The thread is the
+/// discussion that precedes a "Send to agent to revise", which bundles these
+/// notes into an instruction that produces a linked new version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProposalRefinement {
+    pub id: Uuid,
+    pub actor_id: String,
+    pub role: WorkspaceRole,
+    pub text: String,
+    /// A change request (vs. a plain comment) — flags that the author wants the
+    /// proposal revised. The "Send to agent" action forwards these.
+    #[serde(default)]
+    pub request_changes: bool,
+    #[serde(default)]
+    pub created_at: Timestamp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActionProposal {
@@ -82,6 +101,21 @@ pub struct ActionProposal {
     /// others, the same way a vote does.
     #[serde(default)]
     pub dismissed: bool,
+    /// The refinement discussion thread (comments + change requests).
+    #[serde(default)]
+    pub refinements: Vec<ProposalRefinement>,
+    /// The proposal this one revises, if any — set when an agent produces a new
+    /// version in response to "Send to agent to revise". Forms a version chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<Uuid>,
+    /// The newer version that superseded this one (the other end of `parent_id`).
+    /// A superseded proposal is history — the UI folds it under its successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<Uuid>,
+    /// The agent whose turn produced this proposal, so "Send to agent to revise"
+    /// knows who to re-dispatch. `None` = the chat's primary runtime (@hive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producing_agent_id: Option<Uuid>,
 }
 
 fn default_floor() -> WorkspaceRole {
@@ -108,6 +142,10 @@ impl ActionProposal {
             diff: None,
             changed_files: Vec::new(),
             dismissed: false,
+            refinements: Vec::new(),
+            parent_id: None,
+            superseded_by: None,
+            producing_agent_id: None,
         }
     }
 
@@ -131,6 +169,15 @@ impl ActionProposal {
         self.approvals.retain(|a| a.actor_id != vote.actor_id);
         self.approvals.push(vote);
         self.recompute_status();
+    }
+
+    /// Append a refinement note (comment or change request). Idempotent by id, so
+    /// a re-applied event from sync doesn't duplicate the note.
+    pub fn add_refinement(&mut self, note: ProposalRefinement) {
+        if self.refinements.iter().any(|r| r.id == note.id) {
+            return;
+        }
+        self.refinements.push(note);
     }
 
     /// Whether `actor_id` authored this proposal (never true for an authorless
@@ -270,6 +317,32 @@ mod tests {
         // A qualifying down-vote vetoes regardless of who casts it.
         p.cast_vote(vote("veto", WorkspaceRole::Contributor, false));
         assert_eq!(p.status, ProposalStatus::Rejected);
+    }
+
+    #[test]
+    fn refinements_append_and_dedup_by_id() {
+        let mut p = ActionProposal::new("Refine me", ProposalKind::FileDiff, "");
+        let note = ProposalRefinement {
+            id: Uuid::new_v4(),
+            actor_id: "u1".into(),
+            role: WorkspaceRole::Contributor,
+            text: "rename the helper".into(),
+            request_changes: true,
+            created_at: Timestamp::epoch(),
+        };
+        p.add_refinement(note.clone());
+        p.add_refinement(note.clone()); // re-applied event (sync) must not duplicate
+        assert_eq!(p.refinements.len(), 1);
+        p.add_refinement(ProposalRefinement {
+            id: Uuid::new_v4(),
+            actor_id: "u2".into(),
+            role: WorkspaceRole::Admin,
+            text: "looks good otherwise".into(),
+            request_changes: false,
+            created_at: Timestamp::epoch(),
+        });
+        assert_eq!(p.refinements.len(), 2);
+        assert!(p.refinements[0].request_changes);
     }
 
     #[test]

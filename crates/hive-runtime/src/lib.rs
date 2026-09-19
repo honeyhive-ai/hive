@@ -5,6 +5,7 @@
 //! Phase 1 lands the SQLite event store and a file-based identity store.
 //! Crypto/signing, providers, MCP, and transports arrive in later phases.
 
+pub mod attachment_blob;
 pub mod chat_service;
 pub mod context;
 pub mod directives;

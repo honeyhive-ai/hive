@@ -39,11 +39,22 @@ export function PermissionsSection() {
   // reset gets — confirm before switching into bypass mode (a plain dropdown
   // pick was writing it through instantly).
   const setMode = (v: ClaudePermissionMode) => {
+    // Granting unattended shell (runCommands or bypass) deserves the same friction
+    // a data reset gets — the agent will run commands with no approval prompt.
     if (v === "bypassPermissions") {
       confirmThen(
-        "Bypass all permissions? The claude agent will be able to edit files AND run shell " +
-          "commands in this workspace with no approval prompt. Only enable this if you fully " +
-          "trust the agents and tasks running here.",
+        "Bypass all permissions? The claude agent will be able to edit files, run shell " +
+          "commands, and use every tool in this workspace with no approval prompt. Only enable " +
+          "this if you fully trust the agents and tasks running here.",
+        () => save.mutate(v),
+      );
+      return;
+    }
+    if (v === "runCommands") {
+      confirmThen(
+        "Let the agent run commands? The claude agent will be able to edit files and run shell " +
+          "commands (builds, tests, git) in this workspace with no approval prompt. Other tools " +
+          "like web access stay gated.",
         () => save.mutate(v),
       );
       return;
@@ -102,8 +113,9 @@ export function PermissionsSection() {
         disabled={!c}
       >
         <option value="default">Read-only — blocks file edits (no approval prompt)</option>
-        <option value="acceptEdits">Accept file edits automatically (needed to write files)</option>
-        <option value="bypassPermissions">Bypass all permissions (edits + shell commands)</option>
+        <option value="acceptEdits">Edit files — write files, but not run commands</option>
+        <option value="runCommands">Edit files &amp; run commands — build, test, git (recommended for coding)</option>
+        <option value="bypassPermissions">Bypass all permissions — edits, commands, and every tool</option>
       </SelectField>
       {permissionMode === "default" ? (
         <p className="text-xs opacity-60">
@@ -113,7 +125,8 @@ export function PermissionsSection() {
       ) : (
         <p className="text-xs" style={{ color: "var(--hive-accent-warm)" }}>
           The <code>claude</code> agent can modify files
-          {permissionMode === "bypassPermissions" ? " and run shell commands" : ""} in your
+          {permissionMode === "runCommands" ? " and run shell commands (build, test, git)" : ""}
+          {permissionMode === "bypassPermissions" ? " and run any command or tool" : ""} in your
           workspace without asking.
         </p>
       )}

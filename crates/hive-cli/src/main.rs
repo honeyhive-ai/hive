@@ -33,7 +33,7 @@ use hive_core::{
 };
 use hive_runtime::{
     parse_mentions, pending_mentions, resolve_workspace_credential, turns_for, ChatService,
-    EventStore, FileKeyVault, IdentityStore, RelayClient, ResolvedRuntime, SyncEngine,
+    ChatTurn, EventStore, FileKeyVault, IdentityStore, RelayClient, ResolvedRuntime, SyncEngine,
 };
 use uuid::Uuid;
 
@@ -205,6 +205,32 @@ async fn sync_once(cfg: &Config) -> Result<(usize, usize)> {
     let fetched = engine.fetch_new().await?;
     let pulled = engine.apply_fetched(&mut store, &fetched)?;
     Ok((pushed, pulled))
+}
+
+/// Resolve any `[Attached-blob: …]` references in agent turns to local files
+/// (downloading + decrypting from the relay's blob channel and caching them), so
+/// a headless agent can read attachments other members shared. No-op when no
+/// relay/workspace key is configured or no turn carries a blob marker.
+async fn materialize_turns(cfg: &Config, turns: &mut [ChatTurn]) {
+    let (Some(relay_url), Some(pass)) = (cfg.relay_url.clone(), cfg.key.clone()) else {
+        return;
+    };
+    if !turns.iter().any(|t| t.content.contains("[Attached-blob:")) {
+        return;
+    }
+    let relay = RelayClient::new(&relay_url)
+        .with_auth(cfg.token.clone())
+        .with_github_token(cfg.github_token.clone());
+    let key = derive_workspace_key(&pass);
+    let cache = cfg.data_dir.join("attachments").join("blobs");
+    for t in turns.iter_mut() {
+        if t.content.contains("[Attached-blob:") {
+            t.content = hive_runtime::attachment_blob::materialize_body(
+                &t.content, &relay, &cfg.room, &key, &cache,
+            )
+            .await;
+        }
+    }
 }
 
 fn cmd_whoami(cfg: &Config) -> Result<()> {
@@ -609,7 +635,8 @@ async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Re
             }
             // Non-Send store is held across .await — cmd_agent runs on a
             // current-thread runtime (see run()), so this is allowed.
-            let turns = turns_for(&s, None, &name);
+            let mut turns = turns_for(&s, None, &name);
+            materialize_turns(cfg, &mut turns).await;
             print!("↳ @{name} replying in {} … ", s.id);
             // H1 gate: only execute MCP tools when the triggering author holds
             // ≥ HIVE_MCP_MIN_ROLE (default Contributor). Unresolved author →
@@ -904,7 +931,8 @@ async fn drain_worker_tick(
                     continue;
                 }
             };
-            let turns = turns_for(&s, Some(agent.id), &agent.name);
+            let mut turns = turns_for(&s, Some(agent.id), &agent.name);
+            materialize_turns(cfg, &mut turns).await;
             let system = format!(
                 "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.",
                 agent.name

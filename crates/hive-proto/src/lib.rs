@@ -108,8 +108,30 @@ pub struct ToolResultDto {
 #[ts(rename_all = "camelCase")]
 pub struct ApprovalDto {
     pub actor_id: String,
+    /// Human-readable name of the voter, resolved from the workspace roster at
+    /// projection time so the Review pane can tag who approved/rejected without a
+    /// separate roster lookup. Falls back to a short actor id when unknown.
+    #[serde(default)]
+    pub display_name: String,
     pub role: String,
     pub approved: bool,
+}
+
+/// One note on a proposal's refinement thread.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(rename_all = "camelCase")]
+pub struct RefinementDto {
+    pub id: String,
+    pub actor_id: String,
+    /// Voter/commenter name resolved from the roster at projection time.
+    #[serde(default)]
+    pub display_name: String,
+    pub role: String,
+    pub text: String,
+    #[serde(default)]
+    pub request_changes: bool,
+    pub created_at: String,
 }
 
 /// A proposal in the review queue, with computed quorum state.
@@ -145,6 +167,15 @@ pub struct ProposalDto {
     pub created_at: String,
     /// Hidden from the Review inbox (the record survives; see `ActionProposal`).
     pub dismissed: bool,
+    /// The refinement discussion thread (comments + change requests), oldest first.
+    #[serde(default)]
+    pub refinements: Vec<RefinementDto>,
+    /// The proposal this one revises (a version chain), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
+    /// The newer version that superseded this one, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 /// A chat as listed in the sidebar.
@@ -679,6 +710,7 @@ mod tests {
         McpServerDto::export_all(&cfg).unwrap();
         ReactionDto::export_all(&cfg).unwrap();
         ProposalDto::export_all(&cfg).unwrap();
+        RefinementDto::export_all(&cfg).unwrap();
         ApprovalDto::export_all(&cfg).unwrap();
         WorkspaceMemberDto::export_all(&cfg).unwrap();
         WorkspaceInfoDto::export_all(&cfg).unwrap();

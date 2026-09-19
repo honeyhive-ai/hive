@@ -3,4 +3,10 @@
 /**
  * One vote on a proposal.
  */
-export type ApprovalDto = { actorId: string, role: string, approved: boolean, };
+export type ApprovalDto = { actorId: string, 
+/**
+ * Human-readable name of the voter, resolved from the workspace roster at
+ * projection time so the Review pane can tag who approved/rejected without a
+ * separate roster lookup. Falls back to a short actor id when unknown.
+ */
+displayName: string, role: string, approved: boolean, };

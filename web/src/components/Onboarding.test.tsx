@@ -91,10 +91,10 @@ describe("Onboarding wizard flow", () => {
     await waitFor(() =>
       expect(ipc.setDefaultModel).toHaveBeenCalledWith("claude-sonnet-4-6"),
     );
-    // …and default permission = acceptEdits ("let agents edit files" on).
+    // …and default permission = runCommands ("edit files and run commands" on).
     await waitFor(() =>
       expect(ipc.updateConnectionSettings).toHaveBeenCalledWith(
-        expect.objectContaining({ permissionMode: "acceptEdits", apiKey: null }),
+        expect.objectContaining({ permissionMode: "runCommands", apiKey: null }),
       ),
     );
 
@@ -190,7 +190,7 @@ describe("Onboarding wizard flow", () => {
       ),
     );
     expect(ipc.updateConnectionSettings).toHaveBeenCalledWith(
-      expect.objectContaining({ apiKey: "sk-test-123", permissionMode: "acceptEdits" }),
+      expect.objectContaining({ apiKey: "sk-test-123", permissionMode: "runCommands" }),
     );
   });
 

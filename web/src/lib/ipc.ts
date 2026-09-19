@@ -87,6 +87,12 @@ export const sendMessage = (sessionId: string, body: string) =>
 export const stopTurn = (sessionId: string) =>
   invoke<void>("stop_turn", { sessionId });
 
+/// Force a chat out of a wedged "responding" state: aborts any in-flight turn,
+/// frees the per-chat busy slot a stuck turn couldn't release, and clears a
+/// lingering "generating" placeholder. Escape hatch for the stalled banner.
+export const resetChatDispatch = (sessionId: string) =>
+  invoke<void>("reset_chat_dispatch", { sessionId });
+
 /// Replace the last assistant/agent turn with a fresh generation.
 export const regenerate = (sessionId: string) =>
   invoke<void>("regenerate", { sessionId });
@@ -241,6 +247,18 @@ export const exportChat = (sessionId: string) =>
 /// absolute path, embedded in the message as a `[Attached: ...]` marker.
 export const saveAttachment = (name: string, dataBase64: string) =>
   invoke<string>("save_attachment", { name, dataBase64 });
+
+/// Share an attachment so other workspace members can receive it: uploads the
+/// sealed file to the relay's blob channel and returns the `[Attached-blob: …]`
+/// marker to embed. Falls back to a local `[Attached: <path>]` marker when no
+/// relay is configured (only this device can open it).
+export const shareAttachment = (sessionId: string, path: string) =>
+  invoke<string>("share_attachment", { sessionId, path });
+
+/// Resolve a received blob reference to a local file path (cache hit, or download
+/// + decrypt). Rejects when it can't be fetched (no relay, aged out, wrong key).
+export const resolveAttachmentBlob = (id: string, name: string) =>
+  invoke<string>("resolve_attachment_blob", { id, name });
 
 /// Read a local image attachment as a data: URL for inline preview. Rejects when
 /// the file isn't present on this device (e.g. an attachment synced from another
@@ -698,6 +716,19 @@ export const createProposal = (
 export const voteProposal = (sessionId: string, proposalId: string, approved: boolean) =>
   invoke<ProposalDto | null>("vote_proposal", { sessionId, proposalId, approved });
 
+/// Append a refinement note (comment or change request) to a proposal's thread.
+export const refineProposal = (
+  sessionId: string,
+  proposalId: string,
+  text: string,
+  requestChanges: boolean,
+) => invoke<ProposalDto | null>("refine_proposal", { sessionId, proposalId, text, requestChanges });
+
+/// Send a proposal back to the agent to revise per the thread's feedback; the
+/// agent produces a linked new version and this one is marked superseded.
+export const requestProposalChanges = (sessionId: string, proposalId: string) =>
+  invoke<void>("request_proposal_changes", { sessionId, proposalId });
+
 /// Hide (or restore) proposals in the Review inbox. Hides only — the proposals
 /// stay in the event log as a paper trail. Resolves to the number changed.
 export const dismissProposals = (
@@ -864,6 +895,7 @@ export const removeWorkspace = (workspaceId: string) =>
 export type ClaudePermissionMode =
   | "default"
   | "acceptEdits"
+  | "runCommands"
   | "bypassPermissions";
 
 export interface ConnectionSettingsDto {

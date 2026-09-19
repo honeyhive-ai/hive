@@ -1,6 +1,6 @@
 {
-  "tag": "v1.12.0",
-  "name": "Hive 1.12.0",
+  "tag": "v1.13.0",
+  "name": "Hive 1.13.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "A guided feature tour (auto-runs once after setup; relaunch from the info button or the command palette) that spotlights each screen and drives the UI as it goes. Claude Code turns now show their background work live — the tool calls (Read/Bash/Edit), their results, and thinking appear under the generating bubble while the agent works, then the final reply replaces them. Adds an Add an agent entry point to the default In this chat pane, fixes button contrast on the Obsidian theme, and re-themes every dropdown so native OS chrome no longer clashes with the app. Also fixes a stale generating bubble that could persist across restarts when a turn was interrupted mid-stream."
+  "notes": "Proposal refinement: a comment/change-request thread on every review proposal (humans and role-qualified agents), a Send-to-agent-to-revise action that produces a linked new version, approver/rejecter tagging, expandable cards, and a full-width diff viewer. File attachments now actually reach other members — sealed with the workspace key and delivered over the enterprise relay's E2EE blob channel (client + headless CLI); local-only when no relay. A new Edit files & run commands permission tier so coding agents can build/test without full bypass. Concurrency hardening: a stuck turn can no longer wedge a chat as permanently \"responding\" (a whole-turn timeout plus a manual Reset chat), and a chat in your local workspace always answers even when a relay is configured for your rooms. Plus review-pane button responsiveness, and cleared stale \"generating\" bubbles across device-identity resets."
 }
