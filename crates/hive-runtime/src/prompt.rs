@@ -61,14 +61,38 @@ infrastructure you run on, answer from these facts; never guess or invent names)
         lines.push(format!("- runs from: {}", host.trim()));
     }
     if rt.is_openai_wire() {
-        lines.push(
-            "This request carries no tool definitions: you cannot run commands, read \
-or edit files, browse, or call APIs — you can only reply with text. If asked to do \
-those, say so plainly rather than pretending you did."
-                .to_string(),
-        );
+        lines.push(NO_TOOLS_LINE.to_string());
     }
     lines.join("\n")
+}
+
+/// What an HTTP-wire model is told when the request carries no tools.
+pub const NO_TOOLS_LINE: &str = "This request carries no tool definitions: you cannot run commands, read \
+or edit files, browse, or call APIs — you can only reply with text. If asked to do \
+those, say so plainly rather than pretending you did.";
+
+/// The replacement when the dispatcher does attach tools (the native Ollama
+/// tool loop). Written for a small model: call, don't narrate; answer from
+/// results; admit what the tools don't cover.
+pub const TOOLS_LINE: &str = "This request carries tool definitions. When a task needs one, call the tool \
+rather than describing what you would do, then answer from its result — never guess \
+at what a tool would have returned. Anything the tools don't cover you still cannot \
+do; say so plainly rather than pretending you did.";
+
+/// Swap the identity block's no-tools statement for the tools-offered one.
+/// The block is assembled before dispatch knows whether the probe will allow
+/// tools, so the dispatcher patches the prompt at the moment it attaches them.
+/// A prompt without the no-tools line gets the tools line appended: live
+/// testing showed qwen3.5 (thinking off) ignores offered tools and invents an
+/// answer unless the prompt says to call them.
+pub fn with_tools_offered(system: &str) -> String {
+    if system.contains(NO_TOOLS_LINE) {
+        system.replace(NO_TOOLS_LINE, TOOLS_LINE)
+    } else if system.trim().is_empty() {
+        TOOLS_LINE.to_string()
+    } else {
+        format!("{}\n\n{TOOLS_LINE}", system.trim_end())
+    }
 }
 
 /// A human-readable roster of everyone in the workspace and how to address them.
@@ -304,6 +328,7 @@ mod tests {
             context_window_tokens: None,
             keep_alive: None,
             think: None,
+            tools: false,
         }
     }
 
@@ -316,6 +341,11 @@ mod tests {
         assert!(!b.contains("/v1/chat/completions"), "path must not leak: {b}");
         assert!(b.contains("runs from: Michael's MacBook"), "{b}");
         assert!(b.contains("no tool definitions"), "{b}");
+        let with = with_tools_offered(&b);
+        assert!(!with.contains("no tool definitions") && with.contains("carries tool definitions"), "{with}");
+        assert!(with.starts_with("Your runtime"), "only the tools line changes: {with}");
+        assert_eq!(with_tools_offered("Be brief.\n"), format!("Be brief.\n\n{TOOLS_LINE}"));
+        assert_eq!(with_tools_offered(""), TOOLS_LINE);
         assert!(b.contains("never guess"), "{b}");
     }
 

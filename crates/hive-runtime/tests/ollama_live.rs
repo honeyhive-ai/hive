@@ -7,7 +7,10 @@
 //! ```
 
 use hive_runtime::provider::ollama::{ChatOptions, OllamaClient};
-use hive_runtime::provider::ChatTurn;
+use hive_runtime::provider::{ChatTurn, StreamActivity};
+use hive_runtime::tool_loop::ToolExecutor;
+use serde_json::{json, Value};
+use std::sync::Mutex;
 use std::time::Duration;
 
 fn live() -> Option<(String, String)> {
@@ -184,4 +187,74 @@ async fn pull_update_and_remove_a_small_model() {
     let again = client.delete(&model).await;
     eprintln!("second delete: {again:?}");
     assert!(again.is_err(), "deleting an absent model is an error");
+}
+
+/// A one-tool executor for the live loop: records what the model asked for
+/// and answers with a value the model can only know by calling it.
+struct Weather {
+    calls: Mutex<Vec<(String, Value)>>,
+}
+impl ToolExecutor for Weather {
+    async fn call(&self, name: &str, input: &Value) -> (String, bool) {
+        self.calls.lock().unwrap().push((name.to_string(), input.clone()));
+        let city = input.get("city").and_then(Value::as_str).unwrap_or("?");
+        (format!("Weather in {city}: 23°C, clear sky, wind 9 km/h"), false)
+    }
+}
+
+/// The tool loop against the live model: the probe must say `tools`, the
+/// model must call the offered tool (not narrate it), the result must come
+/// back through history, and the final answer must use it. This is the
+/// harness's phase-3 acceptance check — "does qwen3.5 actually drop tool
+/// calls?" — so it prints every round.
+#[tokio::test]
+async fn tool_call_round_trip_with_the_live_model() {
+    let Some((endpoint, model)) = live() else {
+        eprintln!("HIVE_OLLAMA_LIVE_ENDPOINT unset; skipping live Ollama test");
+        return;
+    };
+    let client = OllamaClient::new(&endpoint).with_idle_timeout(Duration::from_secs(120));
+    let caps = client.show(&model).await.expect("/api/show");
+    eprintln!("probe: {}", caps.summary());
+    assert!(caps.tools, "{model} must report tool support for the tool loop to be offered");
+
+    let tools = vec![json!({
+        "name": "get_weather",
+        "description": "Current weather for a city. Call this whenever asked about weather.",
+        "input_schema": {
+            "type": "object",
+            "properties": { "city": { "type": "string", "description": "City name" } },
+            "required": ["city"]
+        }
+    })];
+    let exec = Weather { calls: Mutex::new(vec![]) };
+    let system = hive_runtime::prompt::with_tools_offered(
+        "You are a terse assistant. Answer in one short sentence."
+    );
+    let turns = [ChatTurn::user("What is the weather in Lisbon right now?")];
+    let opts = ChatOptions { num_ctx: Some(8192), keep_alive: Some("5m".into()), think: Some(false) };
+    let mut acts: Vec<String> = Vec::new();
+    let mut deltas = 0usize;
+    let started = std::time::Instant::now();
+    let out = client
+        .stream_chat_with_tools(&model, Some(&system), &turns, &opts, &tools, &exec, 4, |_| deltas += 1, |a| {
+            acts.push(match a {
+                StreamActivity::Tool { name, input_json, .. } => format!("call {name}({input_json})"),
+                StreamActivity::ToolResult { content, is_error, .. } => format!("result err={is_error} {content}"),
+                StreamActivity::Thinking { text } => format!("thinking {} chars", text.len()),
+            });
+        })
+        .await
+        .expect("tool loop");
+    eprintln!("{:.1}s, {deltas} deltas, activity: {acts:#?}", started.elapsed().as_secs_f64());
+    eprintln!("final: {:?} (prompt_tokens={:?}, completion_tokens={:?})", out.text.trim(), out.prompt_tokens, out.completion_tokens);
+
+    let calls = exec.calls.lock().unwrap();
+    assert!(!out.tools_unsupported, "server accepted the tool definitions");
+    assert_eq!(calls.len(), 1, "the model called the tool exactly once: {calls:?}");
+    assert_eq!(calls[0].0, "get_weather");
+    let city = calls[0].1.get("city").and_then(Value::as_str).unwrap_or("").to_lowercase();
+    assert!(city.contains("lisbon"), "the model passed the city through: {:?}", calls[0].1);
+    assert!(out.text.contains("23"), "the answer uses the tool's result: {:?}", out.text);
+    assert!(deltas > 0, "the final answer was streamed");
 }

@@ -2795,6 +2795,9 @@ impl AppState {
                     // Native-Ollama request settings (ignored by other providers).
                     keep_alive: rt.request_keep_alive.clone().filter(|s| !s.trim().is_empty()),
                     think: rt.think,
+                    // The runtime's "Supports tools" switch: opts a native-Ollama
+                    // runtime into the MCP tool loop (still gated on the probe).
+                    tools: rt.capabilities.supports_tools,
                 };
             }
         }
@@ -2812,6 +2815,7 @@ impl AppState {
             context_window_tokens: None,
             keep_alive: None,
             think: None,
+            tools: false,
         }
     }
 }
@@ -5941,6 +5945,41 @@ fn turns_to_messages(turns: &[ChatTurn]) -> Vec<Value> {
         .collect()
 }
 
+/// The enabled MCP tools as neutral provider definitions plus the executor
+/// that routes a call back to its server. `None` when no server is enabled or
+/// none of them lists a tool, so the caller streams a plain turn instead.
+/// Shared by the Anthropic loop and the native-Ollama loop.
+async fn mcp_tool_set(state: &State<'_, AppState>) -> Option<(Vec<Value>, McpToolExecutor)> {
+    // Renew any near-expiry remote-server tokens before we build the registry.
+    state.ensure_fresh_mcp_tokens().await;
+    // Snapshot the registry so we don't hold locks across awaits.
+    let registry = McpRegistry::new(state.combined_mcp_servers());
+    registry.enabled().next()?;
+
+    let tagged = registry.list_all_tools().await;
+    if tagged.is_empty() {
+        return None;
+    }
+
+    let mut tool_defs = Vec::with_capacity(tagged.len());
+    let mut names = HashMap::new();
+    for (server, tool) in &tagged {
+        let tname = sanitize_tool_name(&format!("{server}__{}", tool.name));
+        tool_defs.push(json!({
+            "name": tname,
+            "description": tool.description,
+            "input_schema": tool.input_schema,
+        }));
+        names.insert(tname, (server.clone(), tool.name.clone()));
+    }
+    Some((tool_defs, McpToolExecutor { registry, names }))
+}
+
+/// Model rounds per tool-using turn (the last one is forced tool-less for
+/// Ollama so a small model still ends on an answer). Matches the Anthropic
+/// loop's bound.
+const MAX_TOOL_ROUNDS: usize = 6;
+
 /// Attempt the MCP tool loop. Returns `Ok(Some(text))` if it ran, `Ok(None)` if
 /// there were no enabled tools / no API key (caller falls back to streaming).
 async fn try_tool_loop(
@@ -5956,30 +5995,9 @@ async fn try_tool_loop(
     let Some(api_key) = responder.runtime.api_key.clone() else {
         return Ok(None);
     };
-    // Renew any near-expiry remote-server tokens before we build the registry.
-    state.ensure_fresh_mcp_tokens().await;
-    // Snapshot the registry so we don't hold locks across awaits.
-    let registry = McpRegistry::new(state.combined_mcp_servers());
-    if registry.enabled().next().is_none() {
+    let Some((tool_defs, executor)) = mcp_tool_set(state).await else {
         return Ok(None);
-    }
-
-    let tagged = registry.list_all_tools().await;
-    if tagged.is_empty() {
-        return Ok(None);
-    }
-
-    let mut tool_defs = Vec::with_capacity(tagged.len());
-    let mut names = HashMap::new();
-    for (server, tool) in &tagged {
-        let tname = sanitize_tool_name(&format!("{server}__{}", tool.name));
-        tool_defs.push(json!({
-            "name": tname,
-            "description": tool.description,
-            "input_schema": tool.input_schema,
-        }));
-        names.insert(tname, (server.clone(), tool.name.clone()));
-    }
+    };
 
     let message_id = {
         let mut svc = state.service.lock().unwrap();
@@ -5993,10 +6011,9 @@ async fn try_tool_loop(
         model: responder.runtime.model.clone(),
         system: Some(system.to_string()),
     };
-    let executor = McpToolExecutor { registry, names };
     let initial = turns_to_messages(turns);
 
-    let result = tool_loop::run_with_messages(&model, &executor, initial, tool_defs, 6).await;
+    let result = tool_loop::run_with_messages(&model, &executor, initial, tool_defs, MAX_TOOL_ROUNDS).await;
 
     let (phase, text) = match result {
         Ok(text) => {
@@ -6215,6 +6232,18 @@ async fn run_prepared_turn(
         }
     }
 
+    // A native-Ollama runtime that opted in ("Supports tools") gets the same MCP
+    // tools on the streaming path; the dispatcher still gates on the capability
+    // probe, so a model that can't call tools is never offered them.
+    let ollama_tools = if responder.runtime.provider == ModelProviderKind::Ollama
+        && responder.runtime.tools
+        && !dispatch::ollama_uses_openai_shim()
+    {
+        mcp_tool_set(state).await
+    } else {
+        None
+    };
+
     // Git commit attribution: credit the human who drove this turn as the
     // commit author (+ other thread participants as co-authors), so commits a
     // subprocess agent makes on this host aren't credited to the host owner.
@@ -6377,13 +6406,16 @@ async fn run_prepared_turn(
     // outer select, which still wins there, so its clean break path is unchanged.
     let stop = state.turn_stops.lock().unwrap().entry(session_id).or_default().clone();
     let mut stopped = false;
-    let stream_fut = dispatch::stream(
+    let stream_fut = dispatch::stream_with_tools(
         &responder.runtime,
         Some(&system),
         &turns,
         working_dir,
         &git_env,
         1024,
+        ollama_tools
+            .as_ref()
+            .map(|(defs, executor)| dispatch::ToolSet { defs, executor, max_rounds: MAX_TOOL_ROUNDS }),
         |text| {
             pending.push_str(&text);
             let _ = app.emit(
@@ -7886,6 +7918,7 @@ async fn probe_provider(
         context_window_tokens: None,
         keep_alive: None,
         think: None,
+        tools: false,
     };
     let workspace_root = {
         let r = state.workspace_root.lock().unwrap().clone();

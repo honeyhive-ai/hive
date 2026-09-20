@@ -9,7 +9,14 @@
 //! should think (`think`). The native API carries all three, streams reasoning
 //! in a separate `message.thinking` field, and exposes a capability probe
 //! (`/api/show` → `capabilities: ["completion","tools","thinking"]` plus the
-//! model's maximum context length) that later phases gate tool use on.
+//! model's maximum context length) that the tool loop is gated on.
+//!
+//! Tool loop ([`OllamaClient::stream_chat_with_tools`]): when a runtime opts
+//! in and the probe says the model can call tools, each round streams as
+//! usual, and any `message.tool_calls` the model emits are executed through a
+//! [`ToolExecutor`] and fed back as `role: "tool"` messages until the model
+//! answers in text. The last permitted round goes out without tools so a
+//! model that keeps calling them still ends on an answer.
 //!
 //! Wire shape (NDJSON, one object per line):
 //! ```text
@@ -38,10 +45,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::anthropic::{ChatTurn, ProviderError};
+use super::dispatch::StreamActivity;
 use super::http::{self, Peer};
 use super::openai::endpoint_host;
 use super::thinking::ThinkFilter;
 use super::turn_idle_timeout;
+use crate::tool_loop::ToolExecutor;
 
 const PROVIDER: &str = "ollama";
 const DEFAULT_BASE: &str = "http://localhost:11434";
@@ -185,6 +194,62 @@ pub struct ChatOutcome {
     /// The server rejected `think` for this model and the request was retried
     /// without it (a hint to stop sending it).
     pub think_unsupported: bool,
+    /// The server rejected the tool definitions for this model (a stale probe,
+    /// e.g. after the tag was re-pulled as a build without tool support) and
+    /// the turn finished as a plain chat.
+    pub tools_unsupported: bool,
+}
+
+/// A tool the model asked to call, as Ollama reports it in
+/// `message.tool_calls[].function`. `id` is set only by servers that assign
+/// one; older ones don't, and the loop synthesizes an id for the UI.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: Option<String>,
+    pub name: String,
+    pub arguments: Value,
+}
+
+/// Convert neutral tool definitions (`{name, description, input_schema}`, the
+/// shape the MCP registry produces for Anthropic) into Ollama's
+/// `{"type":"function","function":{name, description, parameters}}`. A
+/// definition already in Ollama's shape passes through.
+pub fn ollama_tool_defs(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .map(|t| {
+            if t.get("type").and_then(Value::as_str) == Some("function") && t.get("function").is_some() {
+                return t.clone();
+            }
+            let parameters = t
+                .get("input_schema")
+                .or_else(|| t.get("parameters"))
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+            json!({
+                "type": "function",
+                "function": {
+                    "name": t.get("name").cloned().unwrap_or(Value::Null),
+                    "description": t.get("description").cloned().unwrap_or_else(|| json!("")),
+                    "parameters": parameters,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Longest tool result fed back to a local model, in characters. A local
+/// window is small (8k–40k tokens) and one oversized read would evict the
+/// system prompt; the tail is replaced by a note so the model knows.
+pub const TOOL_RESULT_MAX_CHARS: usize = 24_000;
+
+fn clip_tool_result(s: String) -> String {
+    if s.chars().count() <= TOOL_RESULT_MAX_CHARS {
+        return s;
+    }
+    let mut out: String = s.chars().take(TOOL_RESULT_MAX_CHARS).collect();
+    out.push_str("\n…[tool result truncated by Hive: too long for a local model's context window]");
+    out
 }
 
 /// Process-wide probe cache: a model's capabilities only change when it is
@@ -505,25 +570,147 @@ impl OllamaClient {
         system: Option<&str>,
         turns: &[ChatTurn],
         opts: &ChatOptions,
+        on_delta: impl FnMut(String),
+        on_thinking: impl FnMut(String),
+    ) -> Result<ChatOutcome, ProviderError> {
+        let messages = seed_messages(system, turns);
+        let mut state = RoundState { think: opts.think, ..Default::default() };
+        let round = self.stream_round(model, &messages, opts, &[], &mut state, on_delta, on_thinking).await?;
+        Ok(round.outcome)
+    }
+
+    /// Stream a chat with tools on offer: the agentic loop for a local model.
+    /// `tools` are neutral definitions (`{name, description, input_schema}`),
+    /// converted with [`ollama_tool_defs`]. Each round streams its text to
+    /// `on_delta` as it arrives; a tool call is announced on `on_activity`
+    /// ([`StreamActivity::Tool`]), run through `executor`, its result reported
+    /// ([`StreamActivity::ToolResult`]) and appended as a `role: "tool"`
+    /// message, and the next round begins. The loop ends when a round makes no
+    /// tool call; the last of `max_rounds` goes out *without* tools so the
+    /// model must answer in text. The returned text is exactly what was
+    /// streamed: the rounds' replies, blank-line separated.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn stream_chat_with_tools<E: ToolExecutor>(
+        &self,
+        model: &str,
+        system: Option<&str>,
+        turns: &[ChatTurn],
+        opts: &ChatOptions,
+        tools: &[Value],
+        executor: &E,
+        max_rounds: usize,
+        mut on_delta: impl FnMut(String),
+        mut on_activity: impl FnMut(StreamActivity),
+    ) -> Result<ChatOutcome, ProviderError> {
+        let defs = ollama_tool_defs(tools);
+        let mut messages = seed_messages(system, turns);
+        let mut state = RoundState { think: opts.think, ..Default::default() };
+        let mut out = ChatOutcome::default();
+        let rounds = max_rounds.max(1);
+        for round in 0..rounds {
+            let last = round + 1 == rounds;
+            let offered: &[Value] = if last || state.tools_rejected { &[] } else { &defs };
+            // Separate this round's text from the previous round's with a blank
+            // line — in the stream and in the body alike, so they match.
+            let mut need_sep = !out.text.is_empty();
+            let r = self
+                .stream_round(
+                    model,
+                    &messages,
+                    opts,
+                    offered,
+                    &mut state,
+                    |t| {
+                        if need_sep {
+                            need_sep = false;
+                            on_delta("\n\n".into());
+                        }
+                        on_delta(t)
+                    },
+                    |text| on_activity(StreamActivity::Thinking { text }),
+                )
+                .await?;
+            if !r.outcome.text.is_empty() {
+                if !out.text.is_empty() {
+                    out.text.push_str("\n\n");
+                }
+                out.text.push_str(&r.outcome.text);
+            }
+            out.prompt_tokens = r.outcome.prompt_tokens.or(out.prompt_tokens);
+            out.completion_tokens = match (out.completion_tokens, r.outcome.completion_tokens) {
+                (Some(a), Some(b)) => Some(a + b),
+                (a, b) => b.or(a),
+            };
+            out.think_unsupported |= r.outcome.think_unsupported;
+            out.tools_unsupported |= r.outcome.tools_unsupported;
+            if r.tool_calls.is_empty() {
+                return Ok(out);
+            }
+            tracing::debug!(
+                target: "dispatch",
+                host = %self.host(),
+                model,
+                round,
+                calls = r.tool_calls.len(),
+                "ollama tool round"
+            );
+            messages.push(assistant_message(&r.outcome.text, &r.tool_calls));
+            for (idx, call) in r.tool_calls.iter().enumerate() {
+                let id = call.id.clone().unwrap_or_else(|| format!("call_{round}_{idx}"));
+                on_activity(StreamActivity::Tool {
+                    id: id.clone(),
+                    name: call.name.clone(),
+                    input_json: call.arguments.to_string(),
+                });
+                let (content, is_error) = executor.call(&call.name, &call.arguments).await;
+                let content = clip_tool_result(content);
+                on_activity(StreamActivity::ToolResult { call_id: id, is_error, content: content.clone() });
+                messages.push(tool_message(call, content));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One streamed `/api/chat` round over an explicit message array, with
+    /// `tools` (already in Ollama's shape) on offer. `state` carries the
+    /// think/tools fallbacks across rounds so a rejected field is dropped once
+    /// per turn, not retried every round.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_round(
+        &self,
+        model: &str,
+        messages: &[Value],
+        opts: &ChatOptions,
+        tools: &[Value],
+        state: &mut RoundState,
         mut on_delta: impl FnMut(String),
         mut on_thinking: impl FnMut(String),
-    ) -> Result<ChatOutcome, ProviderError> {
-        let mut think = opts.think;
-        let mut retried_without_think = false;
+    ) -> Result<Round, ProviderError> {
         let resp = loop {
-            let body = build_request(model, system, turns, opts, think);
+            let body = request_body(model, messages, opts, state.think, if state.tools_rejected { &[] } else { tools });
             let resp = self.post_chat(&body).await?;
             if resp.status().is_success() {
                 break resp;
             }
             let status = resp.status().as_u16();
             let text = error_text(&resp.text().await.unwrap_or_default());
+            let lower = text.to_lowercase();
             // "\"qwen2.5\" does not support thinking" — drop the field and retry
             // once, so a non-reasoning model works with the default `think: false`.
-            if status == 400 && think.is_some() && !retried_without_think && text.to_lowercase().contains("think") {
+            if status == 400 && state.think.is_some() && !state.retried_without_think && lower.contains("think") {
                 tracing::info!(target: "dispatch", host = %self.host(), model, "server rejected `think` ({text}); retrying without it");
-                think = None;
-                retried_without_think = true;
+                state.think = None;
+                state.retried_without_think = true;
+                continue;
+            }
+            // "\"gemma\" does not support tools" — the probe was stale (the tag
+            // was re-pulled as a build without tool support). Finish the turn
+            // as a plain chat and forget the cached probe so the next turn
+            // re-checks.
+            if status == 400 && !tools.is_empty() && !state.tools_rejected && lower.contains("tool") {
+                tracing::warn!(target: "dispatch", host = %self.host(), model, "server rejected tool definitions ({text}); continuing without tools");
+                self.forget_cached(model);
+                state.tools_rejected = true;
                 continue;
             }
             return Err(ProviderError::Api { provider: PROVIDER, status, body: text });
@@ -531,7 +718,14 @@ impl OllamaClient {
 
         let url = self.chat_url();
         let peer = Peer { provider: PROVIDER, url: &url };
-        let mut out = ChatOutcome { think_unsupported: retried_without_think, ..Default::default() };
+        let mut round = Round {
+            outcome: ChatOutcome {
+                think_unsupported: state.retried_without_think,
+                tools_unsupported: state.tools_rejected,
+                ..Default::default()
+            },
+            tool_calls: Vec::new(),
+        };
         let mut buffer = String::new();
         let mut filter = ThinkFilter::new();
         let mut stream = resp.bytes_stream();
@@ -548,65 +742,32 @@ impl OllamaClient {
                 if line.is_empty() {
                     continue;
                 }
-                let frame = parse_frame(&line)?;
-                if !frame.thinking.is_empty() {
-                    on_thinking(frame.thinking);
-                }
-                if !frame.content.is_empty() {
-                    let split = filter.push(&frame.content);
-                    if !split.thinking.is_empty() {
-                        on_thinking(split.thinking);
-                    }
-                    if !split.content.is_empty() {
-                        out.text.push_str(&split.content);
-                        on_delta(split.content);
-                    }
-                }
-                if frame.done {
-                    out.prompt_tokens = frame.prompt_tokens;
-                    out.completion_tokens = frame.completion_tokens;
-                }
+                absorb(parse_frame(&line)?, &mut round, &mut filter, &mut on_delta, &mut on_thinking);
             }
         }
         // A final line without a trailing newline.
         let rest = buffer.trim();
         if !rest.is_empty() {
-            let frame = parse_frame(rest)?;
-            if !frame.thinking.is_empty() {
-                on_thinking(frame.thinking);
-            }
-            if !frame.content.is_empty() {
-                let split = filter.push(&frame.content);
-                if !split.thinking.is_empty() {
-                    on_thinking(split.thinking);
-                }
-                if !split.content.is_empty() {
-                    out.text.push_str(&split.content);
-                    on_delta(split.content);
-                }
-            }
-            if frame.done {
-                out.prompt_tokens = frame.prompt_tokens;
-                out.completion_tokens = frame.completion_tokens;
-            }
+            absorb(parse_frame(rest)?, &mut round, &mut filter, &mut on_delta, &mut on_thinking);
         }
         let tail = filter.finish();
         if !tail.thinking.is_empty() {
             on_thinking(tail.thinking);
         }
         if !tail.content.is_empty() {
-            out.text.push_str(&tail.content);
+            round.outcome.text.push_str(&tail.content);
             on_delta(tail.content);
         }
         tracing::debug!(
             target: "dispatch",
             host = %self.host(),
             model,
-            prompt_tokens = ?out.prompt_tokens,
-            completion_tokens = ?out.completion_tokens,
+            prompt_tokens = ?round.outcome.prompt_tokens,
+            completion_tokens = ?round.outcome.completion_tokens,
+            tool_calls = round.tool_calls.len(),
             "ollama chat complete"
         );
-        Ok(out)
+        Ok(round)
     }
 
     async fn post_chat(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
@@ -621,10 +782,87 @@ impl OllamaClient {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct Message<'a> {
-    role: &'a str,
-    content: &'a str,
+/// Fallbacks carried across the rounds of one turn.
+#[derive(Debug, Default)]
+struct RoundState {
+    think: Option<bool>,
+    retried_without_think: bool,
+    tools_rejected: bool,
+}
+
+/// One round's result: the streamed text plus any tool calls the model made.
+#[derive(Debug, Default)]
+struct Round {
+    outcome: ChatOutcome,
+    tool_calls: Vec<ToolCall>,
+}
+
+/// Fold one frame into the round: thinking to its sink, content through the
+/// `<think>` filter to the delta sink, tool calls and token counts recorded.
+fn absorb(
+    frame: Frame,
+    round: &mut Round,
+    filter: &mut ThinkFilter,
+    on_delta: &mut impl FnMut(String),
+    on_thinking: &mut impl FnMut(String),
+) {
+    if !frame.thinking.is_empty() {
+        on_thinking(frame.thinking);
+    }
+    if !frame.content.is_empty() {
+        let split = filter.push(&frame.content);
+        if !split.thinking.is_empty() {
+            on_thinking(split.thinking);
+        }
+        if !split.content.is_empty() {
+            round.outcome.text.push_str(&split.content);
+            on_delta(split.content);
+        }
+    }
+    round.tool_calls.extend(frame.tool_calls);
+    if frame.done {
+        round.outcome.prompt_tokens = frame.prompt_tokens;
+        round.outcome.completion_tokens = frame.completion_tokens;
+    }
+}
+
+/// The message array a turn starts from: the system prompt, then the turns.
+pub fn seed_messages(system: Option<&str>, turns: &[ChatTurn]) -> Vec<Value> {
+    let mut messages = Vec::with_capacity(turns.len() + 1);
+    if let Some(sys) = system {
+        messages.push(json!({ "role": "system", "content": sys }));
+    }
+    for t in turns {
+        messages.push(json!({ "role": t.role, "content": t.content }));
+    }
+    messages
+}
+
+/// The assistant turn to echo back into history after a tool round: its text
+/// and the calls it made, in the shape Ollama's chat templates expect.
+fn assistant_message(text: &str, calls: &[ToolCall]) -> Value {
+    let tool_calls: Vec<Value> = calls
+        .iter()
+        .map(|c| {
+            let mut v = json!({ "function": { "name": c.name, "arguments": c.arguments } });
+            if let Some(id) = &c.id {
+                v["id"] = json!(id);
+            }
+            v
+        })
+        .collect();
+    json!({ "role": "assistant", "content": text, "tool_calls": tool_calls })
+}
+
+/// A tool's result as the `role: "tool"` message that answers `call`.
+/// `tool_name` is what Ollama's templates key on; `tool_call_id` is added when
+/// the server assigned an id, for the templates that use it instead.
+fn tool_message(call: &ToolCall, content: String) -> Value {
+    let mut v = json!({ "role": "tool", "content": content, "tool_name": call.name });
+    if let Some(id) = &call.id {
+        v["tool_call_id"] = json!(id);
+    }
+    v
 }
 
 /// Build the `/api/chat` body. Only set fields are serialized so an older
@@ -636,13 +874,12 @@ pub fn build_request(
     opts: &ChatOptions,
     think: Option<bool>,
 ) -> Value {
-    let mut messages = Vec::with_capacity(turns.len() + 1);
-    if let Some(sys) = system {
-        messages.push(Message { role: "system", content: sys });
-    }
-    for t in turns {
-        messages.push(Message { role: &t.role, content: &t.content });
-    }
+    request_body(model, &seed_messages(system, turns), opts, think, &[])
+}
+
+/// [`build_request`] over an explicit message array, with `tools` (Ollama
+/// shape) attached when non-empty.
+fn request_body(model: &str, messages: &[Value], opts: &ChatOptions, think: Option<bool>, tools: &[Value]) -> Value {
     let mut body = json!({
         "model": model,
         "stream": true,
@@ -657,6 +894,9 @@ pub fn build_request(
     if let Some(n) = opts.num_ctx.filter(|n| *n > 0) {
         body["options"] = json!({ "num_ctx": n });
     }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
+    }
     body
 }
 
@@ -665,6 +905,8 @@ pub fn build_request(
 pub struct Frame {
     pub content: String,
     pub thinking: String,
+    /// Tool calls in this frame (`message.tool_calls`), whole per call.
+    pub tool_calls: Vec<ToolCall>,
     pub done: bool,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
@@ -689,10 +931,43 @@ pub fn parse_frame(line: &str) -> Result<Frame, ProviderError> {
     Ok(Frame {
         content: field("content"),
         thinking: field("thinking"),
+        tool_calls: parse_tool_calls(msg),
         done: v.get("done").and_then(Value::as_bool).unwrap_or(false),
         prompt_tokens: count("prompt_eval_count"),
         completion_tokens: count("eval_count"),
     })
+}
+
+/// `message.tool_calls[]` → [`ToolCall`]s. `arguments` is an object on the
+/// wire; a model that emits it as a JSON *string* is tolerated (parsed, or
+/// wrapped as `{"input": …}` when it isn't JSON). Entries without a function
+/// name are skipped.
+fn parse_tool_calls(msg: Option<&Value>) -> Vec<ToolCall> {
+    let Some(calls) = msg.and_then(|m| m.get("tool_calls")).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    calls
+        .iter()
+        .filter_map(|c| {
+            let f = c.get("function")?;
+            let name = f.get("name")?.as_str()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let arguments = match f.get("arguments") {
+                Some(Value::String(raw)) => serde_json::from_str(raw).unwrap_or_else(|_| json!({ "input": raw })),
+                Some(v) => v.clone(),
+                None => json!({}),
+            };
+            let id = c
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            Some(ToolCall { id, name, arguments })
+        })
+        .collect()
 }
 
 /// The `error` string out of an Ollama error body, else the body itself.
@@ -764,7 +1039,7 @@ mod tests {
     #[test]
     fn parses_frames_thinking_done_and_errors() {
         let f = parse_frame(r#"{"message":{"role":"assistant","content":"Hi","thinking":"hmm"},"done":false}"#).unwrap();
-        assert_eq!(f, Frame { content: "Hi".into(), thinking: "hmm".into(), done: false, prompt_tokens: None, completion_tokens: None });
+        assert_eq!(f, Frame { content: "Hi".into(), thinking: "hmm".into(), tool_calls: vec![], done: false, prompt_tokens: None, completion_tokens: None });
         let f = parse_frame(r#"{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":26,"eval_count":298}"#).unwrap();
         assert!(f.done);
         assert_eq!(f.prompt_tokens, Some(26));
@@ -819,6 +1094,12 @@ mod wire {
         reply: Arc<Vec<String>>,
         /// Reject any request carrying `think` with Ollama's 400.
         reject_think: bool,
+        /// Reject any request carrying `tools` with Ollama's 400.
+        reject_tools: bool,
+        /// Per-request scripted replies for multi-round tests: the n-th chat
+        /// request streams `rounds[n]`; requests past the end fall back to
+        /// `reply`.
+        rounds: Arc<Vec<Vec<String>>>,
         /// Stall (never finish) after the first line.
         stall: bool,
         /// `/api/show` response.
@@ -841,7 +1122,11 @@ mod wire {
 
     async fn chat(State(f): State<Fake>, body: String) -> axum::response::Response {
         let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-        f.seen.lock().unwrap().chat_bodies.push(v.clone());
+        let n = {
+            let mut seen = f.seen.lock().unwrap();
+            seen.chat_bodies.push(v.clone());
+            seen.chat_bodies.len() - 1
+        };
         if f.reject_think && v.get("think").is_some() {
             return axum::response::Response::builder()
                 .status(StatusCode::BAD_REQUEST)
@@ -849,7 +1134,14 @@ mod wire {
                 .body(Body::from(json!({"error": "\"qwen2.5\" does not support thinking"}).to_string()))
                 .unwrap();
         }
-        let lines = f.reply.clone();
+        if f.reject_tools && v.get("tools").is_some() {
+            return axum::response::Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"error": "registry.ollama.ai/library/gemma:2b does not support tools"}).to_string()))
+                .unwrap();
+        }
+        let lines = f.rounds.get(n).map(|r| Arc::new(r.clone())).unwrap_or_else(|| f.reply.clone());
         let stall = f.stall;
         let stream = futures_util::stream::unfold(0usize, move |i| {
             let lines = lines.clone();
@@ -961,6 +1253,8 @@ mod wire {
             seen: Arc::new(Mutex::new(Seen::default())),
             reply: Arc::new(reply),
             reject_think: false,
+            reject_tools: false,
+            rounds: Arc::new(Vec::new()),
             stall: false,
             show: Arc::new(json!({
                 "capabilities": ["completion", "tools", "thinking"],
@@ -1202,5 +1496,179 @@ mod wire {
         let err = client.delete("missing").await.unwrap_err();
         assert!(matches!(err, ProviderError::Api { status: 404, .. }), "{err}");
         assert!(err.to_string().contains("not found"));
+    }
+
+    fn tool_call_frame(name: &str, args: Value) -> String {
+        json!({"message": {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": name, "arguments": args}}]}, "done": false}).to_string()
+    }
+
+    /// Records calls; answers every one with the same text.
+    struct Recorder {
+        calls: Mutex<Vec<(String, Value)>>,
+    }
+    impl ToolExecutor for Recorder {
+        async fn call(&self, name: &str, input: &Value) -> (String, bool) {
+            self.calls.lock().unwrap().push((name.to_string(), input.clone()));
+            (format!("result for {name}: 42"), false)
+        }
+    }
+
+    fn search_tool() -> Vec<Value> {
+        vec![json!({
+            "name": "search",
+            "description": "Search the index",
+            "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]}
+        })]
+    }
+
+    #[tokio::test]
+    async fn tool_call_round_trips_through_the_executor_and_back_to_the_model() {
+        let mut f = fake(vec![frame("unused"), done()]);
+        f.rounds = Arc::new(vec![
+            vec![frame("Let me check."), tool_call_frame("search", json!({"q": "x"})), done()],
+            vec![frame("final "), frame("answer"), done()],
+        ]);
+        let (base, seen) = serve(f).await;
+        let exec = Recorder { calls: Mutex::new(vec![]) };
+        let (mut deltas, mut acts) = (Vec::new(), Vec::new());
+        let opts = ChatOptions { num_ctx: Some(8192), think: Some(false), ..Default::default() };
+        let out = OllamaClient::new(&base)
+            .stream_chat_with_tools(
+                "qwen3.5",
+                Some("sys"),
+                &[ChatTurn::user("find x")],
+                &opts,
+                &search_tool(),
+                &exec,
+                4,
+                |d| deltas.push(d),
+                |a| acts.push(a),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.text, "Let me check.\n\nfinal answer");
+        assert_eq!(deltas.concat(), out.text, "the body is exactly what was streamed");
+        assert!(!out.tools_unsupported);
+        assert_eq!(out.completion_tokens, Some(14), "completion tokens summed over rounds");
+        assert_eq!(exec.calls.lock().unwrap().as_slice(), &[("search".to_string(), json!({"q": "x"}))]);
+        // Activity: the call, then its result, with a synthesized id.
+        assert!(matches!(&acts[0], StreamActivity::Tool { id, name, input_json } if id == "call_0_0" && name == "search" && input_json == r#"{"q":"x"}"#), "{acts:?}");
+        assert!(matches!(&acts[1], StreamActivity::ToolResult { call_id, is_error: false, content } if call_id == "call_0_0" && content == "result for search: 42"), "{acts:?}");
+        assert_eq!(acts.len(), 2);
+
+        let s = seen.lock().unwrap();
+        assert_eq!(s.chat_bodies.len(), 2);
+        let first = &s.chat_bodies[0];
+        assert_eq!(first["tools"][0]["type"], "function");
+        assert_eq!(first["tools"][0]["function"]["name"], "search");
+        assert_eq!(first["tools"][0]["function"]["parameters"]["required"][0], "q");
+        assert_eq!(first["options"]["num_ctx"], 8192);
+        // Round 2 carries the history: the assistant's call and the tool's answer.
+        let second = &s.chat_bodies[1];
+        assert!(second.get("tools").is_some(), "tools stay on offer until the last round");
+        let msgs = second["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["content"], "Let me check.");
+        assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "search");
+        assert_eq!(msgs[2]["tool_calls"][0]["function"]["arguments"]["q"], "x");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_name"], "search");
+        assert_eq!(msgs[3]["content"], "result for search: 42");
+        assert!(msgs[3].get("tool_call_id").is_none(), "no id was assigned by the server");
+    }
+
+    #[tokio::test]
+    async fn last_round_goes_out_without_tools_so_a_looping_model_still_answers() {
+        // The model calls the tool every time it is offered.
+        let f = fake(vec![tool_call_frame("search", json!({"q": "again"})), done()]);
+        let mut f = f;
+        f.rounds = Arc::new(vec![
+            vec![tool_call_frame("search", json!({"q": "1"})), done()],
+            vec![tool_call_frame("search", json!({"q": "2"})), done()],
+            vec![frame("giving up: 42"), done()],
+        ]);
+        let (base, seen) = serve(f).await;
+        let exec = Recorder { calls: Mutex::new(vec![]) };
+        let out = OllamaClient::new(&base)
+            .stream_chat_with_tools("m", None, &[ChatTurn::user("go")], &ChatOptions::default(), &search_tool(), &exec, 3, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.text, "giving up: 42");
+        assert_eq!(exec.calls.lock().unwrap().len(), 2);
+        let s = seen.lock().unwrap();
+        assert_eq!(s.chat_bodies.len(), 3);
+        assert!(s.chat_bodies[0].get("tools").is_some());
+        assert!(s.chat_bodies[1].get("tools").is_some());
+        assert!(s.chat_bodies[2].get("tools").is_none(), "the final round forces a text answer");
+        // Every earlier round's calls and results are in the last request's history.
+        let roles: Vec<&str> = s.chat_bodies[2]["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant", "tool"]);
+    }
+
+    #[tokio::test]
+    async fn tools_rejected_by_the_server_fall_back_to_a_plain_chat() {
+        let mut f = fake(vec![frame("plain"), done()]);
+        f.reject_tools = true;
+        let (base, seen) = serve(f).await;
+        let client = OllamaClient::new(&base);
+        // A cached probe that (wrongly) says tools are fine must be dropped.
+        assert!(client.capabilities_cached("gemma:2b").await.is_some());
+        let exec = Recorder { calls: Mutex::new(vec![]) };
+        let out = client
+            .stream_chat_with_tools("gemma:2b", None, &[ChatTurn::user("go")], &ChatOptions::default(), &search_tool(), &exec, 4, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.text, "plain");
+        assert!(out.tools_unsupported);
+        assert!(exec.calls.lock().unwrap().is_empty());
+        let s = seen.lock().unwrap();
+        assert_eq!(s.chat_bodies.len(), 2);
+        assert!(s.chat_bodies[0].get("tools").is_some());
+        assert!(s.chat_bodies[1].get("tools").is_none());
+        drop(s);
+        assert!(
+            probe_cache().lock().unwrap().get(&format!("{}|gemma:2b", client.base())).is_none(),
+            "stale probe forgotten so the next turn re-checks"
+        );
+    }
+
+    #[test]
+    fn tool_call_frames_parse_object_and_string_arguments() {
+        let f = parse_frame(
+            r#"{"message":{"role":"assistant","content":"","tool_calls":[
+                {"id":"call_9","function":{"name":"search","arguments":{"q":"x"}}},
+                {"function":{"name":"read","arguments":"{\"path\":\"a.rs\"}"}},
+                {"function":{"name":"raw","arguments":"not json"}},
+                {"function":{"arguments":{}}}
+            ]},"done":false}"#,
+        )
+        .unwrap();
+        assert_eq!(f.tool_calls.len(), 3, "a call without a name is dropped");
+        assert_eq!(f.tool_calls[0], ToolCall { id: Some("call_9".into()), name: "search".into(), arguments: json!({"q": "x"}) });
+        assert_eq!(f.tool_calls[1].arguments, json!({"path": "a.rs"}));
+        assert_eq!(f.tool_calls[2].arguments, json!({"input": "not json"}));
+        // A server-assigned id is echoed on both sides of the exchange.
+        let a = assistant_message("", &f.tool_calls[..1]);
+        assert_eq!(a["tool_calls"][0]["id"], "call_9");
+        let t = tool_message(&f.tool_calls[0], "r".into());
+        assert_eq!(t["tool_call_id"], "call_9");
+        assert_eq!(t["tool_name"], "search");
+    }
+
+    #[test]
+    fn tool_defs_convert_to_ollama_shape_and_pass_native_through() {
+        let defs = ollama_tool_defs(&[
+            json!({"name": "a", "description": "d", "input_schema": {"type": "object"}}),
+            json!({"name": "b"}),
+            json!({"type": "function", "function": {"name": "c", "parameters": {}}}),
+        ]);
+        assert_eq!(defs[0], json!({"type": "function", "function": {"name": "a", "description": "d", "parameters": {"type": "object"}}}));
+        assert_eq!(defs[1]["function"]["parameters"], json!({"type": "object", "properties": {}}));
+        assert_eq!(defs[2]["function"]["name"], "c");
+        let long: String = "x".repeat(TOOL_RESULT_MAX_CHARS + 5);
+        assert!(clip_tool_result(long).ends_with("context window]"));
+        assert_eq!(clip_tool_result("short".into()), "short");
     }
 }

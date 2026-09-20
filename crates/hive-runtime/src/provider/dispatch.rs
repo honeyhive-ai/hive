@@ -4,11 +4,13 @@
 //! actually runs there, and aider/pi/claude-code runtimes run as subprocesses.
 
 use hive_core::ModelProviderKind;
+use serde_json::Value;
 
 use super::anthropic::{AnthropicClient, ChatTurn, ProviderError};
 use super::ollama::{ChatOptions, OllamaClient};
 use super::openai::OpenAiClient;
 use super::subprocess;
+use crate::tool_loop::ToolExecutor;
 
 /// A runtime resolved to everything needed to execute against it.
 #[derive(Debug, Clone)]
@@ -36,6 +38,29 @@ pub struct ResolvedRuntime {
     /// Ollama `think`: ask a reasoning model to think (`Some(true)`) or not
     /// (`Some(false)`); `None` ⇒ Hive's default, which is off.
     pub think: Option<bool>,
+    /// The runtime's "Supports tools" switch. For native Ollama this opts the
+    /// runtime into the MCP tool loop, which then also needs the capability
+    /// probe to say the model can call tools. Other HTTP providers ignore it.
+    pub tools: bool,
+}
+
+/// Tools to offer a turn: neutral definitions (`{name, description,
+/// input_schema}`) and the executor that runs them. Today only native Ollama
+/// consumes this from [`stream_with_tools`]; Anthropic has its own loop in
+/// the app, and the OpenAI wire ignores it.
+pub struct ToolSet<'a, E: ToolExecutor> {
+    pub defs: &'a [Value],
+    pub executor: &'a E,
+    /// Model rounds per turn, including the final tool-less one.
+    pub max_rounds: usize,
+}
+
+/// The executor type for a turn that offers no tools.
+pub struct NoTools;
+impl ToolExecutor for NoTools {
+    async fn call(&self, name: &str, _input: &Value) -> (String, bool) {
+        (format!("no tools are available (asked for {name})"), true)
+    }
 }
 
 /// Env override forcing Ollama runtimes through the OpenAI-compatible `/v1`
@@ -65,6 +90,14 @@ pub fn ollama_chat_options(rt: &ResolvedRuntime, caps: Option<&super::ollama::Mo
         (None, _) => Some(false),
     };
     ChatOptions { num_ctx: Some(num_ctx), keep_alive: rt.keep_alive.clone().filter(|s| !s.trim().is_empty()), think }
+}
+
+/// Whether a native-Ollama turn may carry tool definitions: the runtime opted
+/// in AND the probe says the model can call tools. No probe (server
+/// unreachable at probe time, or an old server without `capabilities`) means
+/// no tools — a model that can't parse them would answer with junk.
+pub fn ollama_tools_allowed(rt: &ResolvedRuntime, caps: Option<&super::ollama::ModelCapabilities>) -> bool {
+    rt.tools && caps.map(|c| c.tools).unwrap_or(false)
 }
 
 impl ResolvedRuntime {
@@ -160,6 +193,27 @@ pub async fn stream(
     on_delta: impl FnMut(String),
     // Live tool/thinking activity: subprocess agents emit tool calls/results;
     // OpenAI-wire providers emit reasoning fragments.
+    on_activity: impl FnMut(StreamActivity),
+) -> Result<String, ProviderError> {
+    stream_with_tools(rt, system, turns, working_dir, extra_env, max_tokens, None::<ToolSet<'_, NoTools>>, on_delta, on_activity)
+        .await
+}
+
+/// [`stream`], with `tools` on offer. A native-Ollama runtime runs the tool
+/// loop when the runtime opts in (`tools` switch), the probe reports tool
+/// support, and `tools` is non-empty; tool calls and results are surfaced as
+/// [`StreamActivity`] like a subprocess agent's. Otherwise `tools` is ignored
+/// and the turn streams as plain chat.
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_with_tools<E: ToolExecutor>(
+    rt: &ResolvedRuntime,
+    system: Option<&str>,
+    turns: &[ChatTurn],
+    working_dir: Option<&str>,
+    extra_env: &[(String, String)],
+    max_tokens: u32,
+    tools: Option<ToolSet<'_, E>>,
+    on_delta: impl FnMut(String),
     mut on_activity: impl FnMut(StreamActivity),
 ) -> Result<String, ProviderError> {
     match rt.provider {
@@ -175,12 +229,45 @@ pub async fn stream(
             let client = OllamaClient::new(&rt.endpoint);
             let caps = client.capabilities_cached(&rt.model).await;
             let opts = ollama_chat_options(rt, caps.as_ref());
-            client
-                .stream_chat(&rt.model, system, turns, &opts, on_delta, |text| {
-                    on_activity(StreamActivity::Thinking { text })
-                })
-                .await
-                .map(|out| out.text)
+            match tools.filter(|t| !t.defs.is_empty()) {
+                Some(t) if ollama_tools_allowed(rt, caps.as_ref()) => {
+                    tracing::info!(target: "dispatch", host = %client.host(), model = %rt.model, tools = t.defs.len(), "ollama turn with tools");
+                    // The identity block told the model it has no tools; it does now.
+                    let system = system.map(crate::prompt::with_tools_offered);
+                    client
+                        .stream_chat_with_tools(
+                            &rt.model,
+                            system.as_deref(),
+                            turns,
+                            &opts,
+                            t.defs,
+                            t.executor,
+                            t.max_rounds,
+                            on_delta,
+                            on_activity,
+                        )
+                        .await
+                        .map(|out| out.text)
+                }
+                offered => {
+                    if offered.is_some() {
+                        tracing::info!(
+                            target: "dispatch",
+                            host = %client.host(),
+                            model = %rt.model,
+                            opted_in = rt.tools,
+                            probe = ?caps.as_ref().map(|c| c.tools),
+                            "ollama turn: tools requested but not offered"
+                        );
+                    }
+                    client
+                        .stream_chat(&rt.model, system, turns, &opts, on_delta, |text| {
+                            on_activity(StreamActivity::Thinking { text })
+                        })
+                        .await
+                        .map(|out| out.text)
+                }
+            }
         }
         ModelProviderKind::OpenAI
         | ModelProviderKind::OpenRouter
@@ -388,6 +475,7 @@ mod tests {
             context_window_tokens: None,
             keep_alive: None,
             think: None,
+            tools: false,
         }
     }
 
@@ -447,6 +535,7 @@ mod tests {
             context_window_tokens: None,
             keep_alive: None,
             think: None,
+            tools: false,
         };
         assert!(rt.is_subprocess());
         rt.provider = ModelProviderKind::Anthropic;
@@ -469,6 +558,7 @@ mod tests {
             context_window_tokens: None,
             keep_alive: None,
             think: None,
+            tools: false,
         };
         // Name-based guess for a qwen model.
         assert_eq!(rt.context_window(), 32_768);

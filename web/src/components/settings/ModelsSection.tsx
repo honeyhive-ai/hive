@@ -974,7 +974,7 @@ function RuntimesSection() {
         )}
         <div className="flex items-center gap-2 text-sm opacity-75">
           <Switch on={runtimeSupportsTools} onChange={setRuntimeSupportsTools} label="Supports tools" />
-          <span>Supports tools</span>
+          <span>Supports tools (Ollama: offer your enabled MCP tools when the model's probe says it can call them)</span>
         </div>
         <div className="flex items-center gap-2 text-sm opacity-75">
           <Switch on={runtimeSupportsEmbeddings} onChange={setRuntimeSupportsEmbeddings} label="Supports embeddings" />
