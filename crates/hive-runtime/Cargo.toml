@@ -22,7 +22,7 @@ futures-util = "0.3"
 base64 = "0.22"
 # MCP OAuth 2.1 (PKCE): SHA-256 challenge + random verifier/state. Versions
 # already in the tree (hive-core uses them), so no new crates are pulled.
-sha2 = "0.10"
+sha2 = "0.11"
 getrandom = "0.2"
 iroh = { version = "1.0.0-rc.1", optional = true }
 
