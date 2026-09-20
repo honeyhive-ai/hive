@@ -13,7 +13,7 @@ Open **Settings → Models** to add or edit.
 
 | Provider          | What it is                                       | Auth                      | Tools? |
 |-------------------|--------------------------------------------------|---------------------------|--------|
-| `ollama`          | Local Ollama daemon                              | none                      | text-only today |
+| `ollama`          | Local Ollama daemon (spoken natively)            | none                      | yes (MCP tools) when the runtime's **Supports tools** switch is on and the model reports tool support |
 | `openai`          | OpenAI's API (or any OpenAI-compatible endpoint) | `OPENAI_API_KEY` env / pasted key | yes (MCP tools) |
 | `anthropic`       | Anthropic's API                                  | `ANTHROPIC_API_KEY` env / pasted key | yes (MCP tools) |
 | `openrouter`      | OpenRouter aggregator                            | `OPENROUTER_API_KEY` env / pasted key | yes (MCP tools) |

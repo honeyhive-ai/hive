@@ -147,6 +147,16 @@ LLM access is organized as a hierarchy:
   The add form includes an optional **Context window in tokens** — set
   it for Ollama/custom models whose window Hive can't infer from the
   name; the [context planner](voice-and-slash.md) budgets against it.
+  Ollama runtimes add **Keep alive** (how long the server keeps the
+  model loaded) and **Let the model think** (reasoning models: the
+  chain of thought streams live but never lands in the transcript).
+- **Models panel (Ollama)** — each Ollama runtime row has a **Models**
+  panel showing what is installed on that server (parameters, quant,
+  size, a *loaded* badge with the context window it is loaded at).
+  **Pull** a new tag or **Update** an installed one with per-layer
+  progress, **Cancel** a pull (the server keeps downloaded layers, so a
+  retry resumes), **Remove** a model, or **Use** one to point the
+  runtime at it — no ssh + `ollama pull` needed.
 - **Agents** — reusable personas (name + model/runtime + role +
   instructions) you can attach to any chat.
 

@@ -75,7 +75,8 @@ Different runtimes expose different capabilities:
 | API providers       | Enabled MCP tools (whatever MCP servers you've turned on for the chat). |
 | Claude Code         | Claude Code's own tools, governed by its own permission mode. |
 | aider / pi          | The agent's own internal tools. Hive captures stdout as the reply. |
-| Ollama / hive-daemon| Text only (no tool calls in either direction yet). |
+| Ollama              | Enabled MCP tools when the runtime's **Supports tools** switch is on and the model's capability probe reports tools; text only otherwise. |
+| hive-daemon         | Text only (no tool calls in either direction yet). |
 
 MCP servers are inert until you enable them, so an API runtime starts with no
 tools until you turn some on in the Tools pane.
