@@ -28,6 +28,13 @@ import {
   removeAgentTemplate,
   getContextCommands,
   setContextCommands,
+  listOllamaModels,
+  pullOllamaModel,
+  cancelOllamaPull,
+  deleteOllamaModel,
+  onOllamaPull,
+  openExternal,
+  type OllamaPullEvent,
 } from "@/lib/ipc";
 import { IconChevronDown, IconChevronRight } from "@/lib/icons";
 import { Button, Section, Switch, fieldStyle } from "@/components/ui";
@@ -670,6 +677,51 @@ function RuntimesSection() {
     onError: (e) => toast.error(`Couldn't set default: ${errMsg(e)}`),
   });
 
+  // Ollama rows can expand a "Models on this server" panel (list / pull /
+  // update / remove). Which rows are expanded, by runtime id.
+  const [openModels, setOpenModels] = useState<Record<string, boolean>>({});
+  // "Use" in that panel: re-save the runtime with the chosen model (add_runtime
+  // upserts by id, so every other field round-trips unchanged).
+  const useModelMutation = useMutation({
+    mutationFn: ({ runtime, model }: { runtime: RuntimeSummaryDto; model: string }) =>
+      addRuntime(
+        runtime.id,
+        runtime.name,
+        runtime.provider,
+        runtime.location,
+        runtime.endpoint,
+        model,
+        runtime.supportsTools,
+        runtime.supportsEmbeddings,
+        runtime.modelBaseUrl,
+        runtime.modelProviderId,
+        runtime.contextWindow,
+        runtime.keepAlive ?? null,
+        runtime.think ?? null,
+      ),
+    onSuccess: (_d, { model }) => {
+      toast.success(`Runtime now uses ${model}.`);
+      qc.invalidateQueries({ queryKey: ["runtimes"] });
+    },
+    onError: (e) => toast.error(`Couldn't switch model: ${errMsg(e)}`),
+  });
+
+  // Add-runtime form, Ollama provider: offer the server's installed models as
+  // completions for the model field. Debounced so typing an endpoint doesn't
+  // hit every partial host.
+  const [formEndpoint, setFormEndpoint] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setFormEndpoint(runtimeEndpoint.trim()), 400);
+    return () => clearTimeout(t);
+  }, [runtimeEndpoint]);
+  const formModels = useQuery({
+    queryKey: ["ollama-models", "form", formEndpoint],
+    queryFn: () => listOllamaModels({ endpoint: formEndpoint || null }),
+    enabled: runtimeProvider === "ollama",
+    retry: false,
+    staleTime: 30_000,
+  });
+
   return (
     <Section title="Models (runtimes)">
       <p className="text-xs opacity-50">
@@ -694,6 +746,16 @@ function RuntimesSection() {
                 {runtime.provider === "claude-code" && !runtime.isManaged && <ClaudeCodeRowModel />}
               </div>
               <div className="flex items-center gap-2">
+                {runtime.provider === "ollama" && (
+                  <button
+                    onClick={() => setOpenModels((o) => ({ ...o, [runtime.id]: !o[runtime.id] }))}
+                    className="text-xs hover:opacity-80"
+                    title="See, pull, update, or remove models on this Ollama server"
+                    aria-expanded={!!openModels[runtime.id]}
+                  >
+                    {openModels[runtime.id] ? "Hide models" : "Models"}
+                  </button>
+                )}
                 <button
                   onClick={() => runTest(runtime.id)}
                   disabled={tests[runtime.id]?.pending}
@@ -750,6 +812,13 @@ function RuntimesSection() {
                   </span>
                 )}
               </div>
+            )}
+            {runtime.provider === "ollama" && openModels[runtime.id] && (
+              <OllamaModelsPanel
+                runtime={runtime}
+                switching={useModelMutation.isPending}
+                onUse={(model) => useModelMutation.mutate({ runtime, model })}
+              />
             )}
           </div>
         ))}
@@ -851,9 +920,30 @@ function RuntimesSection() {
           value={runtimeModel}
           onChange={(e) => setRuntimeModel(e.target.value)}
           placeholder={runtimeProvider === "pi" ? "Model — e.g. qwen2.5-coder" : "Preferred model"}
+          list={runtimeProvider === "ollama" ? "ollama-form-models" : undefined}
           className="w-full rounded-xl border px-3 py-2 text-sm"
           style={fieldStyle}
         />
+        {runtimeProvider === "ollama" && (
+          <>
+            <datalist id="ollama-form-models">
+              {(formModels.data?.models ?? []).map((m) => (
+                <option key={m.name} value={m.name}>
+                  {[m.parameterSize, m.quantization].filter(Boolean).join(" · ")}
+                </option>
+              ))}
+            </datalist>
+            <p className="text-xs opacity-50">
+              {formModels.data
+                ? formModels.data.models.length
+                  ? `${formModels.data.models.length} model${formModels.data.models.length === 1 ? "" : "s"} installed on ${formModels.data.host} — pick one above, or add the runtime and pull more from its Models panel.`
+                  : `No models installed on ${formModels.data.host} yet — add the runtime, then pull one from its Models panel.`
+                : formModels.isError
+                  ? `Couldn't list models: ${errMsg(formModels.error)}`
+                  : "Looking up installed models…"}
+            </p>
+          </>
+        )}
         <input
           value={runtimeContextWindow}
           onChange={(e) => setRuntimeContextWindow(e.target.value.replace(/[^0-9]/g, ""))}
@@ -906,6 +996,291 @@ function RuntimesSection() {
         </div>
       </div>
     </Section>
+  );
+}
+
+function fmtBytes(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${Math.round(n / 1e6)} MB`;
+  return `${n} B`;
+}
+
+function fmtCtx(n: number): string {
+  return n >= 1024 ? `${Math.round(n / 1024)}k ctx` : `${n} ctx`;
+}
+
+/// One Ollama server's model catalogue, on the runtime's row: what's installed
+/// (and loaded, with the window it was loaded at), pull a new model or update an
+/// installed one with live progress, remove one, or point this runtime at a
+/// listed model. Ollama has no API for browsing its remote library, so that is
+/// a link.
+function OllamaModelsPanel({
+  runtime,
+  switching,
+  onUse,
+}: {
+  runtime: RuntimeSummaryDto;
+  switching: boolean;
+  onUse: (model: string) => void;
+}) {
+  const qc = useQueryClient();
+  const server = { runtimeId: runtime.id };
+  const list = useQuery({
+    queryKey: ["ollama-models", runtime.id],
+    queryFn: () => listOllamaModels(server),
+    retry: false,
+  });
+  const base = list.data?.base;
+  const [pullName, setPullName] = useState("");
+  // model → its latest progress event. Terminal events (done/canceled) are
+  // removed once the list has refreshed; errors stay until dismissed.
+  const [pulls, setPulls] = useState<Record<string, OllamaPullEvent>>({});
+
+  // A pull started before this panel opened (or from another panel on the same
+  // server) shows as in progress until its next event arrives.
+  useEffect(() => {
+    if (!list.data) return;
+    const { base, pulling } = list.data;
+    setPulls((p) => {
+      const next = { ...p };
+      for (const m of pulling) {
+        if (!next[m]) next[m] = { base, model: m, status: "pulling…", done: false, canceled: false };
+      }
+      return next;
+    });
+  }, [list.data]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void onOllamaPull((e) => {
+      if (base && e.base !== base) return;
+      if (e.done || e.canceled) {
+        setPulls((p) => {
+          const { [e.model]: _gone, ...rest } = p;
+          return rest;
+        });
+        if (e.done) {
+          toast.success(`Pulled ${e.model}.`);
+          void qc.invalidateQueries({ queryKey: ["ollama-models"] });
+        }
+        return;
+      }
+      setPulls((p) => ({ ...p, [e.model]: e }));
+    }).then((u) => {
+      if (disposed) u();
+      else unlisten = u;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [base, qc]);
+
+  async function startPull(name: string) {
+    const model = name.trim();
+    if (!model) return;
+    try {
+      await pullOllamaModel(server, model);
+      setPullName("");
+      setPulls((p) => ({ ...p, [model]: { base: base ?? "", model, status: "starting", done: false, canceled: false } }));
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  }
+  async function cancel(model: string) {
+    try {
+      await cancelOllamaPull(server, model);
+    } catch (e) {
+      toast.error(errMsg(e));
+    }
+  }
+  const remove = useMutation({
+    mutationFn: (model: string) => deleteOllamaModel(server, model),
+    onSuccess: (_d, model) => {
+      toast.success(`Removed ${model} from ${list.data?.host ?? "the server"}.`);
+      void qc.invalidateQueries({ queryKey: ["ollama-models"] });
+    },
+    onError: (e) => toast.error(`Couldn't remove model: ${errMsg(e)}`),
+  });
+
+  const models = list.data?.models ?? [];
+  // Pulls for models not (yet) in the installed list get their own rows.
+  const newPulls = Object.values(pulls).filter((p) => !models.some((m) => m.name === p.model));
+
+  const renderPull = (p: OllamaPullEvent) => {
+    const pct = p.total && p.completed !== undefined ? Math.min(100, Math.round((p.completed / p.total) * 100)) : null;
+    return (
+      <div className="mt-1 space-y-1">
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <span style={{ color: p.error ? "var(--hive-danger)" : undefined }} className={p.error ? "" : "opacity-70"}>
+            {p.error
+              ? `✕ ${p.error}`
+              : pct !== null
+                ? `${p.status.startsWith("pulling") ? "Downloading" : p.status} · ${fmtBytes(p.completed!)} / ${fmtBytes(p.total!)} (${pct}%)`
+                : p.status}
+          </span>
+          {p.error ? (
+            <div className="flex items-center gap-2">
+              <button onClick={() => void startPull(p.model)} className="text-xs hover:opacity-80">
+                Retry
+              </button>
+              <button
+                onClick={() =>
+                  setPulls((all) => {
+                    const { [p.model]: _gone, ...rest } = all;
+                    return rest;
+                  })
+                }
+                className="text-xs hover:opacity-80"
+              >
+                Dismiss
+              </button>
+            </div>
+          ) : (
+            <button onClick={() => void cancel(p.model)} className="text-xs hover:opacity-80" style={{ color: "var(--hive-danger)" }}>
+              Cancel
+            </button>
+          )}
+        </div>
+        {!p.error && (
+          <div className="h-1.5 w-full overflow-hidden rounded-full" style={{ background: "var(--hive-line)" }} role="progressbar" aria-valuenow={pct ?? undefined} aria-valuemin={0} aria-valuemax={100}>
+            <div
+              className={`h-full rounded-full transition-[width] ${pct === null ? "animate-pulse" : ""}`}
+              style={{ width: `${pct ?? 15}%`, background: "var(--hive-accent-cool)" }}
+            />
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="mt-3 space-y-2 rounded-xl border p-3" style={{ borderColor: "var(--hive-line)" }}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs font-semibold uppercase tracking-wide opacity-60">
+          Models on {list.data?.host ?? "this server"}
+        </div>
+        <div className="flex items-center gap-3">
+          <button onClick={() => void list.refetch()} disabled={list.isFetching} className="text-xs hover:opacity-80 disabled:opacity-50">
+            {list.isFetching ? "Refreshing…" : "Refresh"}
+          </button>
+          <button
+            onClick={() => void openExternal("https://ollama.com/library")}
+            className="text-xs hover:opacity-80"
+            title="Browse models you can pull (opens ollama.com)"
+          >
+            Browse library ↗
+          </button>
+        </div>
+      </div>
+      {list.isError && (
+        <p className="text-xs" style={{ color: "var(--hive-danger)" }}>
+          ✕ {errMsg(list.error)}
+        </p>
+      )}
+      {list.isLoading && <p className="text-xs opacity-50">Loading…</p>}
+      {list.data && models.length === 0 && newPulls.length === 0 && (
+        <p className="text-xs opacity-50">No models installed yet. Pull one below.</p>
+      )}
+      <div className="space-y-1">
+        {models.map((m) => {
+          const current = m.name === runtime.model || `${m.name}` === `${runtime.model}:latest`;
+          const pull = pulls[m.name];
+          const meta = [m.parameterSize, m.quantization, m.sizeBytes ? fmtBytes(m.sizeBytes) : ""].filter(Boolean).join(" · ");
+          return (
+            <div key={m.name} className="rounded-lg px-2 py-1.5" style={{ background: "var(--hive-mist)" }}>
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate font-mono text-sm">{m.name}</span>
+                    {current && (
+                      <span className="rounded-full px-2 py-0.5 text-[10px]" style={{ background: "var(--hive-accent-cool)", color: "white" }}>
+                        current
+                      </span>
+                    )}
+                    {m.loaded && (
+                      <span
+                        className="rounded-full border px-2 py-0.5 text-[10px]"
+                        style={{ borderColor: "var(--hive-success)", color: "var(--hive-success)" }}
+                        title={m.expiresAt ? `Loaded in memory; unloads at ${new Date(m.expiresAt).toLocaleTimeString()}` : "Loaded in memory"}
+                      >
+                        loaded{m.loadedContextLength ? ` · ${fmtCtx(m.loadedContextLength)}` : ""}
+                      </span>
+                    )}
+                  </div>
+                  {meta && <div className="text-xs opacity-50">{meta}</div>}
+                </div>
+                {!pull && (
+                  <div className="flex shrink-0 items-center gap-2">
+                    {!current && (
+                      <button
+                        onClick={() => onUse(m.name)}
+                        disabled={switching}
+                        className="text-xs hover:opacity-80 disabled:opacity-50"
+                        title="Point this runtime at this model"
+                      >
+                        Use
+                      </button>
+                    )}
+                    <button
+                      onClick={() => void startPull(m.name)}
+                      className="text-xs hover:opacity-80"
+                      title="Re-pull this tag: fetches only what changed upstream"
+                    >
+                      Update
+                    </button>
+                    <button
+                      onClick={() =>
+                        confirmThen(
+                          `Remove ${m.name} from ${list.data?.host ?? "the server"}? Runtimes using it will fail until it's pulled again.`,
+                          () => remove.mutate(m.name),
+                        )
+                      }
+                      disabled={remove.isPending}
+                      className="text-xs hover:opacity-80 disabled:opacity-50"
+                      style={{ color: "var(--hive-danger)" }}
+                    >
+                      Remove
+                    </button>
+                  </div>
+                )}
+              </div>
+              {pull && renderPull(pull)}
+            </div>
+          );
+        })}
+        {newPulls.map((p) => (
+          <div key={p.model} className="rounded-lg px-2 py-1.5" style={{ background: "var(--hive-mist)" }}>
+            <span className="font-mono text-sm">{p.model}</span>
+            {renderPull(p)}
+          </div>
+        ))}
+      </div>
+      <form
+        className="flex items-center gap-2"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void startPull(pullName);
+        }}
+      >
+        <input
+          value={pullName}
+          onChange={(e) => setPullName(e.target.value)}
+          placeholder="Pull a model — e.g. qwen3.5:latest"
+          className="min-w-0 flex-1 rounded-xl border px-3 py-1.5 font-mono text-sm"
+          style={fieldStyle}
+          spellCheck={false}
+        />
+        <Button type="submit" variant="primary" size="sm" disabled={!pullName.trim()}>
+          Pull
+        </Button>
+      </form>
+      <p className="text-xs opacity-50">
+        Pulls run on the server and continue while you use Hive; a cancelled pull keeps what it downloaded and resumes on
+        the next attempt.
+      </p>
+    </div>
   );
 }
 

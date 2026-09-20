@@ -183,6 +183,67 @@ export type RuntimeTestResult = {
 export const testRuntime = (runtimeId: string) =>
   invoke<RuntimeTestResult>("test_runtime", { runtimeId });
 
+// --- Ollama model management (Settings → Models → "Models on this server") ---
+
+/// A model installed on an Ollama server, plus whether it's loaded right now.
+export type OllamaModel = {
+  name: string;
+  sizeBytes: number;
+  modifiedAt: string;
+  family: string;
+  parameterSize: string;
+  quantization: string;
+  loaded: boolean;
+  loadedContextLength: number | null;
+  expiresAt: string | null;
+};
+export type OllamaModels = {
+  /// Normalized server base URL; `ollama://pull` events carry the same string.
+  base: string;
+  host: string;
+  models: OllamaModel[];
+  /// Models with a pull already in flight on this server.
+  pulling: string[];
+};
+/// Which server: an existing Ollama runtime's id, or a bare endpoint (the
+/// add-runtime form, before a runtime exists). Both omitted = the Ollama
+/// provider's saved base URL, else localhost.
+export type OllamaServerRef = { runtimeId?: string | null; endpoint?: string | null };
+const serverArgs = (s: OllamaServerRef) => ({
+  runtimeId: s.runtimeId ?? null,
+  endpoint: s.endpoint ?? null,
+});
+
+/// Installed + loaded models on the server (`/api/tags` + `/api/ps`).
+export const listOllamaModels = (server: OllamaServerRef) =>
+  invoke<OllamaModels>("ollama_list_models", serverArgs(server));
+/// Start pulling (or updating) a model in the background; progress arrives on
+/// `onOllamaPull`. Rejects if that model is already being pulled there.
+export const pullOllamaModel = (server: OllamaServerRef, model: string) =>
+  invoke<void>("ollama_pull_model", { ...serverArgs(server), model });
+/// Cancel an in-flight pull (already-downloaded layers stay; re-pull resumes).
+export const cancelOllamaPull = (server: OllamaServerRef, model: string) =>
+  invoke<void>("ollama_cancel_pull", { ...serverArgs(server), model });
+/// Remove an installed model from the server.
+export const deleteOllamaModel = (server: OllamaServerRef, model: string) =>
+  invoke<void>("ollama_delete_model", { ...serverArgs(server), model });
+
+/// Pull progress. `done` / `error` / `canceled` are terminal; before that
+/// `status` is the server's phase and `completed`/`total` are bytes of the
+/// layer currently downloading.
+export type OllamaPullEvent = {
+  base: string;
+  model: string;
+  status: string;
+  total?: number;
+  completed?: number;
+  done: boolean;
+  canceled: boolean;
+  error?: string;
+};
+export const onOllamaPull = (cb: (e: OllamaPullEvent) => void): Promise<UnlistenFn> =>
+  listen<OllamaPullEvent>("ollama://pull", (evt) => cb(evt.payload));
+
 /// Validate a provider's key at entry (no runtime needed): pings the provider
 /// with a chosen/default model and reports pass/fail + latency + error. `model`
 /// is optional — omit to use a safe default just to check the key.

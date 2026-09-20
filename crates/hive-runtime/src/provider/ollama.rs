@@ -1,4 +1,5 @@
-//! Native Ollama client (`/api/chat` + `/api/show`).
+//! Native Ollama client (`/api/chat` + `/api/show`, plus model management:
+//! `/api/tags`, `/api/ps`, `/api/pull`, `/api/delete`).
 //!
 //! Ollama's OpenAI-compatible `/v1` shim accepts only the OpenAI request shape,
 //! so the settings that matter most for a local model never reached the server:
@@ -17,6 +18,13 @@
 //! ```
 //! Errors arrive as a non-2xx JSON `{"error":"…"}` body or, mid-stream, as an
 //! `{"error":"…"}` line.
+//!
+//! Model management (Settings → Models → "Models on this server"): list what's
+//! installed (`GET /api/tags`) and loaded (`GET /api/ps`), pull or update a
+//! model with streamed progress (`POST /api/pull`, NDJSON
+//! `{"status":"pulling <digest>","digest":"…","total":N,"completed":M}` lines
+//! ending in `{"status":"success"}`), and remove one (`DELETE /api/delete`).
+//! Ollama has no API for browsing its remote library; the UI links to it.
 //!
 //! Shares the connect/idle/retry policy with the OpenAI-wire client
 //! ([`super::http`]) so a Tailscale box that's asleep fails the same way.
@@ -181,6 +189,103 @@ pub struct ChatOutcome {
 
 /// Process-wide probe cache: a model's capabilities only change when it is
 /// re-pulled, and a probe per turn would otherwise add a round trip.
+/// A model installed on an Ollama server (one entry of `GET /api/tags`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LocalModel {
+    /// `name:tag`, e.g. `qwen3.5:latest`.
+    pub name: String,
+    pub size_bytes: u64,
+    /// RFC 3339 as the server reports it (empty when absent).
+    pub modified_at: String,
+    pub digest: String,
+    /// From `details`: `family`, `parameter_size` ("7.6B"), `quantization_level` ("Q4_K_M").
+    pub family: String,
+    pub parameter_size: String,
+    pub quantization: String,
+}
+
+impl LocalModel {
+    fn from_tag(v: &Value) -> Option<Self> {
+        let name = v.get("name").or_else(|| v.get("model"))?.as_str()?.to_string();
+        let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let d = |k: &str| v.get("details").and_then(|d| d.get(k)).and_then(Value::as_str).unwrap_or("").to_string();
+        Some(Self {
+            name,
+            size_bytes: v.get("size").and_then(Value::as_u64).unwrap_or(0),
+            modified_at: s("modified_at"),
+            digest: s("digest"),
+            family: d("family"),
+            parameter_size: d("parameter_size"),
+            quantization: d("quantization_level"),
+        })
+    }
+}
+
+/// A model currently loaded in memory (one entry of `GET /api/ps`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RunningModel {
+    pub name: String,
+    /// Total resident size and the part of it in VRAM.
+    pub size_bytes: u64,
+    pub size_vram_bytes: u64,
+    /// When the server will unload it (RFC 3339; empty when absent).
+    pub expires_at: String,
+    /// The context window it was loaded with — the observable proof that
+    /// `num_ctx` reached the server. Older servers omit it.
+    pub context_length: Option<u64>,
+}
+
+impl RunningModel {
+    fn from_ps(v: &Value) -> Option<Self> {
+        let name = v.get("name").or_else(|| v.get("model"))?.as_str()?.to_string();
+        Some(Self {
+            name,
+            size_bytes: v.get("size").and_then(Value::as_u64).unwrap_or(0),
+            size_vram_bytes: v.get("size_vram").and_then(Value::as_u64).unwrap_or(0),
+            expires_at: v.get("expires_at").and_then(Value::as_str).unwrap_or("").to_string(),
+            context_length: v.get("context_length").and_then(Value::as_u64),
+        })
+    }
+}
+
+/// One progress line of `POST /api/pull`. `total`/`completed` are set while a
+/// layer downloads; `status` is otherwise a phase ("pulling manifest",
+/// "verifying sha256 digest", "writing manifest", "success").
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PullProgress {
+    pub status: String,
+    pub digest: Option<String>,
+    pub total: Option<u64>,
+    pub completed: Option<u64>,
+}
+
+impl PullProgress {
+    /// Parse a pull stream line. An `{"error": …}` line is the server
+    /// aborting the pull (unknown model, disk full, registry unreachable).
+    pub fn parse(line: &str) -> Result<Self, ProviderError> {
+        let v: Value = serde_json::from_str(line)
+            .map_err(|e| ProviderError::Decode(format!("ollama pull frame: {e}: {}", truncate(line, 120))))?;
+        if let Some(err) = v.get("error").and_then(Value::as_str) {
+            return Err(ProviderError::Api { provider: PROVIDER, status: 0, body: err.to_string() });
+        }
+        Ok(Self {
+            status: v.get("status").and_then(Value::as_str).unwrap_or("").to_string(),
+            digest: v.get("digest").and_then(Value::as_str).map(str::to_string),
+            total: v.get("total").and_then(Value::as_u64),
+            completed: v.get("completed").and_then(Value::as_u64),
+        })
+    }
+
+    /// The server's terminal line.
+    pub fn is_success(&self) -> bool {
+        self.status == "success"
+    }
+}
+
+/// A pull can sit silent for a while between layers and during digest
+/// verification of a large model, so its idle window is wider than a turn's.
+const PULL_IDLE: Duration = Duration::from_secs(600);
+
 fn probe_cache() -> &'static Mutex<HashMap<String, ModelCapabilities>> {
     static CACHE: OnceLock<Mutex<HashMap<String, ModelCapabilities>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -280,6 +385,114 @@ impl OllamaClient {
     /// Forget a cached probe (e.g. after the user re-pulls a model).
     pub fn forget_cached(&self, model: &str) {
         probe_cache().lock().unwrap().remove(&format!("{}|{}", self.base, model));
+    }
+
+    /// Models installed on the server (`GET /api/tags`).
+    pub async fn list_models(&self) -> Result<Vec<LocalModel>, ProviderError> {
+        let v = self.get_json("/api/tags").await?;
+        Ok(v.get("models")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(LocalModel::from_tag).collect())
+            .unwrap_or_default())
+    }
+
+    /// Models currently loaded in memory (`GET /api/ps`).
+    pub async fn list_running(&self) -> Result<Vec<RunningModel>, ProviderError> {
+        let v = self.get_json("/api/ps").await?;
+        Ok(v.get("models")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(RunningModel::from_ps).collect())
+            .unwrap_or_default())
+    }
+
+    /// Pull (or update — pulling an installed tag fetches only what changed)
+    /// a model, reporting each progress line. Resolves on the server's
+    /// `success` line; a server-side `{"error":…}` line, a dropped link, or
+    /// silence longer than [`PULL_IDLE`] is an error. Dropping the future
+    /// disconnects, which makes the server abandon the pull (partial layers
+    /// stay on disk, so a retry resumes). Clears the capability cache for the
+    /// model so the next turn re-probes what was just installed.
+    pub async fn pull(&self, model: &str, mut on_progress: impl FnMut(PullProgress)) -> Result<(), ProviderError> {
+        let url = format!("{}/api/pull", self.base);
+        let peer = Peer { provider: PROVIDER, url: &url };
+        let body = serde_json::to_vec(&json!({ "model": model, "stream": true }))
+            .map_err(|e| ProviderError::Decode(format!("encode pull request: {e}")))?;
+        let resp = http::send_with_retry(peer, PULL_IDLE, self.connect_retries, || {
+            self.http.post(&url).header("content-type", "application/json").body(body.clone())
+        })
+        .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = error_text(&resp.text().await.unwrap_or_default());
+            return Err(ProviderError::Api { provider: PROVIDER, status, body });
+        }
+        let mut buffer = String::new();
+        let mut stream = resp.bytes_stream();
+        let mut succeeded = false;
+        loop {
+            let chunk = match tokio::time::timeout(PULL_IDLE, stream.next()).await {
+                Ok(Some(chunk)) => chunk?,
+                Ok(None) => break,
+                Err(_) => return Err(peer.idle_error(PULL_IDLE)),
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(idx) = buffer.find('\n') {
+                let line = buffer[..idx].trim().to_string();
+                buffer.drain(..=idx);
+                if line.is_empty() {
+                    continue;
+                }
+                let p = PullProgress::parse(&line)?;
+                succeeded |= p.is_success();
+                on_progress(p);
+            }
+        }
+        let rest = buffer.trim();
+        if !rest.is_empty() {
+            let p = PullProgress::parse(rest)?;
+            succeeded |= p.is_success();
+            on_progress(p);
+        }
+        if !succeeded {
+            return Err(ProviderError::Decode("ollama pull ended without a success line".into()));
+        }
+        self.forget_cached(model);
+        tracing::info!(target: "dispatch", host = %self.host(), model, "ollama pull complete");
+        Ok(())
+    }
+
+    /// Remove an installed model (`DELETE /api/delete`). A 404 means it was
+    /// not installed.
+    pub async fn delete(&self, model: &str) -> Result<(), ProviderError> {
+        let url = format!("{}/api/delete", self.base);
+        let peer = Peer { provider: PROVIDER, url: &url };
+        let idle = self.idle_timeout.min(Duration::from_secs(30));
+        let body = serde_json::to_vec(&json!({ "model": model }))
+            .map_err(|e| ProviderError::Decode(format!("encode delete request: {e}")))?;
+        let resp = http::send_with_retry(peer, idle, self.connect_retries, || {
+            self.http.delete(&url).header("content-type", "application/json").body(body.clone())
+        })
+        .await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = error_text(&resp.text().await.unwrap_or_default());
+            return Err(ProviderError::Api { provider: PROVIDER, status, body });
+        }
+        self.forget_cached(model);
+        Ok(())
+    }
+
+    async fn get_json(&self, path: &str) -> Result<Value, ProviderError> {
+        let url = format!("{}{}", self.base, path);
+        let peer = Peer { provider: PROVIDER, url: &url };
+        let idle = self.idle_timeout.min(Duration::from_secs(20));
+        let resp = http::send_with_retry(peer, idle, self.connect_retries, || self.http.get(&url)).await?;
+        if !resp.status().is_success() {
+            let status = resp.status().as_u16();
+            let body = error_text(&resp.text().await.unwrap_or_default());
+            return Err(ProviderError::Api { provider: PROVIDER, status, body });
+        }
+        resp.json().await.map_err(|e| ProviderError::Decode(format!("{path}: {e}")))
     }
 
     /// Stream a chat. Reply text goes to `on_delta` (and the returned
@@ -587,7 +800,7 @@ mod wire {
     use axum::body::Body;
     use axum::extract::State;
     use axum::http::StatusCode;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::Router;
     use std::sync::{Arc, Mutex};
 
@@ -595,6 +808,8 @@ mod wire {
     struct Seen {
         chat_bodies: Vec<Value>,
         show_bodies: Vec<Value>,
+        pull_bodies: Vec<Value>,
+        delete_bodies: Vec<Value>,
     }
 
     #[derive(Clone)]
@@ -608,6 +823,8 @@ mod wire {
         stall: bool,
         /// `/api/show` response.
         show: Arc<Value>,
+        /// NDJSON lines `/api/pull` streams back.
+        pull_lines: Arc<Vec<String>>,
     }
 
     fn frame(content: &str) -> String {
@@ -668,11 +885,68 @@ mod wire {
             .unwrap()
     }
 
+    async fn tags() -> axum::response::Response {
+        axum::response::Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"models": [
+                    {"name": "qwen3.5:latest", "model": "qwen3.5:latest", "modified_at": "2026-09-01T10:00:00Z",
+                     "size": 5_000_000_000u64, "digest": "abc",
+                     "details": {"family": "qwen3", "parameter_size": "7.6B", "quantization_level": "Q4_K_M"}},
+                    {"name": "nomic-embed-text:latest", "size": 274_000_000u64, "details": {"family": "nomic-bert"}}
+                ]})
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn ps() -> axum::response::Response {
+        axum::response::Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"models": [
+                    {"name": "qwen3.5:latest", "size": 6_000_000_000u64, "size_vram": 6_000_000_000u64,
+                     "expires_at": "2026-09-20T12:05:00Z", "context_length": 32768}
+                ]})
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    async fn pull(State(f): State<Fake>, body: String) -> axum::response::Response {
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        f.seen.lock().unwrap().pull_bodies.push(v);
+        let lines = f.pull_lines.clone();
+        let stream = futures_util::stream::iter((0..lines.len()).map(move |i| {
+            Ok::<_, std::io::Error>(format!("{}\n", lines[i]))
+        }));
+        axum::response::Response::builder()
+            .header("content-type", "application/x-ndjson")
+            .body(Body::from_stream(stream))
+            .unwrap()
+    }
+
+    async fn delete(State(f): State<Fake>, body: String) -> axum::response::Response {
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        f.seen.lock().unwrap().delete_bodies.push(v.clone());
+        if v["model"] == "missing" {
+            return axum::response::Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(Body::from(json!({"error": "model 'missing' not found"}).to_string()))
+                .unwrap();
+        }
+        axum::response::Response::builder().status(StatusCode::OK).body(Body::empty()).unwrap()
+    }
+
     async fn serve(fake: Fake) -> (String, Arc<Mutex<Seen>>) {
         let seen = fake.seen.clone();
         let app = Router::new()
             .route("/api/chat", post(chat))
             .route("/api/show", post(show))
+            .route("/api/tags", get(tags))
+            .route("/api/ps", get(ps))
+            .route("/api/pull", post(pull))
+            .route("/api/delete", axum::routing::delete(delete))
             .with_state(fake);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -693,7 +967,19 @@ mod wire {
                 "details": {"family": "qwen3"},
                 "model_info": {"qwen3.context_length": 40960}
             })),
+            pull_lines: Arc::new(Vec::new()),
         }
+    }
+
+    fn pull_ok() -> Vec<String> {
+        vec![
+            json!({"status": "pulling manifest"}).to_string(),
+            json!({"status": "pulling abc123", "digest": "sha256:abc123", "total": 1000, "completed": 250}).to_string(),
+            json!({"status": "pulling abc123", "digest": "sha256:abc123", "total": 1000, "completed": 1000}).to_string(),
+            json!({"status": "verifying sha256 digest"}).to_string(),
+            json!({"status": "writing manifest"}).to_string(),
+            json!({"status": "success"}).to_string(),
+        ]
     }
 
     #[tokio::test]
@@ -840,5 +1126,81 @@ mod wire {
         // Unknown model → None, never an error.
         assert!(client.capabilities_cached("missing").await.is_none());
         client.forget_cached("qwen3");
+    }
+
+    #[tokio::test]
+    async fn lists_installed_and_running_models() {
+        let (base, _) = serve(fake(vec![])).await;
+        let client = OllamaClient::new(&base);
+        let models = client.list_models().await.unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name, "qwen3.5:latest");
+        assert_eq!(models[0].size_bytes, 5_000_000_000);
+        assert_eq!(models[0].family, "qwen3");
+        assert_eq!(models[0].parameter_size, "7.6B");
+        assert_eq!(models[0].quantization, "Q4_K_M");
+        // Sparse entry: name only, the rest defaulted rather than dropped.
+        assert_eq!(models[1].name, "nomic-embed-text:latest");
+        assert_eq!(models[1].quantization, "");
+        let running = client.list_running().await.unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].name, "qwen3.5:latest");
+        assert_eq!(running[0].context_length, Some(32768));
+        assert_eq!(running[0].size_vram_bytes, 6_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn pull_streams_progress_and_clears_probe_cache() {
+        let mut f = fake(vec![]);
+        f.pull_lines = Arc::new(pull_ok());
+        let (base, seen) = serve(f).await;
+        let client = OllamaClient::new(&base);
+        // Warm the probe cache so we can see the pull evict it.
+        assert!(client.capabilities_cached("qwen3.5:latest").await.is_some());
+        let key = format!("{}|qwen3.5:latest", client.base());
+        assert!(probe_cache().lock().unwrap().contains_key(&key));
+
+        let mut seen_progress = Vec::new();
+        client.pull("qwen3.5:latest", |p| seen_progress.push(p)).await.unwrap();
+
+        assert_eq!(seen.lock().unwrap().pull_bodies[0], json!({"model": "qwen3.5:latest", "stream": true}));
+        assert_eq!(seen_progress.len(), 6);
+        assert_eq!(seen_progress[1].completed, Some(250));
+        assert_eq!(seen_progress[1].total, Some(1000));
+        assert_eq!(seen_progress[1].digest.as_deref(), Some("sha256:abc123"));
+        assert!(seen_progress[5].is_success());
+        assert!(!probe_cache().lock().unwrap().contains_key(&key), "pull should evict the cached probe");
+    }
+
+    #[tokio::test]
+    async fn pull_surfaces_server_error_line() {
+        let mut f = fake(vec![]);
+        f.pull_lines = Arc::new(vec![
+            json!({"status": "pulling manifest"}).to_string(),
+            json!({"error": "pull model manifest: file does not exist"}).to_string(),
+        ]);
+        let (base, _) = serve(f).await;
+        let err = OllamaClient::new(&base).pull("nope:latest", |_| {}).await.unwrap_err();
+        assert!(err.to_string().contains("file does not exist"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pull_without_success_line_is_an_error() {
+        let mut f = fake(vec![]);
+        f.pull_lines = Arc::new(vec![json!({"status": "pulling manifest"}).to_string()]);
+        let (base, _) = serve(f).await;
+        let err = OllamaClient::new(&base).pull("qwen3.5:latest", |_| {}).await.unwrap_err();
+        assert!(err.to_string().contains("without a success line"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn delete_sends_model_and_maps_404() {
+        let (base, seen) = serve(fake(vec![])).await;
+        let client = OllamaClient::new(&base);
+        client.delete("qwen3.5:latest").await.unwrap();
+        assert_eq!(seen.lock().unwrap().delete_bodies[0], json!({"model": "qwen3.5:latest"}));
+        let err = client.delete("missing").await.unwrap_err();
+        assert!(matches!(err, ProviderError::Api { status: 404, .. }), "{err}");
+        assert!(err.to_string().contains("not found"));
     }
 }

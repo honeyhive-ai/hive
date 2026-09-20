@@ -161,6 +161,10 @@ struct AppState {
     /// that's already running returns the existing session instead of spawning
     /// a duplicate.
     lsp_by_server: Mutex<HashMap<String, String>>,
+    /// In-flight Ollama model pulls, keyed `"<base url>|<model>"`. Holds the
+    /// task's abort handle so Settings can cancel a download; aborting drops
+    /// the HTTP stream, which makes the server abandon the pull.
+    ollama_pulls: Mutex<HashMap<String, tokio::task::AbortHandle>>,
 }
 
 /// The concrete debounced-watcher type held alive in `AppState`.
@@ -7505,6 +7509,301 @@ async fn ping_runtime(runtime: ResolvedRuntime, workspace_root: Option<String>) 
     }
 }
 
+// ---------------------------------------------------------------------------
+// Ollama model management (Settings → Models → "Models on this server").
+//
+// Ollama is the one provider whose model catalogue lives on a server the user
+// runs, so "which models can I pick?" has a real answer: `GET /api/tags`. These
+// commands let Settings show that list, pull a new model (or update an
+// installed one) with live progress, and remove one — instead of the user
+// ssh-ing to the box to run `ollama pull`. Nothing here is a chat turn; it all
+// uses the native client's management endpoints.
+// ---------------------------------------------------------------------------
+
+/// A model installed on the Ollama server.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OllamaModelDto {
+    name: String,
+    size_bytes: u64,
+    modified_at: String,
+    family: String,
+    parameter_size: String,
+    quantization: String,
+    /// Set when the model is currently loaded in memory.
+    loaded: bool,
+    /// The context window it's loaded with (only when `loaded`).
+    loaded_context_length: Option<u64>,
+    /// When the server will unload it (only when `loaded`).
+    expires_at: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OllamaModelsDto {
+    /// The normalized server base URL the list came from; pull/delete/cancel
+    /// events carry the same string so the UI can match them.
+    base: String,
+    host: String,
+    models: Vec<OllamaModelDto>,
+    /// Models with a pull in flight on this server (so a re-opened panel can
+    /// show them as downloading even before the next progress event).
+    pulling: Vec<String>,
+}
+
+/// Progress of an `ollama_pull_model`, streamed as `ollama://pull`. One of
+/// `done`, `error`, or `canceled` marks the terminal event; before that,
+/// `status` is the server's phase and `completed`/`total` are bytes of the
+/// layer currently downloading.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OllamaPullEvent {
+    base: String,
+    model: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completed: Option<u64>,
+    done: bool,
+    canceled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+const OLLAMA_PULL_EVENT: &str = "ollama://pull";
+
+impl AppState {
+    /// The Ollama server a management call should talk to. An existing
+    /// runtime's id wins (its endpoint resolves exactly like a live turn,
+    /// including the provider base URL); otherwise the endpoint typed into the
+    /// add-runtime form; otherwise the Ollama provider's saved base URL; else
+    /// the local default. Returns the normalized base URL.
+    fn ollama_base(&self, runtime_id: Option<&str>, endpoint: Option<&str>) -> Result<String, String> {
+        if let Some(id) = runtime_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let rt = self.resolve_runtime(id);
+            if rt.provider != ModelProviderKind::Ollama {
+                return Err(format!("Runtime \"{id}\" is not an Ollama runtime."));
+            }
+            return Ok(hive_runtime::provider::ollama::base_url(&rt.endpoint));
+        }
+        if let Some(ep) = endpoint.map(str::trim).filter(|s| !s.is_empty()) {
+            return Ok(hive_runtime::provider::ollama::base_url(ep));
+        }
+        let saved = self
+            .settings
+            .lock()
+            .unwrap()
+            .provider_base_urls
+            .get(provider_config_name(ModelProviderKind::Ollama))
+            .cloned()
+            .unwrap_or_default();
+        Ok(hive_runtime::provider::ollama::base_url(&saved))
+    }
+}
+
+fn ollama_pull_key(base: &str, model: &str) -> String {
+    format!("{base}|{model}")
+}
+
+/// Installed + loaded models on an Ollama server. `runtime_id` names an
+/// existing Ollama runtime; `endpoint` is for the add-runtime form before a
+/// runtime exists (either may be omitted; see `AppState::ollama_base`).
+#[tauri::command]
+async fn ollama_list_models(
+    state: State<'_, AppState>,
+    runtime_id: Option<String>,
+    endpoint: Option<String>,
+) -> Result<OllamaModelsDto, String> {
+    let base = state.ollama_base(runtime_id.as_deref(), endpoint.as_deref())?;
+    let client = hive_runtime::provider::OllamaClient::new(&base);
+    let installed = client.list_models().await.map_err(|e| e.to_string())?;
+    // `/api/ps` is decoration; an old server without it must not hide the list.
+    let running = client.list_running().await.unwrap_or_default();
+    let models = installed
+        .into_iter()
+        .map(|m| {
+            let live = running.iter().find(|r| r.name == m.name);
+            OllamaModelDto {
+                name: m.name,
+                size_bytes: m.size_bytes,
+                modified_at: m.modified_at,
+                family: m.family,
+                parameter_size: m.parameter_size,
+                quantization: m.quantization,
+                loaded: live.is_some(),
+                loaded_context_length: live.and_then(|r| r.context_length),
+                expires_at: live.map(|r| r.expires_at.clone()).filter(|s| !s.is_empty()),
+            }
+        })
+        .collect();
+    let prefix = format!("{base}|");
+    let pulling = state
+        .ollama_pulls
+        .lock()
+        .unwrap()
+        .keys()
+        .filter_map(|k| k.strip_prefix(&prefix).map(str::to_string))
+        .collect();
+    Ok(OllamaModelsDto { host: client.host(), base, models, pulling })
+}
+
+/// Start pulling (or updating) `model` on the server, in the background.
+/// Returns as soon as the pull is registered; progress streams as
+/// `ollama://pull` events until a terminal `done`/`error`/`canceled`. A second
+/// call for the same server+model while one is in flight is a no-op error.
+#[tauri::command]
+async fn ollama_pull_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    runtime_id: Option<String>,
+    endpoint: Option<String>,
+    model: String,
+) -> Result<(), String> {
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("Model name can't be empty.".to_string());
+    }
+    if model.chars().any(|c| c.is_whitespace()) {
+        return Err("Model name can't contain spaces — use the form name:tag, e.g. qwen3.5:latest.".to_string());
+    }
+    let base = state.ollama_base(runtime_id.as_deref(), endpoint.as_deref())?;
+    let key = ollama_pull_key(&base, &model);
+    if state.ollama_pulls.lock().unwrap().contains_key(&key) {
+        return Err(format!("Already pulling {model} on {}.", endpoint_host_of(&base)));
+    }
+    let client = hive_runtime::provider::OllamaClient::new(&base);
+    let event = |status: &str| OllamaPullEvent {
+        base: base.clone(),
+        model: model.clone(),
+        status: status.to_string(),
+        total: None,
+        completed: None,
+        done: false,
+        canceled: false,
+        error: None,
+    };
+    let _ = app.emit(OLLAMA_PULL_EVENT, event("starting"));
+    let task_app = app.clone();
+    let (task_base, task_model, task_key) = (base.clone(), model.clone(), key.clone());
+    let task = tauri::async_runtime::spawn(async move {
+        let progress_app = task_app.clone();
+        let (pb, pm) = (task_base.clone(), task_model.clone());
+        let result = client
+            .pull(&task_model, move |p| {
+                let _ = progress_app.emit(
+                    OLLAMA_PULL_EVENT,
+                    OllamaPullEvent {
+                        base: pb.clone(),
+                        model: pm.clone(),
+                        status: p.status,
+                        total: p.total,
+                        completed: p.completed,
+                        done: false,
+                        canceled: false,
+                        error: None,
+                    },
+                );
+            })
+            .await;
+        // Deregister before the terminal event so a UI that refreshes the
+        // list on `done` doesn't still see the model as pulling.
+        if let Some(state) = task_app.try_state::<AppState>() {
+            state.ollama_pulls.lock().unwrap().remove(&task_key);
+        }
+        let terminal = match result {
+            Ok(()) => OllamaPullEvent {
+                base: task_base,
+                model: task_model,
+                status: "success".into(),
+                total: None,
+                completed: None,
+                done: true,
+                canceled: false,
+                error: None,
+            },
+            Err(e) => {
+                tracing::warn!(target: "dispatch", model = %task_model, "ollama pull failed: {e}");
+                OllamaPullEvent {
+                    base: task_base,
+                    model: task_model,
+                    status: "error".into(),
+                    total: None,
+                    completed: None,
+                    done: false,
+                    canceled: false,
+                    error: Some(e.to_string()),
+                }
+            }
+        };
+        let _ = task_app.emit(OLLAMA_PULL_EVENT, terminal);
+    });
+    state.ollama_pulls.lock().unwrap().insert(key, task.inner().abort_handle());
+    Ok(())
+}
+
+/// Cancel an in-flight pull. Aborting the task drops the HTTP stream; the
+/// server keeps the layers already downloaded, so pulling again resumes.
+#[tauri::command]
+async fn ollama_cancel_pull(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    runtime_id: Option<String>,
+    endpoint: Option<String>,
+    model: String,
+) -> Result<(), String> {
+    let base = state.ollama_base(runtime_id.as_deref(), endpoint.as_deref())?;
+    let model = model.trim().to_string();
+    let handle = state.ollama_pulls.lock().unwrap().remove(&ollama_pull_key(&base, &model));
+    let Some(handle) = handle else {
+        return Err(format!("No pull of {model} is in progress."));
+    };
+    handle.abort();
+    let _ = app.emit(
+        OLLAMA_PULL_EVENT,
+        OllamaPullEvent {
+            base,
+            model,
+            status: "canceled".into(),
+            total: None,
+            completed: None,
+            done: false,
+            canceled: true,
+            error: None,
+        },
+    );
+    Ok(())
+}
+
+/// Remove an installed model from the server. Refuses while that model is
+/// being pulled. Does not touch runtimes that reference it — their next turn
+/// fails with the server's "model not found", which is the honest state.
+#[tauri::command]
+async fn ollama_delete_model(
+    state: State<'_, AppState>,
+    runtime_id: Option<String>,
+    endpoint: Option<String>,
+    model: String,
+) -> Result<(), String> {
+    let base = state.ollama_base(runtime_id.as_deref(), endpoint.as_deref())?;
+    let model = model.trim().to_string();
+    if model.is_empty() {
+        return Err("Model name can't be empty.".to_string());
+    }
+    if state.ollama_pulls.lock().unwrap().contains_key(&ollama_pull_key(&base, &model)) {
+        return Err(format!("{model} is being pulled; cancel the pull first."));
+    }
+    hive_runtime::provider::OllamaClient::new(&base)
+        .delete(&model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `host[:port]` of a base URL, for messages.
+fn endpoint_host_of(base: &str) -> String {
+    hive_runtime::provider::OllamaClient::new(base).host()
+}
+
 /// Validate a provider's credentials at entry: build a transient runtime for
 /// (provider kind + a chosen/default model + the saved key) and ping it — so the
 /// user learns whether a key works WITHOUT first hand-building a runtime. Powers
@@ -8524,6 +8823,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         run_wakers: Mutex::new(HashMap::new()),
         gate_runs: Mutex::new(HashMap::new()),
         canceled_runs: Mutex::new(std::collections::HashSet::new()),
+        ollama_pulls: Mutex::new(HashMap::new()),
         turn_stops: Mutex::new(HashMap::new()),
         conn_health: Mutex::new(ConnHealth::default()),
         active_membership: Mutex::new(None),
@@ -11957,6 +12257,10 @@ pub fn run() {
             list_runtimes,
             test_runtime,
             probe_provider,
+            ollama_list_models,
+            ollama_pull_model,
+            ollama_cancel_pull,
+            ollama_delete_model,
             add_runtime,
             remove_runtime,
             set_chat_runtime,

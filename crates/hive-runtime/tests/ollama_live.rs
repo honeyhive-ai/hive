@@ -18,13 +18,32 @@ fn live() -> Option<(String, String)> {
 
 /// `/api/ps` reports the context window the loaded model was started with —
 /// the only observable proof that `num_ctx` reached the server.
-async fn loaded_context_length(base: &str, model: &str) -> Option<u64> {
-    let v: serde_json::Value = reqwest::get(format!("{base}/api/ps")).await.ok()?.json().await.ok()?;
-    v["models"]
-        .as_array()?
-        .iter()
-        .find(|m| m["name"].as_str() == Some(model) || m["model"].as_str() == Some(model))
-        .and_then(|m| m["context_length"].as_u64())
+async fn loaded_context_length(client: &OllamaClient, model: &str) -> Option<u64> {
+    client
+        .list_running()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|m| m.name == model)
+        .and_then(|m| m.context_length)
+}
+
+/// Model management against the live server: the configured model is in the
+/// installed list, and the probe's details agree with the tag listing.
+#[tokio::test]
+async fn lists_installed_models() {
+    let Some((endpoint, model)) = live() else {
+        eprintln!("HIVE_OLLAMA_LIVE_ENDPOINT unset; skipping live Ollama test");
+        return;
+    };
+    let client = OllamaClient::new(&endpoint).with_idle_timeout(Duration::from_secs(60));
+    let models = client.list_models().await.expect("/api/tags");
+    for m in &models {
+        eprintln!("installed: {} {} {} {:.1} GB", m.name, m.parameter_size, m.quantization, m.size_bytes as f64 / 1e9);
+    }
+    let found = models.iter().find(|m| m.name == model || m.name == format!("{model}:latest"));
+    assert!(found.is_some(), "{model} is installed on the live server");
+    assert!(found.unwrap().size_bytes > 0, "tag listing carries a size");
 }
 
 #[tokio::test]
@@ -68,7 +87,7 @@ async fn probe_then_chat_with_and_without_thinking() {
     }
 
     // num_ctx reached the server: the loaded model reports our window.
-    let loaded = loaded_context_length(client.base(), &model).await;
+    let loaded = loaded_context_length(&client, &model).await;
     eprintln!("loaded context_length per /api/ps: {loaded:?}");
     assert_eq!(loaded, Some(num_ctx as u64), "num_ctx was applied by the server");
 
