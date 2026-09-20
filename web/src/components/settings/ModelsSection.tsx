@@ -1081,9 +1081,12 @@ function OllamaModelsPanel({
     const model = name.trim();
     if (!model) return;
     try {
+      // The backend emits "starting" before the command resolves, so the row
+      // comes from the event stream. Adding it here too could resurrect a pull
+      // whose `done` already arrived (updating an up-to-date tag takes one
+      // round trip), leaving a row that never clears.
       await pullOllamaModel(server, model);
       setPullName("");
-      setPulls((p) => ({ ...p, [model]: { base: base ?? "", model, status: "starting", done: false, canceled: false } }));
     } catch (e) {
       toast.error(errMsg(e));
     }

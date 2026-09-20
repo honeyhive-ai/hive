@@ -7686,6 +7686,11 @@ async fn ollama_pull_model(
     let _ = app.emit(OLLAMA_PULL_EVENT, event("starting"));
     let task_app = app.clone();
     let (task_base, task_model, task_key) = (base.clone(), model.clone(), key.clone());
+    // Hold the registry lock across spawn + insert: a pull that finishes
+    // almost immediately (updating an up-to-date tag is one round trip) would
+    // otherwise deregister before it was registered, leaving a stale entry
+    // that reports "already pulling" forever.
+    let mut pulls = state.ollama_pulls.lock().unwrap();
     let task = tauri::async_runtime::spawn(async move {
         let progress_app = task_app.clone();
         let (pb, pm) = (task_base.clone(), task_model.clone());
@@ -7738,7 +7743,8 @@ async fn ollama_pull_model(
         };
         let _ = task_app.emit(OLLAMA_PULL_EVENT, terminal);
     });
-    state.ollama_pulls.lock().unwrap().insert(key, task.inner().abort_handle());
+    pulls.insert(key, task.inner().abort_handle());
+    drop(pulls);
     Ok(())
 }
 

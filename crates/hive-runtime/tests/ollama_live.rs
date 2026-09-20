@@ -106,3 +106,82 @@ async fn probe_then_chat_with_and_without_thinking() {
         assert!(!reasoning.is_empty(), "think=true ⇒ reasoning stream is populated");
     }
 }
+
+/// Pull a small model over the network, update it (a second pull of the same
+/// tag is one manifest round trip with no bytes), then remove it. This
+/// writes to the server, so it has its own gate on top of the endpoint:
+///
+/// ```text
+/// HIVE_OLLAMA_LIVE_ENDPOINT=http://host:11434 HIVE_OLLAMA_LIVE_PULL_MODEL=all-minilm:22m \
+///   cargo test -p hive-runtime --test ollama_live pull_update_and_remove -- --nocapture
+/// ```
+///
+/// Pick a tag the server does not already have: the test refuses to run
+/// against an installed model so it never removes something the user wanted.
+#[tokio::test]
+async fn pull_update_and_remove_a_small_model() {
+    let Some((endpoint, _)) = live() else {
+        eprintln!("HIVE_OLLAMA_LIVE_ENDPOINT unset; skipping live Ollama test");
+        return;
+    };
+    let Ok(model) = std::env::var("HIVE_OLLAMA_LIVE_PULL_MODEL") else {
+        eprintln!("HIVE_OLLAMA_LIVE_PULL_MODEL unset; skipping live pull test");
+        return;
+    };
+    let client = OllamaClient::new(&endpoint).with_idle_timeout(Duration::from_secs(60));
+    let installed = |models: &[hive_runtime::provider::ollama::LocalModel]| models.iter().any(|m| m.name == model);
+
+    let before = client.list_models().await.expect("/api/tags before");
+    assert!(
+        !installed(&before),
+        "{model} is already installed on {}; pick a tag the server doesn't have so the test can remove it afterwards",
+        client.host()
+    );
+
+    // Pull: progress lines stream in, at least one layer reports bytes, and
+    // the stream ends on the server's success line.
+    let started = std::time::Instant::now();
+    let (mut lines, mut byte_lines, mut max_total, mut last_completed) = (0usize, 0usize, 0u64, 0u64);
+    let mut phases: Vec<String> = Vec::new();
+    client
+        .pull(&model, |p| {
+            lines += 1;
+            if let (Some(t), Some(c)) = (p.total, p.completed) {
+                byte_lines += 1;
+                max_total = max_total.max(t);
+                last_completed = c;
+            }
+            if phases.last() != Some(&p.status) {
+                phases.push(p.status.clone());
+            }
+        })
+        .await
+        .expect("pull");
+    eprintln!(
+        "pull {model}: {lines} progress lines ({byte_lines} with byte counts), largest layer {:.1} MB, {:.1}s, phases: {}",
+        max_total as f64 / 1e6,
+        started.elapsed().as_secs_f64(),
+        phases.join(" -> ")
+    );
+    assert!(lines > 0, "pull streamed progress");
+    assert!(byte_lines > 0 && max_total > 0, "at least one layer reported total/completed bytes");
+    assert_eq!(phases.last().map(String::as_str), Some("success"), "stream ended on success");
+    let after = client.list_models().await.expect("/api/tags after pull");
+    let entry = after.iter().find(|m| m.name == model).expect("pulled model is now listed");
+    assert!(entry.size_bytes > 0, "listed with a size");
+
+    // Update: pulling an installed, current tag is a quick success.
+    let started = std::time::Instant::now();
+    let mut update_lines = 0usize;
+    client.pull(&model, |_| update_lines += 1).await.expect("update pull");
+    eprintln!("update {model}: {update_lines} lines, {:.2}s", started.elapsed().as_secs_f64());
+    assert!(update_lines > 0, "update streamed at least the success line");
+
+    // Remove, and confirm the server agrees. A second delete is a 404.
+    client.delete(&model).await.expect("delete");
+    let final_list = client.list_models().await.expect("/api/tags after delete");
+    assert!(!installed(&final_list), "{model} is gone after delete");
+    let again = client.delete(&model).await;
+    eprintln!("second delete: {again:?}");
+    assert!(again.is_err(), "deleting an absent model is an error");
+}
