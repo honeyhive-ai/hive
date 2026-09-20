@@ -81,6 +81,10 @@ pub struct RuntimeTarget {
     pub model_base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_keep_alive: Option<String>,
+    /// Ollama `think`: let a reasoning model think before answering. `None`
+    /// ⇒ Hive's default (off). Set via `think` in a `[[runtimes]]` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<bool>,
     #[serde(default)]
     pub estimated_performance_score: f64,
     #[serde(default)]
@@ -127,6 +131,7 @@ mod tests {
             model_provider_id: None,
             model_base_url: None,
             request_keep_alive: None,
+            think: None,
             estimated_performance_score: 0.0,
             estimated_cost_per_1m_input_tokens_usd: 0.0,
             capabilities: RuntimeCapabilities::default(),

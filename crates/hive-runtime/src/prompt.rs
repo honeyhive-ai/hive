@@ -16,7 +16,7 @@ fn provider_display(provider: ModelProviderKind) -> &'static str {
         ModelProviderKind::Anthropic => "Anthropic API",
         ModelProviderKind::OpenAI => "OpenAI API",
         ModelProviderKind::OpenRouter => "OpenRouter",
-        ModelProviderKind::Ollama => "Ollama (OpenAI-compatible endpoint)",
+        ModelProviderKind::Ollama => "Ollama",
         ModelProviderKind::Azure => "Azure OpenAI",
         ModelProviderKind::Custom => "custom OpenAI-compatible endpoint",
         ModelProviderKind::HiveDaemon => "Hive daemon (OpenAI-compatible endpoint)",
@@ -302,6 +302,8 @@ mod tests {
             model_provider_id: None,
             model_base_url: None,
             context_window_tokens: None,
+            keep_alive: None,
+            think: None,
         }
     }
 

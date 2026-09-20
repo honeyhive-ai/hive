@@ -281,6 +281,14 @@ pub struct RuntimeSummaryDto {
     pub model_provider_id: Option<String>,
     /// Explicit context-window override (Ollama/custom endpoints). None = inferred.
     pub context_window: Option<u32>,
+    /// Ollama `keep_alive` ("5m", "-1" = forever). None = server default.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub keep_alive: Option<String>,
+    /// Ollama `think`: let a reasoning model think. None = Hive default (off).
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub think: Option<bool>,
 }
 
 /// Actual context-budget telemetry computed by the backend planner.

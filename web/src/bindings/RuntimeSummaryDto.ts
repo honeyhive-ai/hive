@@ -16,4 +16,12 @@ modelProviderId: string | null,
 /**
  * Explicit context-window override (Ollama/custom endpoints). None = inferred.
  */
-contextWindow: number | null, };
+contextWindow: number | null, 
+/**
+ * Ollama `keep_alive` ("5m", "-1" = forever). None = server default.
+ */
+keepAlive?: string | null, 
+/**
+ * Ollama `think`: let a reasoning model think. None = Hive default (off).
+ */
+think?: boolean | null, };

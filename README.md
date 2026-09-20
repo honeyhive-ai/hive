@@ -80,8 +80,10 @@ Model lists come from each runtime you connect, not a hardcoded set. Out of the
 box Hive drives:
 
 - **The `claude` CLI** — no API key required, uses your existing Claude auth.
-- **Anthropic**, **OpenAI**, **OpenRouter**, **Ollama** (local), and **any
-  OpenAI-compatible endpoint**.
+- **Anthropic**, **OpenAI**, **OpenRouter**, **Ollama** (local or over
+  Tailscale — spoken natively, so the runtime's context window, `keep_alive`,
+  and `think` settings reach the server; set `HIVE_OLLAMA_WIRE=openai` to force
+  the OpenAI-compatible shim), and **any OpenAI-compatible endpoint**.
 - **Subprocess agents** — CLI coding agents run as child processes and
   participate as first-class agents: **aider**, **pi**, **Codex** (OpenAI's
   `codex exec`), and any stdin-driven CLI via the generic **Hermes** runtime.

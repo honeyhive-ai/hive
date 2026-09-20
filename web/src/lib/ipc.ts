@@ -134,6 +134,8 @@ export const addRuntime = (
   modelBaseUrl?: string | null,
   modelProviderId?: string | null,
   contextWindow?: number | null,
+  keepAlive?: string | null,
+  think?: boolean | null,
 ) =>
   invoke<void>("add_runtime", {
     id,
@@ -147,6 +149,8 @@ export const addRuntime = (
     modelBaseUrl: modelBaseUrl ?? null,
     modelProviderId: modelProviderId ?? null,
     contextWindow: contextWindow ?? null,
+    keepAlive: keepAlive ?? null,
+    think: think ?? null,
   });
 
 /// Custom /summarize + /compact instructions ("" = using the built-in default,
@@ -169,6 +173,8 @@ export type RuntimeTestResult = {
   latency_ms: number;
   reply: string;
   error: string | null;
+  /// Native Ollama only: "tools · thinking · 40k max ctx" as reported by the server.
+  capabilities?: string | null;
 };
 
 /// Preflight a runtime: sends a trivial prompt through the real dispatch path

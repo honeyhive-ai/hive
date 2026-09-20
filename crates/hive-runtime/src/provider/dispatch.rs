@@ -6,6 +6,7 @@
 use hive_core::ModelProviderKind;
 
 use super::anthropic::{AnthropicClient, ChatTurn, ProviderError};
+use super::ollama::{ChatOptions, OllamaClient};
 use super::openai::OpenAiClient;
 use super::subprocess;
 
@@ -29,6 +30,41 @@ pub struct ResolvedRuntime {
     /// small window regardless of what the model *could* take, so the user's
     /// setting must win over the name-based guess.
     pub context_window_tokens: Option<u32>,
+    /// Ollama `keep_alive`: how long the model stays loaded after a request
+    /// ("5m", "-1" = forever). `None` ⇒ server default.
+    pub keep_alive: Option<String>,
+    /// Ollama `think`: ask a reasoning model to think (`Some(true)`) or not
+    /// (`Some(false)`); `None` ⇒ Hive's default, which is off.
+    pub think: Option<bool>,
+}
+
+/// Env override forcing Ollama runtimes through the OpenAI-compatible `/v1`
+/// shim instead of the native API (`HIVE_OLLAMA_WIRE=openai`). Escape hatch
+/// for a proxy that only speaks OpenAI; loses num_ctx/keep_alive/think.
+pub fn ollama_uses_openai_shim() -> bool {
+    std::env::var("HIVE_OLLAMA_WIRE")
+        .map(|v| v.trim().eq_ignore_ascii_case("openai"))
+        .unwrap_or(false)
+}
+
+/// The native-Ollama request options for a runtime, given what the capability
+/// probe reported (if anything). The server is told to allocate the window the
+/// planner budgets against (override or model-name guess), capped by the
+/// model's maximum; otherwise Ollama serves a small default and truncates the
+/// *start* of the prompt — the system prompt — while the planner believes it
+/// fits. Thinking is off unless the runtime opts in; when the probe says the
+/// model can't think, the field is omitted entirely.
+pub fn ollama_chat_options(rt: &ResolvedRuntime, caps: Option<&super::ollama::ModelCapabilities>) -> ChatOptions {
+    let mut num_ctx = rt.context_window();
+    if let Some(max) = caps.and_then(|c| c.context_length) {
+        num_ctx = num_ctx.min(max);
+    }
+    let think = match (rt.think, caps) {
+        (_, Some(c)) if !c.thinking => None,
+        (Some(t), _) => Some(t),
+        (None, _) => Some(false),
+    };
+    ChatOptions { num_ctx: Some(num_ctx), keep_alive: rt.keep_alive.clone().filter(|s| !s.trim().is_empty()), think }
 }
 
 impl ResolvedRuntime {
@@ -41,7 +77,9 @@ impl ResolvedRuntime {
         }
     }
 
-    /// True for runtimes reached over the OpenAI-compatible HTTP wire.
+    /// True for runtimes reached over an HTTP model endpoint with no tool loop
+    /// (OpenAI-compatible wire, or Ollama's native API). Subprocess agents and
+    /// Anthropic are excluded.
     pub fn is_openai_wire(&self) -> bool {
         matches!(
             self.provider,
@@ -130,6 +168,19 @@ pub async fn stream(
             AnthropicClient::new()
                 .stream_reply(key, &rt.model, system, turns, max_tokens, on_delta)
                 .await
+        }
+        ModelProviderKind::Ollama if !ollama_uses_openai_shim() => {
+            // Native API: carries num_ctx / keep_alive / think, which the `/v1`
+            // shim drops. The endpoint may be stored in either spelling.
+            let client = OllamaClient::new(&rt.endpoint);
+            let caps = client.capabilities_cached(&rt.model).await;
+            let opts = ollama_chat_options(rt, caps.as_ref());
+            client
+                .stream_chat(&rt.model, system, turns, &opts, on_delta, |text| {
+                    on_activity(StreamActivity::Thinking { text })
+                })
+                .await
+                .map(|out| out.text)
         }
         ModelProviderKind::OpenAI
         | ModelProviderKind::OpenRouter
@@ -323,6 +374,65 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::ollama::ModelCapabilities;
+
+    fn ollama_rt() -> ResolvedRuntime {
+        ResolvedRuntime {
+            provider: ModelProviderKind::Ollama,
+            model: "qwen3.5".into(),
+            endpoint: "http://100.64.0.5:11434/v1/chat/completions".into(),
+            api_key: None,
+            args: vec![],
+            model_provider_id: None,
+            model_base_url: None,
+            context_window_tokens: None,
+            keep_alive: None,
+            think: None,
+        }
+    }
+
+    #[test]
+    fn ollama_options_default_to_planner_window_and_thinking_off() {
+        let rt = ollama_rt();
+        let o = ollama_chat_options(&rt, None);
+        // No override → the model-name guess the planner budgets against.
+        assert_eq!(o.num_ctx, Some(rt.context_window()));
+        assert_eq!(o.think, Some(false), "thinking is off by default");
+        assert_eq!(o.keep_alive, None);
+    }
+
+    #[test]
+    fn ollama_options_honor_override_capped_by_model_max_and_opt_in() {
+        let mut rt = ollama_rt();
+        rt.context_window_tokens = Some(131_072);
+        rt.think = Some(true);
+        rt.keep_alive = Some("-1".into());
+        let caps = ModelCapabilities { thinking: true, context_length: Some(40_960), ..Default::default() };
+        let o = ollama_chat_options(&rt, Some(&caps));
+        assert_eq!(o.num_ctx, Some(40_960), "override capped at the model's max");
+        assert_eq!(o.think, Some(true));
+        assert_eq!(o.keep_alive.as_deref(), Some("-1"));
+        // Blank keep-alive is dropped.
+        rt.keep_alive = Some("  ".into());
+        assert_eq!(ollama_chat_options(&rt, None).keep_alive, None);
+    }
+
+    #[test]
+    fn ollama_options_omit_think_when_the_model_cannot() {
+        let mut rt = ollama_rt();
+        rt.think = Some(true);
+        let caps = ModelCapabilities { thinking: false, ..Default::default() };
+        assert_eq!(ollama_chat_options(&rt, Some(&caps)).think, None);
+    }
+
+    #[test]
+    fn openai_shim_is_opt_in_via_env() {
+        // Default: native. (The env var is process-global; only assert the
+        // default here rather than mutating it under parallel tests.)
+        if std::env::var("HIVE_OLLAMA_WIRE").is_err() {
+            assert!(!ollama_uses_openai_shim());
+        }
+    }
 
     #[test]
     fn classifies_subprocess_providers() {
@@ -335,6 +445,8 @@ mod tests {
             model_provider_id: None,
             model_base_url: None,
             context_window_tokens: None,
+            keep_alive: None,
+            think: None,
         };
         assert!(rt.is_subprocess());
         rt.provider = ModelProviderKind::Anthropic;
@@ -355,6 +467,8 @@ mod tests {
             model_provider_id: None,
             model_base_url: None,
             context_window_tokens: None,
+            keep_alive: None,
+            think: None,
         };
         // Name-based guess for a qwen model.
         assert_eq!(rt.context_window(), 32_768);

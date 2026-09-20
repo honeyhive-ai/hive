@@ -20,11 +20,9 @@ use futures_util::StreamExt;
 use serde::Serialize;
 
 use super::anthropic::{ChatTurn, ProviderError};
+use super::http::{self, Peer};
 use super::thinking::ThinkFilter;
-use super::{turn_idle_timeout, HTTP_CONNECT_TIMEOUT};
-
-/// Pause before the single reconnect attempt.
-const RETRY_DELAY: Duration = Duration::from_millis(500);
+use super::turn_idle_timeout;
 
 #[derive(Debug, Serialize)]
 struct Message<'a> {
@@ -64,12 +62,8 @@ impl OpenAiClient {
     /// `https://api.openai.com/v1/chat/completions` or
     /// `http://localhost:11434/v1/chat/completions`.
     pub fn new(endpoint: impl Into<String>) -> Self {
-        let http = reqwest::Client::builder()
-            .connect_timeout(HTTP_CONNECT_TIMEOUT)
-            .build()
-            .unwrap_or_default();
         Self {
-            http,
+            http: http::client(),
             endpoint: endpoint.into(),
             api_key_header: false,
             provider_label: "openai",
@@ -208,55 +202,25 @@ impl OpenAiClient {
         req
     }
 
-    /// Send the request, waiting at most the idle timeout for response headers
-    /// (a cold Ollama model can take a while to load — that's "activity" from
-    /// the user's point of view, so the same generous window applies), and
-    /// reconnect once if the connection was refused or dropped before any
-    /// response arrived.
+    fn peer(&self) -> Peer<'_> {
+        Peer { provider: self.provider_label, url: &self.endpoint }
+    }
+
+    /// Send the request with the shared connect/idle/retry policy (see
+    /// [`http::send_with_retry`]).
     async fn send_with_retry(
         &self,
         api_key: Option<&str>,
         body: Vec<u8>,
     ) -> Result<reqwest::Response, ProviderError> {
-        let mut attempt = 0u32;
-        loop {
-            let sent = tokio::time::timeout(self.idle_timeout, self.request(api_key, &body).send()).await;
-            match sent {
-                Ok(Ok(resp)) => return Ok(resp),
-                Ok(Err(e)) => {
-                    let transient = e.is_connect() || e.is_timeout() || e.is_request();
-                    if transient && attempt < self.connect_retries {
-                        attempt += 1;
-                        tracing::warn!(
-                            target: "dispatch",
-                            provider = self.provider_label,
-                            host = %self.host(),
-                            attempt,
-                            "connection failed ({e}); retrying"
-                        );
-                        tokio::time::sleep(RETRY_DELAY).await;
-                        continue;
-                    }
-                    if transient {
-                        return Err(ProviderError::Unreachable {
-                            provider: self.provider_label,
-                            host: self.host(),
-                            detail: root_cause(&e),
-                        });
-                    }
-                    return Err(ProviderError::Http(e));
-                }
-                Err(_) => return Err(self.idle_error()),
-            }
-        }
+        http::send_with_retry(self.peer(), self.idle_timeout, self.connect_retries, || {
+            self.request(api_key, &body)
+        })
+        .await
     }
 
     fn idle_error(&self) -> ProviderError {
-        ProviderError::Idle {
-            provider: self.provider_label,
-            host: self.host(),
-            secs: self.idle_timeout.as_secs(),
-        }
+        self.peer().idle_error(self.idle_timeout)
     }
 }
 
@@ -270,16 +234,6 @@ pub fn endpoint_host(endpoint: &str) -> String {
     let rest = rest.split('/').next().unwrap_or(rest);
     // Drop userinfo if any.
     rest.rsplit('@').next().unwrap_or(rest).to_string()
-}
-
-/// The innermost error message of a reqwest error chain (the OS-level reason:
-/// "Connection refused", "No route to host", …) rather than the URL wrapper.
-fn root_cause(e: &reqwest::Error) -> String {
-    let mut src: &(dyn std::error::Error + 'static) = e;
-    while let Some(next) = src.source() {
-        src = next;
-    }
-    src.to_string()
 }
 
 /// Extract incremental text from an OpenAI-style SSE `data:` line
@@ -563,7 +517,7 @@ mod wire {
         assert!(msg.contains(&addr.to_string()), "{msg}");
         assert!(msg.contains("Tailscale"), "{msg}");
         // One retry happened (the retry delay elapsed).
-        assert!(start.elapsed() >= RETRY_DELAY, "no retry delay observed");
+        assert!(start.elapsed() >= http::RETRY_DELAY, "no retry delay observed");
     }
 
     #[tokio::test]

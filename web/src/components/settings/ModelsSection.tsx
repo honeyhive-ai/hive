@@ -578,6 +578,9 @@ function RuntimesSection() {
   const [runtimeSupportsTools, setRuntimeSupportsTools] = useState(true);
   const [runtimeSupportsEmbeddings, setRuntimeSupportsEmbeddings] = useState(false);
   const [runtimeContextWindow, setRuntimeContextWindow] = useState("");
+  // Native-Ollama request settings (shown only for the ollama provider).
+  const [runtimeKeepAlive, setRuntimeKeepAlive] = useState("");
+  const [runtimeThink, setRuntimeThink] = useState(false);
   // null = the form is adding; an id = editing that runtime in place (add_runtime
   // upserts by id, so the same form both adds and edits).
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -610,6 +613,8 @@ function RuntimesSection() {
     setRuntimeBaseUrl("");
     setRuntimeModel("");
     setRuntimeContextWindow("");
+    setRuntimeKeepAlive("");
+    setRuntimeThink(false);
     setRuntimeSupportsTools(true);
     setRuntimeSupportsEmbeddings(false);
   }
@@ -623,6 +628,8 @@ function RuntimesSection() {
     setRuntimeBaseUrl(runtime.modelBaseUrl ?? "");
     setRuntimeModel(runtime.model);
     setRuntimeContextWindow(runtime.contextWindow ? String(runtime.contextWindow) : "");
+    setRuntimeKeepAlive(runtime.keepAlive ?? "");
+    setRuntimeThink(runtime.think ?? false);
     setRuntimeSupportsTools(runtime.supportsTools);
     setRuntimeSupportsEmbeddings(runtime.supportsEmbeddings);
     formRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -643,6 +650,8 @@ function RuntimesSection() {
         // pi targets an OpenAI-compatible provider; default that id to "ollama".
         runtimeBaseUrl.trim() && runtimeProvider === "pi" ? "ollama" : null,
         Number(runtimeContextWindow) > 0 ? Number(runtimeContextWindow) : null,
+        runtimeProvider === "ollama" ? runtimeKeepAlive.trim() || null : null,
+        runtimeProvider === "ollama" ? runtimeThink : null,
       ),
     onSuccess: () => {
       resetRuntimeForm();
@@ -730,6 +739,9 @@ function RuntimesSection() {
                     ✓ Responded in {tests[runtime.id]!.result!.latency_ms} ms
                     {tests[runtime.id]!.result!.reply
                       ? ` — "${tests[runtime.id]!.result!.reply.slice(0, 60)}"`
+                      : ""}
+                    {tests[runtime.id]!.result!.capabilities
+                      ? ` · model: ${tests[runtime.id]!.result!.capabilities}`
                       : ""}
                   </span>
                 ) : (
@@ -853,7 +865,23 @@ function RuntimesSection() {
         <p className="text-xs opacity-50">
           Overrides the window the context planner budgets against. Useful for Ollama/custom
           models whose window can't be inferred from the model name.
+          {runtimeProvider === "ollama" && " Ollama is told to allocate this window (num_ctx) on every request."}
         </p>
+        {runtimeProvider === "ollama" && (
+          <>
+            <input
+              value={runtimeKeepAlive}
+              onChange={(e) => setRuntimeKeepAlive(e.target.value)}
+              placeholder="Keep model loaded — e.g. 5m, 1h, or -1 for always (optional)"
+              className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
+              style={fieldStyle}
+            />
+            <div className="flex items-center gap-2 text-sm opacity-75">
+              <Switch on={runtimeThink} onChange={setRuntimeThink} label="Let the model think" />
+              <span>Let the model think (reasoning models; slower, shown live, never in the transcript)</span>
+            </div>
+          </>
+        )}
         <div className="flex items-center gap-2 text-sm opacity-75">
           <Switch on={runtimeSupportsTools} onChange={setRuntimeSupportsTools} label="Supports tools" />
           <span>Supports tools</span>

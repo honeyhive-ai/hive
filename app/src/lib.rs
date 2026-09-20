@@ -2244,6 +2244,9 @@ fn runtime_to_toml(runtime: &RuntimeTarget) -> toml::Value {
     if let Some(value) = &runtime.request_keep_alive {
         table.insert("keep_alive".into(), toml::Value::String(value.clone()));
     }
+    if let Some(think) = runtime.think {
+        table.insert("think".into(), toml::Value::Boolean(think));
+    }
     if runtime.capabilities.supports_embeddings {
         table.insert("supports_embeddings".into(), toml::Value::Boolean(true));
     }
@@ -2485,6 +2488,8 @@ fn runtime_dto(rt: &RuntimeTarget, is_default: bool) -> RuntimeSummaryDto {
         model_base_url: rt.model_base_url.clone().filter(|s| !s.is_empty()),
         model_provider_id: rt.model_provider_id.clone().filter(|s| !s.is_empty()),
         context_window: rt.capabilities.context_window_tokens,
+        keep_alive: rt.request_keep_alive.clone().filter(|s| !s.trim().is_empty()),
+        think: rt.think,
     }
 }
 
@@ -2783,6 +2788,9 @@ impl AppState {
                     // Runtimes) — honored by the budget planner over the
                     // model-name guess.
                     context_window_tokens: rt.capabilities.context_window_tokens.filter(|w| *w > 0),
+                    // Native-Ollama request settings (ignored by other providers).
+                    keep_alive: rt.request_keep_alive.clone().filter(|s| !s.trim().is_empty()),
+                    think: rt.think,
                 };
             }
         }
@@ -2798,6 +2806,8 @@ impl AppState {
             model_provider_id: None,
             model_base_url: None,
             context_window_tokens: None,
+            keep_alive: None,
+            think: None,
         }
     }
 }
@@ -7410,6 +7420,10 @@ struct RuntimeTestDto {
     latency_ms: u64,
     reply: String,
     error: Option<String>,
+    /// What the server reports about the model (native Ollama only): a short
+    /// "tools · thinking · 40k max ctx" summary, or None when not probed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: Option<String>,
 }
 
 /// Preflight a runtime: send a trivial prompt and confirm it answers within a
@@ -7458,18 +7472,31 @@ async fn ping_runtime(runtime: ResolvedRuntime, workspace_root: Option<String>) 
     );
     let outcome = tokio::time::timeout(timeout, fut).await;
     let latency_ms = start.elapsed().as_millis() as u64;
+    // Native Ollama: also report what the server knows about the model, so
+    // the Test result shows whether it can use tools / think and how big its
+    // window is (the probe is cached; this is the same call a live turn makes).
+    let capabilities = if runtime.provider == ModelProviderKind::Ollama && !dispatch::ollama_uses_openai_shim() {
+        hive_runtime::provider::OllamaClient::new(&runtime.endpoint)
+            .capabilities_cached(&runtime.model)
+            .await
+            .map(|c| c.summary())
+            .filter(|s| !s.is_empty())
+    } else {
+        None
+    };
     match outcome {
         Ok(Ok(reply)) => {
             let reply = reply.trim().to_string();
-            RuntimeTestDto { ok: !reply.is_empty(), latency_ms, reply, error: None }
+            RuntimeTestDto { ok: !reply.is_empty(), latency_ms, reply, error: None, capabilities }
         }
         Ok(Err(e)) => {
-            RuntimeTestDto { ok: false, latency_ms, reply: String::new(), error: Some(e.to_string()) }
+            RuntimeTestDto { ok: false, latency_ms, reply: String::new(), error: Some(e.to_string()), capabilities }
         }
         Err(_) => RuntimeTestDto {
             ok: false,
             latency_ms,
             reply: String::new(),
+            capabilities,
             error: Some(format!(
                 "No response within {}s — the runtime spawned but never answered. Likely a missing login/auth (run the CLI's login once), a wrong executable path, or the CLI blocking on project config (e.g. an MCP server or hook) in the workspace folder.",
                 timeout.as_secs()
@@ -7509,6 +7536,7 @@ async fn probe_provider(
             latency_ms: 0,
             reply: String::new(),
             error: Some("No API key set for this provider — save one first.".to_string()),
+            capabilities: None,
         });
     }
     // A passed base URL wins (test-before-save from onboarding); else the stored one.
@@ -7528,6 +7556,7 @@ async fn probe_provider(
                     latency_ms: 0,
                     reply: String::new(),
                     error: Some("Set a base URL for this provider first.".to_string()),
+                    capabilities: None,
                 });
             }
             if b.contains("/chat/completions") {
@@ -7550,6 +7579,8 @@ async fn probe_provider(
         model_provider_id: None,
         model_base_url: base,
         context_window_tokens: None,
+        keep_alive: None,
+        think: None,
     };
     let workspace_root = {
         let r = state.workspace_root.lock().unwrap().clone();
@@ -7614,6 +7645,8 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
                 model_base_url: None,
                 model_provider_id: None,
                 context_window: None,
+                keep_alive: None,
+                think: None,
             },
         );
     }
@@ -7637,6 +7670,8 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
             model_base_url: None,
             model_provider_id: None,
             context_window: None,
+            keep_alive: None,
+            think: None,
         });
     }
 
@@ -7683,6 +7718,8 @@ fn add_runtime(
     model_base_url: Option<String>,
     model_provider_id: Option<String>,
     context_window: Option<u32>,
+    keep_alive: Option<String>,
+    think: Option<bool>,
 ) -> Result<(), String> {
     let provider_kind = parse_provider_kind(&provider)?;
     let model_base_url = model_base_url
@@ -7718,7 +7755,9 @@ fn add_runtime(
         metrics_endpoint: None,
         model_provider_id,
         model_base_url,
-        request_keep_alive: None,
+        // Native-Ollama settings; other providers ignore them.
+        request_keep_alive: keep_alive.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
+        think,
         estimated_performance_score: 0.0,
         estimated_cost_per_1m_input_tokens_usd: 0.0,
         capabilities: hive_core::RuntimeCapabilities {
@@ -11243,6 +11282,8 @@ fn import_config(state: State<AppState>, toml_text: String) -> Result<String, St
             r.model_base_url,
             None,
             r.context_window,
+            None,
+            None,
         ) {
             Ok(()) => runtimes += 1,
             Err(e) => warnings.push(format!("runtime {}: {e}", r.id)),

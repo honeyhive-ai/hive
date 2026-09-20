@@ -221,6 +221,7 @@ struct RawRuntime {
     model_provider_id: Option<String>,
     model_base_url: Option<String>,
     keep_alive: Option<String>,
+    think: Option<bool>,
     #[serde(default)]
     supports_embeddings: bool,
     #[serde(default)]
@@ -461,6 +462,7 @@ impl RawRuntime {
             model_provider_id: self.model_provider_id,
             model_base_url: self.model_base_url,
             request_keep_alive: self.keep_alive,
+            think: self.think,
             estimated_performance_score: self.performance_score,
             estimated_cost_per_1m_input_tokens_usd: self.cost_per_1m_input_tokens_usd,
             capabilities: RuntimeCapabilities {

@@ -1,7 +1,9 @@
 //! Provider adapters — ported from `Providers.swift` / `RuntimeChatClient.swift`.
 //!
 //! - `anthropic` — Anthropic Messages API streaming (Phase 3)
-//! - `openai` — OpenAI-compatible streaming: OpenAI/OpenRouter/custom/Ollama (Phase 5)
+//! - `openai` — OpenAI-compatible streaming: OpenAI/OpenRouter/custom gateways
+//! - `ollama` — native Ollama API (`/api/chat`, `/api/show`): num_ctx, keep_alive, think, capability probe
+//! - `http` — connect/idle/retry policy shared by the HTTP clients
 //! - `subprocess` — external CLI agents: aider/pi/claude-code (Phase 5 follow-up)
 //! - `thinking` — splits a reasoning model's `<think>` output from its reply
 //! - `dispatch` — resolves + routes a turn to the right client by runtime
@@ -12,12 +14,15 @@ pub mod anthropic;
 pub mod claude_code;
 pub mod codex;
 pub mod dispatch;
+pub mod http;
+pub mod ollama;
 pub mod openai;
 pub mod subprocess;
 pub mod thinking;
 
 pub use anthropic::{AnthropicClient, ChatTurn, ProviderError};
 pub use dispatch::{default_endpoint, stream, ResolvedRuntime, StreamActivity};
+pub use ollama::{ModelCapabilities, OllamaClient};
 pub use openai::{endpoint_host, OpenAiClient};
 
 /// TCP connect timeout for HTTP providers. A remote box that is off, or a

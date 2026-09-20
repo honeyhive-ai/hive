@@ -368,6 +368,8 @@ fn resolve_runtime_from_env() -> Result<(ResolvedRuntime, String)> {
         model_provider_id: None,
         model_base_url: None,
         context_window_tokens: None,
+        keep_alive: None,
+        think: None,
     };
     Ok((rt, format!("{provider_str}/{model}")))
 }
@@ -571,6 +573,8 @@ fn resolve_agent_runtime(cfg: &Config, runtime_id: Option<&str>) -> Result<(Reso
         model_provider_id: None,
         model_base_url: None,
         context_window_tokens: None,
+        keep_alive: None,
+        think: None,
     };
     Ok((rt, format!("workspace:{}", wr.name)))
 }
@@ -790,6 +794,8 @@ fn agent_workspace_runtime(
         model_provider_id: None,
         model_base_url: None,
         context_window_tokens: None,
+        keep_alive: None,
+        think: None,
     };
     Ok((rt, wr.id.clone()))
 }
