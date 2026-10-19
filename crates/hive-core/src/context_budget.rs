@@ -48,16 +48,14 @@ pub mod model_context_window {
         if m.contains("gemini") {
             return 1_000_000;
         }
-        // Open-weight models served locally (llama.cpp / Ollama). These can
-        // take far more, but a local server allocates a fixed per-slot window
-        // and 32k is the conservative slot size; a runtime override or the
-        // server's own `/props` report wins over this guess. Checked before
-        // the hosted-model rules so e.g. "gpt-oss" never matches a GPT entry.
-        if m.contains("gpt-oss")
-            || m.contains("lfm2")
-            || ["gemma3", "gemma-3", "gemma4", "gemma-4"].iter().any(|g| m.contains(g))
-        {
-            return 32_768;
+        // Open-weight models served locally (llama.cpp / Ollama): the family
+        // profile's per-slot window. These models can take far more, but a
+        // local server allocates a fixed per-slot window and 32k is the
+        // conservative slot size; a runtime override or the server's own
+        // `/props` report wins over this guess. Checked before the hosted-model
+        // rules so e.g. "gpt-oss" never matches a GPT entry.
+        if let Some(profile) = crate::model_profile::profile_for(model_id) {
+            return profile.context_window;
         }
         if m.contains("gpt-4o")
             || m.contains("gpt-4.1")
@@ -271,6 +269,9 @@ mod tests {
         // Hosted GPT entries are untouched.
         assert_eq!(model_context_window::tokens_for_model("gpt-4o"), 128_000);
         assert_eq!(model_context_window::tokens_for_model("gpt-4"), 8_192);
+        // Retrieval models plan against their own (small) windows, not a slot.
+        assert_eq!(model_context_window::tokens_for_model("embeddinggemma-300m"), 2_048);
+        assert_eq!(model_context_window::tokens_for_model("bge-reranker-v2-m3"), 8_192);
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub mod e2ee;
 pub mod events;
 pub mod git_context;
 pub mod identity;
+pub mod model_profile;
 pub mod policy;
 pub mod process_util;
 pub mod proposals;
