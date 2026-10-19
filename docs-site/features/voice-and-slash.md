@@ -27,7 +27,10 @@ The full breakdown, updated live while replies stream:
 
 Long conversations eventually outgrow any window. Hive **auto-summarizes
 overflow** — older messages are collapsed into a running summary that
-rides in the system prompt — but two `/` commands give you the explicit
+rides right after the system prompt, so a server's prompt cache keeps
+reusing the unchanged prefix (see
+[Offline setup with local models](../getting-started/offline-local-models.md#compaction))
+— but two `/` commands give you the explicit
 version (type `/` in the composer; both are tagged **Context**):
 
 ### /summarize

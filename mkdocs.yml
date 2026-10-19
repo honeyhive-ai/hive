@@ -79,6 +79,7 @@ nav:
       - Install with Homebrew: getting-started/homebrew.md
       - First launch: getting-started/first-launch.md
       - Configuring a runtime: getting-started/configuring-a-runtime.md
+      - Offline setup with local models: getting-started/offline-local-models.md
       - Your first chat: getting-started/first-chat.md
   - Concepts:
       - Workspaces & chats: concepts/workspaces.md
