@@ -38,16 +38,17 @@ pub struct ResolvedRuntime {
     /// Ollama `think`: ask a reasoning model to think (`Some(true)`) or not
     /// (`Some(false)`); `None` ⇒ Hive's default, which is off.
     pub think: Option<bool>,
-    /// The runtime's "Supports tools" switch. For native Ollama this opts the
-    /// runtime into the MCP tool loop, which then also needs the capability
-    /// probe to say the model can call tools. Other HTTP providers ignore it.
+    /// The runtime's "Supports tools" switch: opts an HTTP model runtime into
+    /// the MCP tool loop. Native Ollama additionally needs the capability
+    /// probe to say the model can call tools; on the OpenAI wire the switch is
+    /// the gate (a server that rejects `tools` falls back to plain chat).
     pub tools: bool,
 }
 
 /// Tools to offer a turn: neutral definitions (`{name, description,
-/// input_schema}`) and the executor that runs them. Today only native Ollama
-/// consumes this from [`stream_with_tools`]; Anthropic has its own loop in
-/// the app, and the OpenAI wire ignores it.
+/// input_schema}`) and the executor that runs them. Consumed by
+/// [`stream_with_tools`] for native Ollama and every OpenAI-wire provider;
+/// Anthropic has its own loop in the app.
 pub struct ToolSet<'a, E: ToolExecutor> {
     pub defs: &'a [Value],
     pub executor: &'a E,
@@ -100,14 +101,47 @@ pub fn ollama_tools_allowed(rt: &ResolvedRuntime, caps: Option<&super::ollama::M
     rt.tools && caps.map(|c| c.tools).unwrap_or(false)
 }
 
+/// Whether an OpenAI-wire runtime may carry tool definitions: the runtime
+/// opted in. There is no capability probe on this wire; a server that can't
+/// take `tools` says so with a 400 and the client retries without them.
+pub fn openai_tools_allowed(rt: &ResolvedRuntime) -> bool {
+    rt.tools && rt.is_openai_wire()
+}
+
+/// Ask a local OpenAI-compatible server (`llama-server`) for its per-slot
+/// context window and cache the answer, so [`ResolvedRuntime::context_window`]
+/// can use it. Only for runtimes that may front a local server (Custom,
+/// HiveDaemon) and have no explicit override; a no-op otherwise. Never fails.
+pub async fn warm_context_probe(rt: &ResolvedRuntime) {
+    if !rt.probes_server_props() || rt.context_window_tokens.is_some_and(|n| n > 0) {
+        return;
+    }
+    OpenAiClient::new(&rt.endpoint)
+        .with_provider_label(provider_label(rt.provider))
+        .probe_context_window(rt.api_key.as_deref(), &rt.model)
+        .await;
+}
+
 impl ResolvedRuntime {
-    /// Effective context window: the explicit override, else the model-name
-    /// table in `hive_core::context_budget`.
+    /// Effective context window: the explicit override, else what a local
+    /// server reported (`/props`, cached by [`warm_context_probe`]), else the
+    /// model-name table in `hive_core::context_budget`.
     pub fn context_window(&self) -> u32 {
         match self.context_window_tokens {
             Some(n) if n > 0 => n,
-            _ => hive_core::context_budget::model_context_window::tokens_for_model(&self.model),
+            _ => self
+                .probes_server_props()
+                .then(|| super::openai::cached_context_window(&self.endpoint, &self.model))
+                .flatten()
+                .unwrap_or_else(|| hive_core::context_budget::model_context_window::tokens_for_model(&self.model)),
         }
+    }
+
+    /// Runtimes whose endpoint may be a local `llama-server` worth asking
+    /// for its window. Hosted providers (OpenAI, OpenRouter, Azure) and
+    /// Ollama (native probe) are excluded.
+    pub fn probes_server_props(&self) -> bool {
+        matches!(self.provider, ModelProviderKind::Custom | ModelProviderKind::HiveDaemon) && !self.endpoint.is_empty()
     }
 
     /// True for runtimes reached over an HTTP model endpoint with no tool loop
@@ -201,9 +235,11 @@ pub async fn stream(
 
 /// [`stream`], with `tools` on offer. A native-Ollama runtime runs the tool
 /// loop when the runtime opts in (`tools` switch), the probe reports tool
-/// support, and `tools` is non-empty; tool calls and results are surfaced as
-/// [`StreamActivity`] like a subprocess agent's. Otherwise `tools` is ignored
-/// and the turn streams as plain chat.
+/// support, and `tools` is non-empty; an OpenAI-wire runtime (OpenAI,
+/// OpenRouter, Azure, Custom/llama.cpp, HiveDaemon, the Ollama shim) runs it
+/// when it opts in and `tools` is non-empty. Tool calls and results are
+/// surfaced as [`StreamActivity`] like a subprocess agent's. Otherwise `tools`
+/// is ignored and the turn streams as plain chat.
 #[allow(clippy::too_many_arguments)]
 pub async fn stream_with_tools<E: ToolExecutor>(
     rt: &ResolvedRuntime,
@@ -277,18 +313,42 @@ pub async fn stream_with_tools<E: ToolExecutor>(
         | ModelProviderKind::Azure => {
             // Azure OpenAI speaks the same wire format but authenticates with an
             // `api-key` header instead of a bearer token.
-            OpenAiClient::new(&rt.endpoint)
+            let client = OpenAiClient::new(&rt.endpoint)
                 .with_api_key_header(rt.provider == ModelProviderKind::Azure)
-                .with_provider_label(provider_label(rt.provider))
-                .stream_reply_with_thinking(
-                    rt.api_key.as_deref(),
-                    &rt.model,
-                    system,
-                    turns,
-                    on_delta,
-                    |text| on_activity(StreamActivity::Thinking { text }),
-                )
-                .await
+                .with_provider_label(provider_label(rt.provider));
+            match tools.filter(|t| !t.defs.is_empty()) {
+                Some(t) if openai_tools_allowed(rt) => {
+                    tracing::info!(target: "dispatch", provider = provider_label(rt.provider), host = %client.host(), model = %rt.model, tools = t.defs.len(), "openai-wire turn with tools");
+                    // The identity block told the model it has no tools; it does now.
+                    let system = system.map(crate::prompt::with_tools_offered);
+                    client
+                        .stream_chat_with_tools(
+                            rt.api_key.as_deref(),
+                            &rt.model,
+                            system.as_deref(),
+                            turns,
+                            t.defs,
+                            t.executor,
+                            t.max_rounds,
+                            on_delta,
+                            on_activity,
+                        )
+                        .await
+                        .map(|out| out.text)
+                }
+                _ => {
+                    client
+                        .stream_reply_with_thinking(
+                            rt.api_key.as_deref(),
+                            &rt.model,
+                            system,
+                            turns,
+                            on_delta,
+                            |text| on_activity(StreamActivity::Thinking { text }),
+                        )
+                        .await
+                }
+            }
         }
         ModelProviderKind::ClaudeCode => {
             // BYO subscription via the `claude` CLI in stream-json mode (no API
@@ -568,6 +628,48 @@ mod tests {
         // Zero is "unset".
         rt.context_window_tokens = Some(0);
         assert_eq!(rt.context_window(), 32_768);
+    }
+
+    #[test]
+    fn context_window_precedence_is_override_then_server_probe_then_name() {
+        let endpoint = "http://10.9.8.7:8081/v1/chat/completions";
+        let mut rt = ResolvedRuntime {
+            provider: ModelProviderKind::Custom,
+            model: "some-local-gguf".into(),
+            endpoint: endpoint.into(),
+            ..ollama_rt()
+        };
+        // Nothing probed yet: the name table (fallback for an unknown name).
+        assert_eq!(rt.context_window(), hive_core::context_budget::model_context_window::FALLBACK);
+        // A probe that found nothing changes nothing.
+        super::super::openai::seed_context_probe(endpoint, "some-local-gguf", None);
+        assert_eq!(rt.context_window(), hive_core::context_budget::model_context_window::FALLBACK);
+        // The server's per-slot window beats the name guess…
+        super::super::openai::seed_context_probe(endpoint, "some-local-gguf", Some(16_384));
+        assert_eq!(rt.context_window(), 16_384);
+        // …and the runtime's explicit setting beats the probe.
+        rt.context_window_tokens = Some(4096);
+        assert_eq!(rt.context_window(), 4096);
+        // Hosted providers never consult the probe cache.
+        rt.context_window_tokens = None;
+        rt.provider = ModelProviderKind::OpenAI;
+        assert_eq!(rt.context_window(), hive_core::context_budget::model_context_window::FALLBACK);
+    }
+
+    #[test]
+    fn openai_wire_tools_follow_the_runtime_switch() {
+        let mut rt = ResolvedRuntime { provider: ModelProviderKind::Custom, ..ollama_rt() };
+        assert!(!openai_tools_allowed(&rt), "off unless opted in");
+        rt.tools = true;
+        assert!(openai_tools_allowed(&rt));
+        for p in [ModelProviderKind::OpenAI, ModelProviderKind::OpenRouter, ModelProviderKind::Azure, ModelProviderKind::HiveDaemon] {
+            rt.provider = p;
+            assert!(openai_tools_allowed(&rt), "{p:?}");
+        }
+        for p in [ModelProviderKind::Anthropic, ModelProviderKind::ClaudeCode, ModelProviderKind::Pi] {
+            rt.provider = p;
+            assert!(!openai_tools_allowed(&rt), "{p:?}");
+        }
     }
 
     #[test]

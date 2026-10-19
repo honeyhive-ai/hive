@@ -956,6 +956,7 @@ function RuntimesSection() {
           Overrides the window the context planner budgets against. Useful for Ollama/custom
           models whose window can't be inferred from the model name.
           {runtimeProvider === "ollama" && " Ollama is told to allocate this window (num_ctx) on every request."}
+          {runtimeProvider === "custom" && " Left blank, a llama.cpp server's own per-slot window (/props) is used when it reports one."}
         </p>
         {runtimeProvider === "ollama" && (
           <>
@@ -974,7 +975,15 @@ function RuntimesSection() {
         )}
         <div className="flex items-center gap-2 text-sm opacity-75">
           <Switch on={runtimeSupportsTools} onChange={setRuntimeSupportsTools} label="Supports tools" />
-          <span>Supports tools (Ollama: offer your enabled MCP tools when the model's probe says it can call them)</span>
+          <span>
+            Supports tools (offer your enabled MCP tools to this model
+            {runtimeProvider === "ollama"
+              ? " when the server's probe says it can call them"
+              : ["openAI", "openRouter", "azure", "custom"].includes(runtimeProvider)
+                ? " over the OpenAI tools API; a server that rejects tools falls back to plain chat"
+                : ""}
+            )
+          </span>
         </div>
         <div className="flex items-center gap-2 text-sm opacity-75">
           <Switch on={runtimeSupportsEmbeddings} onChange={setRuntimeSupportsEmbeddings} label="Supports embeddings" />

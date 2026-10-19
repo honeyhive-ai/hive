@@ -2795,8 +2795,9 @@ impl AppState {
                     // Native-Ollama request settings (ignored by other providers).
                     keep_alive: rt.request_keep_alive.clone().filter(|s| !s.trim().is_empty()),
                     think: rt.think,
-                    // The runtime's "Supports tools" switch: opts a native-Ollama
-                    // runtime into the MCP tool loop (still gated on the probe).
+                    // The runtime's "Supports tools" switch: opts an HTTP model
+                    // runtime into the MCP tool loop (native Ollama is still
+                    // gated on its capability probe).
                     tools: rt.capabilities.supports_tools,
                 };
             }
@@ -5494,6 +5495,10 @@ async fn windowed_context(
     session: &ChatSession,
     responder: &Responder,
 ) -> (String, Vec<ChatTurn>) {
+    // A local llama-server reports the per-slot window it actually allocated;
+    // learn it (once, cached) so the planner budgets against it rather than a
+    // guess from the model name. No-op for other providers or with an override.
+    dispatch::warm_context_probe(&responder.runtime).await;
     let snapshot = context_snapshot(state, session_id, session, responder);
     let plan = snapshot.plan;
     let mut turns = turns_from(&plan.kept, responder.agent_id, &responder.author);
@@ -5948,7 +5953,8 @@ fn turns_to_messages(turns: &[ChatTurn]) -> Vec<Value> {
 /// The enabled MCP tools as neutral provider definitions plus the executor
 /// that routes a call back to its server. `None` when no server is enabled or
 /// none of them lists a tool, so the caller streams a plain turn instead.
-/// Shared by the Anthropic loop and the native-Ollama loop.
+/// Shared by the Anthropic loop and the HTTP-model loops (native Ollama and
+/// the OpenAI wire).
 async fn mcp_tool_set(state: &State<'_, AppState>) -> Option<(Vec<Value>, McpToolExecutor)> {
     // Renew any near-expiry remote-server tokens before we build the registry.
     state.ensure_fresh_mcp_tokens().await;
@@ -5976,8 +5982,8 @@ async fn mcp_tool_set(state: &State<'_, AppState>) -> Option<(Vec<Value>, McpToo
 }
 
 /// Model rounds per tool-using turn (the last one is forced tool-less for
-/// Ollama so a small model still ends on an answer). Matches the Anthropic
-/// loop's bound.
+/// Ollama and the OpenAI wire so a small model still ends on an answer).
+/// Matches the Anthropic loop's bound.
 const MAX_TOOL_ROUNDS: usize = 6;
 
 /// Attempt the MCP tool loop. Returns `Ok(Some(text))` if it ran, `Ok(None)` if
@@ -6232,13 +6238,12 @@ async fn run_prepared_turn(
         }
     }
 
-    // A native-Ollama runtime that opted in ("Supports tools") gets the same MCP
-    // tools on the streaming path; the dispatcher still gates on the capability
-    // probe, so a model that can't call tools is never offered them.
-    let ollama_tools = if responder.runtime.provider == ModelProviderKind::Ollama
-        && responder.runtime.tools
-        && !dispatch::ollama_uses_openai_shim()
-    {
+    // Any HTTP model runtime that opted in ("Supports tools") — native Ollama
+    // or the OpenAI wire (OpenAI, OpenRouter, Azure, a local llama.cpp
+    // gateway, …) — gets the same MCP tools on the streaming path. Native
+    // Ollama is further gated on its capability probe in the dispatcher; an
+    // OpenAI-wire server that rejects tools falls back to plain chat there.
+    let http_tools = if responder.runtime.tools && responder.runtime.is_openai_wire() {
         mcp_tool_set(state).await
     } else {
         None
@@ -6413,7 +6418,7 @@ async fn run_prepared_turn(
         working_dir,
         &git_env,
         1024,
-        ollama_tools
+        http_tools
             .as_ref()
             .map(|(defs, executor)| dispatch::ToolSet { defs, executor, max_rounds: MAX_TOOL_ROUNDS }),
         |text| {
@@ -7517,6 +7522,12 @@ async fn ping_runtime(runtime: ResolvedRuntime, workspace_root: Option<String>) 
             .await
             .map(|c| c.summary())
             .filter(|s| !s.is_empty())
+    } else if runtime.probes_server_props() {
+        // A local llama-server: report the per-slot window it allocated (the
+        // same cached `/props` probe a live turn budgets against).
+        dispatch::warm_context_probe(&runtime).await;
+        hive_runtime::provider::openai::cached_context_window(&runtime.endpoint, &runtime.model)
+            .map(|n| format!("context {n} tokens per slot (server /props)"))
     } else {
         None
     };
