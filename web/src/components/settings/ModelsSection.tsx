@@ -591,7 +591,13 @@ function RuntimesSection() {
   const [runtimeContextWindow, setRuntimeContextWindow] = useState("");
   // Native-Ollama request settings (shown only for the ollama provider).
   const [runtimeKeepAlive, setRuntimeKeepAlive] = useState("");
+  // Thinking: native Ollama `think`, or chat_template_kwargs.enable_thinking
+  // (+ gpt-oss reasoning_effort) for a local OpenAI-compatible server.
   const [runtimeThink, setRuntimeThink] = useState(false);
+  // HTTP model runtimes: model rounds per tool-using turn ("" = default 24).
+  const [runtimeMaxToolRounds, setRuntimeMaxToolRounds] = useState("");
+  const thinkProviders = ["ollama", "custom", "hive-daemon"];
+  const httpProviders = ["ollama", "openAI", "openRouter", "azure", "custom", "hive-daemon"];
   // null = the form is adding; an id = editing that runtime in place (add_runtime
   // upserts by id, so the same form both adds and edits).
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -626,6 +632,7 @@ function RuntimesSection() {
     setRuntimeContextWindow("");
     setRuntimeKeepAlive("");
     setRuntimeThink(false);
+    setRuntimeMaxToolRounds("");
     setRuntimeSupportsTools(true);
     setRuntimeSupportsEmbeddings(false);
   }
@@ -641,6 +648,7 @@ function RuntimesSection() {
     setRuntimeContextWindow(runtime.contextWindow ? String(runtime.contextWindow) : "");
     setRuntimeKeepAlive(runtime.keepAlive ?? "");
     setRuntimeThink(runtime.think ?? false);
+    setRuntimeMaxToolRounds(runtime.maxToolRounds ? String(runtime.maxToolRounds) : "");
     setRuntimeSupportsTools(runtime.supportsTools);
     setRuntimeSupportsEmbeddings(runtime.supportsEmbeddings);
     formRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -662,7 +670,10 @@ function RuntimesSection() {
         runtimeBaseUrl.trim() && runtimeProvider === "pi" ? "ollama" : null,
         Number(runtimeContextWindow) > 0 ? Number(runtimeContextWindow) : null,
         runtimeProvider === "ollama" ? runtimeKeepAlive.trim() || null : null,
-        runtimeProvider === "ollama" ? runtimeThink : null,
+        thinkProviders.includes(runtimeProvider) ? runtimeThink : null,
+        httpProviders.includes(runtimeProvider) && Number(runtimeMaxToolRounds) > 0
+          ? Number(runtimeMaxToolRounds)
+          : null,
       ),
     onSuccess: () => {
       resetRuntimeForm();
@@ -702,6 +713,7 @@ function RuntimesSection() {
         runtime.contextWindow,
         runtime.keepAlive ?? null,
         runtime.think ?? null,
+        runtime.maxToolRounds ?? null,
       ),
     onSuccess: (_d, { model }) => {
       toast.success(`Runtime now uses ${model}.`);
@@ -963,24 +975,45 @@ function RuntimesSection() {
           {runtimeProvider === "custom" && " Left blank, a llama.cpp server's own per-slot window (/props) is used when it reports one."}
         </p>
         {runtimeProvider === "ollama" && (
+          <input
+            value={runtimeKeepAlive}
+            onChange={(e) => setRuntimeKeepAlive(e.target.value)}
+            placeholder="Keep model loaded — e.g. 5m, 1h, or -1 for always (optional)"
+            className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
+            style={fieldStyle}
+          />
+        )}
+        {thinkProviders.includes(runtimeProvider) && (
+          <div className="flex items-center gap-2 text-sm opacity-75">
+            <Switch on={runtimeThink} onChange={setRuntimeThink} label="Let the model think" />
+            <span>
+              Let the model think (reasoning models; slower, shown live, never in the transcript)
+              {runtimeProvider !== "ollama" &&
+                ". Sent to a llama.cpp server as enable_thinking; gpt-oss always reasons and gets low effort when this is off"}
+            </span>
+          </div>
+        )}
+        {httpProviders.includes(runtimeProvider) && runtimeSupportsTools && (
           <>
             <input
-              value={runtimeKeepAlive}
-              onChange={(e) => setRuntimeKeepAlive(e.target.value)}
-              placeholder="Keep model loaded — e.g. 5m, 1h, or -1 for always (optional)"
+              value={runtimeMaxToolRounds}
+              onChange={(e) => setRuntimeMaxToolRounds(e.target.value.replace(/[^0-9]/g, ""))}
+              inputMode="numeric"
+              placeholder="Max tool rounds per turn (optional — default 24)"
               className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
               style={fieldStyle}
             />
-            <div className="flex items-center gap-2 text-sm opacity-75">
-              <Switch on={runtimeThink} onChange={setRuntimeThink} label="Let the model think" />
-              <span>Let the model think (reasoning models; slower, shown live, never in the transcript)</span>
-            </div>
+            <p className="text-xs opacity-50">
+              How many times the model may call tools before it must answer. Tools also stop being
+              offered when the conversation nears the context window.
+            </p>
           </>
         )}
         <div className="flex items-center gap-2 text-sm opacity-75">
           <Switch on={runtimeSupportsTools} onChange={setRuntimeSupportsTools} label="Supports tools" />
           <span>
-            Supports tools (offer your enabled MCP tools to this model
+            Supports tools (offer your enabled MCP tools
+            {httpProviders.includes(runtimeProvider) ? " and Hive's built-in file tools" : ""} to this model
             {runtimeProvider === "ollama"
               ? " when the server's probe says it can call them"
               : ["openAI", "openRouter", "azure", "custom"].includes(runtimeProvider)

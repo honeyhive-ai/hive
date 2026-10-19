@@ -371,6 +371,7 @@ fn resolve_runtime_from_env() -> Result<(ResolvedRuntime, String)> {
         keep_alive: None,
         think: None,
         tools: false,
+        max_tool_rounds: None,
     };
     Ok((rt, format!("{provider_str}/{model}")))
 }
@@ -577,6 +578,7 @@ fn resolve_agent_runtime(cfg: &Config, runtime_id: Option<&str>) -> Result<(Reso
         keep_alive: None,
         think: None,
         tools: false,
+        max_tool_rounds: None,
     };
     Ok((rt, format!("workspace:{}", wr.name)))
 }
@@ -799,6 +801,7 @@ fn agent_workspace_runtime(
         keep_alive: None,
         think: None,
         tools: false,
+        max_tool_rounds: None,
     };
     Ok((rt, wr.id.clone()))
 }

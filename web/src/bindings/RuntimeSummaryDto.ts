@@ -24,4 +24,8 @@ keepAlive?: string | null,
 /**
  * Ollama `think`: let a reasoning model think. None = Hive default (off).
  */
-think?: boolean | null, };
+think?: boolean | null, 
+/**
+ * Model rounds per tool-using turn (HTTP runtimes). None = Hive default (24).
+ */
+maxToolRounds?: number | null, };

@@ -136,6 +136,7 @@ export const addRuntime = (
   contextWindow?: number | null,
   keepAlive?: string | null,
   think?: boolean | null,
+  maxToolRounds?: number | null,
 ) =>
   invoke<void>("add_runtime", {
     id,
@@ -151,7 +152,21 @@ export const addRuntime = (
     contextWindow: contextWindow ?? null,
     keepAlive: keepAlive ?? null,
     think: think ?? null,
+    maxToolRounds: maxToolRounds ?? null,
   });
+
+/// Hive's built-in file tools for HTTP model runtimes (Settings → Permissions).
+export type AgentToolSettings = {
+  /// Offer read_file / list_dir / search (and edits where allowed).
+  enabled: boolean;
+  /// Allow edits when a turn runs in place (no isolated worktree).
+  writeInPlace: boolean;
+  /// Offer run_command (shell) where edits are allowed.
+  runCommand: boolean;
+};
+export const getAgentToolSettings = () => invoke<AgentToolSettings>("get_agent_tool_settings");
+export const setAgentToolSettings = (settings: AgentToolSettings) =>
+  invoke<void>("set_agent_tool_settings", { settings });
 
 /// Custom /summarize + /compact instructions ("" = using the built-in default,
 /// which is returned so the UI can show it).

@@ -85,6 +85,11 @@ pub struct RuntimeTarget {
     /// ⇒ Hive's default (off). Set via `think` in a `[[runtimes]]` block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub think: Option<bool>,
+    /// Model rounds per tool-using turn for an HTTP runtime (native Ollama,
+    /// OpenAI wire). `None` ⇒ Hive's default (24). Set via `max_tool_rounds`
+    /// in a `[[runtimes]]` block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tool_rounds: Option<u32>,
     #[serde(default)]
     pub estimated_performance_score: f64,
     #[serde(default)]
@@ -132,6 +137,7 @@ mod tests {
             model_base_url: None,
             request_keep_alive: None,
             think: None,
+            max_tool_rounds: None,
             estimated_performance_score: 0.0,
             estimated_cost_per_1m_input_tokens_usd: 0.0,
             capabilities: RuntimeCapabilities::default(),

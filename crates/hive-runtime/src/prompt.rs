@@ -95,6 +95,51 @@ pub fn with_tools_offered(system: &str) -> String {
     }
 }
 
+/// How to work a codebase with Hive's built-in file tools — added when they're
+/// on offer. Small open models follow short literal rules: find before you
+/// read, read before you edit, copy the old text exactly, one change per call.
+pub const CODING_TOOLS_LINE: &str = "To work on files: find them with search or list_dir instead of \
+guessing paths (paths are relative to the project root). Read a file with read_file before \
+changing it.";
+
+/// Added when `edit_file` is on offer.
+pub const EDIT_TOOLS_LINE: &str = "To change a file, call edit_file with old_string copied exactly \
+from read_file's output (without the line numbers), including spaces and indentation, and \
+with enough surrounding lines to be unique. Make one change per call; use write_file only \
+for new files. Your changes come back to the user as a proposal to review.";
+
+/// Added when `run_command` is on offer.
+pub const COMMAND_TOOLS_LINE: &str = "After changing code, run the project's tests or build with \
+run_command to check your work, and say what the result was.";
+
+/// [`with_tools_offered`], plus the built-in coding guidance for whichever of
+/// Hive's built-in file tools `defs` (neutral `{name, …}` definitions) offers.
+pub fn with_tools_offered_for(system: &str, defs: &[serde_json::Value]) -> String {
+    let has = |name: &str| defs.iter().any(|d| d.get("name").and_then(|n| n.as_str()) == Some(name));
+    let mut guidance = Vec::new();
+    if has(crate::builtin_tools::READ_FILE) {
+        guidance.push(CODING_TOOLS_LINE);
+        if has(crate::builtin_tools::EDIT_FILE) {
+            guidance.push(EDIT_TOOLS_LINE);
+        }
+        if has(crate::builtin_tools::RUN_COMMAND) {
+            guidance.push(COMMAND_TOOLS_LINE);
+        }
+    }
+    let base = with_tools_offered(system);
+    if guidance.is_empty() {
+        return base;
+    }
+    let extra = guidance.join(" ");
+    // Keep the guidance next to the tools line so the rest of the prompt (and
+    // its cached prefix) reads the same with or without it.
+    if base.contains(TOOLS_LINE) {
+        base.replacen(TOOLS_LINE, &format!("{TOOLS_LINE} {extra}"), 1)
+    } else {
+        format!("{base}\n\n{extra}")
+    }
+}
+
 /// A human-readable roster of everyone in the workspace and how to address them.
 pub fn workspace_roster(session: &ChatSession) -> String {
     let mut lines = vec!["Workspace participants:".to_string()];
@@ -329,6 +374,7 @@ mod tests {
             keep_alive: None,
             think: None,
             tools: false,
+            max_tool_rounds: None,
         }
     }
 
@@ -347,6 +393,27 @@ mod tests {
         assert_eq!(with_tools_offered("Be brief.\n"), format!("Be brief.\n\n{TOOLS_LINE}"));
         assert_eq!(with_tools_offered(""), TOOLS_LINE);
         assert!(b.contains("never guess"), "{b}");
+    }
+
+    #[test]
+    fn coding_guidance_follows_the_offered_builtins() {
+        use serde_json::json;
+        let b = runtime_identity_block(&ollama_rt(), "");
+        let defs = |names: &[&str]| names.iter().map(|n| json!({ "name": n })).collect::<Vec<_>>();
+        // MCP-only: just the tools line.
+        assert_eq!(with_tools_offered_for(&b, &defs(&["rdna__search_docs"])), with_tools_offered(&b));
+        // Read-only built-ins: find/read guidance, no edit or command lines.
+        let ro = with_tools_offered_for(&b, &defs(&["read_file", "list_dir", "search"]));
+        assert!(ro.contains(CODING_TOOLS_LINE) && !ro.contains(EDIT_TOOLS_LINE) && !ro.contains(COMMAND_TOOLS_LINE), "{ro}");
+        assert!(ro.contains(&format!("{TOOLS_LINE} {CODING_TOOLS_LINE}")), "guidance sits right after the tools line: {ro}");
+        assert!(ro.starts_with("Your runtime"));
+        // Writes + commands.
+        let rw = with_tools_offered_for(&b, &defs(&["read_file", "edit_file", "write_file", "run_command"]));
+        assert!(rw.contains(EDIT_TOOLS_LINE) && rw.contains(COMMAND_TOOLS_LINE), "{rw}");
+        assert!(rw.contains("copied exactly") && rw.contains("one change per call"), "{rw}");
+        // A prompt without the identity block still gets both lines.
+        let bare = with_tools_offered_for("Be brief.", &defs(&["read_file"]));
+        assert!(bare.starts_with("Be brief.") && bare.contains(TOOLS_LINE) && bare.contains(CODING_TOOLS_LINE), "{bare}");
     }
 
     #[test]
