@@ -1825,7 +1825,38 @@ pub fn turns_for(session: &ChatSession, own_id: Option<Uuid>, own_author: &str) 
 /// a clean template and never learns to prefix its own name. Pass an empty
 /// `own_author` to attribute every turn (no self to exclude).
 pub fn turns_from(messages: &[ChatMessage], own_id: Option<Uuid>, own_author: &str) -> Vec<ChatTurn> {
-    let turns: Vec<ChatTurn> = messages
+    repair_alternation(attributed_turns(messages, own_id, own_author))
+}
+
+/// Header of the synthetic turn that carries the compaction summary.
+pub const SUMMARY_TURN_HEADER: &str = "[Summary of the earlier conversation]";
+
+/// Like [`turns_from`], but with an optional compaction `summary` delivered as
+/// the FIRST conversation turn (a user turn headed [`SUMMARY_TURN_HEADER`])
+/// rather than inside the system prompt. Keeping the system prompt
+/// byte-identical across turns lets a server-side prefix cache (llama.cpp
+/// slots, Anthropic/OpenAI prompt caching) reuse it even after compaction;
+/// the summary turn itself is stable while the compaction boundary is fixed.
+/// Alternation repair runs over the combined list, so a kept history that
+/// opens with a user turn is merged into the summary turn, and one that opens
+/// with an assistant turn needs no synthetic "(Continuing…)" placeholder.
+pub fn turns_with_summary(
+    messages: &[ChatMessage],
+    own_id: Option<Uuid>,
+    own_author: &str,
+    summary: Option<&str>,
+) -> Vec<ChatTurn> {
+    let mut turns = Vec::new();
+    if let Some(summary) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        turns.push(ChatTurn::user(format!("{SUMMARY_TURN_HEADER}\n{summary}")));
+    }
+    turns.extend(attributed_turns(messages, own_id, own_author));
+    repair_alternation(turns)
+}
+
+/// The per-message mapping behind [`turns_from`], before alternation repair.
+fn attributed_turns(messages: &[ChatMessage], own_id: Option<Uuid>, own_author: &str) -> Vec<ChatTurn> {
+    messages
         .iter()
         .filter(|m| !m.body.is_empty() && !m.is_streaming)
         .filter_map(|m| {
@@ -1861,8 +1892,7 @@ pub fn turns_from(messages: &[ChatMessage], own_id: Option<Uuid>, own_author: &s
                 MessageRole::System => None,
             }
         })
-        .collect();
-    repair_alternation(turns)
+        .collect()
 }
 
 /// Make a turn list provider-safe: coalesce consecutive same-role turns and
@@ -2743,6 +2773,48 @@ mod tests {
         assert_eq!(turns[1].role, "assistant");
         assert_eq!(turns[1].content, "Summary of earlier work"); // not dropped
         assert_eq!(turns[2].content, "now what?");
+    }
+
+    #[test]
+    fn summary_turn_leads_and_merges_with_a_leading_user_turn() {
+        let kept = vec![
+            ChatMessage::new(MessageRole::User, "Mara", "and then?"),
+            ChatMessage::new(MessageRole::Assistant, "Hive", "we ship"),
+        ];
+        let turns = turns_with_summary(&kept, None, "Hive", Some("Decided X."));
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(
+            turns[0].content,
+            "[Summary of the earlier conversation]\nDecided X.\n\nMara: and then?"
+        );
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "we ship");
+    }
+
+    #[test]
+    fn summary_turn_replaces_the_continuing_placeholder() {
+        // Kept history opening on an assistant turn: the summary is the user
+        // turn ahead of it, no synthetic "(Continuing…)" needed.
+        let kept = vec![
+            ChatMessage::new(MessageRole::Assistant, "Hive", "here is the plan"),
+            ChatMessage::new(MessageRole::User, "Mara", "ok"),
+        ];
+        let turns = turns_with_summary(&kept, None, "Hive", Some("Earlier: X."));
+        let roles: Vec<&str> = turns.iter().map(|t| t.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "user"]);
+        assert!(turns[0].content.starts_with(SUMMARY_TURN_HEADER));
+        assert!(!turns[0].content.contains("Continuing"));
+    }
+
+    #[test]
+    fn no_summary_matches_turns_from() {
+        let kept = vec![
+            ChatMessage::new(MessageRole::Assistant, "Hive", "hello"),
+            ChatMessage::new(MessageRole::User, "Mara", "hi"),
+        ];
+        assert_eq!(turns_with_summary(&kept, None, "Hive", None), turns_from(&kept, None, "Hive"));
+        assert_eq!(turns_with_summary(&kept, None, "Hive", Some("  ")), turns_from(&kept, None, "Hive"));
     }
 
     #[test]
