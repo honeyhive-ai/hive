@@ -195,6 +195,7 @@ struct TurnResult {
     secs: f64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_turn(
     rt: &ResolvedRuntime,
     system: &str,
