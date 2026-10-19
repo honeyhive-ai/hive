@@ -30,7 +30,7 @@ use hive_runtime::provider::anthropic::AnthropicResponse;
 use hive_runtime::tool_loop::{self, MessagesApi, ToolExecutor};
 use hive_runtime::{
     chat_service::ChatService, dispatch, identity_store::FileKeyVault, mcp::McpTransport, mentions::parse_mentions,
-    pending_mentions, prompt, resolve_manifest_url, turns_from, vault_fetcher, AnthropicClient, ChatTurn,
+    pending_mentions, prompt, resolve_manifest_url, turns_with_summary, vault_fetcher, AnthropicClient, ChatTurn,
     EventStore, IdentityStore, McpRegistry, McpServerSpec, ProviderError, ResolvedRuntime,
 };
 use serde_json::{json, Value};
@@ -101,8 +101,9 @@ struct AppState {
     /// each launch; switched to a room id when the user opens a joined room.
     active_workspace: Mutex<Uuid>,
     workspace_root: Mutex<String>,
-    /// Per-session incremental summary cache: (covered overflow ids, summary).
-    summary_cache: Mutex<HashMap<Uuid, (Vec<Uuid>, String)>>,
+    /// Per-session compaction state: the fixed boundary plus the incremental
+    /// summary of everything before it (see [`SummaryCacheEntry`]).
+    summary_cache: Mutex<HashMap<Uuid, SummaryCacheEntry>>,
     /// Fetched vault content, keyed by raw URL, with the fetch time so a stale
     /// entry (older than `VAULT_CACHE_TTL`) is re-fetched instead of served for
     /// the whole app run. Within the TTL it avoids a per-message round-trip.
@@ -5027,6 +5028,41 @@ struct ContextSnapshot {
     overflow_tokens: u32,
     summary_strategy: &'static str,
     plan: hive_core::context_budget::ContextWindowPlan,
+    /// First kept message once compaction has started; persisted with the
+    /// summary so later turns keep the same cut (and a cache-stable prefix).
+    boundary: Option<Uuid>,
+}
+
+/// Per-session compaction state kept between turns. `boundary` is the first
+/// kept message; `covered` the ids the cached `summary` folds in (everything
+/// before the boundary when it was produced). While the boundary holds, the
+/// summary is reused verbatim — no LLM call, and a byte-identical prompt
+/// prefix for the server's prefix cache.
+#[derive(Clone, Debug)]
+struct SummaryCacheEntry {
+    boundary: Option<Uuid>,
+    covered: Vec<Uuid>,
+    summary: String,
+}
+
+/// Batch-compaction watermarks (fractions of the history budget): compact once
+/// the kept history passes HIGH, then cut it back to LOW. Summaries cost tens
+/// of seconds on local models, so they're produced rarely and in batches.
+const COMPACT_HIGH_WATERMARK: f64 = hive_core::context_budget::DEFAULT_HIGH_WATERMARK;
+const COMPACT_LOW_WATERMARK: f64 = hive_core::context_budget::DEFAULT_LOW_WATERMARK;
+
+/// How the overflow summary will be obtained, given the ids the cached summary
+/// covers: "none" (no overflow), "cached" (reuse verbatim), "incremental" (fold
+/// only the newly aged-out messages into it) or "fresh" (summarize it all).
+fn summary_strategy(covered: Option<&[Uuid]>, overflow_ids: &[Uuid]) -> &'static str {
+    if overflow_ids.is_empty() {
+        return "none";
+    }
+    match covered {
+        Some(c) if c == overflow_ids => "cached",
+        Some(c) if overflow_ids.starts_with(c) && c.len() < overflow_ids.len() => "incremental",
+        _ => "fresh",
+    }
 }
 
 fn context_snapshot(
@@ -5044,25 +5080,21 @@ fn context_snapshot(
     let history_budget_tokens =
         (window_tokens - OUTPUT_RESERVE_TOKENS - system_prompt_tokens - SUMMARY_RESERVE_TOKENS)
             .max(1000);
-    let plan = hive_core::context_budget::plan(&session.messages, history_budget_tokens);
+    let cached = state.summary_cache.lock().unwrap().get(&session_id).cloned();
+    let hysteresis = hive_core::context_budget::plan_with_hysteresis(
+        &session.messages,
+        history_budget_tokens,
+        cached.as_ref().and_then(|c| c.boundary),
+        COMPACT_HIGH_WATERMARK,
+        COMPACT_LOW_WATERMARK,
+    );
+    let plan = hysteresis.plan;
     let history_tokens = token_estimator::estimate_messages(&session.messages) as u32;
     let kept_tokens = token_estimator::estimate_messages(&plan.kept) as u32;
     let overflow_tokens = token_estimator::estimate_messages(&plan.overflow) as u32;
-    let summary_strategy = if plan.overflow.is_empty() {
-        "none"
-    } else {
-        let overflow_ids: Vec<Uuid> = plan.overflow.iter().map(|message| message.id).collect();
-        let cached = state.summary_cache.lock().unwrap().get(&session_id).cloned();
-        match cached {
-            Some((covered, _)) if covered == overflow_ids => "cached",
-            Some((covered, _))
-                if overflow_ids.starts_with(&covered) && covered.len() < overflow_ids.len() =>
-            {
-                "incremental"
-            }
-            _ => "fresh",
-        }
-    };
+    let overflow_ids: Vec<Uuid> = plan.overflow.iter().map(|message| message.id).collect();
+    let summary_strategy =
+        summary_strategy(cached.as_ref().map(|c| c.covered.as_slice()), &overflow_ids);
 
     ContextSnapshot {
         window_tokens,
@@ -5073,6 +5105,7 @@ fn context_snapshot(
         overflow_tokens,
         summary_strategy,
         plan,
+        boundary: hysteresis.boundary,
     }
 }
 
@@ -5486,8 +5519,15 @@ fn dispatch_target(body: &str, session: &ChatSession, local_only: bool) -> Optio
 // so the cross-device bound is identical on every device).
 
 /// Window the history to the model budget and, if anything overflows,
-/// summarize it (cached incrementally per session) and prepend the summary to
-/// the system prompt. Returns (system, turns).
+/// summarize it (cached incrementally per session). Returns (system, turns).
+///
+/// Laid out for server-side prefix caching (llama.cpp slots, provider prompt
+/// caches): the system prompt (base + vaults) is byte-identical on every turn
+/// of a chat, and the summary rides as the FIRST conversation turn after it
+/// rather than inside it. Compaction is batched with hysteresis
+/// ([`hive_core::context_budget::plan_with_hysteresis`]): the boundary stays
+/// fixed — and the summary is reused with no LLM call — until the kept history
+/// passes the high watermark, so consecutive turns share the whole prefix.
 async fn windowed_context(
     state: &State<'_, AppState>,
     session_id: Uuid,
@@ -5496,7 +5536,45 @@ async fn windowed_context(
 ) -> (String, Vec<ChatTurn>) {
     let snapshot = context_snapshot(state, session_id, session, responder);
     let plan = snapshot.plan;
-    let mut turns = turns_from(&plan.kept, responder.agent_id, &responder.author);
+    // Reference vaults ride in the system prompt (capped; cached per app run).
+    // Like the summary turn, this is added after the window plan — the caps
+    // keep the skew small and the output/summary reserves absorb it.
+    let vault_section = vault_context_section(state, session, responder.agent_id).await;
+    let system = join_system(&responder.system_base, &vault_section);
+
+    let summary = if plan.overflow.is_empty() {
+        state.summary_cache.lock().unwrap().remove(&session_id);
+        None
+    } else {
+        let overflow_ids: Vec<Uuid> = plan.overflow.iter().map(|m| m.id).collect();
+        let cached = state.summary_cache.lock().unwrap().get(&session_id).cloned();
+        let summarizer = summarizer_runtime(responder);
+        let instruction = summarize_instruction(state);
+        let summary = match cached {
+            Some(c) if c.covered == overflow_ids => c.summary,
+            Some(c) if summary_strategy(Some(&c.covered), &overflow_ids) == "incremental" => {
+                let delta = &plan.overflow[c.covered.len()..];
+                summarize(state, summarizer, &instruction, Some(&c.summary), delta)
+                    .await
+                    .unwrap_or(c.summary)
+            }
+            _ => summarize(state, summarizer, &instruction, None, &plan.overflow)
+                .await
+                .unwrap_or_else(|| format!("[Earlier {} messages omitted.]", plan.overflow.len())),
+        };
+        state.summary_cache.lock().unwrap().insert(
+            session_id,
+            SummaryCacheEntry {
+                boundary: snapshot.boundary,
+                covered: overflow_ids,
+                summary: summary.clone(),
+            },
+        );
+        Some(summary)
+    };
+
+    let mut turns =
+        turns_with_summary(&plan.kept, responder.agent_id, &responder.author, summary.as_deref());
     // Materialize any `[Attached-blob: …]` references to local files so the agent
     // (which reads paths) can open attachments other members shared over the relay.
     // No-op for turns without blob markers, or when no relay/key is configured.
@@ -5511,41 +5589,15 @@ async fn windowed_context(
             }
         }
     }
-    // Reference vaults ride in the system prompt (capped; cached per app run).
-    // Like the summary below, this is appended after the window plan — the
-    // caps keep the skew small and the output/summary reserves absorb it.
-    let vault_section = vault_context_section(state, session, responder.agent_id).await;
-
-    if plan.overflow.is_empty() {
-        state.summary_cache.lock().unwrap().remove(&session_id);
-        return (join_system(&responder.system_base, &vault_section), turns);
-    }
-
-    let overflow_ids: Vec<Uuid> = plan.overflow.iter().map(|m| m.id).collect();
-    let cached = state.summary_cache.lock().unwrap().get(&session_id).cloned();
-    let summary = match cached {
-        Some((covered, sum)) if covered == overflow_ids => sum,
-        Some((covered, sum)) if overflow_ids.starts_with(&covered) && covered.len() < overflow_ids.len() => {
-            let delta = &plan.overflow[covered.len()..];
-            summarize(state, &responder.runtime, &summarize_instruction(state), Some(&sum), delta)
-                .await
-                .unwrap_or(sum)
-        }
-        _ => summarize(state, &responder.runtime, &summarize_instruction(state), None, &plan.overflow)
-            .await
-            .unwrap_or_else(|| format!("[Earlier {} messages omitted.]", plan.overflow.len())),
-    };
-    state
-        .summary_cache
-        .lock()
-        .unwrap()
-        .insert(session_id, (overflow_ids, summary.clone()));
-
-    let system = format!(
-        "[Earlier conversation summary]\n{summary}\n\n{}",
-        join_system(&responder.system_base, &vault_section)
-    );
     (system, turns)
+}
+
+/// The runtime that writes overflow summaries. A seam for a dedicated
+/// summarizer (e.g. a separate local model) later; for now it is the chat's
+/// own runtime, since summaries from small utility models were measured to
+/// lose a large share of the compacted facts.
+fn summarizer_runtime(responder: &Responder) -> &ResolvedRuntime {
+    &responder.runtime
 }
 
 /// Append an optional extra section to a system prompt.
@@ -12989,6 +13041,58 @@ mod export_tests {
     fn blank_title_falls_back() {
         let s = ChatSession::new("  ", Uuid::nil(), "anthropic");
         assert!(chat_markdown(&s).starts_with("# Untitled chat\n"));
+    }
+}
+
+#[cfg(test)]
+mod compaction_tests {
+    use super::{summary_strategy, COMPACT_HIGH_WATERMARK, COMPACT_LOW_WATERMARK};
+    use hive_core::context_budget::plan_with_hysteresis;
+    use hive_core::{ChatMessage, MessageRole};
+    use uuid::Uuid;
+
+    fn ids(messages: &[ChatMessage]) -> Vec<Uuid> {
+        messages.iter().map(|m| m.id).collect()
+    }
+
+    #[test]
+    fn strategy_classifies_cache_state() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        assert_eq!(summary_strategy(None, &[]), "none");
+        assert_eq!(summary_strategy(Some(&[a]), &[]), "none");
+        assert_eq!(summary_strategy(None, &[a]), "fresh");
+        assert_eq!(summary_strategy(Some(&[a, b]), &[a, b]), "cached");
+        assert_eq!(summary_strategy(Some(&[a]), &[a, b]), "incremental");
+        // Covered set no longer a prefix (a message before the boundary was
+        // deleted, or the history rewritten) → start over.
+        assert_eq!(summary_strategy(Some(&[a, b]), &[a, c]), "fresh");
+        assert_eq!(summary_strategy(Some(&[a, b]), &[a]), "fresh");
+    }
+
+    /// Drive the per-turn loop the way `windowed_context` does: the summary is
+    /// produced once per batch, reused verbatim between batches, and extended
+    /// incrementally (never from scratch) when the boundary advances.
+    #[test]
+    fn summary_is_reused_between_batches_and_extended_incrementally() {
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut boundary = None;
+        let mut covered: Option<Vec<Uuid>> = None;
+        let mut strategies = Vec::new();
+        for i in 0..40 {
+            let role = if i % 2 == 0 { MessageRole::User } else { MessageRole::Assistant };
+            // 36 chars → 9 + 4 overhead = 13 tokens per message.
+            history.push(ChatMessage::new(role, "u", &"y".repeat(36)));
+            let p = plan_with_hysteresis(&history, 200, boundary, COMPACT_HIGH_WATERMARK, COMPACT_LOW_WATERMARK);
+            let overflow = ids(&p.plan.overflow);
+            strategies.push(summary_strategy(covered.as_deref(), &overflow));
+            boundary = p.boundary;
+            covered = (!overflow.is_empty()).then_some(overflow);
+        }
+        let count = |s: &str| strategies.iter().filter(|x| **x == s).count();
+        assert_eq!(count("fresh"), 1, "{strategies:?}");
+        assert!(count("incremental") >= 2, "{strategies:?}");
+        // Most compacted turns reuse the cached summary (no LLM call).
+        assert!(count("cached") > 3 * count("incremental"), "{strategies:?}");
     }
 }
 
