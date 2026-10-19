@@ -38,10 +38,14 @@ have to remember them:
 - **Azure OpenAI** — an Azure deployment endpoint (your
   `https://<resource>.openai.azure.com` URL + deployment name).
 - **Ollama** — your local Ollama daemon.
+- **Local gateway (llama.cpp, OpenAI-compatible)** — a `custom` runtime
+  for llama.cpp servers behind an OpenAI-compatible gateway, with tools
+  on. Replace `<host>` in the endpoint with the gateway's address. See
+  [Offline setup with local models](offline-local-models.md).
 - **Custom** — any other **OpenAI-compatible** HTTP endpoint; fill in the
   base URL yourself.
 
-All five are OpenAI-wire-compatible, so the same multi-turn tool loop works
+All of these are OpenAI-wire-compatible, so the same multi-turn tool loop works
 across them. Pick the closest preset, then adjust the endpoint, model id,
 and API key as needed.
 

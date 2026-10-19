@@ -20,6 +20,7 @@ import {
   exportConfig,
   importConfig,
   listProviderPresets,
+  modelProfileHint,
   setProviderKey,
   setProviderBaseUrl,
   type ProviderDto,
@@ -735,6 +736,19 @@ function RuntimesSection() {
     const t = setTimeout(() => setFormEndpoint(runtimeEndpoint.trim()), 400);
     return () => clearTimeout(t);
   }, [runtimeEndpoint]);
+  // Role hint for the typed model, from Hive's model-family profiles.
+  const [formModel, setFormModel] = useState("");
+  useEffect(() => {
+    const t = setTimeout(() => setFormModel(runtimeModel.trim()), 250);
+    return () => clearTimeout(t);
+  }, [runtimeModel]);
+  const modelProfile = useQuery({
+    queryKey: ["model-profile", formModel],
+    queryFn: () => modelProfileHint(formModel),
+    enabled: formModel !== "",
+    staleTime: Infinity,
+  });
+  const profile = formModel ? modelProfile.data ?? null : null;
   const formModels = useQuery({
     queryKey: ["ollama-models", "form", formEndpoint],
     queryFn: () => listOllamaModels({ endpoint: formEndpoint || null }),
@@ -878,6 +892,7 @@ function RuntimesSection() {
               if (!p) return;
               setRuntimeProvider(p.provider);
               setRuntimeEndpoint(p.endpoint);
+              setRuntimeSupportsTools(p.tools);
               if (!runtimeName.trim()) setRuntimeName(p.label);
               if (!runtimeId.trim())
                 setRuntimeId(p.label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""));
@@ -922,6 +937,11 @@ function RuntimesSection() {
           className="w-full rounded-xl border px-3 py-2 font-mono text-sm"
           style={fieldStyle}
         />
+        {runtimeEndpoint.includes("<host>") && (
+          <p className="text-xs opacity-60">
+            Replace <code>&lt;host&gt;</code> with your gateway's address (e.g. its Tailscale IP).
+          </p>
+        )}
         {runtimeProvider === "pi" && (
           <>
             <input
@@ -945,6 +965,16 @@ function RuntimesSection() {
           className="w-full rounded-xl border px-3 py-2 text-sm"
           style={fieldStyle}
         />
+        {profile && (
+          <p className="text-xs opacity-70" data-testid="model-profile-hint">
+            <span className="font-semibold">
+              {profile.roleLabel ? `Recommended for: ${profile.roleLabel}` : "No recommended role"}
+            </span>
+            {" · "}
+            {profile.note}
+            {!profile.tools && runtimeSupportsTools && " This family doesn't call tools well; consider turning tools off."}
+          </p>
+        )}
         {runtimeProvider === "ollama" && (
           <>
             <datalist id="ollama-form-models">

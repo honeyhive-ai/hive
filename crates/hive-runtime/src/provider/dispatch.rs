@@ -116,11 +116,14 @@ pub fn openai_tools_allowed(rt: &ResolvedRuntime) -> bool {
 /// hosted APIs reject unknown fields. A server that still refuses one gets the
 /// request again without them (see [`OpenAiClient::with_extra_body`]).
 ///
+/// The model's family profile (`hive_core::model_profile`) picks the fields:
 /// - `chat_template_kwargs.enable_thinking` follows the runtime's think
 ///   setting (Hive's default is off). llama.cpp hands it to the model's chat
-///   template: gemma4 / qwen3 templates honour it, others ignore it.
-/// - gpt-oss always reasons; with thinking off it gets `reasoning_effort:
-///   "low"` (its template ignores `enable_thinking`).
+///   template: gemma4 / qwen3 templates honour it, others ignore it. Skipped
+///   for families profiled as never reasoning (LFM2, embedders, rerankers).
+/// - Families that always reason with an effort knob (gpt-oss) get
+///   `reasoning_effort: "low"` with thinking off (its template ignores
+///   `enable_thinking`).
 ///
 /// No output cap is set: the OpenAI wire sends no `max_tokens`, so a
 /// reasoning model's answer is bounded only by the server's slot — never by
@@ -130,9 +133,15 @@ pub fn openai_request_extras(rt: &ResolvedRuntime) -> Map<String, Value> {
     if !matches!(rt.provider, ModelProviderKind::Custom | ModelProviderKind::HiveDaemon) {
         return extra;
     }
+    use hive_core::model_profile::{profile_for, ReasoningStyle};
     let think = rt.think.unwrap_or(false);
-    extra.insert("chat_template_kwargs".into(), json!({ "enable_thinking": think }));
-    if !think && rt.model.to_lowercase().contains("gpt-oss") {
+    // Unknown models keep the kwargs: a template that doesn't know the flag
+    // ignores it.
+    let reasoning = profile_for(&rt.model).map(|p| p.reasoning);
+    if reasoning != Some(ReasoningStyle::None) {
+        extra.insert("chat_template_kwargs".into(), json!({ "enable_thinking": think }));
+    }
+    if !think && reasoning == Some(ReasoningStyle::AlwaysWithEffort) {
         extra.insert("reasoning_effort".into(), json!("low"));
     }
     extra
@@ -543,7 +552,13 @@ pub struct ProviderPreset {
     pub endpoint: &'static str,
     /// Whether an API key is expected (false for purely-local servers).
     pub needs_key: bool,
+    /// Whether the new runtime should offer tools (MCP + Hive's built-ins).
+    pub tools: bool,
 }
+
+/// Endpoint template for the local llama.cpp gateway preset; the user
+/// replaces `<host>` with the gateway's address.
+pub const LOCAL_GATEWAY_ENDPOINT: &str = "http://<host>:8080/v1/chat/completions";
 
 /// Known OpenAI-compatible endpoints offered as presets. They all route through
 /// the OpenAI-compatible client; Gemini/LM Studio/Groq/Together need only a base
@@ -551,14 +566,17 @@ pub struct ProviderPreset {
 pub fn provider_presets() -> Vec<ProviderPreset> {
     use ModelProviderKind::*;
     vec![
-        ProviderPreset { label: "OpenAI", provider: OpenAI, endpoint: "https://api.openai.com/v1/chat/completions", needs_key: true },
-        ProviderPreset { label: "OpenRouter", provider: OpenRouter, endpoint: "https://openrouter.ai/api/v1/chat/completions", needs_key: true },
-        ProviderPreset { label: "Ollama (local)", provider: Ollama, endpoint: "http://localhost:11434/v1/chat/completions", needs_key: false },
-        ProviderPreset { label: "LM Studio (local)", provider: Custom, endpoint: "http://localhost:1234/v1/chat/completions", needs_key: false },
-        ProviderPreset { label: "Google Gemini", provider: Custom, endpoint: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", needs_key: true },
-        ProviderPreset { label: "Groq", provider: Custom, endpoint: "https://api.groq.com/openai/v1/chat/completions", needs_key: true },
-        ProviderPreset { label: "Together", provider: Custom, endpoint: "https://api.together.xyz/v1/chat/completions", needs_key: true },
-        ProviderPreset { label: "Azure OpenAI", provider: Azure, endpoint: "", needs_key: true },
+        ProviderPreset { label: "OpenAI", provider: OpenAI, endpoint: "https://api.openai.com/v1/chat/completions", needs_key: true, tools: true },
+        ProviderPreset { label: "OpenRouter", provider: OpenRouter, endpoint: "https://openrouter.ai/api/v1/chat/completions", needs_key: true, tools: true },
+        ProviderPreset { label: "Ollama (local)", provider: Ollama, endpoint: "http://localhost:11434/v1/chat/completions", needs_key: false, tools: true },
+        // llama.cpp behind an OpenAI-compatible gateway: the fast local path
+        // (5.8x Ollama's prefill on ROCm in Hive's lab), tool calls verified.
+        ProviderPreset { label: "Local gateway (llama.cpp, OpenAI-compatible)", provider: Custom, endpoint: LOCAL_GATEWAY_ENDPOINT, needs_key: false, tools: true },
+        ProviderPreset { label: "LM Studio (local)", provider: Custom, endpoint: "http://localhost:1234/v1/chat/completions", needs_key: false, tools: true },
+        ProviderPreset { label: "Google Gemini", provider: Custom, endpoint: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", needs_key: true, tools: true },
+        ProviderPreset { label: "Groq", provider: Custom, endpoint: "https://api.groq.com/openai/v1/chat/completions", needs_key: true, tools: true },
+        ProviderPreset { label: "Together", provider: Custom, endpoint: "https://api.together.xyz/v1/chat/completions", needs_key: true, tools: true },
+        ProviderPreset { label: "Azure OpenAI", provider: Azure, endpoint: "", needs_key: true, tools: true },
     ]
 }
 
@@ -772,5 +790,38 @@ mod tests {
 
         let lm = ps.iter().find(|p| p.label.starts_with("LM Studio")).unwrap();
         assert!(!lm.needs_key); // local server
+    }
+
+    #[test]
+    fn local_gateway_preset_is_a_keyless_custom_runtime_with_tools() {
+        let ps = provider_presets();
+        let gw = ps.iter().find(|p| p.label.starts_with("Local gateway")).unwrap();
+        assert_eq!(gw.provider, ModelProviderKind::Custom);
+        assert_eq!(gw.endpoint, "http://<host>:8080/v1/chat/completions");
+        assert!(!gw.needs_key);
+        assert!(gw.tools);
+        // Labels are the UI's lookup key.
+        let labels: std::collections::HashSet<_> = ps.iter().map(|p| p.label).collect();
+        assert_eq!(labels.len(), ps.len());
+    }
+
+    #[test]
+    fn request_extras_follow_the_model_profile() {
+        let mut rt = ResolvedRuntime { provider: ModelProviderKind::Custom, model: "lfm2:8b".into(), ..ollama_rt() };
+        // A family that never reasons gets no thinking fields at all.
+        assert!(openai_request_extras(&rt).is_empty());
+        rt.model = "bge-reranker-v2-m3".into();
+        assert!(openai_request_extras(&rt).is_empty());
+        // LFM2.5 always reasons with no effort knob: kwargs only.
+        rt.model = "lfm2.5:1.2b".into();
+        let e = openai_request_extras(&rt);
+        assert_eq!(e["chat_template_kwargs"], json!({ "enable_thinking": false }));
+        assert!(!e.contains_key("reasoning_effort"));
+        // Unknown models keep the kwargs (templates ignore unknown flags).
+        rt.model = "mystery-7b".into();
+        assert!(openai_request_extras(&rt).contains_key("chat_template_kwargs"));
+        // gpt-oss under any naming gets low effort.
+        rt.model = "GPT_OSS-20B-Q4_K_M".into();
+        assert_eq!(openai_request_extras(&rt)["reasoning_effort"], "low");
     }
 }
