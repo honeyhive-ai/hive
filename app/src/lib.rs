@@ -5121,7 +5121,7 @@ struct ContextSnapshot {
 /// before the boundary when it was produced). While the boundary holds, the
 /// summary is reused verbatim — no LLM call, and a byte-identical prompt
 /// prefix for the server's prefix cache.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct SummaryCacheEntry {
     boundary: Option<Uuid>,
     covered: Vec<Uuid>,
@@ -5149,6 +5149,40 @@ const COMPACT_LOW_WATERMARK: f64 = hive_core::context_budget::DEFAULT_LOW_WATERM
 /// How the overflow summary will be obtained, given the ids the cached summary
 /// covers: "none" (no overflow), "cached" (reuse verbatim), "incremental" (fold
 /// only the newly aged-out messages into it) or "fresh" (summarize it all).
+/// What to do with a chat's `summary_cache` entry after a turn's summary step.
+#[derive(Debug, PartialEq)]
+enum SummaryCacheUpdate {
+    Keep,
+    Remove,
+    Replace(SummaryCacheEntry),
+}
+
+/// The summary this turn uses and how the cache changes, given the strategy
+/// and what the summarizer `produced` (`None` = failed, or not asked for
+/// "cached"). A failure is never cached as final — the next turn retries:
+/// - incremental failure: this turn uses the old summary (the delta is
+///   missing for now) and the old entry stays, so the next turn re-plans
+///   from the old boundary and folds the delta in again;
+/// - fresh failure: this turn gets a placeholder and any stale entry goes,
+///   so the next turn summarizes from scratch.
+fn settle_summary(
+    cached: Option<&SummaryCacheEntry>,
+    strategy: &str,
+    boundary: Option<Uuid>,
+    overflow_ids: Vec<Uuid>,
+    produced: Option<String>,
+) -> (String, SummaryCacheUpdate) {
+    match (strategy, cached, produced) {
+        ("cached", Some(c), _) => (c.summary.clone(), SummaryCacheUpdate::Keep),
+        (_, _, Some(summary)) => {
+            let entry = SummaryCacheEntry { boundary, covered: overflow_ids, summary: summary.clone() };
+            (summary, SummaryCacheUpdate::Replace(entry))
+        }
+        ("incremental", Some(c), None) => (c.summary.clone(), SummaryCacheUpdate::Keep),
+        (_, _, None) => (format!("[Earlier {} messages omitted.]", overflow_ids.len()), SummaryCacheUpdate::Remove),
+    }
+}
+
 fn summary_strategy(covered: Option<&[Uuid]>, overflow_ids: &[Uuid]) -> &'static str {
     if overflow_ids.is_empty() {
         return "none";
@@ -5687,26 +5721,27 @@ async fn windowed_context(
         let cached = state.summary_cache.lock().unwrap().get(&cache_key).cloned();
         let summarizer = summarizer_runtime(responder);
         let instruction = summarize_instruction(state);
-        let summary = match cached {
-            Some(c) if c.covered == overflow_ids => c.summary,
-            Some(c) if summary_strategy(Some(&c.covered), &overflow_ids) == "incremental" => {
+        let strategy = summary_strategy(cached.as_ref().map(|c| c.covered.as_slice()), &overflow_ids);
+        let produced = match (strategy, &cached) {
+            ("incremental", Some(c)) => {
                 let delta = &plan.overflow[c.covered.len()..];
-                summarize(state, summarizer, &instruction, Some(&c.summary), delta)
-                    .await
-                    .unwrap_or(c.summary)
+                summarize(state, summarizer, &instruction, Some(&c.summary), delta).await
             }
-            _ => summarize(state, summarizer, &instruction, None, &plan.overflow)
-                .await
-                .unwrap_or_else(|| format!("[Earlier {} messages omitted.]", plan.overflow.len())),
+            ("cached", _) => None,
+            _ => summarize(state, summarizer, &instruction, None, &plan.overflow).await,
         };
-        state.summary_cache.lock().unwrap().insert(
-            cache_key,
-            SummaryCacheEntry {
-                boundary: snapshot.boundary,
-                covered: overflow_ids,
-                summary: summary.clone(),
-            },
-        );
+        let (summary, update) =
+            settle_summary(cached.as_ref(), strategy, snapshot.boundary, overflow_ids, produced);
+        let mut cache = state.summary_cache.lock().unwrap();
+        match update {
+            SummaryCacheUpdate::Keep => {}
+            SummaryCacheUpdate::Remove => {
+                cache.remove(&cache_key);
+            }
+            SummaryCacheUpdate::Replace(entry) => {
+                cache.insert(cache_key, entry);
+            }
+        }
         Some(summary)
     };
 
@@ -5971,7 +6006,48 @@ fn compact_instruction(state: &AppState) -> String {
         .unwrap_or_else(|| DEFAULT_CONTEXT_SUMMARY_PROMPT.to_string())
 }
 
-/// One-shot (non-streaming-collected) summary of overflowed turns.
+/// Output cap for one summary request.
+const SUMMARY_OUTPUT_TOKENS: u32 = 512;
+
+/// Transcript tokens one summary request may carry: the summarizer's window
+/// less the output cap, room for a prior summary being folded in, the
+/// instruction and some framing, all under 85% of the window (the estimate
+/// is coarse).
+fn summary_input_budget(window: u32, instruction_tokens: usize) -> usize {
+    let usable = (f64::from(window) * 0.85) as usize;
+    usable
+        .saturating_sub(2 * SUMMARY_OUTPUT_TOKENS as usize + instruction_tokens + 256)
+        .max(512)
+}
+
+/// Split transcript lines into consecutive batches of at most `budget`
+/// estimated tokens each, so no summary request overflows the summarizer's
+/// window (after an app restart a long chat compacts from scratch, and its
+/// overflow can be several windows long). A single line over the budget is
+/// cut down to fit, marked as truncated.
+fn summary_batches(lines: Vec<String>, budget: usize) -> Vec<String> {
+    let max_chars = budget * 4;
+    let mut batches = Vec::new();
+    let mut current = String::new();
+    for mut line in lines {
+        if line.chars().count() > max_chars {
+            line = line.chars().take(max_chars.saturating_sub(16)).collect::<String>() + " […truncated]\n";
+        }
+        if !current.is_empty() && token_estimator::estimate_text(&current) + token_estimator::estimate_text(&line) > budget {
+            batches.push(std::mem::take(&mut current));
+        }
+        current.push_str(&line);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    batches
+}
+
+/// One-shot (non-streaming-collected) summary of overflowed turns, folded
+/// into `prior` when given. A transcript too long for one request is
+/// summarized in batches, each folded into the summary so far. `None` when
+/// any request fails (or there is nothing to summarize and no prior).
 async fn summarize(
     state: &State<'_, AppState>,
     runtime: &ResolvedRuntime,
@@ -5979,26 +6055,41 @@ async fn summarize(
     prior: Option<&str>,
     messages: &[ChatMessage],
 ) -> Option<String> {
-    let mut body = String::new();
-    if let Some(p) = prior {
-        body.push_str("Existing summary so far:\n");
-        body.push_str(p);
-        body.push_str("\n\nNew messages to fold in:\n");
-    }
-    for m in messages {
+    let lines: Vec<String> = messages
+        .iter()
         // Skip system notes ("🧩 X added a workflow…") and empty/streaming
         // placeholders so they don't get summarized as if a participant said them.
-        if m.role == MessageRole::System || m.is_streaming || m.body.trim().is_empty() {
-            continue;
-        }
-        body.push_str(&format!("{}: {}\n", m.author, m.body));
-    }
-    let turns = vec![ChatTurn::user(body)];
+        .filter(|m| !(m.role == MessageRole::System || m.is_streaming || m.body.trim().is_empty()))
+        .map(|m| format!("{}: {}\n", m.author, m.body))
+        .collect();
+    let budget = summary_input_budget(runtime.context_window(), token_estimator::estimate_text(instruction));
     let workspace_root = state.workspace_root.lock().unwrap().clone();
-    dispatch::stream(runtime, Some(instruction), &turns, Some(&workspace_root), &[], 512, |_| {}, |_| {})
+    let mut summary = prior.map(str::to_string);
+    for batch in summary_batches(lines, budget) {
+        let mut body = String::new();
+        if let Some(p) = &summary {
+            body.push_str("Existing summary so far:\n");
+            body.push_str(p);
+            body.push_str("\n\nNew messages to fold in:\n");
+        }
+        body.push_str(&batch);
+        let turns = vec![ChatTurn::user(body)];
+        let next = dispatch::stream(
+            runtime,
+            Some(instruction),
+            &turns,
+            Some(&workspace_root),
+            &[],
+            SUMMARY_OUTPUT_TOKENS,
+            |_| {},
+            |_| {},
+        )
         .await
         .ok()
-        .filter(|s| !s.trim().is_empty())
+        .filter(|s| !s.trim().is_empty())?;
+        summary = Some(next);
+    }
+    summary
 }
 
 /// The (possibly customized) /summarize + /compact instructions, plus the
@@ -13673,6 +13764,58 @@ mod compaction_tests {
         assert!(count("incremental") >= 2, "{strategies:?}");
         // Most compacted turns reuse the cached summary (no LLM call).
         assert!(count("cached") > 3 * count("incremental"), "{strategies:?}");
+    }
+
+    #[test]
+    fn a_failed_summary_is_not_cached_and_is_retried() {
+        use super::{settle_summary, SummaryCacheEntry, SummaryCacheUpdate};
+        let (a, b, c, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let old = SummaryCacheEntry { boundary: Some(c), covered: vec![a, b], summary: "old".into() };
+
+        // Fresh failure: placeholder for this turn only; nothing cached, so
+        // the next turn plans the same overflow as "fresh" and asks again.
+        let (s, u) = settle_summary(None, "fresh", Some(c), vec![a, b], None);
+        assert_eq!(s, "[Earlier 2 messages omitted.]");
+        assert_eq!(u, SummaryCacheUpdate::Remove);
+        assert_eq!(super::summary_strategy(None, &[a, b]), "fresh");
+
+        // Incremental failure: the old summary serves this turn and the old
+        // entry stays — the delta is folded in on the next turn, not lost.
+        let (s, u) = settle_summary(Some(&old), "incremental", Some(d), vec![a, b, c], None);
+        assert_eq!((s.as_str(), u), ("old", SummaryCacheUpdate::Keep));
+        assert_eq!(super::summary_strategy(Some(&old.covered), &[a, b, c]), "incremental");
+
+        // Success replaces; a cache hit keeps.
+        let (s, u) = settle_summary(Some(&old), "incremental", Some(d), vec![a, b, c], Some("new".into()));
+        assert_eq!(s, "new");
+        assert_eq!(u, SummaryCacheUpdate::Replace(SummaryCacheEntry { boundary: Some(d), covered: vec![a, b, c], summary: "new".into() }));
+        let (s, u) = settle_summary(Some(&old), "cached", Some(c), vec![a, b], None);
+        assert_eq!((s.as_str(), u), ("old", SummaryCacheUpdate::Keep));
+    }
+
+    #[test]
+    fn long_overflow_is_summarized_in_batches_that_fit_the_window() {
+        use super::{summary_batches, summary_input_budget};
+        use hive_core::context_budget::token_estimator::estimate_text;
+        let budget = summary_input_budget(32_768, 40);
+        assert!(budget < 32_768 * 85 / 100 - 1024 && budget > 20_000, "{budget}");
+        assert_eq!(summary_input_budget(1024, 40), 512, "never below the floor");
+
+        // ~120k tokens of transcript: several batches, each within budget,
+        // in order, with nothing dropped.
+        let lines: Vec<String> = (0..300).map(|i| format!("u{i}: {}\n", "w".repeat(1600))).collect();
+        let total: String = lines.concat();
+        let batches = summary_batches(lines, budget);
+        assert!(batches.len() >= 4, "{}", batches.len());
+        assert!(batches.iter().all(|b| estimate_text(b) <= budget));
+        assert_eq!(batches.concat(), total);
+
+        // One line larger than the whole budget is cut to fit.
+        let huge = vec!["a: x\n".into(), format!("b: {}\n", "y".repeat(budget * 8)), "c: z\n".into()];
+        let batches = summary_batches(huge, budget);
+        assert!(batches.iter().all(|b| estimate_text(b) <= budget), "{:?}", batches.iter().map(|b| estimate_text(b)).collect::<Vec<_>>());
+        assert!(batches.concat().contains("[…truncated]") && batches.concat().ends_with("c: z\n"));
+        assert!(summary_batches(vec![], budget).is_empty());
     }
 
     /// A code-heavy chat planned right up to the high watermark (no
