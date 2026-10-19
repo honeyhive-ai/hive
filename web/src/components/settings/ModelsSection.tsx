@@ -28,6 +28,8 @@ import {
   removeAgentTemplate,
   getContextCommands,
   setContextCommands,
+  getUtilityRuntime,
+  setUtilityRuntime,
   listOllamaModels,
   pullOllamaModel,
   cancelOllamaPull,
@@ -42,6 +44,7 @@ import { SELECT_CLASS } from "@/components/settings/shared";
 import { toast, errMsg } from "@/components/Toast";
 import { confirmThen } from "@/lib/confirm";
 import { loadTemplates, addTemplate, removeTemplate, type PromptTemplate } from "@/lib/templates";
+import { quickTaskOptions } from "@/lib/utilityRuntime";
 
 /// Models & runtimes: providers + their credentials, the runtimes (models)
 /// built on them, reusable agent personas, prompt templates, and the context
@@ -51,6 +54,7 @@ export function ModelsSection() {
     <>
       <ProvidersSection />
       <RuntimesSection />
+      <QuickTasksSection />
       <AgentsSection />
       <TemplatesSection />
       <ContextCommandsSection />
@@ -1529,6 +1533,41 @@ function TemplatesSection() {
           Add template
         </Button>
       </div>
+    </Section>
+  );
+}
+
+/// The "Quick tasks model": a runtime for side jobs like chat titles, so a slow
+/// or reasoning chat model doesn't spend seconds naming a chat. Falls back to
+/// the chat's runtime on any error. Compaction summaries never use it.
+function QuickTasksSection() {
+  const qc = useQueryClient();
+  const runtimes = useQuery({ queryKey: ["runtimes"], queryFn: listRuntimes });
+  const current = useQuery({ queryKey: ["utility-runtime"], queryFn: getUtilityRuntime });
+  const save = useMutation({
+    mutationFn: (id: string) => setUtilityRuntime(id || null),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["utility-runtime"] }),
+    onError: (e) => toast.error(`Couldn't set quick tasks model: ${errMsg(e)}`),
+  });
+  const options = quickTaskOptions(runtimes.data ?? [], current.data);
+  return (
+    <Section title="Quick tasks model">
+      <select
+        value={current.data ?? ""}
+        onChange={(e) => save.mutate(e.target.value)}
+        className={`w-full ${SELECT_CLASS}`}
+        style={fieldStyle}
+        aria-label="Quick tasks model"
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+      <p className="text-xs opacity-50">
+        Used for chat titles. A small non-reasoning model works best, e.g. lfm2:8b on CPU.
+      </p>
     </Section>
   );
 }

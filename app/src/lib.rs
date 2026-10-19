@@ -250,6 +250,11 @@ struct LiveSettings {
     /// Custom instruction for `/compact`. None/empty = the built-in default.
     #[serde(default)]
     compact_prompt: Option<String>,
+    /// Runtime id for quick side jobs (chat titles) — ideally a small
+    /// non-reasoning model. `None` = use the chat's own runtime. Never used
+    /// for compaction summaries, which need a strong model.
+    #[serde(default)]
+    utility_runtime_id: Option<String>,
     /// Model id for the synthesized "Primary Runtime" (the default when no
     /// runtime is configured). `None` = fall back to env/DEFAULT_MODEL.
     #[serde(default)]
@@ -430,6 +435,7 @@ impl Default for LiveSettings {
             claude_code_model: String::new(),
             summarize_prompt: None,
             compact_prompt: None,
+            utility_runtime_id: None,
             default_model: None,
             default_runtime_id: None,
             local_workspace_id: None,
@@ -2714,6 +2720,25 @@ impl AppState {
             }
             Err(e) => tracing::warn!("fs watcher init failed: {e}"),
         }
+    }
+
+    /// The runtime for quick side jobs (chat titles) in a chat on
+    /// `chat_runtime_id`: the "Quick tasks model" setting when it names a known
+    /// runtime other than the chat's. `None` = just use the chat's runtime.
+    /// Never used for compaction summaries — those need a strong model.
+    fn resolve_utility_runtime(&self, chat_runtime_id: &str) -> Option<ResolvedRuntime> {
+        let setting = self.settings.lock().unwrap().utility_runtime_id.clone();
+        let runtimes = self.combined_runtimes();
+        let provider_of = |id: &str| {
+            runtimes
+                .iter()
+                .find(|r| r.id == id)
+                .map(|r| r.provider_kind)
+                // The synthesized Claude Code CLI runtime isn't a config entry.
+                .or_else(|| (id == "claude-code").then_some(ModelProviderKind::ClaudeCode))
+        };
+        let id = utility_runtime_choice(setting.as_deref(), chat_runtime_id, |id| provider_of(id).is_some())?;
+        prepare_utility_runtime(provider_of(id)?, self.resolve_runtime(id))
     }
 
     /// Resolve a runtime id to an executable runtime. Unknown ids fall back to
@@ -5821,6 +5846,22 @@ fn set_context_commands(
     Ok(())
 }
 
+/// The "Quick tasks model": runtime id used for chat titles. `None` = same as
+/// the chat's runtime.
+#[tauri::command]
+fn get_utility_runtime(state: State<AppState>) -> Option<String> {
+    state.settings.lock().unwrap().utility_runtime_id.clone()
+}
+
+/// Set (or clear, with `None`/blank) the "Quick tasks model".
+#[tauri::command]
+fn set_utility_runtime(state: State<AppState>, runtime_id: Option<String>) -> Result<(), String> {
+    let mut s = state.settings.lock().unwrap();
+    s.utility_runtime_id = runtime_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    save_settings(&state.data_dir, &s);
+    Ok(())
+}
+
 /// `/summarize` — post a model-written summary of the whole conversation as a
 /// new assistant message, leaving the transcript intact. A read-only digest.
 #[tauri::command]
@@ -5923,6 +5964,7 @@ fn sanitize_title(raw: &str) -> String {
 /// Ask the primary runtime for a concise title from the opening exchange.
 async fn generate_title(
     state: &State<'_, AppState>,
+    utility: Option<ResolvedRuntime>,
     runtime: &ResolvedRuntime,
     user_message: &str,
     assistant_reply: &str,
@@ -5939,11 +5981,74 @@ Reply with ONLY the title — no quotes, no surrounding punctuation, no trailing
 Title Case.";
     let turns = vec![ChatTurn::user(body)];
     let workspace_root = state.workspace_root.lock().unwrap().clone();
-    let raw = dispatch::stream(runtime, Some(system), &turns, Some(&workspace_root), &[], 32, |_| {}, |_| {})
-        .await
-        .ok()?;
-    let title = sanitize_title(&raw);
-    (!title.is_empty()).then_some(title)
+    let (turns, workspace_root) = (&turns, &workspace_root);
+    with_utility_fallback(utility, runtime.clone(), UTILITY_JOB_TIMEOUT, |rt: ResolvedRuntime| async move {
+        let raw = dispatch::stream(&rt, Some(system), turns, Some(workspace_root), &[], 32, |_| {}, |_| {})
+            .await
+            .ok()?;
+        let title = sanitize_title(&raw);
+        (!title.is_empty()).then_some(title)
+    })
+    .await
+}
+
+// --- Utility runtime (quick side jobs: chat titles) ---
+
+/// How long a quick job may take on the utility runtime before falling back to
+/// the chat's runtime. A small CPU model answers a title in well under a second;
+/// anything near this means the utility runtime is down or mis-chosen.
+const UTILITY_JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// The utility runtime id to try for a quick job, if any: the setting, trimmed,
+/// unless it's blank, unknown (a deleted runtime), or the chat's own runtime
+/// (no point asking the same model twice on failure).
+fn utility_runtime_choice<'a>(
+    setting: Option<&'a str>,
+    chat_runtime_id: &str,
+    is_known: impl Fn(&str) -> bool,
+) -> Option<&'a str> {
+    let id = setting.map(str::trim).filter(|s| !s.is_empty())?;
+    (id != chat_runtime_id && is_known(id)).then_some(id)
+}
+
+/// Adapt a resolved utility runtime for a quick job. `None` when resolution
+/// swapped providers behind our back (a hosted provider without a key falls
+/// back to the Claude Code CLI) — a slow agent CLI is no quick-task model, so
+/// the caller uses the chat's runtime instead. Native Ollama is told not to
+/// think (a reasoning model would burn the tiny budget mid-thought); the
+/// OpenAI wire is left as configured.
+fn prepare_utility_runtime(expected: ModelProviderKind, mut rt: ResolvedRuntime) -> Option<ResolvedRuntime> {
+    if rt.provider != expected {
+        return None;
+    }
+    if rt.provider == ModelProviderKind::Ollama {
+        rt.think = Some(false);
+    }
+    rt.tools = false;
+    Some(rt)
+}
+
+/// Run a quick job on the utility runtime (bounded by `timeout`), falling back
+/// to the primary runtime on error, timeout or empty output. `run` yields
+/// `None` for any failure.
+async fn with_utility_fallback<R, F, Fut>(
+    utility: Option<R>,
+    primary: R,
+    timeout: std::time::Duration,
+    run: F,
+) -> Option<String>
+where
+    F: Fn(R) -> Fut,
+    Fut: std::future::Future<Output = Option<String>>,
+{
+    if let Some(rt) = utility {
+        match tokio::time::timeout(timeout, run(rt)).await {
+            Ok(Some(out)) if !out.trim().is_empty() => return Some(out),
+            Ok(_) => tracing::info!(target: "dispatch", "utility runtime gave no output; using the chat's runtime"),
+            Err(_) => tracing::info!(target: "dispatch", "utility runtime timed out; using the chat's runtime"),
+        }
+    }
+    run(primary).await
 }
 
 // --- MCP tool-call loop wiring (Anthropic) ---
@@ -6943,18 +7048,20 @@ async fn send_message(
         let user_body = body.clone();
         tauri::async_runtime::spawn(async move {
             let state = app.state::<AppState>();
-            let (needs_title, primary_runtime) = {
+            let (needs_title, primary_runtime, utility_runtime) = {
                 let svc = state.service.lock().unwrap();
                 match svc.load(sid) {
-                    Ok(Some(s)) if is_default_title(&s.title) => {
-                        (true, state.resolve_runtime(&s.runtime_id))
-                    }
-                    _ => (false, state.resolve_runtime("")),
+                    Ok(Some(s)) if is_default_title(&s.title) => (
+                        true,
+                        state.resolve_runtime(&s.runtime_id),
+                        state.resolve_utility_runtime(&s.runtime_id),
+                    ),
+                    _ => (false, state.resolve_runtime(""), None),
                 }
             };
             if needs_title {
                 if let Some(title) =
-                    generate_title(&state, &primary_runtime, &user_body, &reply).await
+                    generate_title(&state, utility_runtime, &primary_runtime, &user_body, &reply).await
                 {
                     {
                         let mut svc = state.service.lock().unwrap();
@@ -8776,6 +8883,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
             claude_code_model: String::new(),
             summarize_prompt: None,
             compact_prompt: None,
+            utility_runtime_id: None,
             default_model: None,
             default_runtime_id: None,
         local_workspace_id: None,
@@ -12499,6 +12607,8 @@ pub fn run() {
             set_default_runtime,
             get_context_commands,
             set_context_commands,
+            get_utility_runtime,
+            set_utility_runtime,
             set_default_model,
             maybe_respond,
             regenerate,
@@ -13449,5 +13559,93 @@ mod lsp_frame_tests {
         // The typescript command line includes its stdio flag.
         let ts = LSP_REGISTRY.iter().find(|s| s.id == "typescript").unwrap();
         assert_eq!(ts.command(), "typescript-language-server --stdio");
+    }
+}
+
+#[cfg(test)]
+mod utility_runtime_tests {
+    use super::{prepare_utility_runtime, utility_runtime_choice, with_utility_fallback};
+    use hive_core::ModelProviderKind;
+    use hive_runtime::provider::dispatch::ResolvedRuntime;
+    use std::time::Duration;
+
+    fn rt(provider: ModelProviderKind) -> ResolvedRuntime {
+        ResolvedRuntime {
+            provider,
+            model: "m".into(),
+            endpoint: String::new(),
+            api_key: None,
+            args: Vec::new(),
+            model_provider_id: None,
+            model_base_url: None,
+            context_window_tokens: None,
+            keep_alive: None,
+            think: Some(true),
+            tools: true,
+        }
+    }
+
+    #[test]
+    fn choice_skips_blank_unknown_and_same_as_chat() {
+        let known = |id: &str| id == "lfm2" || id == "gemma";
+        assert_eq!(utility_runtime_choice(None, "gemma", known), None);
+        assert_eq!(utility_runtime_choice(Some("  "), "gemma", known), None);
+        assert_eq!(utility_runtime_choice(Some("deleted"), "gemma", known), None);
+        assert_eq!(utility_runtime_choice(Some("gemma"), "gemma", known), None);
+        assert_eq!(utility_runtime_choice(Some(" lfm2 "), "gemma", known), Some("lfm2"));
+    }
+
+    #[test]
+    fn prepare_forces_no_think_for_native_ollama_only() {
+        let o = prepare_utility_runtime(ModelProviderKind::Ollama, rt(ModelProviderKind::Ollama)).unwrap();
+        assert_eq!(o.think, Some(false));
+        assert!(!o.tools);
+        // The OpenAI wire is left as configured — no provider-specific hacks.
+        let c = prepare_utility_runtime(ModelProviderKind::Custom, rt(ModelProviderKind::Custom)).unwrap();
+        assert_eq!(c.think, Some(true));
+    }
+
+    #[test]
+    fn prepare_rejects_a_provider_swap() {
+        // A keyless hosted runtime resolves to the Claude Code CLI: not quick.
+        assert!(prepare_utility_runtime(ModelProviderKind::OpenAI, rt(ModelProviderKind::ClaudeCode)).is_none());
+    }
+
+    #[tokio::test]
+    async fn fallback_uses_utility_when_it_answers() {
+        let out = with_utility_fallback(Some("u"), "p", Duration::from_secs(1), |r| async move {
+            Some(format!("from {r}"))
+        })
+        .await;
+        assert_eq!(out.as_deref(), Some("from u"));
+    }
+
+    #[tokio::test]
+    async fn fallback_on_error_empty_or_unset() {
+        let fail = with_utility_fallback(Some("u"), "p", Duration::from_secs(1), |r| async move {
+            (r == "p").then(|| "primary".to_string())
+        })
+        .await;
+        assert_eq!(fail.as_deref(), Some("primary"));
+        let empty = with_utility_fallback(Some("u"), "p", Duration::from_secs(1), |r| async move {
+            Some(if r == "u" { "  ".to_string() } else { "primary".to_string() })
+        })
+        .await;
+        assert_eq!(empty.as_deref(), Some("primary"));
+        let unset =
+            with_utility_fallback(None, "p", Duration::from_secs(1), |r| async move { Some(r.to_string()) }).await;
+        assert_eq!(unset.as_deref(), Some("p"));
+    }
+
+    #[tokio::test]
+    async fn fallback_on_timeout() {
+        let out = with_utility_fallback(Some("u"), "p", Duration::from_millis(50), |r| async move {
+            if r == "u" {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            Some(r.to_string())
+        })
+        .await;
+        assert_eq!(out.as_deref(), Some("p"));
     }
 }
