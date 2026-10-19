@@ -298,11 +298,15 @@ impl RoundAssembly {
     }
 }
 
+/// A call ready to run: the id its result answers, the call, and its parsed
+/// arguments (or why they didn't parse).
+type PreparedCall<'a> = (String, &'a AssembledCall, Result<Value, String>);
+
 /// The assistant turn to echo back after a tool round: its text and the calls
 /// it made, each under the id its result will answer. `arguments` must be a
 /// string on this wire; a malformed one goes back as `{}` (its error result
 /// carries the raw text) so a server that re-parses history doesn't choke.
-fn assistant_message(text: &str, calls: &[(String, &AssembledCall, Result<Value, String>)]) -> Value {
+fn assistant_message(text: &str, calls: &[PreparedCall<'_>]) -> Value {
     let tool_calls: Vec<Value> = calls
         .iter()
         .map(|(id, call, args)| {
@@ -328,8 +332,10 @@ const MALFORMED_ECHO_CHARS: usize = 500;
 /// Process-wide cache of `/props` probes: `Some(n_ctx)` is kept for the
 /// process (a server's slot size only changes on restart); a failed probe is
 /// retried after [`PROBE_RETRY`] so a server that was down isn't written off.
-fn props_cache() -> &'static Mutex<HashMap<String, (Option<u32>, Instant)>> {
-    static CACHE: OnceLock<Mutex<HashMap<String, (Option<u32>, Instant)>>> = OnceLock::new();
+type PropsCache = Mutex<HashMap<String, (Option<u32>, Instant)>>;
+
+fn props_cache() -> &'static PropsCache {
+    static CACHE: OnceLock<PropsCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -528,7 +534,7 @@ impl OpenAiClient {
                 calls = r.calls.len(),
                 "openai-wire tool round"
             );
-            let calls: Vec<(String, &AssembledCall, Result<Value, String>)> = r
+            let calls: Vec<PreparedCall<'_>> = r
                 .calls
                 .iter()
                 .enumerate()
