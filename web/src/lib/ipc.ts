@@ -552,9 +552,26 @@ export interface ProviderPresetDto {
   provider: string; // the value `addRuntime` expects
   endpoint: string; // prefills the chat-completions URL
   needsKey: boolean;
+  tools: boolean; // start the runtime with "Supports tools" on
 }
 export const listProviderPresets = () =>
   invoke<ProviderPresetDto[]>("list_provider_presets");
+
+/// Hive's defaults for a model family (role hint in the add-runtime form).
+export interface ModelProfileDto {
+  family: string;
+  /// "agent" | "chat" | "utility" | "quality" | "embedding" | "rerank"; null
+  /// when the family isn't a good default for any role.
+  role: string | null;
+  roleLabel: string | null;
+  reasoning: "none" | "toggle" | "always-effort" | "always";
+  tools: boolean;
+  contextWindow: number;
+  note: string;
+}
+/// The profile for a model id, or null when Hive has none for its family.
+export const modelProfileHint = (model: string) =>
+  invoke<ModelProfileDto | null>("model_profile_hint", { model });
 export const setProviderKey = (kind: string, key: string) =>
   invoke<void>("set_provider_key", { kind, key });
 export const setProviderBaseUrl = (kind: string, baseUrl: string) =>

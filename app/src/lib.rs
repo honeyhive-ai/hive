@@ -11572,6 +11572,8 @@ struct ProviderPresetDto {
     provider: String,
     endpoint: String,
     needs_key: bool,
+    /// Whether the runtime should start with "Supports tools" on.
+    tools: bool,
 }
 
 #[tauri::command]
@@ -11583,8 +11585,43 @@ fn list_provider_presets() -> Vec<ProviderPresetDto> {
             provider: provider_name(p.provider).to_string(),
             endpoint: p.endpoint.to_string(),
             needs_key: p.needs_key,
+            tools: p.tools,
         })
         .collect()
+}
+
+/// The family profile for a model id (`hive_core::model_profile`), for the
+/// add-runtime form's role hint. `None` for models Hive has no profile for.
+#[derive(serde::Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ModelProfileDto {
+    family: String,
+    /// "agent" | "chat" | "utility" | "quality" | "embedding" | "rerank", or
+    /// null when the family isn't a good default for any role.
+    role: Option<String>,
+    role_label: Option<String>,
+    /// "none" | "toggle" | "always-effort" | "always".
+    reasoning: String,
+    tools: bool,
+    context_window: u32,
+    note: String,
+}
+
+fn model_profile_dto(model: &str) -> Option<ModelProfileDto> {
+    hive_core::model_profile::profile_for(model).map(|p| ModelProfileDto {
+        family: p.family.to_string(),
+        role: p.role.map(|r| r.as_str().to_string()),
+        role_label: p.role.map(|r| r.label().to_string()),
+        reasoning: p.reasoning.as_str().to_string(),
+        tools: p.tools,
+        context_window: p.context_window,
+        note: p.note.to_string(),
+    })
+}
+
+#[tauri::command]
+fn model_profile_hint(model: String) -> Option<ModelProfileDto> {
+    model_profile_dto(&model)
 }
 
 /// Set (or clear, if empty) a provider's API key.
@@ -12705,6 +12742,7 @@ pub fn run() {
             import_config,
             list_providers,
             list_provider_presets,
+            model_profile_hint,
             set_provider_key,
             set_provider_base_url,
             list_agent_templates,
@@ -13162,6 +13200,35 @@ mod title_tests {
     fn caps_overlong_titles_to_eight_words() {
         let out = sanitize_title("one two three four five six seven eight nine ten");
         assert_eq!(out.split_whitespace().count(), 8);
+    }
+}
+
+#[cfg(test)]
+mod model_profile_dto_tests {
+    use super::model_profile_dto;
+
+    #[test]
+    fn maps_profiles_for_the_role_hint() {
+        let p = model_profile_dto("gpt-oss:20b").unwrap();
+        assert_eq!(p.role.as_deref(), Some("agent"));
+        assert_eq!(p.role_label.as_deref(), Some("Agent loops"));
+        assert_eq!(p.reasoning, "always-effort");
+        assert!(p.tools);
+        assert_eq!(p.context_window, 32_768);
+        // A profiled family with no recommended role still carries its note.
+        let lfm25 = model_profile_dto("lfm2.5:1.2b").unwrap();
+        assert_eq!(lfm25.role, None);
+        assert!(!lfm25.note.is_empty());
+        assert_eq!(model_profile_dto("claude-sonnet-4"), None);
+        assert_eq!(model_profile_dto(""), None);
+    }
+
+    #[test]
+    fn serializes_camel_case_for_the_web() {
+        let v = serde_json::to_value(model_profile_dto("lfm2:8b").unwrap()).unwrap();
+        assert_eq!(v["role"], "utility");
+        assert_eq!(v["contextWindow"], 32_768);
+        assert!(v.get("roleLabel").is_some());
     }
 }
 
