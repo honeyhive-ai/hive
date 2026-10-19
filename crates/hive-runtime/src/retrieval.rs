@@ -485,7 +485,7 @@ mod tests {
 
     #[test]
     fn chunks_cut_at_blank_lines_and_overlap() {
-        let para = |c: char| std::iter::repeat(format!("{c}{c}{c} ")).take(100).collect::<String>();
+        let para = |c: char| format!("{c}{c}{c} ").repeat(100);
         // 3 paragraphs of 400 chars, size 1000: the first cut is the blank line
         // after paragraph 2 (in the back half), not mid-paragraph 3.
         let text = format!("{}\n\n{}\n\n{}", para('a'), para('b'), para('c'));

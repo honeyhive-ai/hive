@@ -21,7 +21,8 @@ numbers, but the comparisons should hold.
    when you want the best answer.
 3. Turn on **Supports tools** and connect an MCP server with
    `search_docs`, `web_search` and `fetch_url`. **Retrieve documents;
-   don't paste them.**
+   don't paste them.** For vaults, turn on **Vault retrieval** in
+   Settings → Models.
 
 ## The gateway
 
@@ -215,16 +216,40 @@ calls it when it needs it. On a llama.cpp gateway the reranker endpoint
 is `/v1/rerank` (`{model, query, documents, top_n}` in,
 `results[{index, relevance_score}]` out).
 
-Vaults attached to a chat are pasted into the system prompt, capped at
-3 sources of 6000 characters each. Use them for short reference notes,
-and put large document sets behind `search_docs`.
+### Vault retrieval
+
+Hive can run the same pipeline over the vaults attached to a chat. Set
+it up in **Settings → Models → Vault retrieval**:
+
+| Field | Gateway value |
+|---|---|
+| Embeddings URL | `http://<host>:8080/v1` |
+| Embeddings model | `embeddinggemma-300m` |
+| Rerank URL (optional) | `http://<host>:8080/v1` |
+| Rerank model | `bge-reranker-v2-m3` |
+| Passages per message | 5 |
+| Candidates to rerank | 20 |
+
+Use **Test** to check both endpoints. With retrieval on, each message
+is used as the query, and the top passages are added to the end of
+that message, under a "Retrieved from reference vaults" heading. The
+system prompt stays the same from turn to turn, so the server's prompt
+cache keeps working. Embeddings are cached in memory, so after the
+first message only the question is embedded. The cache is cleared when
+Hive restarts.
+
+With retrieval off, or when it fails or times out, vaults are pasted
+into the system prompt instead, capped at 3 sources of 6000 characters
+each. The endpoints are called without an API key, so they must be
+keyless, as a local gateway is.
 
 ## Hardware takeaways
 
 - **Retrieve, don't paste.** It used fewer tokens, ran faster, and
   didn't overflow slots.
 - **Run retrieval on the GPU.** Embedding and reranking sit on the
-  critical path of every `search_docs` call.
+  critical path of every `search_docs` call and every vault-retrieval
+  message.
 - **A small embedder plus a reranker is enough.** A 300M embedder with
   a reranker matched handing the model the right file.
 - **Use a model that doesn't reason for quick jobs.** A small CPU model
