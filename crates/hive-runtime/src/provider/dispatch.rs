@@ -4,7 +4,7 @@
 //! actually runs there, and aider/pi/claude-code runtimes run as subprocesses.
 
 use hive_core::ModelProviderKind;
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
 use super::anthropic::{AnthropicClient, ChatTurn, ProviderError};
 use super::ollama::{ChatOptions, OllamaClient};
@@ -43,6 +43,9 @@ pub struct ResolvedRuntime {
     /// probe to say the model can call tools; on the OpenAI wire the switch is
     /// the gate (a server that rejects `tools` falls back to plain chat).
     pub tools: bool,
+    /// Model rounds per tool-using turn (the runtime's setting). `None` ⇒
+    /// [`crate::agent_tools::tool_round_budget`]'s default for the provider.
+    pub max_tool_rounds: Option<u32>,
 }
 
 /// Tools to offer a turn: neutral definitions (`{name, description,
@@ -106,6 +109,45 @@ pub fn ollama_tools_allowed(rt: &ResolvedRuntime, caps: Option<&super::ollama::M
 /// take `tools` says so with a 400 and the client retries without them.
 pub fn openai_tools_allowed(rt: &ResolvedRuntime) -> bool {
     rt.tools && rt.is_openai_wire()
+}
+
+/// Per-model request fields for an OpenAI-wire runtime, where they're safe:
+/// only runtimes that may front a local server (Custom, HiveDaemon) get them —
+/// hosted APIs reject unknown fields. A server that still refuses one gets the
+/// request again without them (see [`OpenAiClient::with_extra_body`]).
+///
+/// - `chat_template_kwargs.enable_thinking` follows the runtime's think
+///   setting (Hive's default is off). llama.cpp hands it to the model's chat
+///   template: gemma4 / qwen3 templates honour it, others ignore it.
+/// - gpt-oss always reasons; with thinking off it gets `reasoning_effort:
+///   "low"` (its template ignores `enable_thinking`).
+///
+/// No output cap is set: the OpenAI wire sends no `max_tokens`, so a
+/// reasoning model's answer is bounded only by the server's slot — never by
+/// the 1024 the Anthropic path passes.
+pub fn openai_request_extras(rt: &ResolvedRuntime) -> Map<String, Value> {
+    let mut extra = Map::new();
+    if !matches!(rt.provider, ModelProviderKind::Custom | ModelProviderKind::HiveDaemon) {
+        return extra;
+    }
+    let think = rt.think.unwrap_or(false);
+    extra.insert("chat_template_kwargs".into(), json!({ "enable_thinking": think }));
+    if !think && rt.model.to_lowercase().contains("gpt-oss") {
+        extra.insert("reasoning_effort".into(), json!("low"));
+    }
+    extra
+}
+
+/// The window an HTTP tool loop guards against (0 = don't guard): the
+/// planner's window for runtimes that may be a local server, where the slot
+/// is small and overflowing it fails the request. Hosted APIs aren't guarded —
+/// the name table's fallback would understate their windows.
+pub fn tool_loop_context_window(rt: &ResolvedRuntime) -> u32 {
+    if rt.probes_server_props() || rt.provider == ModelProviderKind::Ollama {
+        rt.context_window()
+    } else {
+        0
+    }
 }
 
 /// Ask a local OpenAI-compatible server (`llama-server`) for its per-slot
@@ -269,7 +311,7 @@ pub async fn stream_with_tools<E: ToolExecutor>(
                 Some(t) if ollama_tools_allowed(rt, caps.as_ref()) => {
                     tracing::info!(target: "dispatch", host = %client.host(), model = %rt.model, tools = t.defs.len(), "ollama turn with tools");
                     // The identity block told the model it has no tools; it does now.
-                    let system = system.map(crate::prompt::with_tools_offered);
+                    let system = system.map(|s| crate::prompt::with_tools_offered_for(s, t.defs));
                     client
                         .stream_chat_with_tools(
                             &rt.model,
@@ -315,12 +357,14 @@ pub async fn stream_with_tools<E: ToolExecutor>(
             // `api-key` header instead of a bearer token.
             let client = OpenAiClient::new(&rt.endpoint)
                 .with_api_key_header(rt.provider == ModelProviderKind::Azure)
-                .with_provider_label(provider_label(rt.provider));
+                .with_provider_label(provider_label(rt.provider))
+                .with_extra_body(openai_request_extras(rt))
+                .with_context_window(tool_loop_context_window(rt));
             match tools.filter(|t| !t.defs.is_empty()) {
                 Some(t) if openai_tools_allowed(rt) => {
                     tracing::info!(target: "dispatch", provider = provider_label(rt.provider), host = %client.host(), model = %rt.model, tools = t.defs.len(), "openai-wire turn with tools");
                     // The identity block told the model it has no tools; it does now.
-                    let system = system.map(crate::prompt::with_tools_offered);
+                    let system = system.map(|s| crate::prompt::with_tools_offered_for(s, t.defs));
                     client
                         .stream_chat_with_tools(
                             rt.api_key.as_deref(),
@@ -536,6 +580,7 @@ mod tests {
             keep_alive: None,
             think: None,
             tools: false,
+            max_tool_rounds: None,
         }
     }
 
@@ -596,6 +641,7 @@ mod tests {
             keep_alive: None,
             think: None,
             tools: false,
+            max_tool_rounds: None,
         };
         assert!(rt.is_subprocess());
         rt.provider = ModelProviderKind::Anthropic;
@@ -619,6 +665,7 @@ mod tests {
             keep_alive: None,
             think: None,
             tools: false,
+            max_tool_rounds: None,
         };
         // Name-based guess for a qwen model.
         assert_eq!(rt.context_window(), 32_768);
@@ -670,6 +717,40 @@ mod tests {
             rt.provider = p;
             assert!(!openai_tools_allowed(&rt), "{p:?}");
         }
+    }
+
+    #[test]
+    fn request_extras_map_think_for_local_servers_only() {
+        let mut rt = ResolvedRuntime { provider: ModelProviderKind::Custom, model: "gemma4:12b".into(), ..ollama_rt() };
+        // Hive's default (unset) is thinking off.
+        let e = openai_request_extras(&rt);
+        assert_eq!(e["chat_template_kwargs"], json!({ "enable_thinking": false }));
+        assert!(!e.contains_key("reasoning_effort"), "only gpt-oss gets reasoning_effort");
+        rt.think = Some(true);
+        assert_eq!(openai_request_extras(&rt)["chat_template_kwargs"], json!({ "enable_thinking": true }));
+        // gpt-oss always reasons: low effort when thinking is off, its default otherwise.
+        rt.model = "gpt-oss:20b".into();
+        assert!(!openai_request_extras(&rt).contains_key("reasoning_effort"));
+        rt.think = None;
+        assert_eq!(openai_request_extras(&rt)["reasoning_effort"], "low");
+        rt.provider = ModelProviderKind::HiveDaemon;
+        assert_eq!(openai_request_extras(&rt)["reasoning_effort"], "low");
+        // Hosted APIs (and the Ollama shim) get nothing they might reject.
+        for p in [ModelProviderKind::OpenAI, ModelProviderKind::OpenRouter, ModelProviderKind::Azure, ModelProviderKind::Ollama] {
+            rt.provider = p;
+            assert!(openai_request_extras(&rt).is_empty(), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn tool_loop_guards_local_windows_only() {
+        let mut rt = ResolvedRuntime { provider: ModelProviderKind::Custom, model: "unknown-gguf".into(), ..ollama_rt() };
+        rt.context_window_tokens = Some(32_768);
+        assert_eq!(tool_loop_context_window(&rt), 32_768);
+        rt.provider = ModelProviderKind::Ollama;
+        assert_eq!(tool_loop_context_window(&rt), 32_768);
+        rt.provider = ModelProviderKind::OpenAI;
+        assert_eq!(tool_loop_context_window(&rt), 0, "hosted windows aren't guessed at");
     }
 
     #[test]

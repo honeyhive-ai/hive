@@ -34,7 +34,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 use super::anthropic::{ChatTurn, ProviderError};
 use super::dispatch::StreamActivity;
@@ -62,6 +62,13 @@ pub struct OpenAiClient {
     /// Reconnect attempts after a refused / dropped connection (before any
     /// response byte). One by default.
     connect_retries: u32,
+    /// Extra top-level request fields merged into every body — per-model
+    /// knobs a local server understands (`chat_template_kwargs`,
+    /// `reasoning_effort`). Dropped for the rest of the turn if the server
+    /// rejects one.
+    extra_body: Map<String, Value>,
+    /// The context window the tool loop guards against (tokens); 0 = unknown.
+    context_window: u32,
 }
 
 /// The assembled result of a chat with tools on offer.
@@ -234,6 +241,8 @@ pub fn parse_chunk(v: &Value, provider: &'static str) -> Result<ChunkParts, Prov
 #[derive(Debug, Default)]
 struct RoundState {
     tools_rejected: bool,
+    /// The server refused one of the `extra_body` fields.
+    extras_rejected: bool,
 }
 
 /// One round's result: the streamed text plus any tool calls the model made.
@@ -326,6 +335,13 @@ fn rejects_tools(status: u16, body: &str) -> bool {
     (status == 400 || status == 422) && body.to_lowercase().contains("tool")
 }
 
+/// Whether a non-2xx body is the server refusing one of the extra fields
+/// (`chat_template_kwargs`, `reasoning_effort`, …) by name.
+fn rejects_extras(status: u16, body: &str, extra: &Map<String, Value>) -> bool {
+    let lower = body.to_lowercase();
+    (status == 400 || status == 422) && extra.keys().any(|k| lower.contains(&k.to_lowercase()))
+}
+
 /// Longest slice of a malformed argument string echoed back to the model.
 const MALFORMED_ECHO_CHARS: usize = 500;
 
@@ -393,7 +409,23 @@ impl OpenAiClient {
             provider_label: "openai",
             idle_timeout: turn_idle_timeout(),
             connect_retries: 1,
+            extra_body: Map::new(),
+            context_window: 0,
         }
+    }
+
+    /// Merge these top-level fields into every request (see `extra_body`).
+    pub fn with_extra_body(mut self, extra: Map<String, Value>) -> Self {
+        self.extra_body = extra;
+        self
+    }
+
+    /// The window the tool loop keeps the running request under: once a round
+    /// would pass [`crate::agent_tools::CONTEXT_GUARD_FRACTION`] of it, tools
+    /// stop being offered and that round is the last.
+    pub fn with_context_window(mut self, tokens: u32) -> Self {
+        self.context_window = tokens;
+        self
     }
 
     /// Authenticate with an `api-key` header instead of a bearer token (Azure
@@ -492,7 +524,13 @@ impl OpenAiClient {
         let rounds = max_rounds.max(1);
         for round in 0..rounds {
             let last = round + 1 == rounds;
-            let offered: &[Value] = if last || state.tools_rejected { &[] } else { &defs };
+            // Near the window, stop offering tools: this round is the last and
+            // must answer from what the earlier rounds gathered.
+            let fits = crate::agent_tools::tools_fit_context(&messages, &defs, self.context_window);
+            if !fits && !last && !state.tools_rejected {
+                tracing::info!(target: "dispatch", host = %self.host(), model, round, window = self.context_window, "context nearly full; final round goes out without tools");
+            }
+            let offered: &[Value] = if last || state.tools_rejected || !fits { &[] } else { &defs };
             // Separate this round's text from the previous round's with a blank
             // line — in the stream and in the body alike, so they match.
             let mut need_sep = !out.text.is_empty();
@@ -592,6 +630,11 @@ impl OpenAiClient {
     ) -> Result<Round, ProviderError> {
         let resp = loop {
             let mut body = json!({ "model": model, "stream": true, "messages": messages });
+            if !state.extras_rejected {
+                for (k, v) in &self.extra_body {
+                    body[k] = v.clone();
+                }
+            }
             if !tools.is_empty() && !state.tools_rejected {
                 body["tools"] = json!(tools);
             }
@@ -603,6 +646,19 @@ impl OpenAiClient {
             }
             let status = resp.status().as_u16();
             let text = resp.text().await.unwrap_or_default();
+            if !self.extra_body.is_empty() && !state.extras_rejected && rejects_extras(status, &text, &self.extra_body) {
+                tracing::warn!(
+                    target: "dispatch",
+                    provider = self.provider_label,
+                    host = %self.host(),
+                    model,
+                    status,
+                    "server rejected extra request fields ({}); continuing without them",
+                    text.trim()
+                );
+                state.extras_rejected = true;
+                continue;
+            }
             if !tools.is_empty() && !state.tools_rejected && rejects_tools(status, &text) {
                 tracing::warn!(
                     target: "dispatch",
@@ -1200,6 +1256,8 @@ mod tool_wire {
         rounds: Arc<Vec<Vec<String>>>,
         /// 400 any request that carries `tools`.
         reject_tools: bool,
+        /// 400 any request that carries `chat_template_kwargs`.
+        reject_extras: bool,
         /// `/props` body; `None` ⇒ 404 (a gateway without the route).
         props: Option<Value>,
         props_hits: Arc<Mutex<usize>>,
@@ -1231,6 +1289,12 @@ mod tool_wire {
             b.push(v.clone());
             b.len() - 1
         };
+        if f.reject_extras && v.get("chat_template_kwargs").is_some() {
+            return axum::response::Response::builder()
+                .status(400)
+                .body(Body::from(r#"{"error":{"code":400,"message":"Unrecognized request argument supplied: chat_template_kwargs"}}"#))
+                .unwrap();
+        }
         if f.reject_tools && v.get("tools").is_some() {
             return axum::response::Response::builder()
                 .status(400)
@@ -1414,6 +1478,92 @@ mod tool_wire {
         assert!(b[0].get("tools").is_some());
         assert!(b[1].get("tools").is_some());
         assert!(b[2].get("tools").is_none(), "the final round forces a text answer");
+    }
+
+    fn extras() -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("chat_template_kwargs".into(), json!({"enable_thinking": false}));
+        m.insert("reasoning_effort".into(), json!("low"));
+        m
+    }
+
+    #[tokio::test]
+    async fn extra_fields_ride_every_round() {
+        let f = Fake {
+            rounds: Arc::new(vec![streamed_call(0, "a", "search", r#"{"q":"1"}"#), vec![text("ok")]]),
+            ..Default::default()
+        };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        let exec = recorder();
+        let out = OpenAiClient::new(&url)
+            .with_extra_body(extras())
+            .stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &exec, 4, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
+        let b = bodies.lock().unwrap();
+        assert_eq!(b.len(), 2);
+        for body in b.iter() {
+            assert_eq!(body["chat_template_kwargs"], json!({"enable_thinking": false}));
+            assert_eq!(body["reasoning_effort"], "low");
+            assert!(body.get("max_tokens").is_none(), "no output cap on the OpenAI wire");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_extra_fields_are_dropped_for_the_rest_of_the_turn() {
+        let f = Fake {
+            // Request 0 is the rejected one; its script slot is never served.
+            rounds: Arc::new(vec![vec![], streamed_call(0, "a", "search", r#"{"q":"1"}"#), vec![text("ok")]]),
+            reject_extras: true,
+            ..Default::default()
+        };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        let exec = recorder();
+        let out = OpenAiClient::new(&url)
+            .with_extra_body(extras())
+            .stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &exec, 4, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.text, "ok");
+        assert_eq!(exec.calls.lock().unwrap().len(), 1);
+        let b = bodies.lock().unwrap();
+        // Rejected once, retried without, and never sent again.
+        assert_eq!(b.len(), 3);
+        assert!(b[0].get("chat_template_kwargs").is_some());
+        assert!(b[1].get("chat_template_kwargs").is_none() && b[1].get("reasoning_effort").is_none());
+        assert!(b[1].get("tools").is_some(), "tools survive an extras rejection");
+        assert!(b[2].get("chat_template_kwargs").is_none());
+    }
+
+    /// An executor whose results are large — fills the window fast.
+    struct Bulky;
+    impl ToolExecutor for Bulky {
+        async fn call(&self, _name: &str, _input: &Value) -> (String, bool) {
+            ("x".repeat(12_000), false)
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_stop_being_offered_when_the_context_nears_the_window() {
+        let f = Fake {
+            rounds: Arc::new(vec![streamed_call(0, "a", "search", r#"{"q":"1"}"#), vec![text("answer from what I have")]]),
+            ..Default::default()
+        };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        let out = OpenAiClient::new(&url)
+            .with_context_window(4096)
+            .stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &Bulky, 24, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.text, "answer from what I have");
+        assert_eq!(out.rounds, 2, "the guard made round 2 the last");
+        let b = bodies.lock().unwrap();
+        assert!(b[0].get("tools").is_some());
+        assert!(b[1].get("tools").is_none(), "near the window the round goes out tool-less");
     }
 
     #[tokio::test]

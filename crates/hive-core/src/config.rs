@@ -222,6 +222,7 @@ struct RawRuntime {
     model_base_url: Option<String>,
     keep_alive: Option<String>,
     think: Option<bool>,
+    max_tool_rounds: Option<u32>,
     #[serde(default)]
     supports_embeddings: bool,
     #[serde(default)]
@@ -463,6 +464,7 @@ impl RawRuntime {
             model_base_url: self.model_base_url,
             request_keep_alive: self.keep_alive,
             think: self.think,
+            max_tool_rounds: self.max_tool_rounds.filter(|n| *n > 0),
             estimated_performance_score: self.performance_score,
             estimated_cost_per_1m_input_tokens_usd: self.cost_per_1m_input_tokens_usd,
             capabilities: RuntimeCapabilities {
@@ -521,6 +523,27 @@ context_window = 32768
             cfg.runtimes[0].capabilities.context_window_tokens,
             Some(32768)
         );
+    }
+
+    #[test]
+    fn max_tool_rounds_parses_and_zero_is_unset() {
+        let toml = r#"
+[[runtimes]]
+id = "gateway"
+provider = "custom"
+endpoint = "http://10.0.0.2:8080/v1/chat/completions"
+preferred_model = "gpt-oss:20b"
+max_tool_rounds = 40
+
+[[runtimes]]
+id = "other"
+provider = "custom"
+endpoint = "http://10.0.0.2:8080/v1/chat/completions"
+max_tool_rounds = 0
+"#;
+        let cfg = load_from_str(toml).unwrap();
+        assert_eq!(cfg.runtimes[0].max_tool_rounds, Some(40));
+        assert_eq!(cfg.runtimes[1].max_tool_rounds, None);
     }
 
     #[test]

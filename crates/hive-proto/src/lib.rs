@@ -289,6 +289,10 @@ pub struct RuntimeSummaryDto {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub think: Option<bool>,
+    /// Model rounds per tool-using turn (HTTP runtimes). None = Hive default (24).
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub max_tool_rounds: Option<u32>,
 }
 
 /// Actual context-budget telemetry computed by the backend planner.

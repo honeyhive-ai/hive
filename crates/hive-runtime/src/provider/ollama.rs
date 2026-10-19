@@ -609,7 +609,13 @@ impl OllamaClient {
         let rounds = max_rounds.max(1);
         for round in 0..rounds {
             let last = round + 1 == rounds;
-            let offered: &[Value] = if last || state.tools_rejected { &[] } else { &defs };
+            // Near the allocated window, stop offering tools: this round is
+            // the last and must answer from what the earlier rounds gathered.
+            let fits = crate::agent_tools::tools_fit_context(&messages, &defs, opts.num_ctx.unwrap_or(0));
+            if !fits && !last && !state.tools_rejected {
+                tracing::info!(target: "dispatch", host = %self.host(), model, round, window = ?opts.num_ctx, "context nearly full; final round goes out without tools");
+            }
+            let offered: &[Value] = if last || state.tools_rejected || !fits { &[] } else { &defs };
             // Separate this round's text from the previous round's with a blank
             // line — in the stream and in the body alike, so they match.
             let mut need_sep = !out.text.is_empty();
@@ -643,7 +649,9 @@ impl OllamaClient {
             };
             out.think_unsupported |= r.outcome.think_unsupported;
             out.tools_unsupported |= r.outcome.tools_unsupported;
-            if r.tool_calls.is_empty() {
+            // No calls — or calls on a tool-less round, which there's no tool
+            // to answer — end the turn.
+            if r.tool_calls.is_empty() || offered.is_empty() {
                 return Ok(out);
             }
             tracing::debug!(

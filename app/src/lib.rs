@@ -255,6 +255,20 @@ struct LiveSettings {
     /// for compaction summaries, which need a strong model.
     #[serde(default)]
     utility_runtime_id: Option<String>,
+    /// Offer Hive's built-in file tools (read/list/search, and edits when
+    /// allowed) to HTTP model runtimes that have "Supports tools" on.
+    #[serde(default = "default_true")]
+    builtin_tools: bool,
+    /// Let the built-in tools edit files when the turn runs in place (no
+    /// isolated worktree, e.g. the folder isn't under version control). Off:
+    /// edits only happen in an isolated worktree, where they come back as a
+    /// proposal to review.
+    #[serde(default)]
+    builtin_write_in_place: bool,
+    /// Offer `run_command` (shell) to HTTP model runtimes. Off by default;
+    /// only takes effect where edits are allowed.
+    #[serde(default)]
+    builtin_run_command: bool,
     /// Model id for the synthesized "Primary Runtime" (the default when no
     /// runtime is configured). `None` = fall back to env/DEFAULT_MODEL.
     #[serde(default)]
@@ -436,6 +450,9 @@ impl Default for LiveSettings {
             summarize_prompt: None,
             compact_prompt: None,
             utility_runtime_id: None,
+            builtin_tools: true,
+            builtin_write_in_place: false,
+            builtin_run_command: false,
             default_model: None,
             default_runtime_id: None,
             local_workspace_id: None,
@@ -2258,6 +2275,9 @@ fn runtime_to_toml(runtime: &RuntimeTarget) -> toml::Value {
     if let Some(think) = runtime.think {
         table.insert("think".into(), toml::Value::Boolean(think));
     }
+    if let Some(rounds) = runtime.max_tool_rounds {
+        table.insert("max_tool_rounds".into(), toml::Value::Integer(rounds.into()));
+    }
     if runtime.capabilities.supports_embeddings {
         table.insert("supports_embeddings".into(), toml::Value::Boolean(true));
     }
@@ -2501,6 +2521,7 @@ fn runtime_dto(rt: &RuntimeTarget, is_default: bool) -> RuntimeSummaryDto {
         context_window: rt.capabilities.context_window_tokens,
         keep_alive: rt.request_keep_alive.clone().filter(|s| !s.trim().is_empty()),
         think: rt.think,
+        max_tool_rounds: rt.max_tool_rounds,
     }
 }
 
@@ -2825,6 +2846,8 @@ impl AppState {
                     // runtime into the MCP tool loop (native Ollama is still
                     // gated on its capability probe).
                     tools: rt.capabilities.supports_tools,
+                    // Tool-loop round budget (None = the provider default).
+                    max_tool_rounds: rt.max_tool_rounds,
                 };
             }
         }
@@ -2843,6 +2866,7 @@ impl AppState {
             keep_alive: None,
             think: None,
             tools: false,
+            max_tool_rounds: None,
         }
     }
 }
@@ -5862,6 +5886,38 @@ fn set_utility_runtime(state: State<AppState>, runtime_id: Option<String>) -> Re
     Ok(())
 }
 
+/// Built-in file tools for HTTP model runtimes (Settings → Permissions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentToolSettings {
+    /// Offer the built-in tools at all.
+    enabled: bool,
+    /// Allow edits when a turn runs in place (no isolated worktree).
+    write_in_place: bool,
+    /// Offer `run_command`.
+    run_command: bool,
+}
+
+#[tauri::command]
+fn get_agent_tool_settings(state: State<AppState>) -> AgentToolSettings {
+    let s = state.settings.lock().unwrap();
+    AgentToolSettings {
+        enabled: s.builtin_tools,
+        write_in_place: s.builtin_write_in_place,
+        run_command: s.builtin_run_command,
+    }
+}
+
+#[tauri::command]
+fn set_agent_tool_settings(state: State<AppState>, settings: AgentToolSettings) -> Result<(), String> {
+    let mut s = state.settings.lock().unwrap();
+    s.builtin_tools = settings.enabled;
+    s.builtin_write_in_place = settings.write_in_place;
+    s.builtin_run_command = settings.run_command;
+    save_settings(&state.data_dir, &s);
+    Ok(())
+}
+
 /// `/summarize` — post a model-written summary of the whole conversation as a
 /// new assistant message, leaving the transcript intact. A read-only digest.
 #[tauri::command]
@@ -6138,10 +6194,21 @@ async fn mcp_tool_set(state: &State<'_, AppState>) -> Option<(Vec<Value>, McpToo
     Some((tool_defs, McpToolExecutor { registry, names }))
 }
 
-/// Model rounds per tool-using turn (the last one is forced tool-less for
-/// Ollama and the OpenAI wire so a small model still ends on an answer).
-/// Matches the Anthropic loop's bound.
-const MAX_TOOL_ROUNDS: usize = 6;
+/// Whether an HTTP model turn gets Hive's built-in file tools: the runtime
+/// opted into tools ("Supports tools") on an HTTP wire (native Ollama or
+/// OpenAI-compatible) and the app setting is on.
+fn wants_builtin_tools(rt: &ResolvedRuntime, setting_on: bool) -> bool {
+    setting_on && rt.tools && rt.is_openai_wire()
+}
+
+/// Whether a turn runs in its own per-turn worktree (cut from the chat's
+/// `hive/chat/<id>` branch) whose diff comes back as a review-gated proposal:
+/// file-mutating subprocess agents, and HTTP turns carrying the built-in file
+/// tools — so a local model's edits land in review, never straight in the
+/// tree. Only in a repo.
+fn isolates_turn(git_subprocess: bool, write_capable: bool, builtin_tools: bool, in_repo: bool) -> bool {
+    in_repo && ((git_subprocess && write_capable) || builtin_tools)
+}
 
 /// Attempt the MCP tool loop. Returns `Ok(Some(text))` if it ran, `Ok(None)` if
 /// there were no enabled tools / no API key (caller falls back to streaming).
@@ -6176,7 +6243,7 @@ async fn try_tool_loop(
     };
     let initial = turns_to_messages(turns);
 
-    let result = tool_loop::run_with_messages(&model, &executor, initial, tool_defs, MAX_TOOL_ROUNDS).await;
+    let result = tool_loop::run_with_messages(&model, &executor, initial, tool_defs, hive_runtime::agent_tools::ANTHROPIC_TOOL_ROUNDS).await;
 
     let (phase, text) = match result {
         Ok(text) => {
@@ -6397,14 +6464,20 @@ async fn run_prepared_turn(
 
     // Any HTTP model runtime that opted in ("Supports tools") — native Ollama
     // or the OpenAI wire (OpenAI, OpenRouter, Azure, a local llama.cpp
-    // gateway, …) — gets the same MCP tools on the streaming path. Native
-    // Ollama is further gated on its capability probe in the dispatcher; an
-    // OpenAI-wire server that rejects tools falls back to plain chat there.
-    let http_tools = if responder.runtime.tools && responder.runtime.is_openai_wire() {
+    // gateway, …) — gets the same MCP tools on the streaming path, plus Hive's
+    // built-in file tools (rooted at the turn's dir, below). Native Ollama is
+    // further gated on its capability probe in the dispatcher; an OpenAI-wire
+    // server that rejects tools falls back to plain chat there.
+    let mcp_tools = if responder.runtime.tools && responder.runtime.is_openai_wire() {
         mcp_tool_set(state).await
     } else {
         None
     };
+    let (builtin_on, builtin_write_in_place, builtin_run_command) = {
+        let s = state.settings.lock().unwrap();
+        (s.builtin_tools, s.builtin_write_in_place, s.builtin_run_command)
+    };
+    let builtin_wanted = wants_builtin_tools(&responder.runtime, builtin_on);
 
     // Git commit attribution: credit the human who drove this turn as the
     // commit author (+ other thread participants as co-authors), so commits a
@@ -6457,10 +6530,13 @@ async fn run_prepared_turn(
         ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes => true,
         _ => false,
     };
-    let worktree = if git_subprocess
-        && write_capable
-        && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root))
-    {
+    let worktree = if isolates_turn(
+        git_subprocess,
+        write_capable,
+        builtin_wanted,
+        !workspace_root.trim().is_empty()
+            && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root)),
+    ) {
         let root = std::path::Path::new(&workspace_root);
         let chat_id = session_id.to_string();
         // Phase 2a: cut the ephemeral turn worktree from the chat's persistent
@@ -6528,6 +6604,37 @@ async fn run_prepared_turn(
     // fails the spawn (chdir to "" → ENOENT). When no workspace folder is set,
     // run the agent in the app's own cwd (None) instead.
     let working_dir = (!effective_root.trim().is_empty()).then_some(effective_root.as_str());
+    // Built-in file tools, confined to the turn's dir. In an isolated worktree
+    // they may edit (the diff is captured below as a proposal); in place only
+    // if the user allowed it. `run_command` needs its own opt-in on top.
+    let builtin = if builtin_wanted && working_dir.is_some() {
+        let policy = hive_runtime::agent_tools::builtin_policy(
+            &effective_root,
+            worktree.is_some(),
+            builtin_write_in_place,
+            builtin_run_command,
+        );
+        match hive_runtime::BuiltinTools::new(policy) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                tracing::warn!(target: "dispatch", dir = %effective_root, "built-in tools unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let http_tools = (builtin.is_some() || mcp_tools.is_some()).then(|| {
+        hive_runtime::agent_tools::CompositeTools::new(
+            builtin,
+            mcp_tools,
+            hive_runtime::agent_tools::MAX_OFFERED_TOOLS,
+        )
+    });
+    let tool_rounds = hive_runtime::agent_tools::tool_round_budget(
+        responder.runtime.provider,
+        responder.runtime.max_tool_rounds,
+    );
     tracing::info!(
         target: "dispatch",
         provider = ?responder.runtime.provider,
@@ -6535,6 +6642,7 @@ async fn run_prepared_turn(
         endpoint = %responder.runtime.endpoint,
         dir = %effective_root,
         isolated = worktree.is_some(),
+        tools = http_tools.as_ref().map_or(0, |t| t.defs().len()),
         "dispatching turn"
     );
 
@@ -6577,7 +6685,8 @@ async fn run_prepared_turn(
         1024,
         http_tools
             .as_ref()
-            .map(|(defs, executor)| dispatch::ToolSet { defs, executor, max_rounds: MAX_TOOL_ROUNDS }),
+            .filter(|t| !t.is_empty())
+            .map(|t| dispatch::ToolSet { defs: t.defs(), executor: t, max_rounds: tool_rounds }),
         |text| {
             pending.push_str(&text);
             let _ = app.emit(
@@ -8089,6 +8198,7 @@ async fn probe_provider(
         keep_alive: None,
         think: None,
         tools: false,
+        max_tool_rounds: None,
     };
     let workspace_root = {
         let r = state.workspace_root.lock().unwrap().clone();
@@ -8155,6 +8265,7 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
                 context_window: None,
                 keep_alive: None,
                 think: None,
+                max_tool_rounds: None,
             },
         );
     }
@@ -8180,6 +8291,7 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
             context_window: None,
             keep_alive: None,
             think: None,
+            max_tool_rounds: None,
         });
     }
 
@@ -8228,6 +8340,7 @@ fn add_runtime(
     context_window: Option<u32>,
     keep_alive: Option<String>,
     think: Option<bool>,
+    max_tool_rounds: Option<u32>,
 ) -> Result<(), String> {
     let provider_kind = parse_provider_kind(&provider)?;
     let model_base_url = model_base_url
@@ -8266,6 +8379,8 @@ fn add_runtime(
         // Native-Ollama settings; other providers ignore them.
         request_keep_alive: keep_alive.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()),
         think,
+        // HTTP runtimes' tool-loop round budget; 0/None = Hive's default.
+        max_tool_rounds: max_tool_rounds.filter(|n| *n > 0),
         estimated_performance_score: 0.0,
         estimated_cost_per_1m_input_tokens_usd: 0.0,
         capabilities: hive_core::RuntimeCapabilities {
@@ -8884,6 +8999,9 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
             summarize_prompt: None,
             compact_prompt: None,
             utility_runtime_id: None,
+            builtin_tools: true,
+            builtin_write_in_place: false,
+            builtin_run_command: false,
             default_model: None,
             default_runtime_id: None,
         local_workspace_id: None,
@@ -11806,6 +11924,7 @@ fn import_config(state: State<AppState>, toml_text: String) -> Result<String, St
             r.context_window,
             None,
             None,
+            None,
         ) {
             Ok(()) => runtimes += 1,
             Err(e) => warnings.push(format!("runtime {}: {e}", r.id)),
@@ -12609,6 +12728,8 @@ pub fn run() {
             set_context_commands,
             get_utility_runtime,
             set_utility_runtime,
+            get_agent_tool_settings,
+            set_agent_tool_settings,
             set_default_model,
             maybe_respond,
             regenerate,
@@ -13582,6 +13703,7 @@ mod utility_runtime_tests {
             keep_alive: None,
             think: Some(true),
             tools: true,
+            max_tool_rounds: None,
         }
     }
 
@@ -13647,5 +13769,64 @@ mod utility_runtime_tests {
         })
         .await;
         assert_eq!(out.as_deref(), Some("p"));
+    }
+}
+
+#[cfg(test)]
+mod agentic_turn_tests {
+    use super::{isolates_turn, wants_builtin_tools, AgentToolSettings, LiveSettings};
+    use hive_core::ModelProviderKind;
+    use hive_runtime::provider::dispatch::ResolvedRuntime;
+
+    fn rt(provider: ModelProviderKind, tools: bool) -> ResolvedRuntime {
+        ResolvedRuntime {
+            provider,
+            model: "gemma4:12b".into(),
+            endpoint: "http://10.0.0.2:8080/v1/chat/completions".into(),
+            api_key: None,
+            args: Vec::new(),
+            model_provider_id: None,
+            model_base_url: None,
+            context_window_tokens: None,
+            keep_alive: None,
+            think: None,
+            tools,
+            max_tool_rounds: None,
+        }
+    }
+
+    #[test]
+    fn builtin_tools_need_an_http_runtime_with_tools_on_and_the_setting() {
+        assert!(wants_builtin_tools(&rt(ModelProviderKind::Custom, true), true));
+        assert!(wants_builtin_tools(&rt(ModelProviderKind::Ollama, true), true));
+        assert!(!wants_builtin_tools(&rt(ModelProviderKind::Custom, false), true), "runtime switch off");
+        assert!(!wants_builtin_tools(&rt(ModelProviderKind::Custom, true), false), "app setting off");
+        assert!(!wants_builtin_tools(&rt(ModelProviderKind::Anthropic, true), true), "Anthropic has its own loop");
+        assert!(!wants_builtin_tools(&rt(ModelProviderKind::ClaudeCode, true), true), "CLI agents bring their own tools");
+    }
+
+    #[test]
+    fn http_turns_with_builtins_are_isolated_in_a_repo_only() {
+        // HTTP turn with built-ins: isolated in a repo, in place otherwise.
+        assert!(isolates_turn(false, false, true, true));
+        assert!(!isolates_turn(false, false, true, false));
+        // Existing behaviour: write-capable subprocess agents isolate…
+        assert!(isolates_turn(true, true, false, true));
+        // …read-only ones and plain HTTP chat don't.
+        assert!(!isolates_turn(true, false, false, true));
+        assert!(!isolates_turn(false, false, false, true));
+    }
+
+    #[test]
+    fn agent_tool_settings_default_to_builtins_on_writes_isolated_commands_off() {
+        let s: LiveSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.builtin_tools);
+        assert!(!s.builtin_write_in_place);
+        assert!(!s.builtin_run_command);
+        let d = LiveSettings::default();
+        assert!(d.builtin_tools && !d.builtin_write_in_place && !d.builtin_run_command);
+        let wire: AgentToolSettings =
+            serde_json::from_str(r#"{"enabled":true,"writeInPlace":false,"runCommand":true}"#).unwrap();
+        assert!(wire.enabled && wire.run_command && !wire.write_in_place);
     }
 }
