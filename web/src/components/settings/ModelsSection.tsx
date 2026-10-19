@@ -604,6 +604,10 @@ function RuntimesSection() {
   const [runtimeMaxToolRounds, setRuntimeMaxToolRounds] = useState("");
   const thinkProviders = ["ollama", "custom", "hive-daemon"];
   const httpProviders = ["ollama", "openAI", "openRouter", "azure", "custom", "hive-daemon"];
+  // Providers whose "Supports tools" runs Hive's agent tool loop (MCP + file
+  // tools): ones that may front a local or self-hosted server. Hosted APIs
+  // never get it, so workspace files never go to a third-party cloud.
+  const agentToolProviders = ["ollama", "custom", "hive-daemon"];
   // null = the form is adding; an id = editing that runtime in place (add_runtime
   // upserts by id, so the same form both adds and edits).
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -677,7 +681,7 @@ function RuntimesSection() {
         Number(runtimeContextWindow) > 0 ? Number(runtimeContextWindow) : null,
         runtimeProvider === "ollama" ? runtimeKeepAlive.trim() || null : null,
         thinkProviders.includes(runtimeProvider) ? runtimeThink : null,
-        httpProviders.includes(runtimeProvider) && Number(runtimeMaxToolRounds) > 0
+        agentToolProviders.includes(runtimeProvider) && Number(runtimeMaxToolRounds) > 0
           ? Number(runtimeMaxToolRounds)
           : null,
       ),
@@ -1028,7 +1032,7 @@ function RuntimesSection() {
             </span>
           </div>
         )}
-        {httpProviders.includes(runtimeProvider) && runtimeSupportsTools && (
+        {agentToolProviders.includes(runtimeProvider) && runtimeSupportsTools && (
           <>
             <input
               value={runtimeMaxToolRounds}
@@ -1047,14 +1051,24 @@ function RuntimesSection() {
         <div className="flex items-center gap-2 text-sm opacity-75">
           <Switch on={runtimeSupportsTools} onChange={setRuntimeSupportsTools} label="Supports tools" />
           <span>
-            Supports tools (offer your enabled MCP tools
-            {httpProviders.includes(runtimeProvider) ? " and Hive's built-in file tools" : ""} to this model
-            {runtimeProvider === "ollama"
-              ? " when the server's probe says it can call them"
-              : ["openAI", "openRouter", "azure", "custom"].includes(runtimeProvider)
-                ? " over the OpenAI tools API; a server that rejects tools falls back to plain chat"
-                : ""}
-            )
+            {httpProviders.includes(runtimeProvider) && !agentToolProviders.includes(runtimeProvider) ? (
+              <>
+                Supports tools (not used for hosted APIs: Hive's MCP and file tools only run against
+                local or self-hosted servers — Ollama, Custom, Hive daemon — so workspace files never
+                go to a third-party cloud)
+              </>
+            ) : (
+              <>
+                Supports tools (offer your enabled MCP tools
+                {agentToolProviders.includes(runtimeProvider) ? " and Hive's built-in file tools" : ""} to this model
+                {runtimeProvider === "ollama"
+                  ? " when the server's probe says it can call them"
+                  : ["custom", "hive-daemon"].includes(runtimeProvider)
+                    ? " over the OpenAI tools API; a server that rejects tools falls back to plain chat"
+                    : ""}
+                )
+              </>
+            )}
           </span>
         </div>
         <div className="flex items-center gap-2 text-sm opacity-75">

@@ -170,7 +170,8 @@ export function PermissionsSection() {
       <div className="mt-4 space-y-2">
         <div className="text-sm font-medium">Local model file tools</div>
         <p className="text-xs opacity-60">
-          Model runtimes reached over HTTP (Ollama, llama.cpp, OpenAI-compatible servers) with{" "}
+          Local or self-hosted model runtimes (Ollama, or a Custom / Hive daemon endpoint such as a
+          llama.cpp server — never hosted APIs like OpenAI or OpenRouter) with{" "}
           <strong>Supports tools</strong> on get Hive's built-in tools: <code>read_file</code>,{" "}
           <code>list_dir</code> and <code>search</code>, plus <code>edit_file</code> and{" "}
           <code>write_file</code> when the turn runs in the chat's isolated git worktree — their
