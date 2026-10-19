@@ -137,6 +137,7 @@ export const addRuntime = (
   keepAlive?: string | null,
   think?: boolean | null,
   maxToolRounds?: number | null,
+  allowRemoteFileTools?: boolean | null,
 ) =>
   invoke<void>("add_runtime", {
     id,
@@ -153,7 +154,13 @@ export const addRuntime = (
     keepAlive: keepAlive ?? null,
     think: think ?? null,
     maxToolRounds: maxToolRounds ?? null,
+    allowRemoteFileTools: allowRemoteFileTools ?? null,
   });
+
+/// Whether an endpoint's host is local or private (loopback, LAN, Tailscale,
+/// link-local, *.local, *.ts.net) — Hive's built-in file tools are only offered
+/// to other endpoints with the runtime's explicit opt-in.
+export const endpointIsPrivate = (endpoint: string) => invoke<boolean>("endpoint_is_private", { endpoint });
 
 /// Hive's built-in file tools for HTTP model runtimes (Settings → Permissions).
 export type AgentToolSettings = {

@@ -10,6 +10,7 @@ pub mod config;
 pub mod context_budget;
 pub mod crypto;
 pub mod e2ee;
+pub mod endpoint;
 pub mod events;
 pub mod git_context;
 pub mod identity;

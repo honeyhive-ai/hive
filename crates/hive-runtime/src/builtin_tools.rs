@@ -102,11 +102,45 @@ impl Policy {
     }
 }
 
+/// Supplies a turn's write root on demand — in the app, a per-turn git
+/// worktree cut when the model first writes. See [`BuiltinTools::lazy`].
+pub trait WriteRoot: Send + Sync {
+    /// Create (or return the already-created) directory writes go to. Runs on
+    /// the blocking pool, at most once per executor.
+    fn write_root(&self) -> Result<PathBuf, String>;
+}
+
+/// Where a lazy executor's calls go.
+enum LazyState {
+    /// No write yet: everything runs at the read root.
+    Reading,
+    /// Writes (and every later call) run here.
+    Writing(Arc<Inner>),
+    /// The write root couldn't be created: writes run at the read root when
+    /// in-place writes are allowed, else they're refused with this reason.
+    Failed(String),
+}
+
+struct Lazy {
+    write_root: Arc<dyn WriteRoot>,
+    /// Fall back to writing at the read root if the write root fails.
+    in_place_fallback: bool,
+    state: tokio::sync::Mutex<LazyState>,
+}
+
+impl std::fmt::Debug for Lazy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Lazy").field("in_place_fallback", &self.in_place_fallback).finish_non_exhaustive()
+    }
+}
+
 /// The built-in tool executor. Cheap to clone; file work runs on the blocking
 /// pool so a big search never stalls the async runtime.
 #[derive(Debug, Clone)]
 pub struct BuiltinTools {
     inner: Arc<Inner>,
+    /// Set by [`BuiltinTools::lazy`]: writes move to a root made on demand.
+    lazy: Option<Arc<Lazy>>,
 }
 
 #[derive(Debug)]
@@ -125,7 +159,80 @@ impl BuiltinTools {
         if !root.is_dir() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "tool root is not a directory"));
         }
-        Ok(Self { inner: Arc::new(Inner { policy, root }) })
+        Ok(Self { inner: Arc::new(Inner { policy, root }), lazy: None })
+    }
+
+    /// Tools whose writes move to a separate root, created on first use.
+    /// `policy` (its `root` is the read root) decides what's offered; reads,
+    /// listing and search run at the read root until the first `write_file`,
+    /// `edit_file` or `run_command`, which asks `write_root` for the write
+    /// directory. That call and every later one — reads included, so the
+    /// model sees its own edits — run there, under the same policy. A turn
+    /// that never writes never creates it. If `write_root` fails, writes run
+    /// at the read root when `in_place_fallback` is set, else are refused for
+    /// the rest of the turn.
+    pub fn lazy(policy: Policy, write_root: Arc<dyn WriteRoot>, in_place_fallback: bool) -> io::Result<Self> {
+        let mut tools = Self::new(policy)?;
+        tools.lazy = Some(Arc::new(Lazy {
+            write_root,
+            in_place_fallback,
+            state: tokio::sync::Mutex::new(LazyState::Reading),
+        }));
+        Ok(tools)
+    }
+
+    /// The canonical write root once a lazy executor has switched to it.
+    pub async fn active_write_root(&self) -> Option<PathBuf> {
+        let lazy = self.lazy.as_ref()?;
+        match &*lazy.state.lock().await {
+            LazyState::Writing(inner) => Some(inner.root.clone()),
+            _ => None,
+        }
+    }
+
+    /// The [`Inner`] a call to `name` runs against: the read root, or — for a
+    /// lazy executor — the write root (created on the first writing call).
+    async fn target(&self, name: &str) -> Result<Arc<Inner>, String> {
+        let Some(lazy) = &self.lazy else {
+            return Ok(self.inner.clone());
+        };
+        let writes = matches!(name, WRITE_FILE | EDIT_FILE | RUN_COMMAND);
+        let mut state = lazy.state.lock().await;
+        match &*state {
+            LazyState::Writing(inner) => return Ok(inner.clone()),
+            LazyState::Reading if !writes => return Ok(self.inner.clone()),
+            LazyState::Failed(_) if !writes || lazy.in_place_fallback => return Ok(self.inner.clone()),
+            LazyState::Failed(reason) => return Err(format!("{name} is unavailable: {reason}")),
+            LazyState::Reading => {}
+        }
+        let provider = lazy.write_root.clone();
+        let created = tokio::task::spawn_blocking(move || provider.write_root())
+            .await
+            .unwrap_or_else(|e| Err(format!("creating the write root failed: {e}")))
+            .and_then(|dir| {
+                let root = std::fs::canonicalize(&dir).map_err(|e| format!("write root {}: {e}", dir.display()))?;
+                if !root.is_dir() {
+                    return Err(format!("write root {} is not a directory", root.display()));
+                }
+                let mut policy = self.inner.policy.clone();
+                policy.root = root.clone();
+                Ok(Arc::new(Inner { policy, root }))
+            });
+        match created {
+            Ok(inner) => {
+                *state = LazyState::Writing(inner.clone());
+                Ok(inner)
+            }
+            Err(reason) => {
+                tracing::warn!(target: "dispatch", "write root unavailable: {reason}");
+                *state = LazyState::Failed(reason.clone());
+                if lazy.in_place_fallback {
+                    Ok(self.inner.clone())
+                } else {
+                    Err(format!("{name} is unavailable: {reason}"))
+                }
+            }
+        }
     }
 
     pub fn policy(&self) -> &Policy {
@@ -155,10 +262,10 @@ impl BuiltinTools {
         if !self.inner.policy.allows(name) {
             return Err(format!("{name} is not allowed in this workspace"));
         }
+        let inner = self.target(name).await?;
         if name == RUN_COMMAND {
-            return self.inner.run_command(input).await;
+            return inner.run_command(input).await;
         }
-        let inner = self.inner.clone();
         let name = name.to_string();
         let input = input.clone();
         tokio::task::spawn_blocking(move || match name.as_str() {
@@ -1282,5 +1389,106 @@ mod tests {
             fail(&t, RUN_COMMAND, json!({ "command": chained })).await;
         }
         assert!(!root.join("x").exists());
+    }
+
+    /// Copies the read root into a fresh dir on demand, counting calls.
+    struct CopyRoot {
+        src: PathBuf,
+        dest: PathBuf,
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+    impl WriteRoot for CopyRoot {
+        fn write_root(&self) -> Result<PathBuf, String> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fail {
+                return Err("no worktree".into());
+            }
+            fs::create_dir_all(self.dest.join("src")).unwrap();
+            for f in ["README.md", "src/main.rs"] {
+                fs::copy(self.src.join(f), self.dest.join(f)).unwrap();
+            }
+            Ok(self.dest.clone())
+        }
+    }
+
+    fn lazy_tools(tmp: &TempDir, root: &Path, fail: bool, fallback: bool) -> (BuiltinTools, Arc<CopyRoot>) {
+        let provider = Arc::new(CopyRoot {
+            src: root.to_path_buf(),
+            dest: tmp.path().join("turn-wt"),
+            calls: Default::default(),
+            fail,
+        });
+        let mut p = Policy::new(root);
+        p.allow_write = true;
+        p.allow_commands = true;
+        (BuiltinTools::lazy(p, provider.clone(), fallback).unwrap(), provider)
+    }
+
+    #[tokio::test]
+    async fn lazy_reads_stay_at_the_read_root_and_never_create_the_write_root() {
+        let (tmp, root) = setup();
+        let (t, provider) = lazy_tools(&tmp, &root, false, false);
+        assert_eq!(names(&t), [READ_FILE, LIST_DIR, SEARCH, WRITE_FILE, EDIT_FILE, RUN_COMMAND], "writes are offered up front");
+        ok(&t, READ_FILE, json!({"path": "README.md"})).await;
+        ok(&t, LIST_DIR, json!({})).await;
+        ok(&t, SEARCH, json!({"pattern": "hello"})).await;
+        // A refused call that isn't a write doesn't create it either.
+        fail(&t, READ_FILE, json!({"path": "../escape"})).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(t.active_write_root().await.is_none());
+        assert!(!tmp.path().join("turn-wt").exists());
+    }
+
+    #[tokio::test]
+    async fn lazy_first_write_moves_the_turn_to_the_write_root_once() {
+        let (tmp, root) = setup();
+        let (t, provider) = lazy_tools(&tmp, &root, false, false);
+        ok(&t, READ_FILE, json!({"path": "src/main.rs"})).await;
+        ok(&t, EDIT_FILE, json!({"path": "src/main.rs", "old_string": "hi", "new_string": "bye"})).await;
+        ok(&t, WRITE_FILE, json!({"path": "NEW.md", "content": "new\n"})).await;
+        let wt = tmp.path().join("turn-wt");
+        assert_eq!(t.active_write_root().await, Some(fs::canonicalize(&wt).unwrap()));
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1, "created once");
+        // The edits are in the write root only; the read root is untouched.
+        assert!(fs::read_to_string(wt.join("src/main.rs")).unwrap().contains("bye"));
+        assert!(wt.join("NEW.md").exists());
+        assert!(fs::read_to_string(root.join("src/main.rs")).unwrap().contains("hi"));
+        assert!(!root.join("NEW.md").exists());
+        // Later reads see the model's own edits.
+        assert!(ok(&t, READ_FILE, json!({"path": "src/main.rs"})).await.contains("bye"));
+        assert!(ok(&t, LIST_DIR, json!({})).await.contains("NEW.md"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lazy_run_command_also_cuts_the_write_root_and_runs_there() {
+        let (tmp, root) = setup();
+        let (t, provider) = lazy_tools(&tmp, &root, false, false);
+        let out = ok(&t, RUN_COMMAND, json!({"command": "pwd; touch made"})).await;
+        let wt = fs::canonicalize(tmp.path().join("turn-wt")).unwrap();
+        assert!(out.contains(&wt.display().to_string()), "{out}");
+        assert!(wt.join("made").exists() && !root.join("made").exists());
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn lazy_write_root_failure_refuses_writes_unless_in_place_is_allowed() {
+        let (tmp, root) = setup();
+        let (t, provider) = lazy_tools(&tmp, &root, true, false);
+        let out = fail(&t, WRITE_FILE, json!({"path": "x.md", "content": "x"})).await;
+        assert!(out.contains("no worktree"), "{out}");
+        assert!(!root.join("x.md").exists());
+        // Reads keep working; no retry storm on every later write.
+        ok(&t, READ_FILE, json!({"path": "README.md"})).await;
+        fail(&t, EDIT_FILE, json!({"path": "README.md", "old_string": "hello", "new_string": "bye"})).await;
+        assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // With in-place writes allowed, the write falls back to the read root.
+        let (tmp2, root2) = setup();
+        let (t, _) = lazy_tools(&tmp2, &root2, true, true);
+        ok(&t, WRITE_FILE, json!({"path": "x.md", "content": "x"})).await;
+        assert!(root2.join("x.md").exists());
+        drop(tmp);
     }
 }

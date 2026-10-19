@@ -46,6 +46,10 @@ pub struct ResolvedRuntime {
     /// Model rounds per tool-using turn (the runtime's setting). `None` ⇒
     /// [`crate::agent_tools::tool_round_budget`]'s default for the provider.
     pub max_tool_rounds: Option<u32>,
+    /// The runtime's "Allow workspace file tools for this endpoint" setting:
+    /// offer Hive's built-in file tools even when the endpoint's host isn't
+    /// local or private (they send file contents to it).
+    pub allow_remote_file_tools: bool,
 }
 
 /// Tools to offer a turn: neutral definitions (`{name, description,
@@ -620,6 +624,7 @@ mod tests {
             think: None,
             tools: false,
             max_tool_rounds: None,
+            allow_remote_file_tools: false,
         }
     }
 
@@ -697,6 +702,7 @@ mod tests {
             think: None,
             tools: false,
             max_tool_rounds: None,
+            allow_remote_file_tools: false,
         };
         assert!(rt.is_subprocess());
         rt.provider = ModelProviderKind::Anthropic;
@@ -721,6 +727,7 @@ mod tests {
             think: None,
             tools: false,
             max_tool_rounds: None,
+            allow_remote_file_tools: false,
         };
         // Name-based guess for a qwen model.
         assert_eq!(rt.context_window(), 32_768);

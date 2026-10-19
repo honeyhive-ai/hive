@@ -154,10 +154,27 @@ For an HTTP runtime this offers two kinds of tools:
 
 - **Hive's built-in file tools** (`read_file`, `list_dir`, `search`,
   `edit_file`, `write_file`, optionally `run_command`). In a git
-  workspace, a turn that can write runs in its own worktree, and its
-  edits come back as a proposal for you to review. The switches are in
+  workspace, a turn reads the chat's folder until it first writes or
+  runs a command. At that point Hive creates a worktree for the turn,
+  and the turn's edits come back as a proposal for you to review. A turn
+  that only reads never creates a worktree. The switches are in
   **Settings → Permissions → Local model file tools**.
 - **Tools from your enabled MCP servers.**
+
+The file tools send the contents of the files the model reads to the
+runtime's endpoint. Hive offers them only when the endpoint's host is on
+this machine or a private network:
+
+- loopback, `localhost`, and `*.localhost`
+- RFC 1918 addresses (`10.x`, `172.16–31.x`, `192.168.x`)
+- Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`)
+- link-local addresses
+- `*.local`, `*.ts.net`, and single-label host names
+
+For any other endpoint, turn on **Allow workspace file tools for this
+endpoint** on the runtime (`allow_remote_file_tools = true` in
+`hive.config.toml`). Without it, the model gets only your MCP tools.
+Hosted APIs (OpenAI, OpenRouter, Azure) never get the tool loop.
 
 The tool loop allows 24 rounds by default (set **Max tool rounds** on
 the runtime). When the conversation gets close to the context window,
@@ -206,6 +223,17 @@ into a summary. Two design choices come from our measurements:
   of the budget, then moves the boundary far enough that it fits in 50%.
   Turns between compactions reuse the same summary without another
   model call.
+
+Hive saves each chat's summary on this device, so after a restart it
+reuses the summary instead of writing a new one. The saved summary
+stays out of the synced chat log. If a message that the summary covers
+is edited or removed, Hive writes a new summary.
+
+If the summarizer fails, the turn still goes ahead. It uses the
+previous summary, or a note that earlier messages were left out. Hive
+then waits before it tries the summarizer again: after 2 more turns or 2
+minutes, whichever comes first. Each failure in a row doubles the wait,
+up to 16 turns or 30 minutes.
 
 Summaries are written by the chat's own runtime. Use a strong model for
 chats that run long; gpt-oss 20B kept every fact through compaction.

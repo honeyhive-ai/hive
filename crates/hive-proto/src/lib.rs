@@ -293,6 +293,11 @@ pub struct RuntimeSummaryDto {
     #[serde(default)]
     #[ts(optional = nullable)]
     pub max_tool_rounds: Option<u32>,
+    /// Offer the built-in workspace file tools even though the endpoint isn't
+    /// local or private. None = off.
+    #[serde(default)]
+    #[ts(optional = nullable)]
+    pub allow_remote_file_tools: Option<bool>,
 }
 
 /// Actual context-budget telemetry computed by the backend planner.

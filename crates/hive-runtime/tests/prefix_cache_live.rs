@@ -138,6 +138,7 @@ fn runtime(endpoint: String, model: String) -> ResolvedRuntime {
         think: None,
         tools: true,
         max_tool_rounds: None,
+        allow_remote_file_tools: false,
     }
 }
 

@@ -251,10 +251,127 @@ pub fn plan_with_hysteresis(
     }
 }
 
+/// A stable digest of the messages a compaction summary covers (id, author
+/// and body of each, in order). Stored with the summary so a later turn —
+/// or a later app run — reuses it only while those messages are unchanged:
+/// an edited or removed message changes the digest and forces a re-summary.
+pub fn messages_fingerprint(messages: &[ChatMessage]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for m in messages {
+        for part in [m.id.as_bytes().as_slice(), m.author.as_bytes(), m.body.as_bytes()] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Backoff for a failing summarizer. A summary on a local model takes tens of
+/// seconds; when it fails (server down, timeout, empty reply), retrying on the
+/// very next turn makes every turn pay that cost again for nothing. After the
+/// n-th consecutive failure the next attempt waits until either `2^n` turns
+/// have gone by (capped at [`SummaryBackoff::MAX_SKIPPED_TURNS`]) or
+/// `2^(n-1)` × [`SummaryBackoff::BASE_DELAY`] has passed (capped at
+/// [`SummaryBackoff::MAX_DELAY`]), whichever comes first — so a fast chat
+/// retries by turn count and a slow one by time. Meanwhile turns use the
+/// safe fallback (the previous summary, or an "earlier messages omitted"
+/// note) and the conversation itself is untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryBackoff {
+    failures: u32,
+    skipped: u32,
+    since: std::time::Instant,
+}
+
+impl SummaryBackoff {
+    pub const BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(120);
+    pub const MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    pub const MAX_SKIPPED_TURNS: u32 = 16;
+
+    /// Record a failure at `now`, after `prior` consecutive ones (if any).
+    pub fn after_failure(prior: Option<&SummaryBackoff>, now: std::time::Instant) -> Self {
+        Self { failures: prior.map_or(0, |p| p.failures).saturating_add(1), skipped: 0, since: now }
+    }
+
+    /// Consecutive failures so far.
+    pub fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    /// Turns to skip before the next attempt.
+    pub fn skip_turns(&self) -> u32 {
+        1u32.checked_shl(self.failures.min(31)).unwrap_or(u32::MAX).min(Self::MAX_SKIPPED_TURNS)
+    }
+
+    /// Time to wait before the next attempt.
+    pub fn delay(&self) -> std::time::Duration {
+        let factor = 1u32.checked_shl(self.failures.saturating_sub(1).min(31)).unwrap_or(u32::MAX);
+        Self::BASE_DELAY.saturating_mul(factor).min(Self::MAX_DELAY)
+    }
+
+    /// Whether this turn may call the summarizer again. When it may not, the
+    /// turn counts as skipped.
+    pub fn try_attempt(&mut self, now: std::time::Instant) -> bool {
+        if self.skipped >= self.skip_turns() || now.saturating_duration_since(self.since) >= self.delay() {
+            return true;
+        }
+        self.skipped += 1;
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::chat::{ChatMessage, MessageRole};
+
+    #[test]
+    fn summary_backoff_skips_two_turns_or_two_minutes_then_grows_to_a_cap() {
+        use std::time::Duration;
+        let t0 = std::time::Instant::now();
+        let mut b = SummaryBackoff::after_failure(None, t0);
+        assert_eq!((b.failures(), b.skip_turns(), b.delay()), (1, 2, Duration::from_secs(120)));
+        // Fast chat: two skipped turns, then a retry.
+        assert!(!b.try_attempt(t0 + Duration::from_secs(5)));
+        assert!(!b.try_attempt(t0 + Duration::from_secs(10)));
+        assert!(b.try_attempt(t0 + Duration::from_secs(15)));
+        // Slow chat: the very next turn after two minutes retries.
+        let mut slow = SummaryBackoff::after_failure(None, t0);
+        assert!(slow.try_attempt(t0 + Duration::from_secs(121)));
+
+        // Consecutive failures double both, up to the caps.
+        let b2 = SummaryBackoff::after_failure(Some(&b), t0);
+        assert_eq!((b2.failures(), b2.skip_turns(), b2.delay()), (2, 4, Duration::from_secs(240)));
+        let mut many = b2.clone();
+        for _ in 0..40 {
+            many = SummaryBackoff::after_failure(Some(&many), t0);
+        }
+        assert_eq!(many.skip_turns(), SummaryBackoff::MAX_SKIPPED_TURNS);
+        assert_eq!(many.delay(), SummaryBackoff::MAX_DELAY);
+        let mut m = many.clone();
+        for i in 0..SummaryBackoff::MAX_SKIPPED_TURNS {
+            assert!(!m.try_attempt(t0 + Duration::from_secs(u64::from(i))), "turn {i}");
+        }
+        assert!(m.try_attempt(t0 + Duration::from_secs(60)));
+        let mut m = many;
+        assert!(m.try_attempt(t0 + SummaryBackoff::MAX_DELAY));
+    }
+
+    #[test]
+    fn fingerprint_tracks_ids_authors_and_bodies() {
+        let a = msg("alpha");
+        let b = msg("beta");
+        let fp = messages_fingerprint(&[a.clone(), b.clone()]);
+        assert_eq!(fp.len(), 64);
+        assert_eq!(fp, messages_fingerprint(&[a.clone(), b.clone()]), "stable");
+        assert_ne!(fp, messages_fingerprint(&[b.clone(), a.clone()]), "order matters");
+        let mut edited = b.clone();
+        edited.body = "beta, edited".into();
+        assert_ne!(fp, messages_fingerprint(&[a.clone(), edited]));
+        assert_ne!(fp, messages_fingerprint(&[a.clone(), msg("beta")]), "a different message with the same text");
+        assert_ne!(fp, messages_fingerprint(&[a]));
+    }
 
     fn msg(body: &str) -> ChatMessage {
         ChatMessage::new(MessageRole::User, "u", body)

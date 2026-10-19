@@ -387,6 +387,7 @@ mod tests {
             think: None,
             tools: false,
             max_tool_rounds: None,
+            allow_remote_file_tools: false,
         }
     }
 

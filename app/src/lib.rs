@@ -104,7 +104,12 @@ struct AppState {
     /// Per-session, per-runtime compaction state: the fixed boundary plus the
     /// incremental summary of everything before it (see [`SummaryCacheEntry`]
     /// and [`summary_key`]).
+    /// Mirrored device-locally in the event store's `compaction_state` table
+    /// (never synced), so a restart reuses a summary instead of re-making it.
     summary_cache: Mutex<HashMap<SummaryKey, SummaryCacheEntry>>,
+    /// Per-session, per-runtime backoff for a failing summarizer (in memory
+    /// only; a restart retries).
+    summary_backoff: Mutex<HashMap<SummaryKey, hive_core::context_budget::SummaryBackoff>>,
     /// Fetched vault content, keyed by raw URL, with the fetch time so a stale
     /// entry (older than `VAULT_CACHE_TTL`) is re-fetched instead of served for
     /// the whole app run. Within the TTL it avoids a per-message round-trip.
@@ -2311,6 +2316,9 @@ fn runtime_to_toml(runtime: &RuntimeTarget) -> toml::Value {
     if let Some(rounds) = runtime.max_tool_rounds {
         table.insert("max_tool_rounds".into(), toml::Value::Integer(rounds.into()));
     }
+    if runtime.allow_remote_file_tools {
+        table.insert("allow_remote_file_tools".into(), toml::Value::Boolean(true));
+    }
     if runtime.capabilities.supports_embeddings {
         table.insert("supports_embeddings".into(), toml::Value::Boolean(true));
     }
@@ -2555,6 +2563,7 @@ fn runtime_dto(rt: &RuntimeTarget, is_default: bool) -> RuntimeSummaryDto {
         keep_alive: rt.request_keep_alive.clone().filter(|s| !s.trim().is_empty()),
         think: rt.think,
         max_tool_rounds: rt.max_tool_rounds,
+        allow_remote_file_tools: rt.allow_remote_file_tools.then_some(true),
     }
 }
 
@@ -2881,6 +2890,8 @@ impl AppState {
                     tools: rt.capabilities.supports_tools,
                     // Tool-loop round budget (None = the provider default).
                     max_tool_rounds: rt.max_tool_rounds,
+                    // "Allow workspace file tools for this endpoint".
+                    allow_remote_file_tools: rt.allow_remote_file_tools,
                 };
             }
         }
@@ -2900,6 +2911,7 @@ impl AppState {
             think: None,
             tools: false,
             max_tool_rounds: None,
+            allow_remote_file_tools: false,
         }
     }
 }
@@ -5120,12 +5132,125 @@ struct ContextSnapshot {
 /// kept message; `covered` the ids the cached `summary` folds in (everything
 /// before the boundary when it was produced). While the boundary holds, the
 /// summary is reused verbatim — no LLM call, and a byte-identical prompt
-/// prefix for the server's prefix cache.
+/// prefix for the server's prefix cache. `fingerprint` digests the covered
+/// messages ([`hive_core::context_budget::messages_fingerprint`]); the entry
+/// is only reused while they are unchanged (see [`load_summary_entry`]).
 #[derive(Clone, Debug, PartialEq)]
 struct SummaryCacheEntry {
     boundary: Option<Uuid>,
     covered: Vec<Uuid>,
+    fingerprint: String,
     summary: String,
+}
+
+impl SummaryCacheEntry {
+    fn from_stored(s: hive_runtime::StoredCompaction) -> Self {
+        Self { boundary: s.boundary, covered: s.covered, fingerprint: s.fingerprint, summary: s.summary }
+    }
+
+    fn to_stored(&self) -> hive_runtime::StoredCompaction {
+        hive_runtime::StoredCompaction {
+            boundary: self.boundary,
+            covered: self.covered.clone(),
+            fingerprint: self.fingerprint.clone(),
+            summary: self.summary.clone(),
+        }
+    }
+
+    /// Whether this entry still describes `history`: the messages it covers
+    /// are the history's leading messages (overflow is always a prefix),
+    /// unchanged. An edit, a removal (`/compact`) or an insertion before the
+    /// boundary makes it stale.
+    fn matches(&self, history: &[ChatMessage]) -> bool {
+        let n = self.covered.len();
+        n <= history.len()
+            && history[..n].iter().map(|m| m.id).eq(self.covered.iter().copied())
+            && hive_core::context_budget::messages_fingerprint(&history[..n]) == self.fingerprint
+    }
+}
+
+/// A chat responder's compaction state: the in-memory entry, else the one
+/// persisted on this device by an earlier app run (cached in memory from
+/// then on). An entry whose covered messages changed is dropped from both.
+fn load_summary_entry(state: &AppState, key: &SummaryKey, history: &[ChatMessage]) -> Option<SummaryCacheEntry> {
+    let in_memory = state.summary_cache.lock().unwrap().get(key).cloned();
+    let (entry, from_disk) = match in_memory {
+        Some(e) => (e, false),
+        None => {
+            let stored = state.service.lock().unwrap().store().compaction(key.0, &key.1);
+            match stored {
+                Ok(Some(s)) => (SummaryCacheEntry::from_stored(s), true),
+                Ok(None) => return None,
+                Err(e) => {
+                    tracing::warn!(target: "compaction", "reading saved compaction state failed: {e}");
+                    return None;
+                }
+            }
+        }
+    };
+    if entry.matches(history) {
+        if from_disk {
+            state.summary_cache.lock().unwrap().insert(key.clone(), entry.clone());
+        }
+        Some(entry)
+    } else {
+        tracing::info!(target: "compaction", session = %key.0, runtime = %key.1, "summarized messages changed; dropping the saved summary");
+        apply_summary_update(state, key, SummaryCacheUpdate::Remove);
+        None
+    }
+}
+
+/// Apply a turn's [`SummaryCacheUpdate`] in memory and in the device-local
+/// store (never the synced log). A store error only costs a re-summary after
+/// the next restart, so it is logged, not raised.
+fn apply_summary_update(state: &AppState, key: &SummaryKey, update: SummaryCacheUpdate) {
+    let saved = match &update {
+        SummaryCacheUpdate::Keep => return,
+        SummaryCacheUpdate::Remove => {
+            state.summary_cache.lock().unwrap().remove(key);
+            state.service.lock().unwrap().store().delete_compaction(key.0, Some(&key.1))
+        }
+        SummaryCacheUpdate::Replace(entry) => {
+            state.summary_cache.lock().unwrap().insert(key.clone(), entry.clone());
+            state.service.lock().unwrap().store().save_compaction(key.0, &key.1, &entry.to_stored())
+        }
+    };
+    if let Err(e) = saved {
+        tracing::warn!(target: "compaction", "saving compaction state failed: {e}");
+    }
+}
+
+/// Whether this turn may call the summarizer for `key`, given its backoff
+/// (none = yes). A turn told no counts as skipped.
+fn summary_attempt_allowed(
+    backoff: &mut HashMap<SummaryKey, hive_core::context_budget::SummaryBackoff>,
+    key: &SummaryKey,
+    now: std::time::Instant,
+) -> bool {
+    backoff.get_mut(key).is_none_or(|b| b.try_attempt(now))
+}
+
+/// Record a summarizer attempt: success clears the backoff, a failure
+/// extends it (see [`hive_core::context_budget::SummaryBackoff`]).
+fn record_summary_attempt(
+    backoff: &mut HashMap<SummaryKey, hive_core::context_budget::SummaryBackoff>,
+    key: &SummaryKey,
+    succeeded: bool,
+    now: std::time::Instant,
+) {
+    if succeeded {
+        backoff.remove(key);
+    } else {
+        let next = hive_core::context_budget::SummaryBackoff::after_failure(backoff.get(key), now);
+        tracing::warn!(
+            target: "compaction",
+            failures = next.failures(),
+            skip_turns = next.skip_turns(),
+            delay_secs = next.delay().as_secs(),
+            "summary failed; backing off"
+        );
+        backoff.insert(key.clone(), next);
+    }
 }
 
 /// `summary_cache` key: (chat, responder's runtime id).
@@ -5170,12 +5295,13 @@ fn settle_summary(
     strategy: &str,
     boundary: Option<Uuid>,
     overflow_ids: Vec<Uuid>,
+    fingerprint: String,
     produced: Option<String>,
 ) -> (String, SummaryCacheUpdate) {
     match (strategy, cached, produced) {
         ("cached", Some(c), _) => (c.summary.clone(), SummaryCacheUpdate::Keep),
         (_, _, Some(summary)) => {
-            let entry = SummaryCacheEntry { boundary, covered: overflow_ids, summary: summary.clone() };
+            let entry = SummaryCacheEntry { boundary, covered: overflow_ids, fingerprint, summary: summary.clone() };
             (summary, SummaryCacheUpdate::Replace(entry))
         }
         ("incremental", Some(c), None) => (c.summary.clone(), SummaryCacheUpdate::Keep),
@@ -5228,7 +5354,7 @@ fn context_snapshot(
     // tool definitions + guidance on an agent-tools runtime, and the
     // retrieved passages appended to the last turn.
     let rt = &responder.runtime;
-    let builtins = rt.runs_agent_tools() && state.settings.lock().unwrap().builtin_tools;
+    let builtins = wants_builtin_tools(rt, state.settings.lock().unwrap().builtin_tools);
     let mcp = rt.runs_agent_tools() && state.combined_mcp_servers().iter().any(|s| s.enabled);
     let tools_reserve = hive_runtime::agent_tools::tools_prompt_reserve_tokens(builtins, mcp) as i64;
     let retrieval = retrieval_config(state);
@@ -5240,7 +5366,7 @@ fn context_snapshot(
     let guarded = tools_reserve > 0 && dispatch::tool_loop_context_window(rt) > 0;
     let history_budget_tokens =
         history_budget(window_tokens, system_prompt_tokens, tools_reserve, passages_reserve, guarded);
-    let cached = state.summary_cache.lock().unwrap().get(&summary_key(session_id, &responder.runtime_id)).cloned();
+    let cached = load_summary_entry(state, &summary_key(session_id, &responder.runtime_id), &session.messages);
     let hysteresis = hive_core::context_budget::plan_with_hysteresis(
         &session.messages,
         history_budget_tokens,
@@ -5714,34 +5840,46 @@ async fn windowed_context(
 
     let cache_key = summary_key(session_id, &responder.runtime_id);
     let summary = if plan.overflow.is_empty() {
-        state.summary_cache.lock().unwrap().remove(&cache_key);
+        // Nothing to summarize: forget any state (in memory and on disk).
+        if load_summary_entry(state, &cache_key, &session.messages).is_some() {
+            apply_summary_update(state, &cache_key, SummaryCacheUpdate::Remove);
+        }
+        state.summary_backoff.lock().unwrap().remove(&cache_key);
         None
     } else {
         let overflow_ids: Vec<Uuid> = plan.overflow.iter().map(|m| m.id).collect();
-        let cached = state.summary_cache.lock().unwrap().get(&cache_key).cloned();
+        let cached = load_summary_entry(state, &cache_key, &session.messages);
         let summarizer = summarizer_runtime(responder);
         let instruction = summarize_instruction(state);
         let strategy = summary_strategy(cached.as_ref().map(|c| c.covered.as_slice()), &overflow_ids);
+        // A summarizer that just failed is not asked again on every turn: in
+        // backoff the turn takes the failure fallback below without a call.
+        let calls = matches!(strategy, "incremental" | "fresh");
+        let attempt = calls
+            && summary_attempt_allowed(&mut state.summary_backoff.lock().unwrap(), &cache_key, std::time::Instant::now());
+        if calls && !attempt {
+            tracing::info!(target: "compaction", session = %session_id, strategy, "summarizer backing off; using the fallback this turn");
+        }
         let produced = match (strategy, &cached) {
+            _ if !attempt => None,
             ("incremental", Some(c)) => {
                 let delta = &plan.overflow[c.covered.len()..];
                 summarize(state, summarizer, &instruction, Some(&c.summary), delta).await
             }
-            ("cached", _) => None,
             _ => summarize(state, summarizer, &instruction, None, &plan.overflow).await,
         };
-        let (summary, update) =
-            settle_summary(cached.as_ref(), strategy, snapshot.boundary, overflow_ids, produced);
-        let mut cache = state.summary_cache.lock().unwrap();
-        match update {
-            SummaryCacheUpdate::Keep => {}
-            SummaryCacheUpdate::Remove => {
-                cache.remove(&cache_key);
-            }
-            SummaryCacheUpdate::Replace(entry) => {
-                cache.insert(cache_key, entry);
-            }
+        if attempt {
+            record_summary_attempt(
+                &mut state.summary_backoff.lock().unwrap(),
+                &cache_key,
+                produced.is_some(),
+                std::time::Instant::now(),
+            );
         }
+        let fingerprint = hive_core::context_budget::messages_fingerprint(&plan.overflow);
+        let (summary, update) =
+            settle_summary(cached.as_ref(), strategy, snapshot.boundary, overflow_ids, fingerprint, produced);
+        apply_summary_update(state, &cache_key, update);
         Some(summary)
     };
 
@@ -6324,9 +6462,12 @@ async fn compact_chat(state: State<'_, AppState>, session_id: String) -> Result<
         .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id, None, None)
         .map_err(map_err)?;
     svc.complete_assistant_message(sid, workspace_id, id, body).map_err(map_err)?;
-    // In-memory overflow summary cache is now stale (messages changed), for
-    // every runtime that planned this chat.
+    // The overflow summary cache is now stale (messages changed), for every
+    // runtime that planned this chat — in memory and on disk.
+    let _ = svc.store().delete_compaction(sid, None);
+    drop(svc);
     state.summary_cache.lock().unwrap().retain(|(session, _), _| *session != sid);
+    state.summary_backoff.lock().unwrap().retain(|(session, _), _| *session != sid);
     Ok(())
 }
 
@@ -6546,18 +6687,41 @@ async fn mcp_tool_set(state: &State<'_, AppState>) -> Option<(Vec<Value>, McpToo
 /// Whether an HTTP model turn gets Hive's built-in file tools: the runtime
 /// opted into tools ("Supports tools") on a wire that may front a local
 /// server (native Ollama, Custom, HiveDaemon — never a hosted API) and the
-/// app setting is on.
+/// app setting is on. The tools send file contents to the endpoint, so they
+/// are offered only when its host is on this machine or a private network
+/// (loopback, RFC 1918, Tailscale, link-local, `*.local`, `*.ts.net` — see
+/// [`hive_core::endpoint::endpoint_is_private`]) unless the runtime's "Allow
+/// workspace file tools for this endpoint" setting is on.
 fn wants_builtin_tools(rt: &ResolvedRuntime, setting_on: bool) -> bool {
-    setting_on && rt.runs_agent_tools()
+    setting_on
+        && rt.runs_agent_tools()
+        && (rt.allow_remote_file_tools || hive_core::endpoint::endpoint_is_private(&effective_endpoint(rt)))
 }
 
-/// Whether a turn runs in its own per-turn worktree (cut from the chat's
-/// `hive/chat/<id>` branch) whose diff comes back as a review-gated proposal:
-/// file-mutating subprocess agents, and HTTP turns carrying the built-in file
-/// tools — so a local model's edits land in review, never straight in the
-/// tree. Only in a repo.
-fn isolates_turn(git_subprocess: bool, write_capable: bool, builtin_tools: bool, in_repo: bool) -> bool {
-    in_repo && ((git_subprocess && write_capable) || builtin_tools)
+/// The endpoint a runtime actually talks to: native Ollama with no endpoint
+/// set uses its local default.
+fn effective_endpoint(rt: &ResolvedRuntime) -> String {
+    if rt.endpoint.trim().is_empty() && rt.provider == ModelProviderKind::Ollama {
+        "http://localhost:11434".into()
+    } else {
+        rt.endpoint.clone()
+    }
+}
+
+/// Whether a turn runs in its own per-turn worktree, cut up front from the
+/// chat's `hive/chat/<id>` branch, whose diff comes back as a review-gated
+/// proposal: file-mutating subprocess agents, in a repo. HTTP turns with the
+/// built-in file tools isolate too, but lazily ([`isolates_on_write`]).
+fn isolates_turn(git_subprocess: bool, write_capable: bool, in_repo: bool) -> bool {
+    in_repo && git_subprocess && write_capable
+}
+
+/// Whether a turn cuts its worktree on its first write instead: an HTTP turn
+/// carrying the built-in file tools, in a repo — so a local model's edits
+/// land in review, never straight in the tree, and a turn that only reads
+/// creates no worktree at all.
+fn isolates_on_write(builtin_tools: bool, in_repo: bool) -> bool {
+    in_repo && builtin_tools
 }
 
 /// Attempt the MCP tool loop. Returns `Ok(Some(text))` if it ran, `Ok(None)` if
@@ -6882,36 +7046,16 @@ async fn run_prepared_turn(
         ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes => true,
         _ => false,
     };
-    let worktree = if isolates_turn(
-        git_subprocess,
-        write_capable,
-        builtin_wanted,
-        !workspace_root.trim().is_empty()
-            && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root)),
-    ) {
-        let root = std::path::Path::new(&workspace_root);
-        let chat_id = session_id.to_string();
+    let in_repo = !workspace_root.trim().is_empty()
+        && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root));
+    let worktree = if isolates_turn(git_subprocess, write_capable, in_repo) {
         // Phase 2a: cut the ephemeral turn worktree from the chat's persistent
-        // base branch `hive/chat/<sessionid>` (so the captured diff is vs the
-        // chat branch, and applying advances only that chat) — not global HEAD.
-        // Ensure the chat's base worktree exists first. If that fails (e.g. a
-        // repo with no HEAD), fall back to cutting from HEAD as before; if THAT
-        // also fails, fall back to running in place.
-        let cut = match hive_runtime::git_worktree::chat_worktree(root, &chat_id) {
-            Ok(_) => hive_runtime::git_worktree::Worktree::create_from(
-                root,
-                &chat_id,
-                &format!("hive/chat/{chat_id}"),
-            ),
-            Err(e) => {
-                tracing::warn!(
-                    target: "worktree",
-                    "chat base worktree unavailable, cutting turn from HEAD: {e}"
-                );
-                hive_runtime::git_worktree::Worktree::create(root, &chat_id)
-            }
-        };
-        match cut {
+        // base branch `hive/chat/<sessionid>` (falling back to HEAD); if that
+        // also fails, run in place.
+        match hive_runtime::git_worktree::cut_turn_worktree(
+            std::path::Path::new(&workspace_root),
+            &session_id.to_string(),
+        ) {
             Ok(wt) => Some(wt),
             Err(e) => {
                 tracing::warn!(target: "worktree", "isolation unavailable, running in place: {e}");
@@ -6921,6 +7065,16 @@ async fn run_prepared_turn(
     } else {
         None
     };
+    // An HTTP turn with the built-in file tools isolates lazily: it reads the
+    // chat's dir, and its worktree is cut on the first write or command (see
+    // `LazyTurnWorktree`), so plain Q&A never creates one. Its diff is
+    // captured below exactly like an eagerly isolated turn's.
+    let lazy_worktree = isolates_on_write(builtin_wanted, in_repo).then(|| {
+        std::sync::Arc::new(hive_runtime::git_worktree::LazyTurnWorktree::new(
+            &workspace_root,
+            session_id.to_string(),
+        ))
+    });
     // P2-5: a non-subprocess (API) turn with MCP tools enabled writes to the
     // workspace root directly through its filesystem MCP server — it gets NO
     // worktree isolation and NO review-gated diff (that path covers only subprocess
@@ -6931,6 +7085,7 @@ async fn run_prepared_turn(
     // today), tracked as the remaining P2-5 work. Post-hoc diff capture can't gate:
     // an in-place turn's edits are already applied.
     if worktree.is_none()
+        && lazy_worktree.is_none()
         && !matches!(
             responder.runtime.provider,
             ModelProviderKind::ClaudeCode
@@ -6956,17 +7111,22 @@ async fn run_prepared_turn(
     // fails the spawn (chdir to "" → ENOENT). When no workspace folder is set,
     // run the agent in the app's own cwd (None) instead.
     let working_dir = (!effective_root.trim().is_empty()).then_some(effective_root.as_str());
-    // Built-in file tools, confined to the turn's dir. In an isolated worktree
-    // they may edit (the diff is captured below as a proposal); in place only
-    // if the user allowed it. `run_command` needs its own opt-in on top.
+    // Built-in file tools, confined to the turn's dir. In a repo their edits
+    // land in the lazily cut worktree (captured below as a proposal); outside
+    // one, in place only if the user allowed it. `run_command` needs its own
+    // opt-in on top.
     let builtin = if builtin_wanted && working_dir.is_some() {
         let policy = hive_runtime::agent_tools::builtin_policy(
             &effective_root,
-            worktree.is_some(),
+            lazy_worktree.is_some(),
             builtin_write_in_place,
             builtin_run_command,
         );
-        match hive_runtime::BuiltinTools::new(policy) {
+        let made = match &lazy_worktree {
+            Some(lazy) => hive_runtime::BuiltinTools::lazy(policy, lazy.clone(), builtin_write_in_place),
+            None => hive_runtime::BuiltinTools::new(policy),
+        };
+        match made {
             Ok(b) => Some(b),
             Err(e) => {
                 tracing::warn!(target: "dispatch", dir = %effective_root, "built-in tools unavailable: {e}");
@@ -6994,6 +7154,7 @@ async fn run_prepared_turn(
         endpoint = %responder.runtime.endpoint,
         dir = %effective_root,
         isolated = worktree.is_some(),
+        isolates_on_write = lazy_worktree.is_some(),
         tools = http_tools.as_ref().map_or(0, |t| t.defs().len()),
         "dispatching turn"
     );
@@ -7113,6 +7274,9 @@ async fn run_prepared_turn(
             ))),
         },
     };
+    // The worktree a lazily isolating turn cut on its first write, if it
+    // wrote at all; from here on it is handled like an eager one.
+    let worktree = worktree.or_else(|| lazy_worktree.as_ref().and_then(|l| l.finish()));
 
     match result {
         Ok(full) => {
@@ -8551,6 +8715,7 @@ async fn probe_provider(
         think: None,
         tools: false,
         max_tool_rounds: None,
+        allow_remote_file_tools: false,
     };
     let workspace_root = {
         let r = state.workspace_root.lock().unwrap().clone();
@@ -8618,6 +8783,7 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
                 keep_alive: None,
                 think: None,
                 max_tool_rounds: None,
+                allow_remote_file_tools: None,
             },
         );
     }
@@ -8644,6 +8810,7 @@ fn list_runtimes(state: State<AppState>) -> Result<Vec<RuntimeSummaryDto>, Strin
             keep_alive: None,
             think: None,
             max_tool_rounds: None,
+            allow_remote_file_tools: None,
         });
     }
 
@@ -8676,6 +8843,14 @@ fn set_default_runtime(state: State<AppState>, runtime_id: String) -> Result<(),
     Ok(())
 }
 
+/// Whether an endpoint's host is local or private (loopback, RFC 1918,
+/// Tailscale, link-local, `*.local`, `*.ts.net`): the runtime form shows the
+/// "Allow workspace file tools for this endpoint" warning when it isn't.
+#[tauri::command]
+fn endpoint_is_private(endpoint: String) -> bool {
+    hive_core::endpoint::endpoint_is_private(&endpoint)
+}
+
 #[tauri::command]
 fn add_runtime(
     state: State<AppState>,
@@ -8693,6 +8868,7 @@ fn add_runtime(
     keep_alive: Option<String>,
     think: Option<bool>,
     max_tool_rounds: Option<u32>,
+    allow_remote_file_tools: Option<bool>,
 ) -> Result<(), String> {
     let provider_kind = parse_provider_kind(&provider)?;
     let model_base_url = model_base_url
@@ -8733,6 +8909,8 @@ fn add_runtime(
         think,
         // HTTP runtimes' tool-loop round budget; 0/None = Hive's default.
         max_tool_rounds: max_tool_rounds.filter(|n| *n > 0),
+        // Built-in file tools against a non-local endpoint (explicit opt-in).
+        allow_remote_file_tools: allow_remote_file_tools.unwrap_or(false),
         estimated_performance_score: 0.0,
         estimated_cost_per_1m_input_tokens_usd: 0.0,
         capabilities: hive_core::RuntimeCapabilities {
@@ -9511,6 +9689,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         active_workspace: Mutex::new(local_workspace_id),
         workspace_root: Mutex::new(workspace_root),
         summary_cache: Mutex::new(HashMap::new()),
+        summary_backoff: Mutex::new(HashMap::new()),
         vault_cache: Mutex::new(HashMap::new()),
         retriever: hive_runtime::retrieval::Retriever::new(),
         base_mcp: Mutex::new(base_mcp),
@@ -12321,6 +12500,9 @@ fn import_config(state: State<AppState>, toml_text: String) -> Result<String, St
             None,
             None,
             None,
+            // Never from a shared config: sending files to a non-local endpoint
+            // is this device's user's call.
+            None,
         ) {
             Ok(()) => runtimes += 1,
             Err(e) => warnings.push(format!("runtime {}: {e}", r.id)),
@@ -12999,6 +13181,7 @@ pub fn run() {
             ollama_cancel_pull,
             ollama_delete_model,
             add_runtime,
+            endpoint_is_private,
             remove_runtime,
             set_chat_runtime,
             set_workspace_root,
@@ -13770,27 +13953,111 @@ mod compaction_tests {
     fn a_failed_summary_is_not_cached_and_is_retried() {
         use super::{settle_summary, SummaryCacheEntry, SummaryCacheUpdate};
         let (a, b, c, d) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let old = SummaryCacheEntry { boundary: Some(c), covered: vec![a, b], summary: "old".into() };
+        let old = SummaryCacheEntry { boundary: Some(c), covered: vec![a, b], fingerprint: "fp".into(), summary: "old".into() };
 
         // Fresh failure: placeholder for this turn only; nothing cached, so
         // the next turn plans the same overflow as "fresh" and asks again.
-        let (s, u) = settle_summary(None, "fresh", Some(c), vec![a, b], None);
+        let (s, u) = settle_summary(None, "fresh", Some(c), vec![a, b], "fp".into(), None);
         assert_eq!(s, "[Earlier 2 messages omitted.]");
         assert_eq!(u, SummaryCacheUpdate::Remove);
         assert_eq!(super::summary_strategy(None, &[a, b]), "fresh");
 
         // Incremental failure: the old summary serves this turn and the old
         // entry stays — the delta is folded in on the next turn, not lost.
-        let (s, u) = settle_summary(Some(&old), "incremental", Some(d), vec![a, b, c], None);
+        let (s, u) = settle_summary(Some(&old), "incremental", Some(d), vec![a, b, c], "fp".into(), None);
         assert_eq!((s.as_str(), u), ("old", SummaryCacheUpdate::Keep));
         assert_eq!(super::summary_strategy(Some(&old.covered), &[a, b, c]), "incremental");
 
         // Success replaces; a cache hit keeps.
-        let (s, u) = settle_summary(Some(&old), "incremental", Some(d), vec![a, b, c], Some("new".into()));
+        let (s, u) = settle_summary(Some(&old), "incremental", Some(d), vec![a, b, c], "fp".into(), Some("new".into()));
         assert_eq!(s, "new");
-        assert_eq!(u, SummaryCacheUpdate::Replace(SummaryCacheEntry { boundary: Some(d), covered: vec![a, b, c], summary: "new".into() }));
-        let (s, u) = settle_summary(Some(&old), "cached", Some(c), vec![a, b], None);
+        assert_eq!(u, SummaryCacheUpdate::Replace(SummaryCacheEntry { boundary: Some(d), covered: vec![a, b, c], fingerprint: "fp".into(), summary: "new".into() }));
+        let (s, u) = settle_summary(Some(&old), "cached", Some(c), vec![a, b], "fp".into(), None);
         assert_eq!((s.as_str(), u), ("old", SummaryCacheUpdate::Keep));
+    }
+
+    /// A failing summarizer is not re-run on every turn: after a failure the
+    /// next turns take the fallback without a call, then it is tried again;
+    /// success clears the backoff. Keys are independent.
+    #[test]
+    fn a_failing_summarizer_backs_off_instead_of_retrying_every_turn() {
+        use super::{record_summary_attempt, summary_attempt_allowed, summary_key};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let key = summary_key(Uuid::new_v4(), "gateway");
+        let other = summary_key(Uuid::new_v4(), "gateway");
+        let mut backoff = HashMap::new();
+        // A run of quick turns against a summarizer that always fails.
+        let mut calls = 0;
+        for turn in 0..20u64 {
+            let now = t0 + Duration::from_secs(turn);
+            if summary_attempt_allowed(&mut backoff, &key, now) {
+                calls += 1;
+                record_summary_attempt(&mut backoff, &key, false, now);
+            }
+        }
+        // Attempts at turns 0, 3, 8 and 17 (skipping 2, 4, then 8 turns).
+        assert_eq!(calls, 4, "not 20 slow summary calls");
+        assert!(summary_attempt_allowed(&mut backoff, &other, t0), "other chats are unaffected");
+
+        // Time also ends a backoff: a slow chat retries once the delay passed.
+        let mut slow = HashMap::new();
+        record_summary_attempt(&mut slow, &key, false, t0);
+        assert!(!summary_attempt_allowed(&mut slow, &key, t0 + Duration::from_secs(30)));
+        assert!(summary_attempt_allowed(&mut slow, &key, t0 + Duration::from_secs(150)));
+        // Success clears it.
+        record_summary_attempt(&mut slow, &key, true, t0 + Duration::from_secs(150));
+        assert!(slow.is_empty());
+        assert!(summary_attempt_allowed(&mut slow, &key, t0 + Duration::from_secs(151)));
+    }
+
+    /// Compaction state saved on this device survives a restart (a fresh
+    /// store over the same file) and is reused only while the messages it
+    /// covers are unchanged.
+    #[test]
+    fn saved_compaction_state_is_reused_after_restart_until_its_messages_change() {
+        use super::SummaryCacheEntry;
+        use hive_core::context_budget::messages_fingerprint;
+        let dir = std::env::temp_dir().join(format!("hive-compaction-restart-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("hive.db");
+        let history: Vec<ChatMessage> =
+            (0..6).map(|i| ChatMessage::new(MessageRole::User, "u", &format!("message {i}"))).collect();
+        let session = Uuid::new_v4();
+        let entry = SummaryCacheEntry {
+            boundary: Some(history[4].id),
+            covered: ids(&history[..4]),
+            fingerprint: messages_fingerprint(&history[..4]),
+            summary: "Summary of 0-3.".into(),
+        };
+        assert!(entry.matches(&history));
+        {
+            let store = hive_runtime::EventStore::open(&db).unwrap();
+            store.save_compaction(session, "gateway", &entry.to_stored()).unwrap();
+        }
+        // "Restart": a new store over the same file.
+        let store = hive_runtime::EventStore::open(&db).unwrap();
+        let loaded = SummaryCacheEntry::from_stored(store.compaction(session, "gateway").unwrap().unwrap());
+        assert_eq!(loaded, entry);
+        assert!(loaded.matches(&history), "same transcript: reuse, no re-summary");
+        // New messages after the boundary don't invalidate it.
+        let mut longer = history.clone();
+        longer.push(ChatMessage::new(MessageRole::Assistant, "Hive", "more"));
+        assert!(loaded.matches(&longer));
+        // An edited, removed or inserted covered message does.
+        let mut edited = history.clone();
+        edited[1].body = "message 1, edited".into();
+        assert!(!loaded.matches(&edited));
+        let mut removed = history.clone();
+        removed.remove(2);
+        assert!(!loaded.matches(&removed));
+        let mut inserted = history.clone();
+        inserted.insert(0, ChatMessage::new(MessageRole::User, "u", "late sync"));
+        assert!(!loaded.matches(&inserted));
+        assert!(!loaded.matches(&history[..3]), "transcript shorter than what it covers (/compact)");
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -13910,7 +14177,7 @@ mod compaction_tests {
                 if overflow.is_empty() {
                     cache.remove(key);
                 } else {
-                    cache.insert(key.clone(), SummaryCacheEntry { boundary: p.boundary, covered: overflow, summary: String::new() });
+                    cache.insert(key.clone(), SummaryCacheEntry { boundary: p.boundary, covered: overflow, fingerprint: String::new(), summary: String::new() });
                 }
             }
         }
@@ -14360,6 +14627,7 @@ mod utility_runtime_tests {
             think: Some(true),
             tools: true,
             max_tool_rounds: None,
+            allow_remote_file_tools: false,
         }
     }
 
@@ -14430,7 +14698,7 @@ mod utility_runtime_tests {
 
 #[cfg(test)]
 mod agentic_turn_tests {
-    use super::{isolates_turn, wants_builtin_tools, AgentToolSettings, LiveSettings};
+    use super::{isolates_on_write, isolates_turn, wants_builtin_tools, AgentToolSettings, LiveSettings};
     use hive_core::ModelProviderKind;
     use hive_runtime::provider::dispatch::ResolvedRuntime;
 
@@ -14448,6 +14716,7 @@ mod agentic_turn_tests {
             think: None,
             tools,
             max_tool_rounds: None,
+            allow_remote_file_tools: false,
         }
     }
 
@@ -14464,19 +14733,46 @@ mod agentic_turn_tests {
         // to send workspace files to a third-party cloud.
         for p in [ModelProviderKind::OpenAI, ModelProviderKind::OpenRouter, ModelProviderKind::Azure] {
             assert!(!wants_builtin_tools(&rt(p, true), true), "{p:?}");
+            let mut opted = rt(p, true);
+            opted.allow_remote_file_tools = true;
+            assert!(!wants_builtin_tools(&opted, true), "the per-endpoint opt-in never widens a hosted API: {p:?}");
         }
     }
 
     #[test]
-    fn http_turns_with_builtins_are_isolated_in_a_repo_only() {
-        // HTTP turn with built-ins: isolated in a repo, in place otherwise.
-        assert!(isolates_turn(false, false, true, true));
-        assert!(!isolates_turn(false, false, true, false));
-        // Existing behaviour: write-capable subprocess agents isolate…
-        assert!(isolates_turn(true, true, false, true));
-        // …read-only ones and plain HTTP chat don't.
-        assert!(!isolates_turn(true, false, false, true));
-        assert!(!isolates_turn(false, false, false, true));
+    fn builtin_tools_need_a_local_endpoint_or_the_runtime_opt_in() {
+        let at = |endpoint: &str, allow: bool| {
+            let mut r = rt(ModelProviderKind::Custom, true);
+            r.endpoint = endpoint.into();
+            r.allow_remote_file_tools = allow;
+            wants_builtin_tools(&r, true)
+        };
+        assert!(at("http://100.100.10.20:8080/v1/chat/completions", false), "Tailscale");
+        assert!(at("http://localhost:8080/v1/chat/completions", false));
+        assert!(at("http://gateway.tail1234.ts.net/v1/chat/completions", false));
+        assert!(!at("https://llm.example.com/v1/chat/completions", false), "public host, no opt-in");
+        assert!(at("https://llm.example.com/v1/chat/completions", true), "public host, opted in");
+        // Native Ollama with no endpoint set talks to localhost.
+        let mut o = rt(ModelProviderKind::Ollama, true);
+        o.endpoint = String::new();
+        assert!(wants_builtin_tools(&o, true));
+        let mut d = rt(ModelProviderKind::HiveDaemon, true);
+        d.endpoint = "https://daemon.example.com".into();
+        assert!(!wants_builtin_tools(&d, true));
+    }
+
+    #[test]
+    fn subprocess_turns_isolate_up_front_and_builtin_turns_on_first_write() {
+        // Write-capable subprocess agents get their worktree before the turn…
+        assert!(isolates_turn(true, true, true));
+        // …read-only ones, HTTP turns and anything outside a repo don't.
+        assert!(!isolates_turn(true, false, true));
+        assert!(!isolates_turn(false, false, true));
+        assert!(!isolates_turn(true, true, false));
+        // HTTP turns with built-ins isolate lazily, in a repo only.
+        assert!(isolates_on_write(true, true));
+        assert!(!isolates_on_write(true, false));
+        assert!(!isolates_on_write(false, true));
     }
 
     #[test]
