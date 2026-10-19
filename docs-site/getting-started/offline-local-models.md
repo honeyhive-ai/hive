@@ -67,6 +67,19 @@ llama-server -m gpt-oss-20b.gguf --jinja \
 `--ctx-size` is shared by all slots, so 131072 / 4 = 32k per slot.
 `--jinja` uses the model's own chat template, which tool calling needs.
 
+!!! warning "Route by prefix when one model runs on several workers"
+    Hive keeps each chat's prompt byte-stable from turn to turn, so a
+    turn can reuse the server's cache of the turn before it. In our
+    measurements, the second turn of a chat sent straight to one
+    `llama-server` reused 97–98% of its prompt from cache. This held
+    with plain chat, with tools offered, and after compaction. The same
+    turns sent through a gateway that routes by load reused nothing.
+    When two workers are equally idle, a load-based policy alternates
+    between them, so each turn lands on the worker that does not hold
+    the previous turn's prefix. If the same model runs on more than one
+    worker, use a cache-aware (prefix) routing policy, or give each
+    worker its own model name.
+
 ### Adding it in Hive
 
 **Settings → Models → Add runtime → Preset… → Local gateway (llama.cpp,

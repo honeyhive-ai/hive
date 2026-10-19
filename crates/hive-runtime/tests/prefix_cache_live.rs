@@ -19,6 +19,20 @@
 //! offered, as an agent turn would), and `compacted` (the history overflows
 //! the budget, so a fixed summary rides as the first turn ahead of the kept
 //! messages, as it does between compaction batches).
+//!
+//! Results on the lab (2026-10-19, gemma4:12b, turn 2's first request):
+//!
+//! ```text
+//! variant     one llama-server (:8081)          gateway (least-loaded, 2 workers)
+//! plain       cache_n 2394 / 2445  (97.9%)      cache_n 1 / 2454  (0%)
+//! tools       cache_n 2782 / 2847  (97.7%)      cache_n 1 / 2845  (0%)
+//! compacted   cache_n 1873 / 1926  (97.2%)      cache_n 1 / 1924  (0%)
+//! ```
+//!
+//! Turn 1's messages and tools were byte-identical prefixes of turn 2's in
+//! every run. Through the gateway, the idle `least-loaded` policy rotates ties
+//! across the two gemma4 workers, so turn 2 always lands on the other card;
+//! a cache-aware routing policy is needed there.
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -30,7 +44,7 @@ use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::Router;
 use hive_core::chat::{ChatMessage, MessageRole};
-use hive_core::context_budget::{plan_with_hysteresis, DEFAULT_HIGH_WATERMARK, DEFAULT_LOW_WATERMARK};
+use hive_core::context_budget::{plan_with_hysteresis, token_estimator, DEFAULT_HIGH_WATERMARK, DEFAULT_LOW_WATERMARK};
 use hive_core::{ActorIdentity, ActorKind, ChatSession, ModelProviderKind, WorkspaceMember, WorkspaceRole};
 use hive_runtime::agent_tools::{builtin_policy, CompositeTools, MAX_OFFERED_TOOLS};
 use hive_runtime::chat_service::turns_with_summary;
@@ -174,6 +188,8 @@ fn history() -> Vec<ChatMessage> {
 
 struct TurnResult {
     first: Exchange,
+    boundary: Option<Uuid>,
+    moved: bool,
     requests: usize,
     reply: String,
     secs: f64,
@@ -184,11 +200,12 @@ async fn run_turn(
     system: &str,
     history: &[ChatMessage],
     budget: i64,
+    prior_boundary: Option<Uuid>,
     summary: Option<&str>,
     tools: Option<&CompositeTools<NoTools>>,
     seen: &Arc<Mutex<Vec<Exchange>>>,
 ) -> TurnResult {
-    let hp = plan_with_hysteresis(history, budget, None, DEFAULT_HIGH_WATERMARK, DEFAULT_LOW_WATERMARK);
+    let hp = plan_with_hysteresis(history, budget, prior_boundary, DEFAULT_HIGH_WATERMARK, DEFAULT_LOW_WATERMARK);
     let summary = summary.filter(|_| !hp.plan.overflow.is_empty());
     let turns = turns_with_summary(&hp.plan.kept, None, "Hive", summary);
     let before = seen.lock().unwrap().len();
@@ -208,7 +225,7 @@ async fn run_turn(
     .expect("turn completes");
     let secs = start.elapsed().as_secs_f64();
     let all = seen.lock().unwrap();
-    TurnResult { first: all[before].clone(), requests: all.len() - before, reply, secs }
+    TurnResult { first: all[before].clone(), boundary: hp.boundary, moved: hp.moved, requests: all.len() - before, reply, secs }
 }
 
 fn messages(e: &Exchange) -> Vec<Value> {
@@ -238,10 +255,6 @@ async fn second_turn_reuses_the_cached_prefix() {
             let builtin = BuiltinTools::new(builtin_policy(dir.path(), false, false, false)).unwrap();
             CompositeTools::<NoTools>::new(Some(builtin), None, MAX_OFFERED_TOOLS)
         });
-        // The compacted variant uses a budget the history overflows; the
-        // others keep the whole history. The summary is held fixed across the
-        // two turns, as the app's summary cache does between batches.
-        let budget = if variant == "compacted" { 1200 } else { 20_000 };
         let summary = "Mara and Hive discussed the gateway deploy pipeline and ROCm prefill speed. \
                        Decisions: pin llama.cpp versions; keep prompts stable for the prompt cache.";
         // A per-variant opener keeps variants from sharing a cached prefix.
@@ -249,11 +262,22 @@ async fn second_turn_reuses_the_cached_prefix() {
         hist.push(ChatMessage::new(MessageRole::Assistant, "Hive", "Noted."));
         hist.extend(history());
         hist.push(ChatMessage::new(MessageRole::User, "Mara", "In one sentence: what should we cache?"));
+        // The compacted variant gets a budget turn 1's history just overflows
+        // (so it compacts in one batch down to the low watermark) and turn 2's
+        // short exchange stays inside; the others keep the whole history. The
+        // summary is held fixed across the two turns, as the app's summary
+        // cache does between batches.
+        let budget = if variant == "compacted" {
+            (token_estimator::estimate_messages(&hist) as f64 / 0.9) as i64
+        } else {
+            20_000
+        };
 
-        let t1 = run_turn(&rt, &system, &hist, budget, Some(summary), tools.as_ref(), &seen).await;
+        let t1 = run_turn(&rt, &system, &hist, budget, None, Some(summary), tools.as_ref(), &seen).await;
         hist.push(ChatMessage::new(MessageRole::Assistant, "Hive", t1.reply.clone()));
         hist.push(ChatMessage::new(MessageRole::User, "Mara", "And in one sentence: what should we never cache?"));
-        let t2 = run_turn(&rt, &system, &hist, budget, Some(summary), tools.as_ref(), &seen).await;
+        // The app persists the boundary between turns; carry it forward.
+        let t2 = run_turn(&rt, &system, &hist, budget, t1.boundary, Some(summary), tools.as_ref(), &seen).await;
 
         // The prompt builder's half of the bargain: turn 1's request messages
         // are a byte-identical prefix of turn 2's, system prompt included.
@@ -277,6 +301,8 @@ async fn second_turn_reuses_the_cached_prefix() {
                 "turn2_reuse": reuse.map(|r| (r * 1000.0).round() / 1000.0),
                 "turn2_reuse_of_turn1_prompt": t2.first.cache_n.map(|c| ((c as f64 / t1_prompt.max(1) as f64) * 1000.0).round() / 1000.0),
                 "shared_messages": shared,
+                "compacted_on_turn1": t1.moved,
+                "boundary_moved_on_turn2": t2.moved,
                 "tools_field_identical": tools_same,
             })
         );
@@ -284,6 +310,10 @@ async fn second_turn_reuses_the_cached_prefix() {
         // repair step may merge with the new user message — stay unchanged.
         assert!(shared + 1 >= m1.len(), "{variant}: turn 2 rewrote turn 1's prompt ({shared}/{} shared)", m1.len());
         assert!(tools_same, "{variant}: the offered tools changed between turns");
+        if variant == "compacted" {
+            assert!(t1.moved, "compacted: turn 1 did not compact");
+        }
+        assert!(!t2.moved, "{variant}: the compaction boundary moved on turn 2 (the budget is too tight for this test)");
         if let Some(c) = t2.first.cache_n {
             assert!(c > 0, "{variant}: the server reused nothing from turn 1");
         }
