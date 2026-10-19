@@ -330,9 +330,11 @@ fn assistant_message(text: &str, calls: &[PreparedCall<'_>]) -> Value {
 }
 
 /// Whether a non-2xx body is the server refusing the `tools` field (as
-/// opposed to any other bad request).
+/// opposed to any other bad request). OpenRouter answers a tools request for
+/// a model with no tool-capable endpoint with a 404 ("No endpoints found that
+/// support tool use").
 fn rejects_tools(status: u16, body: &str) -> bool {
-    (status == 400 || status == 422) && body.to_lowercase().contains("tool")
+    matches!(status, 400 | 404 | 422) && body.to_lowercase().contains("tool")
 }
 
 /// Whether a non-2xx body is the server refusing one of the extra fields
@@ -1217,11 +1219,14 @@ mod tool_parts {
     }
 
     #[test]
-    fn rejects_tools_only_on_400_or_422_naming_tools() {
+    fn rejects_tools_only_on_400_404_or_422_naming_tools() {
         assert!(rejects_tools(400, r#"{"error":{"message":"tools param requires --jinja flag"}}"#));
         assert!(rejects_tools(422, "Tool calling is not supported for this model"));
         assert!(!rejects_tools(400, "model not found"));
         assert!(!rejects_tools(500, "tool crashed"));
+        // OpenRouter: a model with no tool-capable endpoint.
+        assert!(rejects_tools(404, r#"{"error":{"message":"No endpoints found that support tool use."}}"#));
+        assert!(!rejects_tools(404, "model not found"));
     }
 
     #[test]

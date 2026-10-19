@@ -6407,10 +6407,11 @@ async fn mcp_tool_set(state: &State<'_, AppState>) -> Option<(Vec<Value>, McpToo
 }
 
 /// Whether an HTTP model turn gets Hive's built-in file tools: the runtime
-/// opted into tools ("Supports tools") on an HTTP wire (native Ollama or
-/// OpenAI-compatible) and the app setting is on.
+/// opted into tools ("Supports tools") on a wire that may front a local
+/// server (native Ollama, Custom, HiveDaemon — never a hosted API) and the
+/// app setting is on.
 fn wants_builtin_tools(rt: &ResolvedRuntime, setting_on: bool) -> bool {
-    setting_on && rt.tools && rt.is_openai_wire()
+    setting_on && rt.runs_agent_tools()
 }
 
 /// Whether a turn runs in its own per-turn worktree (cut from the chat's
@@ -6674,13 +6675,15 @@ async fn run_prepared_turn(
         }
     }
 
-    // Any HTTP model runtime that opted in ("Supports tools") — native Ollama
-    // or the OpenAI wire (OpenAI, OpenRouter, Azure, a local llama.cpp
-    // gateway, …) — gets the same MCP tools on the streaming path, plus Hive's
-    // built-in file tools (rooted at the turn's dir, below). Native Ollama is
-    // further gated on its capability probe in the dispatcher; an OpenAI-wire
-    // server that rejects tools falls back to plain chat there.
-    let mcp_tools = if responder.runtime.tools && responder.runtime.is_openai_wire() {
+    // Any HTTP model runtime that may front a local server and opted in
+    // ("Supports tools") — native Ollama, or a Custom/HiveDaemon endpoint
+    // such as a llama.cpp gateway — gets the same MCP tools on the streaming
+    // path, plus Hive's built-in file tools (rooted at the turn's dir, below).
+    // Hosted APIs (OpenAI, OpenRouter, Azure) stay plain chat, as before this
+    // loop existed. Native Ollama is further gated on its capability probe in
+    // the dispatcher; an OpenAI-wire server that rejects tools falls back to
+    // plain chat there.
+    let mcp_tools = if responder.runtime.runs_agent_tools() {
         mcp_tool_set(state).await
     } else {
         None
@@ -14166,6 +14169,12 @@ mod agentic_turn_tests {
         assert!(!wants_builtin_tools(&rt(ModelProviderKind::Custom, true), false), "app setting off");
         assert!(!wants_builtin_tools(&rt(ModelProviderKind::Anthropic, true), true), "Anthropic has its own loop");
         assert!(!wants_builtin_tools(&rt(ModelProviderKind::ClaudeCode, true), true), "CLI agents bring their own tools");
+        assert!(wants_builtin_tools(&rt(ModelProviderKind::HiveDaemon, true), true));
+        // Hosted APIs: the old-default "Supports tools" switch is not consent
+        // to send workspace files to a third-party cloud.
+        for p in [ModelProviderKind::OpenAI, ModelProviderKind::OpenRouter, ModelProviderKind::Azure] {
+            assert!(!wants_builtin_tools(&rt(p, true), true), "{p:?}");
+        }
     }
 
     #[test]

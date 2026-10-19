@@ -105,10 +105,12 @@ pub fn ollama_tools_allowed(rt: &ResolvedRuntime, caps: Option<&super::ollama::M
 }
 
 /// Whether an OpenAI-wire runtime may carry tool definitions: the runtime
-/// opted in. There is no capability probe on this wire; a server that can't
-/// take `tools` says so with a 400 and the client retries without them.
+/// opted in AND it may front a local server (see
+/// [`ResolvedRuntime::runs_agent_tools`]). There is no capability probe on
+/// this wire; a server that can't take `tools` says so with a 400 and the
+/// client retries without them.
 pub fn openai_tools_allowed(rt: &ResolvedRuntime) -> bool {
-    rt.tools && rt.is_openai_wire()
+    rt.runs_agent_tools() && rt.is_openai_wire()
 }
 
 /// Per-model request fields for an OpenAI-wire runtime, where they're safe:
@@ -208,6 +210,20 @@ impl ResolvedRuntime {
                 | ModelProviderKind::HiveDaemon
                 | ModelProviderKind::Azure
         )
+    }
+
+    /// Whether this runtime's "Supports tools" switch turns on Hive's agent
+    /// tool loop (MCP + built-in file tools): only runtimes that may front a
+    /// local or self-hosted server — Custom, HiveDaemon and Ollama. Hosted
+    /// APIs (OpenAI, OpenRouter, Azure) never get it: the switch defaulted on
+    /// for them back when it did nothing on this wire, so it is not consent to
+    /// send workspace files to a third-party cloud.
+    pub fn runs_agent_tools(&self) -> bool {
+        self.tools
+            && matches!(
+                self.provider,
+                ModelProviderKind::Custom | ModelProviderKind::HiveDaemon | ModelProviderKind::Ollama
+            )
     }
 
     /// True for runtimes executed by spawning an external CLI.
@@ -727,11 +743,20 @@ mod tests {
         assert!(!openai_tools_allowed(&rt), "off unless opted in");
         rt.tools = true;
         assert!(openai_tools_allowed(&rt));
-        for p in [ModelProviderKind::OpenAI, ModelProviderKind::OpenRouter, ModelProviderKind::Azure, ModelProviderKind::HiveDaemon] {
+        for p in [ModelProviderKind::HiveDaemon, ModelProviderKind::Ollama] {
             rt.provider = p;
             assert!(openai_tools_allowed(&rt), "{p:?}");
         }
-        for p in [ModelProviderKind::Anthropic, ModelProviderKind::ClaudeCode, ModelProviderKind::Pi] {
+        // Hosted APIs never run the agent loop, even with the (old-default)
+        // switch on: it isn't consent to upload workspace files.
+        for p in [
+            ModelProviderKind::OpenAI,
+            ModelProviderKind::OpenRouter,
+            ModelProviderKind::Azure,
+            ModelProviderKind::Anthropic,
+            ModelProviderKind::ClaudeCode,
+            ModelProviderKind::Pi,
+        ] {
             rt.provider = p;
             assert!(!openai_tools_allowed(&rt), "{p:?}");
         }
