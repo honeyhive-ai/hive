@@ -165,6 +165,12 @@ export const getContextCommands = () =>
 export const setContextCommands = (summarizePrompt: string, compactPrompt: string) =>
   invoke<void>("set_context_commands", { summarizePrompt, compactPrompt });
 
+/// The "Quick tasks model": runtime id used for chat titles (null = same as
+/// the chat's runtime).
+export const getUtilityRuntime = () => invoke<string | null>("get_utility_runtime");
+export const setUtilityRuntime = (runtimeId: string | null) =>
+  invoke<void>("set_utility_runtime", { runtimeId });
+
 export const removeRuntime = (runtimeId: string) =>
   invoke<void>("remove_runtime", { runtimeId });
 
