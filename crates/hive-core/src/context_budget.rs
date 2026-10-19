@@ -48,6 +48,17 @@ pub mod model_context_window {
         if m.contains("gemini") {
             return 1_000_000;
         }
+        // Open-weight models served locally (llama.cpp / Ollama). These can
+        // take far more, but a local server allocates a fixed per-slot window
+        // and 32k is the conservative slot size; a runtime override or the
+        // server's own `/props` report wins over this guess. Checked before
+        // the hosted-model rules so e.g. "gpt-oss" never matches a GPT entry.
+        if m.contains("gpt-oss")
+            || m.contains("lfm2")
+            || ["gemma3", "gemma-3", "gemma4", "gemma-4"].iter().any(|g| m.contains(g))
+        {
+            return 32_768;
+        }
         if m.contains("gpt-4o")
             || m.contains("gpt-4.1")
             || m.contains("o1")
@@ -148,6 +159,30 @@ mod tests {
         assert_eq!(model_context_window::tokens_for_model("gpt-4o-mini"), 128_000);
         assert_eq!(model_context_window::tokens_for_model("qwen2.5"), 32_768);
         assert_eq!(model_context_window::tokens_for_model("something-else"), 8_192);
+    }
+
+    #[test]
+    fn local_open_models_get_a_32k_slot() {
+        for id in [
+            "gemma4:12b",
+            "gemma3:27b",
+            "google/gemma-3-12b-it",
+            "gemma-4-12b-it-Q4_K_M",
+            "gpt-oss:20b",
+            "openai/gpt-oss-120b",
+            "lfm2:8b",
+            "LFM2-8B-A1B",
+            "lfm2.5:1.2b",
+        ] {
+            assert_eq!(model_context_window::tokens_for_model(id), 32_768, "{id}");
+        }
+        // Older Gemma generations and other local families keep their entries.
+        assert_eq!(model_context_window::tokens_for_model("gemma2:9b"), 8_192);
+        assert_eq!(model_context_window::tokens_for_model("llama3.1:8b"), 8_192);
+        assert_eq!(model_context_window::tokens_for_model("qwen3.6:35b-a3b"), 32_768);
+        // Hosted GPT entries are untouched.
+        assert_eq!(model_context_window::tokens_for_model("gpt-4o"), 128_000);
+        assert_eq!(model_context_window::tokens_for_model("gpt-4"), 8_192);
     }
 
     #[test]
