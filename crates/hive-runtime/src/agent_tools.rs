@@ -235,6 +235,38 @@ pub fn tool_round_budget(provider: ModelProviderKind, configured: Option<u32>) -
     }
 }
 
+/// Prompt allowance for one MCP tool definition (name, description, schema)
+/// when the real list isn't known yet.
+pub const MCP_TOOL_ALLOWANCE_TOKENS: u32 = 150;
+
+/// Prompt tokens a tool-carrying request adds on top of the conversation:
+/// the definitions (every built-in, and the MCP slots left under
+/// [`MAX_OFFERED_TOOLS`] at [`MCP_TOOL_ALLOWANCE_TOKENS`] each) plus the
+/// tool guidance lines the system prompt gains. An upper bound, so the
+/// history planner leaves room for them before the loop's context guard
+/// would strip tools from the first round.
+pub fn tools_prompt_reserve_tokens(builtins: bool, mcp: bool) -> u32 {
+    use crate::prompt::{CODING_TOOLS_LINE, COMMAND_TOOLS_LINE, EDIT_TOOLS_LINE, TOOLS_LINE, UNTRUSTED_TOOLS_LINE};
+    if !builtins && !mcp {
+        return 0;
+    }
+    let mut lines = vec![TOOLS_LINE];
+    let mut tokens = 0u32;
+    let mut builtin_count = 0usize;
+    if builtins {
+        let defs = crate::builtin_tools::all_defs();
+        builtin_count = defs.len();
+        tokens += estimate_request_tokens(&[], &defs);
+        lines.extend([CODING_TOOLS_LINE, EDIT_TOOLS_LINE, COMMAND_TOOLS_LINE]);
+    }
+    if mcp {
+        tokens += MAX_OFFERED_TOOLS.saturating_sub(builtin_count) as u32 * MCP_TOOL_ALLOWANCE_TOKENS;
+        lines.push(UNTRUSTED_TOOLS_LINE);
+    }
+    let line_chars: usize = lines.iter().map(|l| l.len() + 1).sum();
+    tokens + u32::try_from(line_chars.div_ceil(4)).unwrap_or(u32::MAX)
+}
+
 /// Rough token count of a request: ~4 characters per token over the JSON the
 /// server receives. Overestimates (escapes, keys), which is the safe side.
 pub fn estimate_request_tokens(messages: &[Value], tools: &[Value]) -> u32 {

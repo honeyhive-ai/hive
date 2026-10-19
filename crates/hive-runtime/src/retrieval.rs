@@ -69,6 +69,14 @@ impl RetrievalConfig {
         if self.top_k == 0 { DEFAULT_TOP_K } else { self.top_k }
     }
 
+    /// Prompt tokens to set aside for the passages block (`top_k` full
+    /// chunks plus their labels and the header), so the history planner
+    /// leaves room for what [`passages_section`] appends to the last turn.
+    pub fn passages_reserve_tokens(&self) -> u32 {
+        let per_passage = CHUNK_CHARS.div_ceil(4) + 24;
+        u32::try_from(64 + self.top_k() * per_passage).unwrap_or(u32::MAX)
+    }
+
     /// Never fewer candidates than passages wanted.
     fn candidates(&self) -> usize {
         let c = if self.candidates == 0 { DEFAULT_CANDIDATES } else { self.candidates };

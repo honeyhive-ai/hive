@@ -183,7 +183,7 @@ impl ToolExecutor for BuiltinTools {
     }
 }
 
-fn all_defs() -> Vec<Value> {
+pub(crate) fn all_defs() -> Vec<Value> {
     vec![
         json!({
             "name": READ_FILE,

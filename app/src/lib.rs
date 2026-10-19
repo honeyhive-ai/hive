@@ -5160,6 +5160,24 @@ fn summary_strategy(covered: Option<&[Uuid]>, overflow_ids: &[Uuid]) -> &'static
     }
 }
 
+/// Tokens of conversation history a turn may carry. The window minus the
+/// output reserve, the base system prompt, the tools and passages reserves
+/// and the summary reserve. On a tool turn the loop's context guard
+/// (`agent_tools::tools_fit_context`: request + answer reserve within
+/// CONTEXT_GUARD_FRACTION of the window) is the tighter ceiling on large
+/// windows, so the budget is planned under it — otherwise a history near
+/// the high watermark makes round 0 go out with no tools. The hysteresis
+/// headroom (history stays ≤ high × budget) absorbs JSON escaping.
+fn history_budget(window: i64, system: i64, tools_reserve: i64, passages_reserve: i64, guarded: bool) -> i64 {
+    use hive_runtime::agent_tools::{ANSWER_RESERVE_TOKENS, CONTEXT_GUARD_FRACTION};
+    let mut room = window - OUTPUT_RESERVE_TOKENS;
+    if guarded {
+        let guard = (window as f64 * CONTEXT_GUARD_FRACTION).floor() as i64 - i64::from(ANSWER_RESERVE_TOKENS);
+        room = room.min(guard);
+    }
+    (room - system - tools_reserve - passages_reserve - SUMMARY_RESERVE_TOKENS).max(1000)
+}
+
 fn context_snapshot(
     state: &AppState,
     session_id: Uuid,
@@ -5172,9 +5190,22 @@ fn context_snapshot(
     // truncated server-side.
     let window_tokens = responder.runtime.context_window() as i64;
     let system_prompt_tokens = token_estimator::estimate_text(&responder.system_base) as i64;
+    // What the request carries besides history and the base system prompt:
+    // tool definitions + guidance on an agent-tools runtime, and the
+    // retrieved passages appended to the last turn.
+    let rt = &responder.runtime;
+    let builtins = rt.runs_agent_tools() && state.settings.lock().unwrap().builtin_tools;
+    let mcp = rt.runs_agent_tools() && state.combined_mcp_servers().iter().any(|s| s.enabled);
+    let tools_reserve = hive_runtime::agent_tools::tools_prompt_reserve_tokens(builtins, mcp) as i64;
+    let retrieval = retrieval_config(state);
+    let passages_reserve = if retrieval.is_configured() && !session.vault_sources.is_empty() {
+        retrieval.passages_reserve_tokens() as i64
+    } else {
+        0
+    };
+    let guarded = tools_reserve > 0 && dispatch::tool_loop_context_window(rt) > 0;
     let history_budget_tokens =
-        (window_tokens - OUTPUT_RESERVE_TOKENS - system_prompt_tokens - SUMMARY_RESERVE_TOKENS)
-            .max(1000);
+        history_budget(window_tokens, system_prompt_tokens, tools_reserve, passages_reserve, guarded);
     let cached = state.summary_cache.lock().unwrap().get(&summary_key(session_id, &responder.runtime_id)).cloned();
     let hysteresis = hive_core::context_budget::plan_with_hysteresis(
         &session.messages,
@@ -13642,6 +13673,68 @@ mod compaction_tests {
         assert!(count("incremental") >= 2, "{strategies:?}");
         // Most compacted turns reuse the cached summary (no LLM call).
         assert!(count("cached") > 3 * count("incremental"), "{strategies:?}");
+    }
+
+    /// A code-heavy chat planned right up to the high watermark (no
+    /// compaction yet) must still carry its tools on round 0: the loop's
+    /// context guard counts the JSON the server gets (escapes included), the
+    /// tool definitions and the answer reserve.
+    #[test]
+    fn history_at_the_high_watermark_still_fits_the_tool_guard() {
+        use super::history_budget;
+        use hive_runtime::agent_tools::{builtin_policy, tools_fit_context, tools_prompt_reserve_tokens, CompositeTools};
+        use hive_runtime::provider::dispatch::NoTools;
+        use serde_json::{json, Value};
+
+        let window: i64 = 32_768;
+        let system = "s".repeat(1241 * 4);
+        let system_tokens = 1241;
+        // Real built-ins with writes and run_command, plus 7 MCP tools.
+        let root = std::env::temp_dir().join(format!("hive-guard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let builtin = hive_runtime::BuiltinTools::new(builtin_policy(&root, true, false, true)).unwrap();
+        let mut defs: Vec<Value> = CompositeTools::<NoTools>::new(Some(builtin), None, 16).defs().to_vec();
+        defs.extend((0..7).map(|i| {
+            json!({ "name": format!("rdnamcp__tool{i}"), "description": "d".repeat(300),
+                    "input_schema": { "type": "object", "properties": { "q": { "type": "string", "description": "x".repeat(150) } } } })
+        }));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Escape-heavy code: quotes and newlines grow ~17% as JSON.
+        let code = "    let x = \"a\";\n".repeat(100);
+        let fill = |budget: i64| {
+            let mut history = Vec::new();
+            loop {
+                let role = if history.len() % 2 == 0 { MessageRole::User } else { MessageRole::Assistant };
+                history.push(ChatMessage::new(role, "u", &code));
+                let p = plan_with_hysteresis(&history, budget, None, COMPACT_HIGH_WATERMARK, COMPACT_LOW_WATERMARK);
+                if !p.plan.overflow.is_empty() {
+                    history.pop();
+                    return history;
+                }
+            }
+        };
+        let request = |history: &[ChatMessage]| -> Vec<Value> {
+            std::iter::once(json!({ "role": "system", "content": system }))
+                .chain(history.iter().map(|m| json!({ "role": "user", "content": m.body })))
+                .collect()
+        };
+
+        let reserve = tools_prompt_reserve_tokens(true, true) as i64;
+        assert!(reserve as usize >= hive_runtime::agent_tools::estimate_request_tokens(&[], &defs) as usize);
+        let budget = history_budget(window, system_tokens, reserve, 0, true);
+        let history = fill(budget);
+        assert!(tools_fit_context(&request(&history), &defs, window as u32), "budget {budget}");
+
+        // The pre-fix budget (window − output − system − summary reserves)
+        // planned past the guard, so round 0 went out tool-less.
+        let old_budget = window - 4096 - system_tokens - 700;
+        assert!(!tools_fit_context(&request(&fill(old_budget)), &defs, window as u32));
+
+        // Small windows keep the output reserve as the binding limit, and the
+        // budget never drops below its floor.
+        assert_eq!(history_budget(8192, 1241, 0, 0, false), 8192 - 4096 - 1241 - 700);
+        assert_eq!(history_budget(8192, 4000, 3000, 2000, true), 1000);
     }
 
     /// A mixed chat: a small-window local agent and a big-window agent take
