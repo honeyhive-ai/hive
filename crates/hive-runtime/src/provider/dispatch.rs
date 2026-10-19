@@ -178,15 +178,20 @@ pub async fn warm_context_probe(rt: &ResolvedRuntime) {
 impl ResolvedRuntime {
     /// Effective context window: the explicit override, else what a local
     /// server reported (`/props`, cached by [`warm_context_probe`]), else the
-    /// model-name table in `hive_core::context_budget`.
+    /// model-name table in `hive_core::context_budget`. Native Ollama uses
+    /// the name table without the open-model family profiles: this value is
+    /// the `num_ctx` Ollama allocates, and the profiles' 32k (a llama.cpp
+    /// gateway slot) would quadruple an existing 8k runtime's KV cache.
     pub fn context_window(&self) -> u32 {
+        use hive_core::context_budget::model_context_window::{name_table_window, tokens_for_model};
         match self.context_window_tokens {
             Some(n) if n > 0 => n,
+            _ if self.provider == ModelProviderKind::Ollama => name_table_window(&self.model),
             _ => self
                 .probes_server_props()
                 .then(|| super::openai::cached_context_window(&self.endpoint, &self.model))
                 .flatten()
-                .unwrap_or_else(|| hive_core::context_budget::model_context_window::tokens_for_model(&self.model)),
+                .unwrap_or_else(|| tokens_for_model(&self.model)),
         }
     }
 
@@ -626,6 +631,22 @@ mod tests {
         assert_eq!(o.num_ctx, Some(rt.context_window()));
         assert_eq!(o.think, Some(false), "thinking is off by default");
         assert_eq!(o.keep_alive, None);
+    }
+
+    #[test]
+    fn native_ollama_num_ctx_keeps_the_pre_profile_window() {
+        // Existing native-Ollama runtimes with no override: num_ctx stays what
+        // it was (8k for gemma, the fallback for gpt-oss/lfm2), not the
+        // llama.cpp slot size the model profiles carry.
+        let caps = ModelCapabilities { context_length: Some(131_072), ..Default::default() };
+        for model in ["gemma3:27b", "gemma4:12b", "gpt-oss:20b", "lfm2:8b"] {
+            let rt = ResolvedRuntime { model: model.into(), ..ollama_rt() };
+            assert_eq!(ollama_chat_options(&rt, Some(&caps)).num_ctx, Some(8_192), "{model}");
+            assert_eq!(rt.context_window(), 8_192, "{model}: the planner budgets the same window");
+            // The same model behind a llama.cpp gateway gets its slot size.
+            let gw = ResolvedRuntime { provider: ModelProviderKind::Custom, endpoint: "http://10.11.12.13:9/v1/chat/completions".into(), ..rt };
+            assert_eq!(gw.context_window(), 32_768, "{model}");
+        }
     }
 
     #[test]

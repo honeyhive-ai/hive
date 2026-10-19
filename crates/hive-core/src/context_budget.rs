@@ -57,6 +57,23 @@ pub mod model_context_window {
         if let Some(profile) = crate::model_profile::profile_for(model_id) {
             return profile.context_window;
         }
+        name_table_window(model_id)
+    }
+
+    /// The model-name table alone, without the open-model family profiles —
+    /// what native Ollama runtimes size `num_ctx` from. The profiles' 32k is a
+    /// llama.cpp gateway's slot; asking Ollama for it would silently
+    /// quadruple the KV cache of an existing 8k gemma/gpt-oss runtime (spill
+    /// to CPU, or fail to load) where 8k worked before.
+    pub fn name_table_window(model_id: &str) -> u32 {
+        let m = model_id.to_lowercase();
+        if m.contains("claude") || m.contains("sonnet") || m.contains("opus") || m.contains("haiku")
+        {
+            return 200_000;
+        }
+        if m.contains("gemini") {
+            return 1_000_000;
+        }
         if m.contains("gpt-4o")
             || m.contains("gpt-4.1")
             || m.contains("o1")
@@ -283,6 +300,12 @@ mod tests {
         // Hosted GPT entries are untouched.
         assert_eq!(model_context_window::tokens_for_model("gpt-4o"), 128_000);
         assert_eq!(model_context_window::tokens_for_model("gpt-4"), 8_192);
+        // Native Ollama sizes num_ctx from the name table alone: the windows
+        // these families had before the profiles existed.
+        for (id, want) in [("gemma3:27b", 8_192), ("gemma4:12b", 8_192), ("gpt-oss:20b", model_context_window::FALLBACK), ("lfm2:8b", model_context_window::FALLBACK), ("qwen3.5", 32_768)] {
+            assert_eq!(model_context_window::name_table_window(id), want, "{id}");
+        }
+        assert_eq!(model_context_window::name_table_window("gpt-4o"), 128_000);
         // Retrieval models plan against their own (small) windows, not a slot.
         assert_eq!(model_context_window::tokens_for_model("embeddinggemma-300m"), 2_048);
         assert_eq!(model_context_window::tokens_for_model("bge-reranker-v2-m3"), 8_192);
