@@ -2,18 +2,22 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getConnectionSettings,
   updateConnectionSettings,
+  getAgentToolSettings,
+  setAgentToolSettings,
   launchHealth,
   openFileAccessSettings,
+  type AgentToolSettings,
   type ClaudePermissionMode,
 } from "@/lib/ipc";
-import { Button, Section, SelectField } from "@/components/ui";
+import { Button, Section, SelectField, Switch } from "@/components/ui";
 import { toast, errMsg } from "@/components/Toast";
 import { confirmThen } from "@/lib/confirm";
 
-/// Permissions — the one page to audit what agents may reach. Today only the
-/// Claude Code permission mode is backed by an enforcement path, so it is the
-/// only control here (D18 — no dead toggles). It writes through immediately via
-/// update_connection_settings, preserving the rest of the connection config.
+/// Permissions — the one page to audit what agents may reach: the Claude Code
+/// permission mode, and the built-in file tools offered to HTTP model runtimes
+/// (local models over Ollama / an OpenAI-compatible server). Every control is
+/// backed by an enforcement path (D18 — no dead toggles) and writes through
+/// immediately.
 export function PermissionsSection() {
   const qc = useQueryClient();
   const conn = useQuery({ queryKey: ["connection-settings"], queryFn: getConnectionSettings });
@@ -60,6 +64,39 @@ export function PermissionsSection() {
       return;
     }
     save.mutate(v);
+  };
+
+  const agentTools = useQuery({ queryKey: ["agent-tool-settings"], queryFn: getAgentToolSettings });
+  const tools: AgentToolSettings = agentTools.data ?? { enabled: true, writeInPlace: false, runCommand: false };
+  const saveTools = useMutation({
+    mutationFn: (next: AgentToolSettings) => setAgentToolSettings(next),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["agent-tool-settings"] }),
+    onError: (e) => toast.error(`Couldn't save tool settings: ${errMsg(e)}`),
+  });
+  const setTools = (patch: Partial<AgentToolSettings>) => {
+    const next = { ...tools, ...patch };
+    // Unattended shell access and unreviewed edits get the same friction as
+    // the Claude Code modes above.
+    if (patch.runCommand) {
+      confirmThen(
+        "Let local models run shell commands? A model with tools on will be able to run any " +
+          "command (builds, tests, git, network) in the turn's folder with no approval prompt. In an " +
+          "isolated chat worktree its file changes still come back for review, but a command can " +
+          "reach anything your user account can.",
+        () => saveTools.mutate(next),
+      );
+      return;
+    }
+    if (patch.writeInPlace) {
+      confirmThen(
+        "Let local models edit files in place? Where a turn can't run in an isolated worktree " +
+          "(the folder isn't a git repository), the model will change your files directly, with no " +
+          "review step.",
+        () => saveTools.mutate(next),
+      );
+      return;
+    }
+    saveTools.mutate(next);
   };
 
   const health = useQuery({ queryKey: ["launch-health"], queryFn: launchHealth });
@@ -130,7 +167,57 @@ export function PermissionsSection() {
           workspace without asking.
         </p>
       )}
-      <p className="mt-1 text-xs opacity-45">More permission controls arrive with backend support.</p>
+      <div className="mt-4 space-y-2">
+        <div className="text-sm font-medium">Local model file tools</div>
+        <p className="text-xs opacity-60">
+          Model runtimes reached over HTTP (Ollama, llama.cpp, OpenAI-compatible servers) with{" "}
+          <strong>Supports tools</strong> on get Hive's built-in tools: <code>read_file</code>,{" "}
+          <code>list_dir</code> and <code>search</code>, plus <code>edit_file</code> and{" "}
+          <code>write_file</code> when the turn runs in the chat's isolated git worktree — their
+          changes come back as a proposal in the Review pane, never straight into your folder.
+        </p>
+        <div className="flex items-center gap-2 text-sm opacity-75">
+          <Switch
+            on={tools.enabled}
+            onChange={(v) => setTools({ enabled: v })}
+            label="Built-in file tools"
+            disabled={!agentTools.data}
+          />
+          <span>Offer built-in file tools to local models</span>
+        </div>
+        <div className="flex items-center gap-2 text-sm opacity-75">
+          <Switch
+            on={tools.writeInPlace}
+            onChange={(v) => setTools({ writeInPlace: v })}
+            label="Edit files in place"
+            disabled={!agentTools.data || !tools.enabled}
+          />
+          <span>Allow edits outside an isolated worktree (folders that aren't git repositories)</span>
+        </div>
+        <div className="flex items-center gap-2 text-sm opacity-75">
+          <Switch
+            on={tools.runCommand}
+            onChange={(v) => setTools({ runCommand: v })}
+            label="Run commands"
+            disabled={!agentTools.data || !tools.enabled}
+          />
+          <span>
+            Allow <code>run_command</code> — shell commands for builds and tests (only where edits are
+            allowed)
+          </span>
+        </div>
+        {tools.enabled && tools.runCommand && (
+          <p className="text-xs" style={{ color: "var(--hive-accent-warm)" }}>
+            Local models can run any shell command in the turn's folder without asking. A command is
+            not sandboxed: it can reach the network and anything your account can.
+          </p>
+        )}
+        {tools.enabled && tools.writeInPlace && (
+          <p className="text-xs" style={{ color: "var(--hive-accent-warm)" }}>
+            Outside a git repository, local models edit your files directly with no review step.
+          </p>
+        )}
+      </div>
     </Section>
   );
 }
