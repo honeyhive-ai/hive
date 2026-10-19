@@ -89,6 +89,25 @@ Enablement is **per server** — an enabled server exposes all of its tools to
 the model. To narrow what an agent can reach, enable only the servers whose
 tools you want available (or split a broad tool set across separate servers).
 
+## Static bearer tokens
+
+Some HTTP MCP servers are protected by a fixed API token instead of OAuth.
+In **Settings → Tools**, open **Add HTTP server** and fill in **Name**,
+**URL** and **Bearer token (optional)**. For a server you already added,
+click **Set token** (or **Clear token**) on its row. Hive sends the token as
+`Authorization: Bearer <token>`.
+
+The token is a device-local secret, stored like provider API keys in this
+device's `settings.json`:
+
+- It is never written to `hive.config.toml`, `.hive/mcp-servers.json` or a
+  config export, and never synced to the relay. Set it again on each device.
+- Settings shows only **token set**; the value is never shown again.
+
+If a server has both a static token and an OAuth token from **Connect**, the
+static token wins. Clear it to go back to OAuth. Removing a server also
+removes its saved token.
+
 ## Remote MCP servers (OAuth)
 
 Beyond `stdio` and static-token `http` servers, Hive speaks the modern

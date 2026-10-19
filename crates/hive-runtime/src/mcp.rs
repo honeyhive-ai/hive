@@ -33,18 +33,75 @@ pub enum McpTransport {
 }
 
 /// A configured MCP server. `enabled` defaults to `false` — the gate.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpServerSpec {
     pub id: String,
     pub transport: McpTransport,
     #[serde(default)]
     pub enabled: bool,
-    /// Optional bearer token for an authenticated HTTP server (e.g. a remote
-    /// MCP server behind OAuth). Sent as `Authorization: Bearer`. `None` for
-    /// open/stdio servers. Populated by the OAuth flow (see task #147).
-    #[serde(default)]
+    /// Optional bearer token for an authenticated HTTP server. Sent as
+    /// `Authorization: Bearer`. `None` for open/stdio servers. Resolved when
+    /// the registry is assembled, from device-local secrets (a static token
+    /// the user saved, or an OAuth token — see [`resolve_bearer`]).
+    ///
+    /// **Never serialized**: specs are written to workspace catalogs and
+    /// portable exports, so the secret is skipped on the way out. It is still
+    /// accepted on the way in, for back-compat with hand-edited catalogs.
+    /// `Debug` redacts it too.
+    #[serde(default, skip_serializing)]
     pub auth: Option<String>,
+}
+
+impl std::fmt::Debug for McpServerSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServerSpec")
+            .field("id", &self.id)
+            .field("transport", &self.transport)
+            .field("enabled", &self.enabled)
+            .field("auth", &self.auth.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Normalize a user-entered static bearer token: trims whitespace and strips a
+/// pasted `Bearer ` prefix. `Ok(None)` = empty (clear the token). Rejects a
+/// token with inner whitespace/control characters (never a valid header value;
+/// a line break would be header injection). The error never echoes the token.
+pub fn normalize_bearer_token(raw: &str) -> Result<Option<String>, String> {
+    let mut t = raw.trim();
+    if t.len() >= 7 && t.is_char_boundary(7) && t[..7].eq_ignore_ascii_case("bearer ") {
+        t = t[7..].trim_start();
+    }
+    if t.is_empty() || t.eq_ignore_ascii_case("bearer") {
+        return Ok(None);
+    }
+    if t.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("bearer token must not contain spaces or line breaks".into());
+    }
+    Ok(Some(t.to_string()))
+}
+
+/// Pick the bearer token for one HTTP MCP server. Precedence:
+///
+/// 1. a **static token** the user saved for this server (device-local) — an
+///    explicit choice, so it wins;
+/// 2. a token already on the spec (legacy hand-edited catalog, or the
+///    headless worker's `token_env`);
+/// 3. an **OAuth** access token from the Connect flow.
+///
+/// Blank values count as unset at every level.
+pub fn resolve_bearer(
+    static_token: Option<&str>,
+    spec_auth: Option<&str>,
+    oauth_token: Option<&str>,
+) -> Option<String> {
+    [static_token, spec_auth, oauth_token]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|t| !t.is_empty())
+        .map(str::to_string)
 }
 
 /// A tool advertised by a server.
@@ -518,6 +575,55 @@ mod tests {
         // No matching id → None; id=None returns the first JSON object.
         assert!(parse_sse_jsonrpc(body, Some(99)).is_none());
         assert!(parse_sse_jsonrpc(body, None).is_some());
+    }
+
+    #[test]
+    fn auth_is_never_serialized_but_still_deserializes() {
+        let spec = McpServerSpec {
+            id: "rdna".into(),
+            transport: McpTransport::Http { url: "http://x/mcp".into() },
+            enabled: true,
+            auth: Some("s3cret-token".into()),
+        };
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("s3cret-token"), "{json}");
+        assert!(!json.contains("auth"), "{json}");
+        // Debug (logs) redacts it as well.
+        let dbg = format!("{spec:?}");
+        assert!(!dbg.contains("s3cret-token"), "{dbg}");
+        assert!(dbg.contains("<redacted>"));
+        // Back-compat: an old catalog carrying `auth` still loads.
+        let old = r#"{"id":"a","transport":{"kind":"http","url":"http://y"},"enabled":true,"auth":"t"}"#;
+        let parsed: McpServerSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.auth.as_deref(), Some("t"));
+        // And one without it loads unchanged.
+        let plain = r#"{"id":"a","transport":{"kind":"stdio","command":"x","args":[]}}"#;
+        let parsed: McpServerSpec = serde_json::from_str(plain).unwrap();
+        assert_eq!(parsed.auth, None);
+        assert!(!parsed.enabled);
+    }
+
+    #[test]
+    fn bearer_precedence_static_then_spec_then_oauth() {
+        assert_eq!(resolve_bearer(Some("st"), Some("sp"), Some("oa")).as_deref(), Some("st"));
+        assert_eq!(resolve_bearer(None, Some("sp"), Some("oa")).as_deref(), Some("sp"));
+        assert_eq!(resolve_bearer(None, None, Some("oa")).as_deref(), Some("oa"));
+        assert_eq!(resolve_bearer(Some("  "), Some(""), Some("oa")).as_deref(), Some("oa"));
+        assert_eq!(resolve_bearer(None, None, None), None);
+    }
+
+    #[test]
+    fn normalizes_user_entered_tokens() {
+        assert_eq!(normalize_bearer_token("  abc123 \n").unwrap().as_deref(), Some("abc123"));
+        assert_eq!(normalize_bearer_token("Bearer abc").unwrap().as_deref(), Some("abc"));
+        assert_eq!(normalize_bearer_token("bearer   abc").unwrap().as_deref(), Some("abc"));
+        assert_eq!(normalize_bearer_token("").unwrap(), None);
+        assert_eq!(normalize_bearer_token("Bearer ").unwrap(), None);
+        assert!(normalize_bearer_token("ébearer x").is_err());
+        assert_eq!(normalize_bearer_token("bearer").unwrap(), None);
+        let err = normalize_bearer_token("abc\r\nX-Evil: 1").unwrap_err();
+        assert!(!err.contains("abc"));
+        assert!(normalize_bearer_token("two words").is_err());
     }
 
     #[test]

@@ -1113,8 +1113,15 @@ export const summarizeChat = (sessionId: string) => invoke<void>("summarize_chat
 export const compactChat = (sessionId: string) => invoke<void>("compact_chat", { sessionId });
 
 /// Add a remote HTTP MCP server by URL (e.g. a hosted server like Linear's).
-export const addRemoteMcpServer = (id: string, url: string) =>
-  invoke<void>("add_remote_mcp_server", { id, url });
+/// `bearerToken` (optional) is a static token stored on this device only;
+/// omit it to leave any saved token alone.
+export const addRemoteMcpServer = (id: string, url: string, bearerToken?: string) =>
+  invoke<void>("add_remote_mcp_server", { id, url, bearerToken });
+/// Save (or clear, with "") a static bearer token for an HTTP MCP server. The
+/// token stays on this device and is never read back — `McpServerDto` only
+/// reports `hasBearerToken`. Resolves to whether a token is now set.
+export const setMcpBearerToken = (serverId: string, token: string) =>
+  invoke<boolean>("set_mcp_bearer_token", { serverId, token });
 /// Connect a remote MCP server via OAuth 2.1 + PKCE (opens the browser).
 export const authorizeMcpServer = (serverId: string, scope?: string) =>
   invoke<void>("authorize_mcp_server", { serverId, scope });

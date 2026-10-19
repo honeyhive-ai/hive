@@ -8,8 +8,9 @@ import {
   listMcpServers,
   removeMcpServer,
   setMcpEnabled,
+  setMcpBearerToken,
 } from "@/lib/ipc";
-import { Button, Section, Switch, fieldStyle } from "@/components/ui";
+import { Button, Field, FormDisclosure, Section, Switch, fieldStyle } from "@/components/ui";
 import { IconPlus } from "@/lib/icons";
 import { toast, errMsg } from "@/components/Toast";
 import { promptDialog } from "@/components/Dialog";
@@ -66,6 +67,43 @@ export function ToolsSection() {
     },
     onError: (e) => toast.error(`Authorization failed: ${errMsg(e)}`),
   });
+  // Add an HTTP server by URL, optionally with a static bearer token. The
+  // token is sent once, stored on this device only, and never read back.
+  const [addOpen, setAddOpen] = useState(false);
+  const [httpId, setHttpId] = useState("");
+  const [httpUrl, setHttpUrl] = useState("");
+  const [httpToken, setHttpToken] = useState("");
+  const addHttp = useMutation({
+    mutationFn: () =>
+      addRemoteMcpServer(httpId.trim(), httpUrl.trim(), httpToken.trim() || undefined),
+    onSuccess: () => {
+      const id = httpId.trim();
+      setHttpId("");
+      setHttpUrl("");
+      setHttpToken("");
+      setAddOpen(false);
+      qc.invalidateQueries({ queryKey: ["mcp"] });
+      toast.success(`${id} added — enable it to use its tools.`);
+    },
+    onError: (e) => toast.error(`Couldn't add server: ${errMsg(e)}`),
+  });
+  const setToken = useMutation({
+    mutationFn: async ({ id, clear }: { id: string; clear: boolean }) => {
+      if (clear) return setMcpBearerToken(id, "");
+      const token = await promptDialog(`Bearer token for "${id}"`, {
+        placeholder: "Stored on this device only",
+        password: true,
+      });
+      if (token === null || !token.trim()) return null; // cancelled
+      return setMcpBearerToken(id, token);
+    },
+    onSuccess: (set, { id }) => {
+      if (set === null) return;
+      qc.invalidateQueries({ queryKey: ["mcp"] });
+      toast.success(set ? `Token saved for ${id}.` : `Token removed for ${id}.`);
+    },
+    onError: (e) => toast.error(`Couldn't save token: ${errMsg(e)}`),
+  });
   const hasLinear = (servers.data ?? []).some((s) => s.id === "linear");
   return (
     <Section title="MCP servers">
@@ -90,6 +128,57 @@ export function ToolsSection() {
           Install
         </Button>
       </div>
+      <FormDisclosure label="Add HTTP server" open={addOpen} onToggle={() => setAddOpen((v) => !v)}>
+        <form
+          className="flex flex-col gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            addHttp.mutate();
+          }}
+        >
+          <Field label="Name">
+            <input
+              value={httpId}
+              onChange={(e) => setHttpId(e.target.value)}
+              placeholder="docs"
+              className="rounded-xl border px-3 py-2 text-sm"
+              style={fieldStyle}
+            />
+          </Field>
+          <Field label="URL">
+            <input
+              value={httpUrl}
+              onChange={(e) => setHttpUrl(e.target.value)}
+              placeholder="https://host:8090/mcp"
+              className="rounded-xl border px-3 py-2 font-mono text-sm"
+              style={fieldStyle}
+            />
+          </Field>
+          <Field
+            label="Bearer token (optional)"
+            hint="Kept on this device only — never synced, exported or written to hive.config.toml."
+          >
+            <input
+              type="password"
+              autoComplete="off"
+              value={httpToken}
+              onChange={(e) => setHttpToken(e.target.value)}
+              placeholder="For servers protected by a fixed token"
+              className="rounded-xl border px-3 py-2 font-mono text-sm"
+              style={fieldStyle}
+            />
+          </Field>
+          <Button
+            type="submit"
+            variant="primary"
+            size="md"
+            className="self-start"
+            disabled={addHttp.isPending || !httpId.trim() || !httpUrl.trim()}
+          >
+            Add server
+          </Button>
+        </form>
+      </FormDisclosure>
       {servers.data?.length === 0 && <p className="text-sm opacity-50">None configured.</p>}
       {(servers.data ?? []).map((s) => (
         <div
@@ -102,8 +191,30 @@ export function ToolsSection() {
             <span className="text-xs opacity-50">
               [{s.transport}] {s.detail}
             </span>
+            {s.hasBearerToken && (
+              <span className="ml-2 text-xs opacity-70" title="A static bearer token is saved on this device">
+                · token set
+              </span>
+            )}
+            {!s.hasBearerToken && s.oauthConnected && (
+              <span className="ml-2 text-xs opacity-70">· connected</span>
+            )}
           </span>
           <span className="flex items-center gap-3">
+            {s.transport === "http" && (
+              <button
+                className="text-xs underline opacity-70 hover:opacity-100 disabled:opacity-40"
+                disabled={setToken.isPending}
+                onClick={() => setToken.mutate({ id: s.id, clear: s.hasBearerToken })}
+                title={
+                  s.hasBearerToken
+                    ? "Remove the saved bearer token"
+                    : "Save a static bearer token (stored on this device only)"
+                }
+              >
+                {s.hasBearerToken ? "Clear token" : "Set token"}
+              </button>
+            )}
             {s.transport === "http" && (
               <button
                 className="text-xs underline opacity-70 hover:opacity-100 disabled:opacity-40"

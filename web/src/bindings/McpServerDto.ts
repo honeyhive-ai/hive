@@ -8,4 +8,13 @@ export type McpServerDto = { id: string,
 /**
  * "stdio" | "http"
  */
-transport: string, detail: string, enabled: boolean, isManaged: boolean, };
+transport: string, detail: string, enabled: boolean, isManaged: boolean, 
+/**
+ * A static bearer token is saved for this server on this device. The
+ * token itself never crosses to the UI — only this flag.
+ */
+hasBearerToken: boolean, 
+/**
+ * An OAuth token (Connect flow) is stored for this server on this device.
+ */
+oauthConnected: boolean, };

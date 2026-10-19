@@ -385,6 +385,13 @@ pub struct McpServerDto {
     pub detail: String,
     pub enabled: bool,
     pub is_managed: bool,
+    /// A static bearer token is saved for this server on this device. The
+    /// token itself never crosses to the UI — only this flag.
+    #[serde(default)]
+    pub has_bearer_token: bool,
+    /// An OAuth token (Connect flow) is stored for this server on this device.
+    #[serde(default)]
+    pub oauth_connected: bool,
 }
 
 /// A reference-material vault source mounted in the workspace.
