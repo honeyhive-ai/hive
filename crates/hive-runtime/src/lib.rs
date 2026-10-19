@@ -37,8 +37,8 @@ mod test_relay;
 
 pub use builtin_tools::{BuiltinTools, Policy as BuiltinToolPolicy};
 pub use chat_service::{
-    pending_mentions, resolve_workspace_credential, turns_for, turns_from, ChatService,
-    PendingMention,
+    pending_mentions, resolve_workspace_credential, turns_for, turns_from, turns_with_summary,
+    ChatService, PendingMention, SUMMARY_TURN_HEADER,
 };
 pub use context::{Compactor, CompactionResult, Summarizer};
 pub use mcp::{McpRegistry, McpServerSpec, McpTool, McpTransport};

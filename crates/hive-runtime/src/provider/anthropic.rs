@@ -50,7 +50,7 @@ pub enum ProviderError {
 }
 
 /// One conversation turn in provider wire shape.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ChatTurn {
     pub role: String,
     pub content: String,
