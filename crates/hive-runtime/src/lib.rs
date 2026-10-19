@@ -6,6 +6,7 @@
 //! Crypto/signing, providers, MCP, and transports arrive in later phases.
 
 pub mod attachment_blob;
+pub mod builtin_tools;
 pub mod chat_service;
 pub mod context;
 pub mod directives;
@@ -34,6 +35,7 @@ pub mod vault_fetcher;
 #[cfg(test)]
 mod test_relay;
 
+pub use builtin_tools::{BuiltinTools, Policy as BuiltinToolPolicy};
 pub use chat_service::{
     pending_mentions, resolve_workspace_credential, turns_for, turns_from, ChatService,
     PendingMention,
