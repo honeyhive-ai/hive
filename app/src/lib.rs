@@ -108,6 +108,9 @@ struct AppState {
     /// entry (older than `VAULT_CACHE_TTL`) is re-fetched instead of served for
     /// the whole app run. Within the TTL it avoids a per-message round-trip.
     vault_cache: Mutex<HashMap<String, (std::time::Instant, String)>>,
+    /// Vault retrieval (embed → rerank → top passages); holds the per-run
+    /// chunk-embedding cache. Only used when retrieval is configured.
+    retriever: hive_runtime::retrieval::Retriever,
     /// MCP servers from `hive.config.toml`; shell-managed installs live in the
     /// workspace catalog and are merged at read time.
     base_mcp: Mutex<Vec<McpServerSpec>>,
@@ -269,6 +272,23 @@ struct LiveSettings {
     /// only takes effect where edits are allowed.
     #[serde(default)]
     builtin_run_command: bool,
+    /// Vault retrieval (Settings → Models). Empty embeddings URL/model = off:
+    /// vaults are pasted into the system prompt as before.
+    #[serde(default)]
+    retrieval_embed_url: String,
+    #[serde(default)]
+    retrieval_embed_model: String,
+    /// Optional reranker; empty = rank by embedding similarity alone.
+    #[serde(default)]
+    retrieval_rerank_url: String,
+    #[serde(default)]
+    retrieval_rerank_model: String,
+    /// Passages injected per turn.
+    #[serde(default = "default_retrieval_top_k")]
+    retrieval_top_k: usize,
+    /// Nearest chunks handed to the reranker.
+    #[serde(default = "default_retrieval_candidates")]
+    retrieval_candidates: usize,
     /// Model id for the synthesized "Primary Runtime" (the default when no
     /// runtime is configured). `None` = fall back to env/DEFAULT_MODEL.
     #[serde(default)]
@@ -435,6 +455,12 @@ fn default_sync_room() -> String {
 fn default_permission_mode() -> String {
     "default".to_string()
 }
+fn default_retrieval_top_k() -> usize {
+    hive_runtime::retrieval::DEFAULT_TOP_K
+}
+fn default_retrieval_candidates() -> usize {
+    hive_runtime::retrieval::DEFAULT_CANDIDATES
+}
 
 impl Default for LiveSettings {
     fn default() -> Self {
@@ -453,6 +479,12 @@ impl Default for LiveSettings {
             builtin_tools: true,
             builtin_write_in_place: false,
             builtin_run_command: false,
+            retrieval_embed_url: String::new(),
+            retrieval_embed_model: String::new(),
+            retrieval_rerank_url: String::new(),
+            retrieval_rerank_model: String::new(),
+            retrieval_top_k: default_retrieval_top_k(),
+            retrieval_candidates: default_retrieval_candidates(),
             default_model: None,
             default_runtime_id: None,
             local_workspace_id: None,
@@ -5590,11 +5622,17 @@ async fn windowed_context(
     dispatch::warm_context_probe(&responder.runtime).await;
     let snapshot = context_snapshot(state, session_id, session, responder);
     let plan = snapshot.plan;
-    // Reference vaults ride in the system prompt (capped; cached per app run).
-    // Like the summary turn, this is added after the window plan — the caps
-    // keep the skew small and the output/summary reserves absorb it.
-    let vault_section = vault_context_section(state, session, responder.agent_id).await;
-    let system = join_system(&responder.system_base, &vault_section);
+    // Reference vaults: with retrieval configured, the few passages that
+    // answer the latest message ride at the END of the prompt (on that user
+    // turn) and the system prompt stays byte-stable; otherwise, or on any
+    // retrieval error, they are pasted into the system prompt (capped; cached
+    // per app run). Like the summary turn, this is added after the window
+    // plan — the caps keep the skew small and the output/summary reserves
+    // absorb it.
+    let retrieval = retrieval_config(state);
+    let max_sources =
+        if retrieval.is_configured() { RETRIEVAL_MAX_SOURCES } else { VAULT_MAX_SOURCES };
+    let vault_entries = fetch_vault_entries(state, session, responder.agent_id, max_sources).await;
 
     let summary = if plan.overflow.is_empty() {
         state.summary_cache.lock().unwrap().remove(&session_id);
@@ -5643,7 +5681,90 @@ async fn windowed_context(
             }
         }
     }
+    let passages = if retrieval.is_configured() {
+        retrieve_vault_passages(state, &retrieval, &vault_entries, &turns).await
+    } else {
+        None
+    };
+    let system = place_vault_context(&responder.system_base, &vault_entries, &mut turns, passages);
     (system, turns)
+}
+
+/// Vault sources fetched for retrieval (no prompt-size cap applies to them —
+/// only the top passages reach the prompt).
+const RETRIEVAL_MAX_SOURCES: usize = 16;
+/// Upper bound on a turn's retrieval (first-time indexing included); past it
+/// the turn falls back to pasting. Embeddings cached so far are kept.
+const RETRIEVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+fn retrieval_config(state: &AppState) -> hive_runtime::retrieval::RetrievalConfig {
+    let s = state.settings.lock().unwrap();
+    hive_runtime::retrieval::RetrievalConfig {
+        embed_url: s.retrieval_embed_url.clone(),
+        embed_model: s.retrieval_embed_model.clone(),
+        rerank_url: s.retrieval_rerank_url.clone(),
+        rerank_model: s.retrieval_rerank_model.clone(),
+        top_k: s.retrieval_top_k,
+        candidates: s.retrieval_candidates,
+    }
+}
+
+/// Retrieve passages for the latest user turn from the fetched vaults. `None`
+/// means "fall back to pasting" (no query, nothing fetched, error, timeout).
+async fn retrieve_vault_passages(
+    state: &State<'_, AppState>,
+    cfg: &hive_runtime::retrieval::RetrievalConfig,
+    entries: &[(String, Option<String>)],
+    turns: &[ChatTurn],
+) -> Option<Vec<hive_runtime::retrieval::Passage>> {
+    let sources: Vec<(String, String)> = entries
+        .iter()
+        .filter_map(|(label, text)| text.as_ref().map(|t| (label.clone(), t.clone())))
+        .collect();
+    if sources.is_empty() {
+        return None;
+    }
+    let query = hive_runtime::retrieval::latest_user_query(turns)?;
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(RETRIEVAL_TIMEOUT, state.retriever.retrieve(cfg, &sources, query)).await {
+        Ok(Ok(passages)) => {
+            eprintln!(
+                "retrieval: {} passages from {} vaults in {:.2}s",
+                passages.len(),
+                sources.len(),
+                started.elapsed().as_secs_f64()
+            );
+            Some(passages)
+        }
+        Ok(Err(e)) => {
+            eprintln!("retrieval failed, pasting vaults instead: {e}");
+            None
+        }
+        Err(_) => {
+            eprintln!("retrieval timed out after {RETRIEVAL_TIMEOUT:?}, pasting vaults instead");
+            None
+        }
+    }
+}
+
+/// Lay out vault context and return the system prompt (pure; unit-tested).
+/// Retrieved passages go on the latest user turn and leave the system prompt
+/// as `system_base`; with no passages (`None`) or no user turn to carry them,
+/// the capped vault paste joins the system prompt as before.
+fn place_vault_context(
+    system_base: &str,
+    entries: &[(String, Option<String>)],
+    turns: &mut [ChatTurn],
+    passages: Option<Vec<hive_runtime::retrieval::Passage>>,
+) -> String {
+    if let Some(p) = passages {
+        let section = hive_runtime::retrieval::passages_section(&p);
+        if hive_runtime::retrieval::append_to_latest_user(turns, &section) {
+            return system_base.to_string();
+        }
+    }
+    let capped = &entries[..entries.len().min(VAULT_MAX_SOURCES)];
+    join_system(system_base, &vault_section_text(capped))
 }
 
 /// The runtime that writes overflow summaries. A seam for a dedicated
@@ -5678,15 +5799,16 @@ fn vault_entry_fresh(age: std::time::Duration) -> bool {
     age < VAULT_CACHE_TTL
 }
 
-/// Build the `[Reference vaults]` system-prompt section from the session's
-/// vault sources. Content is fetched once per app run (cached by raw URL);
-/// fetch failures degrade to a labeled "unavailable" line rather than
-/// blocking the reply.
-async fn vault_context_section(
+/// Fetch the session's vault sources that apply to `responder`, at most
+/// `max_sources`, as (label, text) — `None` text when the fetch failed (shown
+/// as an "unavailable" line when pasted, so a failure never blocks the reply).
+/// Content is cached by raw URL for `VAULT_CACHE_TTL`.
+async fn fetch_vault_entries(
     state: &State<'_, AppState>,
     session: &ChatSession,
     responder: Option<Uuid>,
-) -> String {
+    max_sources: usize,
+) -> Vec<(String, Option<String>)> {
     // Filter to the vaults that apply to this responder (globals + any that
     // target its agent id), then apply the source/char caps to the remainder.
     let applicable: Vec<&MountedVault> = session
@@ -5695,25 +5817,23 @@ async fn vault_context_section(
         .filter(|v| v.applies_to(responder))
         .collect();
     if applicable.is_empty() {
-        return String::new();
+        return Vec::new();
     }
-    // The source/char caps silently drop the tail when more than VAULT_MAX_SOURCES
-    // vaults apply — log which made it in vs which were dropped so it's diagnosable.
-    if applicable.len() > VAULT_MAX_SOURCES {
-        let included: Vec<String> =
-            applicable.iter().take(VAULT_MAX_SOURCES).map(|v| v.label()).collect();
-        let dropped: Vec<String> =
-            applicable.iter().skip(VAULT_MAX_SOURCES).map(|v| v.label()).collect();
+    // The source cap silently drops the tail when more vaults apply — log
+    // which made it in vs which were dropped so it's diagnosable.
+    if applicable.len() > max_sources {
+        let included: Vec<String> = applicable.iter().take(max_sources).map(|v| v.label()).collect();
+        let dropped: Vec<String> = applicable.iter().skip(max_sources).map(|v| v.label()).collect();
         eprintln!(
             "vault: {} sources apply but only {} fit the cap — included {:?}, dropped {:?}",
             applicable.len(),
-            VAULT_MAX_SOURCES,
+            max_sources,
             included,
             dropped
         );
     }
     let mut entries: Vec<(String, Option<String>)> = Vec::new();
-    for source in applicable.into_iter().take(VAULT_MAX_SOURCES) {
+    for source in applicable.into_iter().take(max_sources) {
         let url = source.raw_url();
         // Serve the cache only while fresh; a stale entry is re-fetched so an
         // updated upstream doc takes effect without restarting the app.
@@ -5746,7 +5866,7 @@ async fn vault_context_section(
         };
         entries.push((source.label(), content));
     }
-    vault_section_text(&entries)
+    entries
 }
 
 /// Pure formatter for the vault section (unit-tested): caps each source and
@@ -5916,6 +6036,98 @@ fn set_agent_tool_settings(state: State<AppState>, settings: AgentToolSettings) 
     s.builtin_run_command = settings.run_command;
     save_settings(&state.data_dir, &s);
     Ok(())
+}
+
+/// Vault retrieval endpoints (Settings → Models → Vault retrieval).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RetrievalSettings {
+    embed_url: String,
+    embed_model: String,
+    rerank_url: String,
+    rerank_model: String,
+    top_k: usize,
+    candidates: usize,
+}
+
+#[tauri::command]
+fn get_retrieval_settings(state: State<AppState>) -> RetrievalSettings {
+    let s = state.settings.lock().unwrap();
+    RetrievalSettings {
+        embed_url: s.retrieval_embed_url.clone(),
+        embed_model: s.retrieval_embed_model.clone(),
+        rerank_url: s.retrieval_rerank_url.clone(),
+        rerank_model: s.retrieval_rerank_model.clone(),
+        top_k: s.retrieval_top_k,
+        candidates: s.retrieval_candidates,
+    }
+}
+
+/// Bounds for the per-turn passage count and reranker candidate pool.
+const RETRIEVAL_TOP_K_MAX: usize = 20;
+const RETRIEVAL_CANDIDATES_MAX: usize = 100;
+
+/// Trim and clamp user-entered retrieval settings (pure; unit-tested). A zero
+/// count means "default"; candidates never drop below top_k.
+fn normalize_retrieval_settings(r: RetrievalSettings) -> RetrievalSettings {
+    let top_k = if r.top_k == 0 { default_retrieval_top_k() } else { r.top_k.min(RETRIEVAL_TOP_K_MAX) };
+    let candidates = if r.candidates == 0 { default_retrieval_candidates() } else { r.candidates };
+    RetrievalSettings {
+        embed_url: r.embed_url.trim().to_string(),
+        embed_model: r.embed_model.trim().to_string(),
+        rerank_url: r.rerank_url.trim().to_string(),
+        rerank_model: r.rerank_model.trim().to_string(),
+        top_k,
+        candidates: candidates.clamp(top_k, RETRIEVAL_CANDIDATES_MAX),
+    }
+}
+
+#[tauri::command]
+fn set_retrieval_settings(state: State<AppState>, settings: RetrievalSettings) -> Result<(), String> {
+    let r = normalize_retrieval_settings(settings);
+    let mut s = state.settings.lock().unwrap();
+    s.retrieval_embed_url = r.embed_url;
+    s.retrieval_embed_model = r.embed_model;
+    s.retrieval_rerank_url = r.rerank_url;
+    s.retrieval_rerank_model = r.rerank_model;
+    s.retrieval_top_k = r.top_k;
+    s.retrieval_candidates = r.candidates;
+    save_settings(&state.data_dir, &s);
+    Ok(())
+}
+
+/// Try the configured retrieval endpoints on a tiny two-passage corpus, so the
+/// Settings form can say whether they work before a chat depends on them.
+#[tauri::command]
+async fn test_retrieval_settings(state: State<'_, AppState>, settings: RetrievalSettings) -> Result<String, String> {
+    let r = normalize_retrieval_settings(settings);
+    let cfg = hive_runtime::retrieval::RetrievalConfig {
+        embed_url: r.embed_url,
+        embed_model: r.embed_model,
+        rerank_url: r.rerank_url,
+        rerank_model: r.rerank_model,
+        top_k: 1,
+        candidates: 2,
+    };
+    if !cfg.is_configured() {
+        return Err("Set an embeddings URL and model first.".into());
+    }
+    let sources = vec![
+        ("a".to_string(), "The kettle boils water for tea in about three minutes.".to_string()),
+        ("b".to_string(), "Bicycle tires should be inflated to the pressure printed on the sidewall.".to_string()),
+    ];
+    let started = std::time::Instant::now();
+    let got = state
+        .retriever
+        .retrieve(&cfg, &sources, "How much air goes in a bike tire?")
+        .await
+        .map_err(|e| e.to_string())?;
+    let ms = started.elapsed().as_millis();
+    match got.first() {
+        Some(p) if p.source == "b" => Ok(format!("Working — found the right passage in {ms} ms.")),
+        Some(_) => Err(format!("Endpoints answered in {ms} ms, but ranked the wrong passage first. Check the model names.")),
+        None => Err("Endpoints returned no passages.".into()),
+    }
 }
 
 /// `/summarize` — post a model-written summary of the whole conversation as a
@@ -9002,6 +9214,12 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
             builtin_tools: true,
             builtin_write_in_place: false,
             builtin_run_command: false,
+            retrieval_embed_url: String::new(),
+            retrieval_embed_model: String::new(),
+            retrieval_rerank_url: String::new(),
+            retrieval_rerank_model: String::new(),
+            retrieval_top_k: default_retrieval_top_k(),
+            retrieval_candidates: default_retrieval_candidates(),
             default_model: None,
             default_runtime_id: None,
         local_workspace_id: None,
@@ -9154,6 +9372,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         workspace_root: Mutex::new(workspace_root),
         summary_cache: Mutex::new(HashMap::new()),
         vault_cache: Mutex::new(HashMap::new()),
+        retriever: hive_runtime::retrieval::Retriever::new(),
         base_mcp: Mutex::new(base_mcp),
         managed_mcp: Mutex::new(managed_mcp),
         db_path,
@@ -12730,6 +12949,9 @@ pub fn run() {
             set_utility_runtime,
             get_agent_tool_settings,
             set_agent_tool_settings,
+            get_retrieval_settings,
+            set_retrieval_settings,
+            test_retrieval_settings,
             set_default_model,
             maybe_respond,
             regenerate,
@@ -13379,6 +13601,80 @@ mod vault_context_tests {
         assert!(s.contains("[…truncated]"));
         // Section stays bounded: cap + small formatting overhead.
         assert!(s.chars().count() < VAULT_MAX_CHARS + 200);
+    }
+}
+
+#[cfg(test)]
+mod retrieval_placement_tests {
+    use super::{
+        normalize_retrieval_settings, place_vault_context, LiveSettings, RetrievalSettings,
+        VAULT_MAX_SOURCES,
+    };
+    use hive_runtime::retrieval::{Passage, PASSAGES_HEADER};
+    use hive_runtime::ChatTurn;
+
+    fn entries(n: usize) -> Vec<(String, Option<String>)> {
+        (0..n).map(|i| (format!("v{i}"), Some(format!("body {i}")))).collect()
+    }
+
+    fn passage() -> Vec<Passage> {
+        vec![Passage { source: "v1".into(), text: "the answer".into(), score: 1.0 }]
+    }
+
+    #[test]
+    fn passages_go_on_the_latest_user_turn_and_keep_the_system_prompt_stable() {
+        let mut turns = vec![ChatTurn::user("Ann: hi"), ChatTurn::assistant("hey"), ChatTurn::user("Ann: question")];
+        let system = place_vault_context("BASE", &entries(2), &mut turns, Some(passage()));
+        assert_eq!(system, "BASE", "no vault text in the system prompt");
+        assert_eq!(turns[0].content, "Ann: hi");
+        assert!(turns[2].content.starts_with("Ann: question\n\n"));
+        assert!(turns[2].content.contains(PASSAGES_HEADER));
+        assert!(turns[2].content.ends_with("--- v1 (passage 1) ---\nthe answer"));
+        // The same system prompt whatever was retrieved — the cacheable prefix.
+        let mut other = vec![ChatTurn::user("Ann: something else")];
+        assert_eq!(place_vault_context("BASE", &entries(2), &mut other, Some(vec![])), "BASE");
+        assert_eq!(other[0].content, "Ann: something else", "nothing retrieved, nothing appended");
+    }
+
+    #[test]
+    fn falls_back_to_the_capped_system_paste() {
+        let mut turns = vec![ChatTurn::user("Ann: q")];
+        let system = place_vault_context("BASE", &entries(VAULT_MAX_SOURCES + 2), &mut turns, None);
+        assert!(system.starts_with("BASE\n\n[Reference vaults]"));
+        assert!(system.contains(&format!("--- v{} ---", VAULT_MAX_SOURCES - 1)));
+        assert!(!system.contains(&format!("--- v{} ---", VAULT_MAX_SOURCES)), "paste keeps its source cap");
+        assert_eq!(turns[0].content, "Ann: q");
+        // No user turn to carry passages: paste instead.
+        let mut no_user = vec![ChatTurn::assistant("x")];
+        let system = place_vault_context("BASE", &entries(1), &mut no_user, Some(passage()));
+        assert!(system.contains("[Reference vaults]"));
+        // No vaults at all: the base prompt untouched.
+        assert_eq!(place_vault_context("BASE", &[], &mut turns, None), "BASE");
+    }
+
+    #[test]
+    fn retrieval_settings_default_off_and_normalize() {
+        let s: LiveSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.retrieval_embed_url.is_empty() && s.retrieval_embed_model.is_empty());
+        assert_eq!((s.retrieval_top_k, s.retrieval_candidates), (5, 20));
+        let r = normalize_retrieval_settings(RetrievalSettings {
+            embed_url: " http://g:8080/v1 ".into(),
+            embed_model: "embeddinggemma-300m ".into(),
+            rerank_url: String::new(),
+            rerank_model: String::new(),
+            top_k: 0,
+            candidates: 3,
+        });
+        assert_eq!(r.embed_url, "http://g:8080/v1");
+        assert_eq!(r.embed_model, "embeddinggemma-300m");
+        assert_eq!((r.top_k, r.candidates), (5, 5), "zero = default; candidates >= top_k");
+        let r = normalize_retrieval_settings(RetrievalSettings { top_k: 500, candidates: 5000, ..r });
+        assert_eq!((r.top_k, r.candidates), (20, 100));
+        let wire: RetrievalSettings = serde_json::from_value(serde_json::json!({
+            "embedUrl": "u", "embedModel": "m", "rerankUrl": "", "rerankModel": "", "topK": 5, "candidates": 20
+        }))
+        .unwrap();
+        assert_eq!(wire.top_k, 5);
     }
 }
 

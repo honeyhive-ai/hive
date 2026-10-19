@@ -30,6 +30,10 @@ import {
   setContextCommands,
   getUtilityRuntime,
   setUtilityRuntime,
+  getRetrievalSettings,
+  setRetrievalSettings,
+  testRetrievalSettings,
+  type RetrievalSettings,
   listOllamaModels,
   pullOllamaModel,
   cancelOllamaPull,
@@ -58,6 +62,7 @@ export function ModelsSection() {
       <AgentsSection />
       <TemplatesSection />
       <ContextCommandsSection />
+      <VaultRetrievalSection />
       <PortableConfigSection />
     </>
   );
@@ -1682,6 +1687,115 @@ function ContextCommandsSection() {
           Reset to defaults
         </button>
       )}
+    </Section>
+  );
+}
+
+const RETRIEVAL_DEFAULTS: RetrievalSettings = {
+  embedUrl: "",
+  embedModel: "",
+  rerankUrl: "",
+  rerankModel: "",
+  topK: 5,
+  candidates: 20,
+};
+
+type RetrievalTextKey = "embedUrl" | "embedModel" | "rerankUrl" | "rerankModel";
+type RetrievalCountKey = "topK" | "candidates";
+
+/// Vault retrieval: instead of pasting whole vaults into the system prompt,
+/// embed them once and add only the passages that answer each message, at the
+/// end of the prompt (keeps the system prompt stable for prefix caching).
+/// Writes through on blur (D18), like the context commands.
+function VaultRetrievalSection() {
+  const qc = useQueryClient();
+  const saved = useQuery({ queryKey: ["retrieval-settings"], queryFn: getRetrievalSettings });
+  const [draft, setDraft] = useState<RetrievalSettings>(RETRIEVAL_DEFAULTS);
+  const [testing, setTesting] = useState(false);
+
+  useEffect(() => {
+    if (saved.data) setDraft(saved.data);
+  }, [saved.data]);
+
+  async function commit(next: RetrievalSettings) {
+    const cur = saved.data ?? RETRIEVAL_DEFAULTS;
+    if (JSON.stringify(next) === JSON.stringify(cur)) return;
+    try {
+      await setRetrievalSettings(next);
+      qc.invalidateQueries({ queryKey: ["retrieval-settings"] });
+    } catch (e) {
+      toast.error(`Couldn't save vault retrieval: ${errMsg(e)}`);
+    }
+  }
+
+  async function runTest() {
+    setTesting(true);
+    try {
+      toast.success(await testRetrievalSettings(draft));
+    } catch (e) {
+      toast.error(`Vault retrieval test failed: ${errMsg(e)}`);
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  const on = draft.embedUrl.trim() !== "" && draft.embedModel.trim() !== "";
+  const text = (key: RetrievalTextKey, label: string, placeholder: string) => (
+    <label className="block text-sm">
+      <span className="opacity-70">{label}</span>
+      <input
+        value={draft[key]}
+        onChange={(e) => setDraft((d) => ({ ...d, [key]: e.target.value }))}
+        onBlur={() => void commit(draft)}
+        placeholder={placeholder}
+        spellCheck={false}
+        className={`mt-1 w-full ${SELECT_CLASS}`}
+        style={fieldStyle}
+      />
+    </label>
+  );
+  const count = (key: RetrievalCountKey, label: string, max: number) => (
+    <label className="block text-sm">
+      <span className="opacity-70">{label}</span>
+      <input
+        type="number"
+        min={1}
+        max={max}
+        value={draft[key]}
+        onChange={(e) =>
+          setDraft((d) => ({ ...d, [key]: Math.max(0, Math.floor(Number(e.target.value) || 0)) }))
+        }
+        onBlur={() => void commit(draft)}
+        className={`mt-1 w-full ${SELECT_CLASS}`}
+        style={fieldStyle}
+      />
+    </label>
+  );
+
+  return (
+    <Section title="Vault retrieval">
+      <p className="text-xs opacity-50">
+        Optional. With an embeddings endpoint set, chats search their vaults and add only the
+        passages that answer each message, instead of pasting whole documents into the system
+        prompt. Any OpenAI-compatible server works, e.g. a llama.cpp gateway. If retrieval fails,
+        the chat falls back to pasting.
+      </p>
+      <div className="grid gap-3 sm:grid-cols-2">
+        {text("embedUrl", "Embeddings URL", "http://host:8080/v1")}
+        {text("embedModel", "Embeddings model", "embeddinggemma-300m")}
+        {text("rerankUrl", "Rerank URL (optional)", "http://host:8080/v1")}
+        {text("rerankModel", "Rerank model", "bge-reranker-v2-m3")}
+        {count("topK", "Passages per message", 20)}
+        {count("candidates", "Candidates to rerank", 100)}
+      </div>
+      <div className="flex items-center gap-3">
+        <Button disabled={!on || testing} onClick={() => void runTest()}>
+          {testing ? "Testing…" : "Test"}
+        </Button>
+        <span className="text-xs opacity-50">
+          {on ? "On: vaults are searched for each message." : "Off: vaults are pasted into the system prompt."}
+        </span>
+      </div>
     </Section>
   );
 }

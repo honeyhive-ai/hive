@@ -168,6 +168,27 @@ export const getAgentToolSettings = () => invoke<AgentToolSettings>("get_agent_t
 export const setAgentToolSettings = (settings: AgentToolSettings) =>
   invoke<void>("set_agent_tool_settings", { settings });
 
+/// Vault retrieval (Settings → Models). Empty embeddings URL/model = off, and
+/// vaults are pasted into the system prompt as before. URLs take a base
+/// (http://host:8080/v1) or the full /embeddings, /rerank endpoint.
+export type RetrievalSettings = {
+  embedUrl: string;
+  embedModel: string;
+  /// Optional; empty = rank by embedding similarity alone.
+  rerankUrl: string;
+  rerankModel: string;
+  /// Passages added to each message.
+  topK: number;
+  /// Nearest chunks handed to the reranker.
+  candidates: number;
+};
+export const getRetrievalSettings = () => invoke<RetrievalSettings>("get_retrieval_settings");
+export const setRetrievalSettings = (settings: RetrievalSettings) =>
+  invoke<void>("set_retrieval_settings", { settings });
+/// Resolves with a short success line; rejects with what went wrong.
+export const testRetrievalSettings = (settings: RetrievalSettings) =>
+  invoke<string>("test_retrieval_settings", { settings });
+
 /// Custom /summarize + /compact instructions ("" = using the built-in default,
 /// which is returned so the UI can show it).
 export interface ContextCommandsDto {
