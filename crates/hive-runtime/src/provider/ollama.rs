@@ -243,7 +243,7 @@ pub fn ollama_tool_defs(tools: &[Value]) -> Vec<Value> {
 /// system prompt; the tail is replaced by a note so the model knows.
 pub const TOOL_RESULT_MAX_CHARS: usize = 24_000;
 
-fn clip_tool_result(s: String) -> String {
+pub(crate) fn clip_tool_result(s: String) -> String {
     if s.chars().count() <= TOOL_RESULT_MAX_CHARS {
         return s;
     }
