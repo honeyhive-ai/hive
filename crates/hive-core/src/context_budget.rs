@@ -193,8 +193,22 @@ pub fn plan_with_hysteresis(
     let high_limit = (budget * high).floor() as i64;
     let low_limit = (budget * low).floor() as i64;
 
+    // The whole history fits this budget: nothing to compact, whatever a
+    // prior boundary says (it may have been set under a smaller window — a
+    // different responder in the same chat, or before the window grew).
+    if token_estimator::estimate_messages(history) as i64 <= high_limit {
+        return unchanged(0, None);
+    }
+
     // Where the kept history currently starts, if a known boundary survives.
-    let start = prior_boundary.and_then(|id| history.iter().position(|m| m.id == id));
+    // A boundary this budget would never have produced — even the message
+    // before it still fits the low watermark — came from a smaller window;
+    // re-plan rather than keep a cut this budget doesn't need.
+    let start = prior_boundary
+        .and_then(|id| history.iter().position(|m| m.id == id))
+        .filter(|&i| {
+            i == 0 || token_estimator::estimate_messages(&history[i - 1..]) as i64 > low_limit
+        });
     let from = start.unwrap_or(0);
     let kept_tokens = token_estimator::estimate_messages(&history[from..]) as i64;
     if kept_tokens <= high_limit {
@@ -412,6 +426,31 @@ mod tests {
         assert_eq!(q.boundary, None);
         assert!(q.plan.overflow.is_empty());
         assert!(!q.moved);
+    }
+
+    #[test]
+    fn hysteresis_boundary_from_a_smaller_window_is_not_inherited() {
+        // 60 messages, ~30k tokens: a 25k-budget responder compacts…
+        let history: Vec<_> = (0..60).map(|_| sized(504)).collect();
+        let small = plan_with_hysteresis(&history, 25_000, None, H, L);
+        assert!(small.moved && small.plan.overflow.len() > 30, "{}", small.plan.overflow.len());
+        // …a 120k-budget responder handed that boundary keeps everything.
+        let big = plan_with_hysteresis(&history, 120_000, small.boundary, H, L);
+        assert!(big.plan.overflow.is_empty(), "inherited {} overflow", big.plan.overflow.len());
+        assert_eq!(big.boundary, None);
+        // A window that grew but still can't hold everything re-plans to its
+        // own low watermark instead of keeping the small window's cut.
+        let long: Vec<_> = (0..200).map(|_| sized(504)).collect();
+        let small = plan_with_hysteresis(&long, 25_000, None, H, L);
+        let grown = plan_with_hysteresis(&long, 60_000, small.boundary, H, L);
+        let fresh = plan_with_hysteresis(&long, 60_000, None, H, L);
+        assert_eq!(grown.boundary, fresh.boundary);
+        assert!(grown.moved);
+        assert!(grown.plan.kept.len() > small.plan.kept.len());
+        // And the larger window's own boundary is stable on the next turn.
+        let again = plan_with_hysteresis(&long, 60_000, grown.boundary, H, L);
+        assert!(!again.moved);
+        assert_eq!(again.boundary, grown.boundary);
     }
 
     #[test]

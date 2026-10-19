@@ -101,9 +101,10 @@ struct AppState {
     /// each launch; switched to a room id when the user opens a joined room.
     active_workspace: Mutex<Uuid>,
     workspace_root: Mutex<String>,
-    /// Per-session compaction state: the fixed boundary plus the incremental
-    /// summary of everything before it (see [`SummaryCacheEntry`]).
-    summary_cache: Mutex<HashMap<Uuid, SummaryCacheEntry>>,
+    /// Per-session, per-runtime compaction state: the fixed boundary plus the
+    /// incremental summary of everything before it (see [`SummaryCacheEntry`]
+    /// and [`summary_key`]).
+    summary_cache: Mutex<HashMap<SummaryKey, SummaryCacheEntry>>,
     /// Fetched vault content, keyed by raw URL, with the fetch time so a stale
     /// entry (older than `VAULT_CACHE_TTL`) is re-fetched instead of served for
     /// the whole app run. Within the TTL it avoids a per-message round-trip.
@@ -5127,6 +5128,18 @@ struct SummaryCacheEntry {
     summary: String,
 }
 
+/// `summary_cache` key: (chat, responder's runtime id).
+type SummaryKey = (Uuid, String);
+
+/// Compaction state is kept per runtime, not just per chat: responders in one
+/// chat can have very different windows (a 32k local agent next to a 200k
+/// hosted one), and one shared boundary would hand the big one the small
+/// one's cut and summary — or make them overwrite each other's batch, and
+/// re-summarize, on every alternation.
+fn summary_key(session_id: Uuid, runtime_id: &str) -> SummaryKey {
+    (session_id, runtime_id.to_string())
+}
+
 /// Batch-compaction watermarks (fractions of the history budget): compact once
 /// the kept history passes HIGH, then cut it back to LOW. Summaries cost tens
 /// of seconds on local models, so they're produced rarely and in batches.
@@ -5162,7 +5175,7 @@ fn context_snapshot(
     let history_budget_tokens =
         (window_tokens - OUTPUT_RESERVE_TOKENS - system_prompt_tokens - SUMMARY_RESERVE_TOKENS)
             .max(1000);
-    let cached = state.summary_cache.lock().unwrap().get(&session_id).cloned();
+    let cached = state.summary_cache.lock().unwrap().get(&summary_key(session_id, &responder.runtime_id)).cloned();
     let hysteresis = hive_core::context_budget::plan_with_hysteresis(
         &session.messages,
         history_budget_tokens,
@@ -5634,12 +5647,13 @@ async fn windowed_context(
         if retrieval.is_configured() { RETRIEVAL_MAX_SOURCES } else { VAULT_MAX_SOURCES };
     let vault_entries = fetch_vault_entries(state, session, responder.agent_id, max_sources).await;
 
+    let cache_key = summary_key(session_id, &responder.runtime_id);
     let summary = if plan.overflow.is_empty() {
-        state.summary_cache.lock().unwrap().remove(&session_id);
+        state.summary_cache.lock().unwrap().remove(&cache_key);
         None
     } else {
         let overflow_ids: Vec<Uuid> = plan.overflow.iter().map(|m| m.id).collect();
-        let cached = state.summary_cache.lock().unwrap().get(&session_id).cloned();
+        let cached = state.summary_cache.lock().unwrap().get(&cache_key).cloned();
         let summarizer = summarizer_runtime(responder);
         let instruction = summarize_instruction(state);
         let summary = match cached {
@@ -5655,7 +5669,7 @@ async fn windowed_context(
                 .unwrap_or_else(|| format!("[Earlier {} messages omitted.]", plan.overflow.len())),
         };
         state.summary_cache.lock().unwrap().insert(
-            session_id,
+            cache_key,
             SummaryCacheEntry {
                 boundary: snapshot.boundary,
                 covered: overflow_ids,
@@ -6188,8 +6202,9 @@ async fn compact_chat(state: State<'_, AppState>, session_id: String) -> Result<
         .begin_assistant_message(sid, workspace_id, "Summary", &responder.runtime_id, None, None)
         .map_err(map_err)?;
     svc.complete_assistant_message(sid, workspace_id, id, body).map_err(map_err)?;
-    // In-memory overflow summary cache is now stale (messages changed).
-    state.summary_cache.lock().unwrap().remove(&sid);
+    // In-memory overflow summary cache is now stale (messages changed), for
+    // every runtime that planned this chat.
+    state.summary_cache.lock().unwrap().retain(|(session, _), _| *session != sid);
     Ok(())
 }
 
@@ -13627,6 +13642,45 @@ mod compaction_tests {
         assert!(count("incremental") >= 2, "{strategies:?}");
         // Most compacted turns reuse the cached summary (no LLM call).
         assert!(count("cached") > 3 * count("incremental"), "{strategies:?}");
+    }
+
+    /// A mixed chat: a small-window local agent and a big-window agent take
+    /// turns. Each keeps its own boundary and summary (keyed per runtime), so
+    /// the big one never inherits the small one's cut and neither forces the
+    /// other to re-summarize on every alternation.
+    #[test]
+    fn responders_with_different_windows_keep_their_own_compaction() {
+        use super::{summary_key, SummaryCacheEntry, SummaryKey};
+        use std::collections::HashMap;
+        let session = Uuid::new_v4();
+        let (small, big) = (summary_key(session, "local-gemma"), summary_key(session, "hosted-claude"));
+        assert_ne!(small, big);
+        let mut cache: HashMap<SummaryKey, SummaryCacheEntry> = HashMap::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut small_strategies = Vec::new();
+        for i in 0..80 {
+            let role = if i % 2 == 0 { MessageRole::User } else { MessageRole::Assistant };
+            history.push(ChatMessage::new(role, "u", &"z".repeat(2000)));
+            for (key, budget) in [(&small, 25_000), (&big, 120_000)] {
+                let prior = cache.get(key).cloned();
+                let p = plan_with_hysteresis(&history, budget, prior.as_ref().and_then(|c| c.boundary), COMPACT_HIGH_WATERMARK, COMPACT_LOW_WATERMARK);
+                let overflow = ids(&p.plan.overflow);
+                if key == &small {
+                    small_strategies.push(summary_strategy(prior.as_ref().map(|c| c.covered.as_slice()), &overflow));
+                } else {
+                    // ~40k tokens of history always fits the big budget.
+                    assert!(overflow.is_empty(), "turn {i}: big responder inherited a cut");
+                }
+                if overflow.is_empty() {
+                    cache.remove(key);
+                } else {
+                    cache.insert(key.clone(), SummaryCacheEntry { boundary: p.boundary, covered: overflow, summary: String::new() });
+                }
+            }
+        }
+        let fresh = small_strategies.iter().filter(|s| **s == "fresh").count();
+        assert_eq!(fresh, 1, "{small_strategies:?}");
+        assert!(small_strategies.iter().filter(|s| **s == "cached").count() > 20, "{small_strategies:?}");
     }
 }
 
