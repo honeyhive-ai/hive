@@ -71,6 +71,33 @@
 //! - web_search: gemma4 called the tool every time, but once answered from
 //!   memory (1.86.0) over a result that said 1.99.1.
 //!
+//! Loop robustness (repeat guard, `tool_choice: "none"` + nudge on the final
+//! round, reasoning echo, "trust tool results" prompt line), same gateway,
+//! later on 2026-10-19, `HIVE_EVAL_RUNS=3`, run_command off. "Before" is the
+//! harness without those changes, measured the same afternoon:
+//!
+//! ```text
+//! scenario            gemma4:12b before / after     gpt-oss:20b before / after
+//! tool_call           3/3  / 3/3                    3/3  / 3/3
+//! bug_fix             2/3  / 3/3  (12-14 s)         3/3  / 3/3  (5-6 s)
+//!   6 more runs       3/6  / 4/6                    -
+//! compaction_recall   3/3  / 3/3                    0/3  / 0/3  (4/5 facts)
+//! web_search          3/3  / 0/3 *                  3/3  / 2/3, rerun 3/3 *
+//! total               11/12 in 107 s / 9/12 *       9/12 in 59 s / 8/12, 9/12 *
+//! ```
+//!
+//! - bug_fix: gemma4's failures used to burn all 24 rounds re-reading files
+//!   (23 calls) and end on leaked `<|tool_call>` markup. Now a repeated read
+//!   is answered from the first result, and a run that still loops ends after
+//!   the third repeat (13-15 calls) with a correct diagnosis in text.
+//! - * web_search: during the "after" runs the rdnamcp search backend answered
+//!   "No results." to nearly every query; the "before" build re-run at the
+//!   same time also scored 0/2. gemma4 searched until the round budget ran
+//!   out and then (5 of 6 runs) said it could not find the version; gpt-oss
+//!   passed by fetching release pages with `fetch_url`.
+//! - compaction_recall: gpt-oss's summaries dropped the fifth fact in every
+//!   run, before and after; nothing here touches summaries.
+//!
 //! pi smoke (Hive's Pi runtime, pi 0.78.0, gemma4:12b through the gateway):
 //! tool calling works. Two of two runs read the code, edited
 //! `inventory/stock.py` and left `./check.sh` passing, in 81 s and 60 s; the

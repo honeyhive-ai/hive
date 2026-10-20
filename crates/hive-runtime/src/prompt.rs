@@ -73,11 +73,14 @@ those, say so plainly rather than pretending you did.";
 
 /// The replacement when the dispatcher does attach tools (the native Ollama
 /// tool loop). Written for a small model: call, don't narrate; answer from
-/// results; admit what the tools don't cover.
+/// results, which beat memory for facts that change (the eval caught gemma4
+/// answering "1.86.0" from memory over a search result that said 1.99.1);
+/// admit what the tools don't cover.
 pub const TOOLS_LINE: &str = "This request carries tool definitions. When a task needs one, call the tool \
 rather than describing what you would do, then answer from its result — never guess \
-at what a tool would have returned. Anything the tools don't cover you still cannot \
-do; say so plainly rather than pretending you did.";
+at what a tool would have returned. For facts that change (versions, dates, prices, \
+file contents), trust what the tools return over what you remember. Anything the \
+tools don't cover you still cannot do; say so plainly rather than pretending you did.";
 
 /// Swap the identity block's no-tools statement for the tools-offered one.
 /// The block is assembled before dispatch knows whether the probe will allow
@@ -405,6 +408,7 @@ mod tests {
         assert_eq!(with_tools_offered("Be brief.\n"), format!("Be brief.\n\n{TOOLS_LINE}"));
         assert_eq!(with_tools_offered(""), TOOLS_LINE);
         assert!(b.contains("never guess"), "{b}");
+        assert!(TOOLS_LINE.contains("trust what the tools return over what you remember"));
     }
 
     #[test]
