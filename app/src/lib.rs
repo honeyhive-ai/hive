@@ -2898,8 +2898,10 @@ impl AppState {
             // the compiled default runtime is `anthropic`. Fall back to the
             // bring-your-own Claude Code CLI (a subscription, no key) so the agent
             // actually responds. A configured key (per-provider/global/env) is
-            // always honored; subprocess/local providers never need one.
-            if provider_needs_key(provider) && api_key.is_none() {
+            // always honored; subprocess/local providers never need one, and
+            // neither does an OpenAI-wire runtime on a private endpoint (a
+            // keyless local server, e.g. the "Local gateway" preset).
+            if runtime_needs_key(provider, &endpoint) && api_key.is_none() {
                 tracing::info!(
                     target: "dispatch",
                     runtime = %runtime_id,
@@ -5854,6 +5856,15 @@ fn deferred_turn_unanswered(session: &ChatSession, trigger_id: Uuid) -> bool {
 /// dispatch, so `resolve_runtime` falls back to the keyless Claude Code CLI.
 /// Subprocess/local providers (Claude Code, Codex, Aider, Pi, Hermes, Ollama,
 /// HiveDaemon) never need a supplied key.
+/// Whether a configured runtime must carry a key to be dispatched to (else
+/// [`AppState::resolve_runtime`] falls back to the Claude Code CLI). A hosted
+/// API needs one; the same wire pointed at loopback, a LAN or the tailnet is
+/// a local server (llama.cpp, LM Studio, a gateway), which is keyless — the
+/// "Local gateway" preset adds exactly that, with no key.
+fn runtime_needs_key(provider: ModelProviderKind, endpoint: &str) -> bool {
+    provider_needs_key(provider) && !hive_core::endpoint::endpoint_is_private(endpoint)
+}
+
 fn provider_needs_key(provider: ModelProviderKind) -> bool {
     matches!(
         provider,
@@ -8764,15 +8775,6 @@ async fn probe_provider(
         .or_else(|| provider_keys.get(cfg).cloned().filter(|s| !s.is_empty()))
         .or(settings_key)
         .or_else(|| api_key_for(provider));
-    if provider_needs_key(provider) && api_key.is_none() {
-        return Ok(RuntimeTestDto {
-            ok: false,
-            latency_ms: 0,
-            reply: String::new(),
-            error: Some("No API key set for this provider — save one first.".to_string()),
-            capabilities: None,
-        });
-    }
     // A passed base URL wins (test-before-save from onboarding); else the stored one.
     let base = base_url
         .map(|b| b.trim().to_string())
@@ -8800,6 +8802,16 @@ async fn probe_provider(
             }
         }
     };
+    // Checked against the endpoint: a keyless local server needs none.
+    if runtime_needs_key(provider, &endpoint) && api_key.is_none() {
+        return Ok(RuntimeTestDto {
+            ok: false,
+            latency_ms: 0,
+            reply: String::new(),
+            error: Some("No API key set for this provider — save one first.".to_string()),
+            capabilities: None,
+        });
+    }
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
@@ -13819,6 +13831,30 @@ mod runtime_fallback_tests {
         for p in [P::Anthropic, P::OpenAI, P::OpenRouter, P::Azure, P::Custom] {
             assert!(provider_needs_key(p), "{p:?} should require a key");
         }
+    }
+
+    #[test]
+    fn openai_wire_runtimes_on_a_private_endpoint_need_no_key() {
+        use super::runtime_needs_key;
+        // A keyless local server — the "Local gateway" preset — must not be
+        // swapped for the Claude Code CLI.
+        for ep in [
+            "http://127.0.0.1:8080/v1/chat/completions",
+            "http://localhost:1234/v1/chat/completions",
+            "http://192.168.1.20:8080/v1/chat/completions",
+            "http://100.100.10.20:8080/v1/chat/completions",
+            "http://gateway.tail1234.ts.net:8080/v1/chat/completions",
+        ] {
+            assert!(!runtime_needs_key(P::Custom, ep), "{ep}");
+            assert!(!runtime_needs_key(P::OpenAI, ep), "{ep}");
+        }
+        // Hosted endpoints still need one.
+        assert!(runtime_needs_key(P::Custom, "https://api.groq.com/openai/v1/chat/completions"));
+        assert!(runtime_needs_key(P::OpenAI, "https://api.openai.com/v1/chat/completions"));
+        assert!(runtime_needs_key(P::OpenRouter, "https://openrouter.ai/api/v1/chat/completions"));
+        // Anthropic's endpoint is implicit (empty) — always hosted.
+        assert!(runtime_needs_key(P::Anthropic, ""));
+        assert!(!runtime_needs_key(P::Ollama, ""));
     }
 
     #[test]
