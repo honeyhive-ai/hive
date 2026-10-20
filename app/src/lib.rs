@@ -5919,6 +5919,7 @@ fn owns_responder(local_actor_id: &str, responder: &Responder) -> bool {
 ///     the primary would defer to a stale self-identity that no live device owns.
 ///   - `solo`: a relay *is* configured but there's ≤1 human — a room you made
 ///     that no one else has joined. Still no other device to defer to.
+///
 /// Only a real, synced, multi-human room falls back to the ownership check.
 ///
 /// An agent sent to a host (`binding`) runs on that host only — the worker
