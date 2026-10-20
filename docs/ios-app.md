@@ -123,7 +123,10 @@ that falls further behind should refetch.
 
 `hive serve --pair` prints a terminal QR code and the text link when it
 starts. `hive pair` does the same without starting a server, which is handy
-while the systemd unit runs. The link is
+while the systemd unit runs. Run it with the server's settings
+(`HIVE_SERVE_LISTEN` or `HIVE_SERVE_PUBLIC_URL`, and `HIVE_DATA_DIR`): it
+refuses to print a link to a loopback address, and it never creates a token of
+its own, so it can't hand the phone one the server doesn't accept. The link is
 `hive://pair?url=<base64url(serverURL), unpadded>&token=<token>`, where
 `serverURL` is `HIVE_SERVE_PUBLIC_URL` or `http://<listen>`. The app's URL
 scheme is `hive`: `hive://pair?…` and `hive://chat/<id>`. ntfy notifications

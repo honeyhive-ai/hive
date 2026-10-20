@@ -117,6 +117,9 @@ Health check from any tailnet device: `curl http://<tailscale-ip>:8787/v1/health
 ## 6. Pair the phone
 
 ```sh
+# Load the unit's settings first: without them `hive pair` has no listen
+# address or data dir, and refuses rather than print a loopback link.
+set -a; . ~/.config/hive-serve/hive-serve.env; set +a
 hive pair        # prints a QR code and a hive://pair?... link for the configured address
 ```
 
