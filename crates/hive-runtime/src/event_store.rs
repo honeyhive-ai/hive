@@ -14,7 +14,7 @@
 
 use std::path::Path;
 
-use hive_core::{project_with_founder, ChatSession, SessionEvent, SessionEventEnvelope};
+use hive_core::{project_with_options, ChatSession, SessionEvent, SessionEventEnvelope};
 use rusqlite::{Connection, OptionalExtension};
 use thiserror::Error;
 use uuid::Uuid;
@@ -417,7 +417,7 @@ impl EventStore {
     /// Project a session into its current state, replaying only from the latest
     /// `sessionSnapshot` so cost stays bounded on long chats (#3).
     pub fn load_session(&self, session_id: Uuid) -> Result<Option<ChatSession>> {
-        self.load_session_with_founder(session_id, None)
+        self.load_session_with_founder(session_id, None, None)
     }
 
     /// [`load_session`], but pinned to a `trusted_founder` — the out-of-band
@@ -430,6 +430,9 @@ impl EventStore {
         &self,
         session_id: Uuid,
         trusted_founder: Option<&str>,
+        // The device-local workspace id, if this session belongs to it — its events
+        // skip ingest-time authz (private, single-device; see project_with_options).
+        trusted_workspace: Option<Uuid>,
     ) -> Result<Option<ChatSession>> {
         // Project the full stream. `project_with_founder` folds in canonical
         // (lamport, event_id) order and selects the base by a deterministic rule
@@ -442,7 +445,7 @@ impl EventStore {
             "SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY row_id ASC",
             [session_id.to_string()],
         )?;
-        Ok(project_with_founder(&envelopes, trusted_founder))
+        Ok(project_with_options(&envelopes, trusted_founder, trusted_workspace))
     }
 
     /// Row id of the latest `sessionSnapshot` for a session, if any.

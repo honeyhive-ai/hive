@@ -8651,7 +8651,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
     // NB: chunk-row pruning (one-time DB shrink) is deferred to a background
     // thread after the window is live — see `run()`. Running it here scanned
     // the events table on every launch and blocked first paint.
-    let service = ChatService::new(store, stored.device.id, device_kp, account_kp, stored.account.actor());
+    let mut service = ChatService::new(store, stored.device.id, device_kp, account_kp, stored.account.actor());
 
     // Restore the folder the user last chose (persisted by `set_workspace_root`);
     // failing that, adopt the process cwd ONLY when it's clearly a project we were
@@ -8817,6 +8817,18 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         save_settings(&data_dir, &s);
         id
     };
+    // The private local workspace skips governance authz (solo, never-synced), so
+    // an identity churn can't lock the sole user out of routine actions in their
+    // own Home workspace.
+    service.set_local_workspace(local_workspace_id);
+    // Make the current user the sole Owner of their auto-created Home workspace,
+    // repairing any churn residue (a stranded Owner under an old id + a demoted
+    // "self" Contributor). Idempotent — a no-op once the roster is clean.
+    match service.reconcile_local_owner(local_workspace_id) {
+        Ok(true) => eprintln!("reconciled local workspace ownership after identity churn"),
+        Ok(false) => {}
+        Err(e) => eprintln!("reconcile local owner: {e}"),
+    }
 
     // MIGRATION (per-workspace code dir): the effective `workspace_root` now
     // follows the active workspace via device-local `workspace_dirs` bindings.

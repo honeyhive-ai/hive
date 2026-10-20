@@ -55,6 +55,15 @@ pub struct ChatService {
     /// legacy workspace ⇒ the earliest-self-consistent-seed fallback. Set via
     /// [`set_trusted_founder`] whenever the active workspace changes.
     trusted_founder: Option<String>,
+    /// The device-local workspace id (the private "Home"/"My workspace"). It never
+    /// syncs and is single-human, so governance authz there is pure friction — and,
+    /// worse, an identity churn (the local actor id changing after a sign-in / reset)
+    /// leaves the roster's role stamped under the old id, so `role_of(current)` falls
+    /// below the floor and the sole user is wrongly told "unauthorized" for a routine
+    /// action (archive a channel, etc.) in their OWN workspace. Writes to this
+    /// workspace bypass the roster-role check (see [`append_signed`]). `None` until
+    /// the app sets it via [`set_local_workspace`].
+    local_workspace_id: Option<Uuid>,
 }
 
 impl ChatService {
@@ -72,7 +81,14 @@ impl ChatService {
             account_keypair,
             author,
             trusted_founder: None,
+            local_workspace_id: None,
         }
+    }
+
+    /// Mark which workspace id is this device's private local workspace, so writes
+    /// to it skip the governance authz check (solo, never-synced — see the field).
+    pub fn set_local_workspace(&mut self, id: Uuid) {
+        self.local_workspace_id = Some(id);
     }
 
     /// Pin (or clear, with `None`/empty) the trusted founder for the active
@@ -264,7 +280,12 @@ impl ChatService {
         workspace_id: Uuid,
         payload: SessionEvent,
     ) -> Result<SessionEventEnvelope> {
-        if requires_authz(&payload) {
+        // Skip governance authz entirely for the device-local workspace: it's solo
+        // and never syncs, so the check protects nothing there — and an identity
+        // churn would otherwise deny the sole user routine actions in their own
+        // workspace (the "unauthorized in your own Home" bug).
+        let is_local = self.local_workspace_id == Some(workspace_id);
+        if !is_local && requires_authz(&payload) {
             // Authorize against the *projected* session — i.e. the workspace-wide
             // roster after the member hoist (§11) unions the config-log members on
             // (config-wins). For a config-log write this loads raw, so it gates on
@@ -1300,6 +1321,65 @@ impl ChatService {
         Ok(())
     }
 
+    /// Device-local workspace only: make the current actor the sole human OWNER.
+    ///
+    /// The default "Home" workspace is auto-created by the app (not by an explicit
+    /// user "create workspace" action), so its roster has no real creator/member
+    /// distinction — and an identity churn (a GitHub sign-in / reset changing the
+    /// actor id) leaves the current self as a Contributor beside a stranded Owner
+    /// under the old id. Since this workspace is private, single-user, and never
+    /// syncs, collapse the human roster to just the current self at Owner: promote
+    /// or add self, and drop any other human member (all churn residue here).
+    ///
+    /// Requires [`set_local_workspace`] to have run first — the role/member changes
+    /// are Admin-gated, and only the local-workspace authz bypass lets the churned
+    /// (non-owner) current self make them. No-op when already correct.
+    pub fn reconcile_local_owner(&mut self, workspace_id: Uuid) -> Result<bool> {
+        let config_id = self.ensure_workspace_config(workspace_id)?;
+        let Some(config) = self.load(config_id)? else {
+            return Ok(false);
+        };
+        let me = self.author.id.clone();
+        let mut changed = false;
+        // 1. Ensure the current self is a member at Owner.
+        match config.members.iter().find(|m| m.actor.id == me) {
+            Some(m) if m.role == WorkspaceRole::Owner => {}
+            Some(_) => {
+                self.set_member_role(config_id, workspace_id, me.clone(), WorkspaceRole::Owner)?;
+                changed = true;
+            }
+            None => {
+                let next_index = config.members.iter().map(|m| m.index).max().unwrap_or(0) + 1;
+                self.add_member(
+                    config_id,
+                    workspace_id,
+                    WorkspaceMember {
+                        id: me.clone(),
+                        actor: self.author.clone(),
+                        role: WorkspaceRole::Owner,
+                        title: String::new(),
+                        index: next_index,
+                        joined_at: Timestamp::now(),
+                    },
+                )?;
+                changed = true;
+            }
+        }
+        // 2. Drop stale duplicate human members (all humans but the current self) —
+        //    a local workspace never has a real second person.
+        let stale: Vec<String> = config
+            .members
+            .iter()
+            .filter(|m| m.actor.kind == hive_core::ActorKind::Human && m.actor.id != me)
+            .map(|m| m.id.clone())
+            .collect();
+        for id in stale {
+            self.remove_member(config_id, workspace_id, id)?;
+            changed = true;
+        }
+        Ok(changed)
+    }
+
     /// Add (dedup by raw URL) a vault source. If a matching URL already exists,
     /// its agent targeting is replaced with the incoming mount's.
     pub fn add_vault_source(
@@ -1571,12 +1651,17 @@ impl ChatService {
         // self-consistent seed (see `events::project_with_founder`); the pin never
         // breaks a legitimately member-created chat.
         let founder = self.trusted_founder.as_deref();
-        let Some(mut session) = self.store.load_session_with_founder(session_id, founder)? else {
+        // Pass the device-local workspace so its events skip ingest authz (projection
+        // only exempts events whose workspace_id actually matches, so room sessions
+        // stay fully gated). This is what lets the churned local self's own governance
+        // events (reconcile / archive channel) fold instead of being dropped.
+        let local = self.local_workspace_id;
+        let Some(mut session) = self.store.load_session_with_founder(session_id, founder, local)? else {
             return Ok(None);
         };
         let config_id = workspace_config_session_id(session.workspace_id);
         if session_id != config_id {
-            if let Some(cfg) = self.store.load_session_with_founder(config_id, founder)? {
+            if let Some(cfg) = self.store.load_session_with_founder(config_id, founder, local)? {
                 // Members hoist onto the config log so the roster is workspace-wide.
                 // Dedup by member id; the config-log entry is the source of truth,
                 // so it *replaces* any same-id per-session member (role/title/index
@@ -2730,6 +2815,71 @@ mod tests {
             let m = s.messages.iter().find(|m| m.id == mid).unwrap();
             assert!(!m.is_streaming, "ghost cleared in every session");
         }
+    }
+
+    #[test]
+    fn reconcile_local_owner_repairs_churned_roster() {
+        // The auto-created Home workspace: seed self (A) as Owner, then churn the
+        // account id to B (sign-in). Reconcile must leave exactly one human — the
+        // current self (B) — as Owner, dropping the stranded A.
+        let (mut svc, _) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("Home", wid, "anthropic").unwrap();
+        svc.ensure_self_member(chat.id, wid).unwrap(); // seeds A into the config roster
+        let old_id = svc.author().id.clone();
+
+        svc.set_author_account(Uuid::new_v4().to_string(), "Michael", None);
+        let new_id = svc.author().id.clone();
+        assert_ne!(old_id, new_id);
+
+        svc.set_local_workspace(wid); // required for the Admin-gated member changes
+        assert!(svc.reconcile_local_owner(wid).unwrap(), "should repair the churned roster");
+
+        let config = svc
+            .load(hive_core::workspace_config_session_id(wid))
+            .unwrap()
+            .unwrap();
+        let humans: Vec<_> = config
+            .members
+            .iter()
+            .filter(|m| m.actor.kind == hive_core::ActorKind::Human)
+            .collect();
+        assert_eq!(humans.len(), 1, "collapsed to a single human self");
+        assert_eq!(humans[0].actor.id, new_id, "current self is the sole member");
+        assert_eq!(humans[0].role, WorkspaceRole::Owner, "current self is Owner");
+
+        // Idempotent: a second run changes nothing.
+        assert!(!svc.reconcile_local_owner(wid).unwrap(), "no-op once clean");
+    }
+
+    #[test]
+    fn local_workspace_bypasses_authz_after_identity_churn() {
+        // Reproduce "unauthorized in your own Home": create a workspace (self seeded
+        // as owner), then churn the account id (sign-in / identity reset) so the
+        // current actor no longer matches the roster → role_of = Viewer, below the
+        // channel floor. Archiving a channel is denied in a synced workspace, but the
+        // private device-local workspace bypasses authz so the sole user isn't locked
+        // out of routine actions in their own space.
+        let (mut svc, _) = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("Home", wid, "anthropic").unwrap();
+        svc.set_author_account(Uuid::new_v4().to_string(), "Michael", None);
+
+        // An authz-gated op (assign the chat to a channel) by the churned, now-
+        // non-member actor (Viewer) is denied in a normal workspace.
+        assert!(
+            matches!(
+                svc.set_chat_channel(chat.id, wid, "general"),
+                Err(ChatError::Unauthorized(_))
+            ),
+            "churned actor should be denied in a synced workspace",
+        );
+        // Marking it the device-local workspace bypasses authz → succeeds.
+        svc.set_local_workspace(wid);
+        assert!(
+            svc.set_chat_channel(chat.id, wid, "general").is_ok(),
+            "own local workspace must bypass authz",
+        );
     }
 
     #[test]

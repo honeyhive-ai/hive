@@ -665,6 +665,21 @@ pub fn project_with_founder(
     envelopes: &[SessionEventEnvelope],
     trusted_founder: Option<&str>,
 ) -> Option<ChatSession> {
+    project_with_options(envelopes, trusted_founder, None)
+}
+
+/// Like [`project_with_founder`], but events whose `workspace_id` equals
+/// `trusted_workspace` skip ingest-time authorization. This is ONLY for the
+/// device-local workspace — private, single-device, never-synced — where there is
+/// no untrusted peer to defend against and an identity churn would otherwise make
+/// the projection drop the sole user's own governance events (leaving them a
+/// stranded Contributor in their own Home). Convergence is unaffected: a local
+/// workspace lives on one device, so there is no second projector to disagree.
+pub fn project_with_options(
+    envelopes: &[SessionEventEnvelope],
+    trusted_founder: Option<&str>,
+    trusted_workspace: Option<Uuid>,
+) -> Option<ChatSession> {
     let mut ordered: Vec<&SessionEventEnvelope> = envelopes.iter().collect();
     ordered.sort_by_key(|e| e.canonical_key());
 
@@ -701,11 +716,14 @@ pub fn project_with_founder(
             if !crate::authorization::nonseed_snapshot_authorized(snap, author, &session) {
                 continue;
             }
-        } else if crate::authorization::requires_projection_authz(&env.payload) {
+        } else if crate::authorization::requires_projection_authz(&env.payload)
+            && trusted_workspace != Some(env.workspace_id)
+        {
             // Ingest-time authorization (spec: defense against a malicious member).
             // A governance/config event is dropped unless its author held the role
             // in the roster projected *so far*. Deterministic over the canonical
             // fold ⇒ every device drops the same events ⇒ convergence preserved.
+            // Skipped for the trusted (device-local) workspace — see project_with_options.
             let author = env.actor_stamp.as_ref().map(|s| s.actor.id.as_str()).unwrap_or("");
             let role = session.role_of(author);
             if !crate::authorization::evaluate(&env.payload, author, role, &session).allowed {
