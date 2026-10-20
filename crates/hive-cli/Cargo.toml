@@ -21,3 +21,17 @@ serde.workspace = true
 serde_json.workspace = true
 toml = "0.8"
 base64 = "0.21"
+# `hive serve` (the home host for the iOS app): HTTP + SSE API. axum 0.7,
+# reqwest 0.12, futures-util and getrandom 0.2 are already in the lockfile
+# (hive-runtime's deps / dev-deps); qrcodegen is a dependency-free QR encoder
+# for the pairing code.
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json", "query"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+getrandom = "0.2"
+qrcodegen = "1.8"
+tracing.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

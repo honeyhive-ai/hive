@@ -1,0 +1,9 @@
+# MCP servers offered to agent turns on the home host (HIVE_MCP_CONFIG).
+# Presence here is the opt-in. Bearer tokens are never written to this file:
+# `token_env` names the environment variable holding one.
+
+[[mcp_servers]]
+id = "lab"
+transport = "http"
+url = "http://100.x.y.z:8090/mcp"
+token_env = "RDNAMCP_TOKEN"
