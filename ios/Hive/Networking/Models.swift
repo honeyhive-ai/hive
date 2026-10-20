@@ -133,24 +133,97 @@ struct LabTemp: Codable, Sendable, Hashable, Identifiable {
     var id: String { name }
 }
 
+/// One hour of the solar pane's chart: average solar production and lab draw.
+struct SolarPoint: Codable, Sendable, Hashable, Identifiable {
+    var t: Date
+    var solarWatts: Double?
+    var labWatts: Double?
+    var id: Date { t }
+}
+
+/// The lab's solar side, present only when the Enphase gateway reports in.
+/// `gridWatts` is positive while importing and negative while exporting.
+struct LabSolar: Codable, Sendable, Hashable {
+    var up: Bool
+    var productionWatts: Double?
+    var consumptionWatts: Double?
+    var gridWatts: Double?
+    var houseSolarShare: Double?
+    var labSolarWatts: Double?
+    var producedKwh24h: Double?
+    var houseKwh24h: Double?
+    var labKwh24h: Double?
+    var labSolarKwh24h: Double?
+    var gridImportKwh24h: Double?
+    var gridExportKwh24h: Double?
+    /// Share of the lab's energy over 24 h that the panels covered (0...1).
+    var labOffset24h: Double?
+    /// What that solar energy is worth at the retail rate.
+    var labSolarValue24h: Double?
+    var history: [SolarPoint]
+
+    init(up: Bool, productionWatts: Double? = nil, consumptionWatts: Double? = nil, gridWatts: Double? = nil,
+         houseSolarShare: Double? = nil, labSolarWatts: Double? = nil, producedKwh24h: Double? = nil,
+         houseKwh24h: Double? = nil, labKwh24h: Double? = nil, labSolarKwh24h: Double? = nil,
+         gridImportKwh24h: Double? = nil, gridExportKwh24h: Double? = nil, labOffset24h: Double? = nil,
+         labSolarValue24h: Double? = nil, history: [SolarPoint] = []) {
+        self.up = up
+        self.productionWatts = productionWatts
+        self.consumptionWatts = consumptionWatts
+        self.gridWatts = gridWatts
+        self.houseSolarShare = houseSolarShare
+        self.labSolarWatts = labSolarWatts
+        self.producedKwh24h = producedKwh24h
+        self.houseKwh24h = houseKwh24h
+        self.labKwh24h = labKwh24h
+        self.labSolarKwh24h = labSolarKwh24h
+        self.gridImportKwh24h = gridImportKwh24h
+        self.gridExportKwh24h = gridExportKwh24h
+        self.labOffset24h = labOffset24h
+        self.labSolarValue24h = labSolarValue24h
+        self.history = history
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        up = try c.decodeIfPresent(Bool.self, forKey: .up) ?? false
+        productionWatts = try c.decodeIfPresent(Double.self, forKey: .productionWatts)
+        consumptionWatts = try c.decodeIfPresent(Double.self, forKey: .consumptionWatts)
+        gridWatts = try c.decodeIfPresent(Double.self, forKey: .gridWatts)
+        houseSolarShare = try c.decodeIfPresent(Double.self, forKey: .houseSolarShare)
+        labSolarWatts = try c.decodeIfPresent(Double.self, forKey: .labSolarWatts)
+        producedKwh24h = try c.decodeIfPresent(Double.self, forKey: .producedKwh24h)
+        houseKwh24h = try c.decodeIfPresent(Double.self, forKey: .houseKwh24h)
+        labKwh24h = try c.decodeIfPresent(Double.self, forKey: .labKwh24h)
+        labSolarKwh24h = try c.decodeIfPresent(Double.self, forKey: .labSolarKwh24h)
+        gridImportKwh24h = try c.decodeIfPresent(Double.self, forKey: .gridImportKwh24h)
+        gridExportKwh24h = try c.decodeIfPresent(Double.self, forKey: .gridExportKwh24h)
+        labOffset24h = try c.decodeIfPresent(Double.self, forKey: .labOffset24h)
+        labSolarValue24h = try c.decodeIfPresent(Double.self, forKey: .labSolarValue24h)
+        history = try c.decodeIfPresent([SolarPoint].self, forKey: .history) ?? []
+    }
+}
+
 struct LabStatus: Codable, Sendable, Hashable {
     var workers: [LabWorker]
     var powerWatts: Double?
     var costPerHour: Double?
     var ratePerKwh: Double?
     var temps: [LabTemp]
+    var solar: LabSolar?
     var updatedAt: Date
 
     /// 30-day month projection of the hourly cost.
     var costPerMonth: Double? { costPerHour.map { $0 * 24 * 30 } }
 
     init(workers: [LabWorker], powerWatts: Double?, costPerHour: Double?, ratePerKwh: Double?,
-         temps: [LabTemp], updatedAt: Date) {
+         temps: [LabTemp], solar: LabSolar? = nil, updatedAt: Date) {
         self.workers = workers
         self.powerWatts = powerWatts
         self.costPerHour = costPerHour
         self.ratePerKwh = ratePerKwh
         self.temps = temps
+        self.solar = solar
         self.updatedAt = updatedAt
     }
 
@@ -161,6 +234,7 @@ struct LabStatus: Codable, Sendable, Hashable {
         costPerHour = try c.decodeIfPresent(Double.self, forKey: .costPerHour)
         ratePerKwh = try c.decodeIfPresent(Double.self, forKey: .ratePerKwh)
         temps = try c.decodeIfPresent([LabTemp].self, forKey: .temps) ?? []
+        solar = try c.decodeIfPresent(LabSolar.self, forKey: .solar)
         updatedAt = try c.decode(Date.self, forKey: .updatedAt)
     }
 }

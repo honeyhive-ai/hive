@@ -149,6 +149,23 @@ enum MockFixtures {
                 LabTemp(name: "SFF CPU", celsius: 49.2),
                 LabTemp(name: "Jetson SoC", celsius: 41.0),
             ],
+            solar: solar(now: now),
             updatedAt: now)
+    }
+
+    /// A sunny afternoon: exporting, with the panels covering the lab.
+    static func solar(now: Date) -> LabSolar {
+        let hour = 3600.0
+        let start = now.addingTimeInterval(-24 * hour)
+        let history = (0...24).map { i -> SolarPoint in
+            let t = start.addingTimeInterval(Double(i) * hour)
+            let h = Calendar.current.component(.hour, from: t)
+            let sun = max(0, sin(Double(h - 6) / 13 * .pi)) * 5200
+            return SolarPoint(t: t, solarWatts: sun.rounded(), labWatts: 180 + Double(i % 5) * 9)
+        }
+        return LabSolar(up: true, productionWatts: 4310, consumptionWatts: 1180, gridWatts: -3130,
+                        houseSolarShare: 1, labSolarWatts: 236.4, producedKwh24h: 31.6, houseKwh24h: 22.4,
+                        labKwh24h: 4.71, labSolarKwh24h: 2.38, gridImportKwh24h: 9.8, gridExportKwh24h: 19.1,
+                        labOffset24h: 0.505, labSolarValue24h: 0.374, history: history)
     }
 }

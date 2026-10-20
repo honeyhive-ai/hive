@@ -21,6 +21,10 @@ struct LabView: View {
                                      systemImage: "gauge.with.needle", tint: .orange)
                         }
 
+                        if let solar = lab.solar {
+                            SolarSection(solar: solar, labWatts: lab.powerWatts)
+                        }
+
                         section("Workers", systemImage: "server.rack") {
                             ForEach(lab.workers) { w in
                                 HStack {

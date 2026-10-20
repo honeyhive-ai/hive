@@ -171,6 +171,18 @@ import Testing
         #expect(lab.workers.first?.up == true)
     }
 
+    @Test func labStatusDecodesSolar() async throws {
+        let (client, _) = makeClient { _ in
+            .json(#"{"workers":[],"temps":[],"updatedAt":"2026-10-20T12:00:00Z","solar":{"up":true,"productionWatts":0,"gridWatts":-1200.5,"labOffset24h":0.625,"labSolarValue24h":0.3125,"history":[{"t":"2026-10-20T11:00:00Z","solarWatts":500},{"t":"2026-10-20T12:00:00Z","labWatts":190}]}}"#)
+        }
+        let lab = try await client.labStatus()
+        let solar = try #require(lab.solar)
+        #expect(solar.up && solar.productionWatts == 0 && solar.gridWatts == -1200.5)
+        #expect(solar.consumptionWatts == nil)
+        #expect(solar.labOffset24h == 0.625 && solar.labSolarValue24h == 0.3125)
+        #expect(solar.history.count == 2 && solar.history[0].labWatts == nil && solar.history[1].labWatts == 190)
+    }
+
     @Test func healthWithoutAuthFields() async throws {
         let (client, _) = makeClient { _ in .json(#"{"ok":true,"version":"1.15.0"}"#) }
         let h = try await client.health()

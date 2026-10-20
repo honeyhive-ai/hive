@@ -2,7 +2,9 @@
 //! Prometheus (`HIVE_PROMETHEUS_URL`, default `http://127.0.0.1:9090`).
 //!
 //! Every query runs concurrently with a short timeout; a query that fails or
-//! comes back empty just leaves its field out. Temperatures come from
+//! comes back empty just leaves its field out. The `solar` object (Enphase
+//! gateway via the lab's `envoy_*` metrics and `lab:solar_*` rules) is only
+//! present when the gateway exporter reports in. Temperatures come from
 //! `HIVE_LAB_TEMPS` (`Name=promql;Name=promql…`), defaulting to the hottest
 //! sensor per exporter family.
 
@@ -71,6 +73,167 @@ fn scalar(samples: Option<Vec<Sample>>) -> Option<f64> {
     samples.and_then(|s| s.first().map(|(_, v)| *v))
 }
 
+/// Run a range query over the last `hours` at one-hour steps: (unix seconds, value).
+async fn query_hourly(client: &reqwest::Client, base: &str, promql: &str, hours: i64) -> Option<Vec<(i64, f64)>> {
+    let url = format!("{}/api/v1/query_range", base.trim_end_matches('/'));
+    let end = time::OffsetDateTime::now_utc().unix_timestamp() / 3600 * 3600;
+    let start = (end - hours * 3600).to_string();
+    let end = end.to_string();
+    let resp = client
+        .get(url)
+        .query(&[("query", promql), ("start", &start), ("end", &end), ("step", "3600")])
+        .timeout(QUERY_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let v: Value = resp.json().await.ok()?;
+    parse_matrix_first(&v)
+}
+
+/// The first series of a Prometheus range-query response.
+pub fn parse_matrix_first(v: &Value) -> Option<Vec<(i64, f64)>> {
+    if v.get("status").and_then(Value::as_str) != Some("success") {
+        return None;
+    }
+    let values = v.pointer("/data/result/0/values")?.as_array()?;
+    Some(
+        values
+            .iter()
+            .filter_map(|p| {
+                let t = p.get(0)?.as_f64()? as i64;
+                let v = p.get(1)?.as_str()?.parse::<f64>().ok()?;
+                v.is_finite().then_some((t, v))
+            })
+            .collect(),
+    )
+}
+
+/// The solar side of the lab: what the panels produce, what the house and lab
+/// draw, and how much of the lab's energy the panels covered.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Solar {
+    pub up: Option<f64>,
+    pub production_w: Option<f64>,
+    pub consumption_w: Option<f64>,
+    pub grid_w: Option<f64>,
+    pub house_share: Option<f64>,
+    pub lab_solar_w: Option<f64>,
+    pub produced_kwh_24h: Option<f64>,
+    pub house_kwh_24h: Option<f64>,
+    pub lab_kwh_24h: Option<f64>,
+    pub lab_solar_kwh_24h: Option<f64>,
+    pub grid_import_kwh_24h: Option<f64>,
+    pub grid_export_kwh_24h: Option<f64>,
+    /// Hourly (unix seconds, solar W, lab W) for the last 24 h.
+    pub history: Vec<(i64, Option<f64>, Option<f64>)>,
+}
+
+fn round(v: f64, places: i32) -> f64 {
+    let f = 10f64.powi(places);
+    (v * f).round() / f
+}
+
+/// The `solar` JSON object, or `None` when the gateway exporter isn't reporting.
+pub fn solar_json(s: &Solar, rate: Option<f64>) -> Option<Value> {
+    s.up?;
+    let mut o = Map::new();
+    o.insert("up".into(), json!(s.up.is_some_and(|u| u >= 1.0)));
+    let mut put = |k: &str, v: Option<f64>, places: i32| {
+        if let Some(v) = v {
+            o.insert(k.into(), json!(round(v, places)));
+        }
+    };
+    put("productionWatts", s.production_w.map(|w| w.max(0.0)), 1);
+    put("consumptionWatts", s.consumption_w, 1);
+    put("gridWatts", s.grid_w, 1);
+    put("houseSolarShare", s.house_share, 3);
+    put("labSolarWatts", s.lab_solar_w, 1);
+    put("producedKwh24h", s.produced_kwh_24h, 2);
+    put("houseKwh24h", s.house_kwh_24h, 2);
+    put("labKwh24h", s.lab_kwh_24h, 3);
+    put("labSolarKwh24h", s.lab_solar_kwh_24h, 3);
+    put("gridImportKwh24h", s.grid_import_kwh_24h, 2);
+    put("gridExportKwh24h", s.grid_export_kwh_24h, 2);
+    // The offset: the share of the lab's energy the panels covered, and what
+    // that energy is worth at the retail rate (net metering credits it 1:1).
+    let offset = match (s.lab_solar_kwh_24h, s.lab_kwh_24h) {
+        (Some(sol), Some(lab)) if lab > 0.0 => Some((sol / lab).clamp(0.0, 1.0)),
+        _ => None,
+    };
+    put("labOffset24h", offset, 3);
+    put("labSolarValue24h", s.lab_solar_kwh_24h.zip(rate).map(|(k, r)| k * r), 4);
+    let history: Vec<Value> = s
+        .history
+        .iter()
+        .map(|(t, sol, lab)| {
+            let iso = time::OffsetDateTime::from_unix_timestamp(*t)
+                .ok()
+                .and_then(|d| d.format(&time::format_description::well_known::Rfc3339).ok())
+                .unwrap_or_default();
+            let mut p = json!({ "t": iso });
+            if let Some(v) = sol {
+                p["solarWatts"] = json!(round(v.max(0.0), 1));
+            }
+            if let Some(v) = lab {
+                p["labWatts"] = json!(round(*v, 1));
+            }
+            p
+        })
+        .collect();
+    if !history.is_empty() {
+        o.insert("history".into(), Value::Array(history));
+    }
+    Some(Value::Object(o))
+}
+
+/// Query everything the solar pane shows.
+async fn solar(client: &reqwest::Client, base: &str) -> Solar {
+    let q = |promql: &'static str| query(client, base, promql);
+    let (up, prod, cons, grid, share, lab_sol, produced, house, lab, lab_solar, import, export, hist_sol, hist_lab) = tokio::join!(
+        q("envoy_up"),
+        q("envoy_production_watts"),
+        q("envoy_consumption_watts"),
+        q("envoy_grid_watts"),
+        q("lab:solar_share"),
+        q("lab:solar_watts"),
+        q("sum_over_time(clamp_min(envoy_production_watts, 0)[24h:1m]) / 60 / 1000"),
+        q("sum_over_time(envoy_consumption_watts[24h:1m]) / 60 / 1000"),
+        q("sum_over_time(lab:power_watts:sum[24h:1m]) / 60 / 1000"),
+        q("sum_over_time(lab:solar_watts[24h:1m]) / 60 / 1000"),
+        q("sum_over_time(clamp_min(envoy_grid_watts, 0)[24h:1m]) / 60 / 1000"),
+        q("sum_over_time(clamp_min(-envoy_grid_watts, 0)[24h:1m]) / 60 / 1000"),
+        query_hourly(client, base, "avg_over_time(clamp_min(envoy_production_watts, 0)[1h:1m])", 24),
+        query_hourly(client, base, "avg_over_time(lab:power_watts:sum[1h:1m])", 24),
+    );
+    Solar {
+        up: scalar(up),
+        production_w: scalar(prod),
+        consumption_w: scalar(cons),
+        grid_w: scalar(grid),
+        house_share: scalar(share),
+        lab_solar_w: scalar(lab_sol),
+        produced_kwh_24h: scalar(produced),
+        house_kwh_24h: scalar(house),
+        lab_kwh_24h: scalar(lab),
+        lab_solar_kwh_24h: scalar(lab_solar),
+        grid_import_kwh_24h: scalar(import),
+        grid_export_kwh_24h: scalar(export),
+        history: merge_hourly(hist_sol.unwrap_or_default(), hist_lab.unwrap_or_default()),
+    }
+}
+
+/// Join two hourly series on their timestamps.
+pub fn merge_hourly(sol: Vec<(i64, f64)>, lab: Vec<(i64, f64)>) -> Vec<(i64, Option<f64>, Option<f64>)> {
+    let mut ts: Vec<i64> = sol.iter().chain(lab.iter()).map(|(t, _)| *t).collect();
+    ts.sort_unstable();
+    ts.dedup();
+    let find = |s: &[(i64, f64)], t: i64| s.iter().find(|(x, _)| *x == t).map(|(_, v)| *v);
+    ts.into_iter().map(|t| (t, find(&sol, t), find(&lab, t))).collect()
+}
+
 /// Assemble the status object from the query results.
 pub fn assemble(
     workers: Option<Vec<Sample>>,
@@ -78,6 +241,7 @@ pub fn assemble(
     cost: Option<f64>,
     rate: Option<f64>,
     temps: Vec<(String, Option<f64>)>,
+    solar: &Solar,
 ) -> Value {
     let mut workers: Vec<Value> = workers
         .unwrap_or_default()
@@ -107,6 +271,9 @@ pub fn assemble(
     if let Some(r) = rate {
         o.insert("ratePerKwh".into(), json!(r));
     }
+    if let Some(sj) = solar_json(solar, rate) {
+        o.insert("solar".into(), sj);
+    }
     out
 }
 
@@ -114,19 +281,20 @@ pub fn assemble(
 pub async fn status(client: &reqwest::Client, base: &str) -> Value {
     let temp_qs = temp_queries();
     let temps_fut = futures_util::future::join_all(temp_qs.iter().map(|(_, q)| query(client, base, q)));
-    let (workers, power, cost, rate, temps) = tokio::join!(
+    let (workers, power, cost, rate, temps, solar) = tokio::join!(
         query(client, base, "rdnagw_worker_up"),
         query(client, base, "lab:power_watts:sum"),
         query(client, base, "lab:cost_usd_per_hour"),
         query(client, base, "lab:electric_rate_usd_per_kwh"),
         temps_fut,
+        solar(client, base),
     );
     let temps = temp_qs
         .into_iter()
         .zip(temps)
         .map(|((name, _), r)| (name, scalar(r)))
         .collect();
-    assemble(workers, scalar(power), scalar(cost), scalar(rate), temps)
+    assemble(workers, scalar(power), scalar(cost), scalar(rate), temps, &solar)
 }
 
 #[cfg(test)]
@@ -140,7 +308,14 @@ mod tests {
             {"metric":{"worker":"desktop-6900xt"},"value":[1.0,"0"]}
         ]}});
         let workers = parse_vector(&body);
-        let out = assemble(workers, Some(184.61), None, Some(0.25), vec![("Server".into(), Some(49.25)), ("Jetson".into(), None)]);
+        let out = assemble(
+            workers,
+            Some(184.61),
+            None,
+            Some(0.25),
+            vec![("Server".into(), Some(49.25)), ("Jetson".into(), None)],
+            &Solar::default(),
+        );
         assert_eq!(out["workers"][0], json!({"name":"desktop-6900xt","up":false}));
         assert_eq!(out["workers"][1], json!({"name":"server-cpu","up":true}));
         assert_eq!(out["powerWatts"], json!(184.6));
@@ -148,6 +323,43 @@ mod tests {
         assert_eq!(out["ratePerKwh"], json!(0.25));
         assert_eq!(out["temps"], json!([{"name":"Server","celsius":49.3}]));
         assert!(out["updatedAt"].as_str().unwrap().ends_with('Z'));
+        assert!(out.get("solar").is_none(), "no gateway, no solar object");
+    }
+
+    #[test]
+    fn solar_offset_and_value() {
+        let s = Solar {
+            up: Some(1.0),
+            production_w: Some(-3.0),
+            grid_w: Some(-1200.0),
+            lab_kwh_24h: Some(2.0),
+            lab_solar_kwh_24h: Some(1.25),
+            history: merge_hourly(vec![(3600, 500.0), (7200, 0.0)], vec![(7200, 190.0)]),
+            ..Solar::default()
+        };
+        let j = solar_json(&s, Some(0.25)).unwrap();
+        assert_eq!(j["up"], json!(true));
+        assert_eq!(j["productionWatts"], json!(0.0), "night-time meter noise reads as zero");
+        assert_eq!(j["gridWatts"], json!(-1200.0));
+        assert_eq!(j["labOffset24h"], json!(0.625));
+        assert_eq!(j["labSolarValue24h"], json!(0.3125));
+        assert!(j.get("consumptionWatts").is_none());
+        let h = j["history"].as_array().unwrap();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0]["solarWatts"], json!(500.0));
+        assert!(h[0].get("labWatts").is_none());
+        assert_eq!(h[1]["labWatts"], json!(190.0));
+        assert!(h[0]["t"].as_str().unwrap().ends_with('Z'));
+
+        let none = Solar { up: None, production_w: Some(100.0), ..Solar::default() };
+        assert!(solar_json(&none, None).is_none());
+    }
+
+    #[test]
+    fn matrix_first_series_parses() {
+        let body = json!({"status":"success","data":{"resultType":"matrix","result":[
+            {"metric":{},"values":[[3600,"1.5"],[7200,"NaN"],[10800,"2"]]}]}});
+        assert_eq!(parse_matrix_first(&body), Some(vec![(3600, 1.5), (10800, 2.0)]));
     }
 
     #[test]
