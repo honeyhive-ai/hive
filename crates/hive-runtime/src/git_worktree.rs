@@ -169,7 +169,13 @@ impl Worktree {
             std::fs::create_dir_all(parent)?;
         }
         // A stale worktree/branch from a crashed prior turn with the same id
-        // would block creation — best-effort clear it first.
+        // would block creation — best-effort clear it first. Turn ids are
+        // unique per turn, so this only ever meets a leftover, never a live
+        // turn's tree; say so when it throws edits away.
+        if path.exists() {
+            let dirty = git(&path, &["status", "--porcelain"]).map(|s| !s.trim().is_empty()).unwrap_or(false);
+            tracing::warn!(target: "worktree", path = %path.display(), dirty, "clearing a stale turn worktree");
+        }
         let _ = command("git")
             .arg("-C")
             .arg(repo_root)
@@ -218,12 +224,17 @@ impl Worktree {
 /// and applying advances only that chat), ensuring the chat's base worktree
 /// first. If that fails (e.g. a repo with no `HEAD`) the turn is cut from
 /// `HEAD`; an `Err` means isolation is unavailable and the caller runs in place.
-pub fn cut_turn_worktree(repo_root: &Path, chat_id: &str) -> io::Result<Worktree> {
+///
+/// The worktree's path and branch are keyed by `turn_id` (unique per turn,
+/// e.g. the reply's message id), not by the chat: two turns running in one
+/// chat at once each get their own tree instead of the second force-removing
+/// the first's.
+pub fn cut_turn_worktree(repo_root: &Path, chat_id: &str, turn_id: &str) -> io::Result<Worktree> {
     match chat_worktree(repo_root, chat_id) {
-        Ok(_) => Worktree::create_from(repo_root, chat_id, &format!("hive/chat/{chat_id}")),
+        Ok(_) => Worktree::create_from(repo_root, turn_id, &format!("hive/chat/{chat_id}")),
         Err(e) => {
             tracing::warn!(target: "worktree", "chat base worktree unavailable, cutting turn from HEAD: {e}");
-            Worktree::create(repo_root, chat_id)
+            Worktree::create(repo_root, turn_id)
         }
     }
 }
@@ -241,6 +252,7 @@ pub fn cut_turn_worktree(repo_root: &Path, chat_id: &str) -> io::Result<Worktree
 pub struct LazyTurnWorktree {
     repo_root: PathBuf,
     chat_id: String,
+    turn_id: String,
     state: std::sync::Mutex<LazyTurnState>,
 }
 
@@ -251,12 +263,20 @@ struct LazyTurnState {
 }
 
 impl LazyTurnWorktree {
-    pub fn new(repo_root: impl Into<PathBuf>, chat_id: impl Into<String>) -> Self {
+    /// `turn_id` names the worktree and its branch; it must be unique per
+    /// turn (see [`cut_turn_worktree`]).
+    pub fn new(repo_root: impl Into<PathBuf>, chat_id: impl Into<String>, turn_id: impl Into<String>) -> Self {
         Self {
             repo_root: repo_root.into(),
             chat_id: chat_id.into(),
+            turn_id: turn_id.into(),
             state: std::sync::Mutex::new(LazyTurnState { worktree: None, closed: false }),
         }
+    }
+
+    /// Where a stopped turn's unfinished edits are saved (see `Drop`).
+    pub fn stopped_patch_path(repo_root: &Path, turn_id: &str) -> PathBuf {
+        repo_root.join(".hive").join("stopped-turns").join(format!("{}.patch", slug(turn_id)))
     }
 
     /// The worktree cut so far, if any (without taking it).
@@ -283,11 +303,41 @@ impl crate::builtin_tools::WriteRoot for LazyTurnWorktree {
         if st.closed {
             return Err("the turn has ended".into());
         }
-        let wt = cut_turn_worktree(&self.repo_root, &self.chat_id).map_err(|e| format!("isolation unavailable: {e}"))?;
+        let wt = cut_turn_worktree(&self.repo_root, &self.chat_id, &self.turn_id)
+            .map_err(|e| format!("isolation unavailable: {e}"))?;
         tracing::info!(target: "worktree", path = %wt.path.display(), "turn wrote: cut its worktree");
         let path = wt.path.clone();
         st.worktree = Some(wt);
         Ok(path)
+    }
+}
+
+/// A turn dropped before [`LazyTurnWorktree::finish`] — the user pressed
+/// Stop, which drops the turn's future — would otherwise leave its worktree
+/// and branch behind with whatever the model had edited. Save those edits as
+/// a patch under `.hive/stopped-turns/` (so nothing is lost silently) and
+/// remove the worktree.
+impl Drop for LazyTurnWorktree {
+    fn drop(&mut self) {
+        let st = self.state.get_mut().unwrap_or_else(|e| e.into_inner());
+        st.closed = true;
+        let Some(wt) = st.worktree.take() else { return };
+        let diff = wt.diff().unwrap_or_default();
+        if !diff.trim().is_empty() {
+            let patch = Self::stopped_patch_path(&self.repo_root, &self.turn_id);
+            let saved = patch.parent().map(std::fs::create_dir_all).transpose().and_then(|_| std::fs::write(&patch, &diff));
+            match saved {
+                Ok(()) => tracing::warn!(target: "worktree", patch = %patch.display(), "turn stopped mid-edit: saved its changes as a patch"),
+                Err(e) => {
+                    tracing::warn!(target: "worktree", path = %wt.path.display(), "turn stopped mid-edit; could not save its patch ({e}), keeping the worktree");
+                    return;
+                }
+            }
+        }
+        let path = wt.path.clone();
+        if let Err(e) = wt.remove() {
+            tracing::warn!(target: "worktree", path = %path.display(), "could not remove a stopped turn's worktree: {e}");
+        }
     }
 }
 

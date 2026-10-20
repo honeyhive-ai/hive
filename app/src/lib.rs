@@ -6977,6 +6977,12 @@ fn store_remote_file_tools_optin(settings: &mut LiveSettings, runtime_id: &str, 
     }
 }
 
+/// The checkout a turn's worktrees are cut from: the active workspace's bound
+/// folder, else (no binding) the effective workspace root.
+fn turn_repo_root(bound: &str, workspace_root: &str) -> String {
+    if bound.trim().is_empty() { workspace_root.to_string() } else { bound.to_string() }
+}
+
 /// Whether a turn runs in its own per-turn worktree, cut up front from the
 /// chat's `hive/chat/<id>` branch, whose diff comes back as a review-gated
 /// proposal: file-mutating subprocess agents, in a repo. HTTP turns with the
@@ -7325,15 +7331,22 @@ async fn run_prepared_turn(
         ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes => true,
         _ => false,
     };
-    let in_repo = !workspace_root.trim().is_empty()
-        && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root));
+    // Worktrees are cut from the workspace's own checkout, not from
+    // `workspace_root`, which follows the *active* chat's base worktree.
+    let repo_root = turn_repo_root(&state.workspace_repo_root(), &workspace_root);
+    let in_repo = !repo_root.trim().is_empty()
+        && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&repo_root));
+    // Unique per turn, so two turns in one chat never share (and remove)
+    // one worktree.
+    let turn_key = message_id.to_string();
     let worktree = if isolates_turn(git_subprocess, write_capable, in_repo) {
         // Phase 2a: cut the ephemeral turn worktree from the chat's persistent
         // base branch `hive/chat/<sessionid>` (falling back to HEAD); if that
         // also fails, run in place.
         match hive_runtime::git_worktree::cut_turn_worktree(
-            std::path::Path::new(&workspace_root),
+            std::path::Path::new(&repo_root),
             &session_id.to_string(),
+            &turn_key,
         ) {
             Ok(wt) => Some(wt),
             Err(e) => {
@@ -7350,10 +7363,25 @@ async fn run_prepared_turn(
     // captured below exactly like an eagerly isolated turn's.
     let lazy_worktree = isolates_on_write(builtin_wanted, in_repo).then(|| {
         std::sync::Arc::new(hive_runtime::git_worktree::LazyTurnWorktree::new(
-            &workspace_root,
+            &repo_root,
             session_id.to_string(),
+            turn_key.clone(),
         ))
     });
+    // Until it writes, a lazily isolated turn reads its OWN chat's base
+    // worktree — the tree its worktree will be cut from — not the active
+    // chat's (or the main checkout's uncommitted work), so a scheduled,
+    // synced or workflow turn in another chat edits what it read.
+    let builtin_read_root = match &lazy_worktree {
+        Some(_) => match hive_runtime::git_worktree::chat_worktree(std::path::Path::new(&repo_root), &session_id.to_string()) {
+            Ok(dir) => dir.to_string_lossy().into_owned(),
+            Err(e) => {
+                tracing::warn!(target: "worktree", "chat base worktree unavailable, reading the workspace folder: {e}");
+                repo_root.clone()
+            }
+        },
+        None => String::new(),
+    };
     // P2-5: a non-subprocess (API) turn with MCP tools enabled writes to the
     // workspace root directly through its filesystem MCP server — it gets NO
     // worktree isolation and NO review-gated diff (that path covers only subprocess
@@ -7394,9 +7422,10 @@ async fn run_prepared_turn(
     // land in the lazily cut worktree (captured below as a proposal); outside
     // one, in place only if the user allowed it. `run_command` needs its own
     // opt-in on top.
+    let builtin_root = if lazy_worktree.is_some() { builtin_read_root.as_str() } else { effective_root.as_str() };
     let builtin = if builtin_wanted && working_dir.is_some() {
         let policy = hive_runtime::agent_tools::builtin_policy(
-            &effective_root,
+            builtin_root,
             lazy_worktree.is_some(),
             builtin_write_in_place,
             builtin_run_command,
@@ -7408,7 +7437,7 @@ async fn run_prepared_turn(
         match made {
             Ok(b) => Some(b),
             Err(e) => {
-                tracing::warn!(target: "dispatch", dir = %effective_root, "built-in tools unavailable: {e}");
+                tracing::warn!(target: "dispatch", dir = %builtin_root, "built-in tools unavailable: {e}");
                 None
             }
         }

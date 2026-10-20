@@ -93,7 +93,7 @@ async fn in_place_turn_without_opt_in_cannot_write() {
 /// The app's lazy path: built-ins read the chat's dir, and the per-turn
 /// worktree is cut by the first write — what `run_prepared_turn` wires up.
 fn lazy_turn(repo: &Path, chat: &str) -> (CompositeTools<NoTools>, std::sync::Arc<LazyTurnWorktree>) {
-    let lazy = std::sync::Arc::new(LazyTurnWorktree::new(repo, chat));
+    let lazy = std::sync::Arc::new(LazyTurnWorktree::new(repo, chat, format!("{chat}-turn")));
     let builtin = BuiltinTools::lazy(builtin_policy(repo, true, false, false), lazy.clone(), false).unwrap();
     (CompositeTools::new(Some(builtin), None, MAX_OFFERED_TOOLS), lazy)
 }
@@ -152,5 +152,66 @@ async fn the_first_write_cuts_the_worktree_and_its_edits_become_the_captured_dif
     assert!(err, "{out}");
     wt.remove().unwrap();
     assert!(turn_worktrees(&repo).is_empty(), "{:?}", turn_worktrees(&repo));
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Two turns in one chat at once (a synced message mid-turn, a workflow
+/// stage) each get their own worktree: the second doesn't force-remove the
+/// first's tree, and each captured diff holds only that turn's edits.
+#[tokio::test]
+async fn concurrent_turns_in_one_chat_get_separate_worktrees() {
+    let repo = temp_repo("lazy-two");
+    let chat = "chat-two";
+    let mk = |turn: &str| {
+        let lazy = std::sync::Arc::new(LazyTurnWorktree::new(&repo, chat, turn));
+        let builtin = BuiltinTools::lazy(builtin_policy(&repo, true, false, false), lazy.clone(), false).unwrap();
+        (CompositeTools::<NoTools>::new(Some(builtin), None, MAX_OFFERED_TOOLS), lazy)
+    };
+    let (first, first_lazy) = mk("turn-1");
+    let (second, second_lazy) = mk("turn-2");
+    assert!(!first.call("write_file", &json!({ "path": "one.txt", "content": "1\n" })).await.1);
+    assert!(!second.call("write_file", &json!({ "path": "two.txt", "content": "2\n" })).await.1);
+    // The first turn keeps writing into its own, still-present tree.
+    let (out, err) = first.call("write_file", &json!({ "path": "one-more.txt", "content": "1b\n" })).await;
+    assert!(!err, "{out}");
+    assert_eq!(turn_worktrees(&repo).len(), 2, "{:?}", turn_worktrees(&repo));
+
+    let a = first_lazy.finish().unwrap();
+    let b = second_lazy.finish().unwrap();
+    assert_ne!(a.path, b.path);
+    assert_eq!(a.changed_files().unwrap(), ["one-more.txt", "one.txt"]);
+    assert_eq!(b.changed_files().unwrap(), ["two.txt"]);
+    a.remove().unwrap();
+    assert!(b.path.exists(), "removing one turn's tree leaves the other's");
+    b.remove().unwrap();
+    assert!(turn_worktrees(&repo).is_empty());
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Stop drops the turn without `finish`: its edits are saved as a patch and
+/// the worktree goes away, instead of lingering for a later turn to delete.
+#[tokio::test]
+async fn a_stopped_turn_saves_its_edits_and_removes_its_worktree() {
+    let repo = temp_repo("lazy-stop");
+    let (tools, lazy) = lazy_turn(&repo, "chat-stop");
+    let (out, err) = tools
+        .call("edit_file", &json!({ "path": "calc.py", "old_string": "return a - b", "new_string": "return a + b" }))
+        .await;
+    assert!(!err, "{out}");
+    assert_eq!(turn_worktrees(&repo).len(), 1);
+    drop(tools);
+    drop(lazy);
+    assert!(turn_worktrees(&repo).is_empty(), "{:?}", turn_worktrees(&repo));
+    let patch = LazyTurnWorktree::stopped_patch_path(&repo, "chat-stop-turn");
+    let saved = std::fs::read_to_string(&patch).expect("patch saved");
+    assert!(saved.contains("+    return a + b"), "{saved}");
+    assert!(std::fs::read_to_string(repo.join("calc.py")).unwrap().contains("a - b"), "main tree untouched");
+
+    // A read-only turn that is stopped leaves nothing behind.
+    let (tools, lazy) = lazy_turn(&repo, "chat-stop-read");
+    assert!(!tools.call("read_file", &json!({ "path": "calc.py" })).await.1);
+    drop(tools);
+    drop(lazy);
+    assert!(!LazyTurnWorktree::stopped_patch_path(&repo, "chat-stop-read-turn").exists());
     let _ = std::fs::remove_dir_all(&repo);
 }
