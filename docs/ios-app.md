@@ -175,7 +175,12 @@ carry `Click: hive://chat/<chatId>`.
     message's author has at least `HIVE_MCP_MIN_ROLE` (default Contributor).
   - Optional: `HIVE_SERVE_APPLY_ON_APPROVE=1` applies an approved diff to the
     chat's branch (`hive/chat/<id>`) in the bound checkout, the way the
-    desktop's Implement does.
+    desktop's Implement does. Only a proposal whose status is `approved`
+    applies: one a qualifying reviewer rejected, or that was dismissed or
+    superseded, never does.
+  - A file-writing subprocess agent (aider, pi, codex, hermes, or Claude Code
+    in an edit mode) runs only in a per-turn worktree of a bound repository.
+    Without one the turn fails instead of writing in place.
 - **Notifications carry no content.** An ntfy push says who replied in which
   chat, or that a change is ready for review, plus the deep link. It never
   includes message bodies, diffs or secrets. `HIVE_NTFY_TOKEN` (optional) is
@@ -195,14 +200,21 @@ carry `Click: hive://chat/<chatId>`.
 - Deltas are pushed only for turns that run on this box. A reply streamed on
   another device arrives as `created` and then `done` once it syncs (3 s
   cadence).
-- Event replay keeps 1024 events in memory and is lost on restart. Clients
-  should refetch chats on reconnect.
+- Event replay keeps 1024 events in memory and is lost on restart. The app
+  refetches its lists and the open chat whenever its stream reconnects.
+- On SIGTERM a turn in flight gets 15 s to finish. A reply cut off by a stop
+  is finished on the next start with an "interrupted" note; ask again to
+  retry.
+- A fresh box whose first relay sync fails refuses to start (systemd
+  retries), so it never seeds a workspace config of its own.
 - Read marks are per box, not per device, and persist in
   `serve-state.json`.
 - Creating agents and editing runtimes aren't in the API. Assigning existing
   agents to hosts is.
 - New agents created on the desktop default to their owner's device. Send them
-  here explicitly.
+  here explicitly. Once an agent is sent to a host, only that host answers its
+  mentions; the desktop defers to it (and answers after 25 s only if the host
+  is offline).
 - Approving doesn't apply a diff by default; the desktop's Implement does that.
   Set `HIVE_SERVE_APPLY_ON_APPROVE=1` to apply on the home host.
 
