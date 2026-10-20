@@ -33,7 +33,7 @@ struct ProposalRow: View {
             Text(proposal.title).font(.body.weight(.semibold)).lineLimit(2)
             Text(proposal.body).font(.subheadline).foregroundStyle(.secondary).lineLimit(2)
             HStack(spacing: 10) {
-                Label("@\(proposal.author)", systemImage: "sparkle").font(.caption)
+                Label(proposal.authorLabel, systemImage: proposal.isFromAgent ? "sparkle" : "person").font(.caption)
                 Text(proposal.kind).font(.caption.monospaced())
                     .padding(.horizontal, 6).padding(.vertical, 1)
                     .background(.fill.tertiary, in: .capsule)
@@ -69,7 +69,7 @@ struct ProposalDetailView: View {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(p.title).font(.title3.bold())
                             HStack(spacing: 8) {
-                                Text("@\(p.author)")
+                                Text(p.authorLabel)
                                 Text("·")
                                 Text(p.createdAt, format: .relative(presentation: .named))
                                 if let chat = model.chat(id: p.chatId) {

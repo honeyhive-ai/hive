@@ -108,7 +108,7 @@ enum MockFixtures {
                       path = "/models/lfm2-8b-q4_k_m.gguf"
                       ctx_size = 8192
                      +flash_attn = true
-                     """, status: .open, createdAt: ago(300), author: "gpt-oss"),
+                     """, status: .open, createdAt: ago(300), author: "@gpt-oss"),
             Proposal(id: "p2", chatId: "c-infra", title: "Add power alert to ntfy",
                      body: "Alert when lab:power_watts:sum stays above 450 W for 10 minutes.",
                      kind: "edit", diff: """
@@ -127,7 +127,7 @@ enum MockFixtures {
                      +          summary: "Lab drawing {{ $value }} W"
                      +
                             - record: lab:power_watts:sum
-                     """, status: .open, createdAt: ago(5400), author: "gemma"),
+                     """, status: .open, createdAt: ago(5400), author: "@gemma"),
         ]
 
         return Bundle(chats: chats,

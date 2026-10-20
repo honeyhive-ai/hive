@@ -80,3 +80,27 @@ targets:
         GENERATE_INFOPLIST_FILE: YES
         TEST_HOST: $(BUILT_PRODUCTS_DIR)/Hive.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Hive
         BUNDLE_LOADER: $(TEST_HOST)
+  HiveUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: HiveUITests
+    dependencies:
+      - target: Hive
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zazulam.hive.lab.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: Hive
+schemes:
+  # Live end-to-end UI run against a real `hive serve` (see HiveUITests/LiveE2ETests.swift).
+  # Kept out of the Hive scheme so `xcodebuild test` stays fast and offline.
+  HiveE2E:
+    build:
+      targets:
+        Hive: all
+        HiveUITests: [test]
+    test:
+      targets:
+        - HiveUITests

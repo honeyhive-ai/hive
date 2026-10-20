@@ -38,6 +38,24 @@ xcodebuild -project Hive.xcodeproj -scheme Hive \
   -destination 'generic/platform=iOS' -allowProvisioningUpdates build
 ```
 
+## Live end-to-end UI test
+
+`HiveUITests/LiveE2ETests.swift` (scheme `HiveE2E`) drives the real app against
+a running `hive serve`: pair via the `hive://pair` link, new chat, `@agent`
+message, reply, approve the proposal in Review, Lab, and send the agent to
+another host. It is skipped unless the pairing link is passed in:
+
+```sh
+TEST_RUNNER_HIVE_E2E_PAIR_URL='hive://pair?url=…&token=…' \
+TEST_RUNNER_HIVE_E2E_AGENT=coder TEST_RUNNER_HIVE_E2E_MOVE_TO=MacBook \
+TEST_RUNNER_HIVE_E2E_SHOTS=/tmp/hive-ios-shots \
+xcodebuild -project Hive.xcodeproj -scheme HiveE2E \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+```
+
+A loopback serve (`127.0.0.1:8787`) is reachable from the simulator.
+Screenshots and per-step timings land in the shots directory.
+
 ## Pairing
 
 On the home host run `hive serve --pair`; it prints a QR code for

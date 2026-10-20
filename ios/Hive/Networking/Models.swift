@@ -109,6 +109,16 @@ struct Proposal: Codable, Sendable, Identifiable, Hashable {
     var status: ProposalStatus
     var createdAt: Date
     var author: String
+
+    /// Who it's from, ready to show: the server already writes an agent as
+    /// `@name` and a person by display name, so never add another `@`.
+    var authorLabel: String {
+        let a = author.trimmingCharacters(in: .whitespaces)
+        return a.isEmpty ? "Unknown" : a
+    }
+
+    /// Whether an agent's turn produced it (the server's `@name` form).
+    var isFromAgent: Bool { author.hasPrefix("@") }
 }
 
 struct LabWorker: Codable, Sendable, Hashable, Identifiable {

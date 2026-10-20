@@ -178,6 +178,7 @@ struct PairConfirmView: View {
             .buttonStyle(.glassProminent)
             .controlSize(.large)
             .disabled(busy)
+            .accessibilityIdentifier("pair.confirm")
         }
         .padding(24)
         .toolbar {

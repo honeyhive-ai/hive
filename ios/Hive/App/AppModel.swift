@@ -60,6 +60,8 @@ final class AppModel {
     var reviewPath: [String] = []
     var pendingPair: ServerConfig?
     var banner: String?
+    /// How long a failed turn stays in a chat's status strip.
+    var errorTurnLinger: Duration = .seconds(12)
 
     private let store: ServerStore
     private let session: URLSession
@@ -195,9 +197,18 @@ final class AppModel {
 
     func apply(_ ev: ServerEvent) {
         switch ev {
-        case let .messageCreated(m), let .messageDone(m):
+        case let .messageCreated(m):
             upsert(m)
             bumpChat(for: m)
+        case let .messageDone(m):
+            upsert(m)
+            bumpChat(for: m)
+            // A reply that finished while its chat is on screen has been read:
+            // re-fetch the page, which also advances the server's read mark —
+            // otherwise the next chat.updated / chats refresh counts it unread.
+            if chatPath.last == m.chatId, client != nil {
+                Task { await self.loadMessages(chatId: m.chatId) }
+            }
         case let .messageDelta(d):
             var list = messages[d.chatId] ?? []
             if let i = list.firstIndex(where: { $0.id == d.messageId }) {
@@ -219,9 +230,25 @@ final class AppModel {
             default: perChat[t.agentId] = t
             }
             turns[t.chatId] = perChat.isEmpty ? nil : perChat
+            // A failure is terminal: show it for a while, then clear it (unless
+            // a newer status for that agent replaced it in the meantime).
+            if t.state == .error {
+                let linger = errorTurnLinger
+                Task { [weak self] in
+                    try? await Task.sleep(for: linger)
+                    self?.clearTurn(t)
+                }
+            }
         case .unknown:
             break
         }
+    }
+
+    /// Drop `t` from the turn strip if it is still the agent's latest status.
+    func clearTurn(_ t: TurnStatus) {
+        guard var perChat = turns[t.chatId], perChat[t.agentId] == t else { return }
+        perChat[t.agentId] = nil
+        turns[t.chatId] = perChat.isEmpty ? nil : perChat
     }
 
     private func upsert(_ m: Message) {
