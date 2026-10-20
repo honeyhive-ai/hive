@@ -179,8 +179,11 @@ reads the host the same way its HTTP client does, so an endpoint such as
 `http://example.com\@127.0.0.1/` counts as `example.com`.
 
 For any other endpoint, turn on **Allow workspace file tools for this
-endpoint** on the runtime (`allow_remote_file_tools = true` in
-`hive.config.toml`). Without it, the model gets only your MCP tools.
+endpoint** on the runtime. Without it, the model gets only your MCP tools.
+The switch is saved on this device only, for that endpoint: it is never
+read from or written to `hive.config.toml`, so a shared or cloned config
+can't turn it on, and pointing the runtime at another endpoint turns it
+off.
 Hosted APIs (OpenAI, OpenRouter, Azure) never get the tool loop.
 
 The tool loop allows 24 rounds by default (set **Max tool rounds** on

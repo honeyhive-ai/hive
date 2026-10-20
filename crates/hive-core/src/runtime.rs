@@ -92,8 +92,11 @@ pub struct RuntimeTarget {
     pub max_tool_rounds: Option<u32>,
     /// Offer Hive's built-in workspace file tools even though the endpoint's
     /// host isn't local or private — the user accepts that file contents are
-    /// sent to it. Set via `allow_remote_file_tools` in a `[[runtimes]]` block.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// sent to it. **Device-local**: never read from or written to any config
+    /// or catalog (a shared `hive.config.toml` must not be able to turn it
+    /// on). The app fills it in from this device's settings, bound to the
+    /// runtime's endpoint origin.
+    #[serde(skip)]
     pub allow_remote_file_tools: bool,
     #[serde(default)]
     pub estimated_performance_score: f64,

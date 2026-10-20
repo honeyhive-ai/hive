@@ -224,8 +224,6 @@ struct RawRuntime {
     think: Option<bool>,
     max_tool_rounds: Option<u32>,
     #[serde(default)]
-    allow_remote_file_tools: bool,
-    #[serde(default)]
     supports_embeddings: bool,
     #[serde(default)]
     supports_tools: bool,
@@ -467,7 +465,8 @@ impl RawRuntime {
             request_keep_alive: self.keep_alive,
             think: self.think,
             max_tool_rounds: self.max_tool_rounds.filter(|n| *n > 0),
-            allow_remote_file_tools: self.allow_remote_file_tools,
+            // Device-local consent, never taken from a config file.
+            allow_remote_file_tools: false,
             estimated_performance_score: self.performance_score,
             estimated_cost_per_1m_input_tokens_usd: self.cost_per_1m_input_tokens_usd,
             capabilities: RuntimeCapabilities {
@@ -550,7 +549,7 @@ max_tool_rounds = 0
     }
 
     #[test]
-    fn allow_remote_file_tools_parses_and_defaults_off() {
+    fn allow_remote_file_tools_in_a_config_file_is_ignored() {
         let toml = r#"
 [[runtimes]]
 id = "hosted-gateway"
@@ -563,9 +562,19 @@ id = "other"
 provider = "custom"
 endpoint = "https://llm.example.com/v1/chat/completions"
 "#;
+        // A repo's config can't consent for the device that opens it.
         let cfg = load_from_str(toml).unwrap();
-        assert!(cfg.runtimes[0].allow_remote_file_tools);
+        assert!(!cfg.runtimes[0].allow_remote_file_tools);
         assert!(!cfg.runtimes[1].allow_remote_file_tools);
+        // Nor can a JSON runtime catalog.
+        let json = r#"{"id":"x","name":"x","providerKind":"custom","location":"remote","modelId":"m","availableModels":[],"endpoint":"https://llm.example.com","allowRemoteFileTools":true,"allow_remote_file_tools":true,"capabilities":{}}"#;
+        if let Ok(rt) = serde_json::from_str::<crate::RuntimeTarget>(json) {
+            assert!(!rt.allow_remote_file_tools);
+        }
+        let mut rt = cfg.runtimes[0].clone();
+        rt.allow_remote_file_tools = true;
+        let out = serde_json::to_string(&rt).unwrap();
+        assert!(!out.to_lowercase().contains("remotefiletools") && !out.contains("allow_remote"), "{out}")
     }
 
     #[test]

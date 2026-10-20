@@ -388,6 +388,13 @@ struct LiveSettings {
     /// this device's secret. A token with no recorded origin is never sent.
     #[serde(default)]
     mcp_bearer_origins: std::collections::HashMap<String, String>,
+    /// "Allow workspace file tools for this endpoint", per runtime id: the
+    /// endpoint origin the user consented for. Device-local on purpose (a
+    /// shared or committed config must not be able to send this device's
+    /// files anywhere), and bound to the origin so pointing the runtime at
+    /// another endpoint withdraws the consent.
+    #[serde(default)]
+    remote_file_tools_optins: std::collections::HashMap<String, String>,
     /// The workspace folder the user last chose (via `set_workspace_root`), so a
     /// GUI launch reopens it instead of starting with no workspace. `None` = never
     /// chosen; restored only if still a valid, non-shallow/-system dir at launch.
@@ -535,6 +542,7 @@ impl Default for LiveSettings {
             mcp_oauth: std::collections::HashMap::new(),
             mcp_bearer_tokens: std::collections::HashMap::new(),
             mcp_bearer_origins: std::collections::HashMap::new(),
+            remote_file_tools_optins: std::collections::HashMap::new(),
             workspace_root: None,
             workspace_dirs: std::collections::HashMap::new(),
         }
@@ -2461,9 +2469,6 @@ fn runtime_to_toml(runtime: &RuntimeTarget) -> toml::Value {
     if let Some(rounds) = runtime.max_tool_rounds {
         table.insert("max_tool_rounds".into(), toml::Value::Integer(rounds.into()));
     }
-    if runtime.allow_remote_file_tools {
-        table.insert("allow_remote_file_tools".into(), toml::Value::Boolean(true));
-    }
     if runtime.capabilities.supports_embeddings {
         table.insert("supports_embeddings".into(), toml::Value::Boolean(true));
     }
@@ -2782,7 +2787,9 @@ impl AppState {
     fn combined_runtimes(&self) -> Vec<RuntimeTarget> {
         let base = self.base_runtimes.lock().unwrap();
         let managed = self.managed_runtimes.lock().unwrap();
-        merge_runtimes(&base, &managed)
+        let mut merged = merge_runtimes(&base, &managed);
+        apply_remote_file_tools_optins(&mut merged, &self.settings.lock().unwrap());
+        merged
     }
 
     fn current_default_runtime_id(&self) -> String {
@@ -6942,6 +6949,34 @@ fn effective_endpoint(rt: &ResolvedRuntime) -> String {
     }
 }
 
+/// The origin (`scheme://host:port`) of a runtime endpoint, parsed the way
+/// the HTTP client parses it; `None` when there is no usable URL.
+fn endpoint_origin(endpoint: &str) -> Option<String> {
+    let origin = hive_core::endpoint::endpoint_url(endpoint)?.origin();
+    origin.is_tuple().then(|| origin.ascii_serialization())
+}
+
+/// Fill in each runtime's device-local "Allow workspace file tools for this
+/// endpoint" from settings: on only when this device's user consented for
+/// the runtime's current endpoint origin.
+fn apply_remote_file_tools_optins(runtimes: &mut [RuntimeTarget], settings: &LiveSettings) {
+    for rt in runtimes {
+        let origin = endpoint_origin(&rt.endpoint);
+        rt.allow_remote_file_tools = origin.is_some()
+            && settings.remote_file_tools_optins.get(&rt.id) == origin.as_ref();
+    }
+}
+
+/// Record (or withdraw) this device's consent to send workspace files to a
+/// runtime's endpoint, bound to the endpoint's origin. Returns whether the
+/// settings changed.
+fn store_remote_file_tools_optin(settings: &mut LiveSettings, runtime_id: &str, endpoint: &str, allow: bool) -> bool {
+    match endpoint_origin(endpoint).filter(|_| allow) {
+        Some(origin) => settings.remote_file_tools_optins.insert(runtime_id.to_string(), origin.clone()) != Some(origin),
+        None => settings.remote_file_tools_optins.remove(runtime_id).is_some(),
+    }
+}
+
 /// Whether a turn runs in its own per-turn worktree, cut up front from the
 /// chat's `hive/chat/<id>` branch, whose diff comes back as a review-gated
 /// proposal: file-mutating subprocess agents, in a repo. HTTP turns with the
@@ -9163,8 +9198,9 @@ fn add_runtime(
         think,
         // HTTP runtimes' tool-loop round budget; 0/None = Hive's default.
         max_tool_rounds: max_tool_rounds.filter(|n| *n > 0),
-        // Built-in file tools against a non-local endpoint (explicit opt-in).
-        allow_remote_file_tools: allow_remote_file_tools.unwrap_or(false),
+        // Built-in file tools against a non-local endpoint: the explicit
+        // opt-in lives in this device's settings (below), never in config.
+        allow_remote_file_tools: false,
         estimated_performance_score: 0.0,
         estimated_cost_per_1m_input_tokens_usd: 0.0,
         capabilities: hive_core::RuntimeCapabilities {
@@ -9177,6 +9213,12 @@ fn add_runtime(
             context_window_tokens: context_window.filter(|w| *w > 0),
         },
     };
+    if let Some(allow) = allow_remote_file_tools {
+        let mut s = state.settings.lock().unwrap();
+        if store_remote_file_tools_optin(&mut s, &runtime.id, &runtime.endpoint, allow) {
+            save_settings(&state.data_dir, &s);
+        }
+    }
     let root = state.workspace_root.lock().unwrap().clone();
     upsert_runtime_in_config(&state.data_dir, &root, &runtime)?;
     let runtimes = {
@@ -9207,6 +9249,12 @@ fn remove_runtime(state: State<AppState>, runtime_id: String) -> Result<(), Stri
     };
     save_managed_runtimes(&root, &runtimes)?;
     state.reload_workspace_catalogs(&root);
+    if !state.combined_runtimes().iter().any(|rt| rt.id == runtime_id) {
+        let mut s = state.settings.lock().unwrap();
+        if s.remote_file_tools_optins.remove(&runtime_id).is_some() {
+            save_settings(&state.data_dir, &s);
+        }
+    }
     if !removed_from_config && runtimes.is_empty() {
         return Err(format!("unknown runtime {runtime_id}"));
     }
@@ -9818,6 +9866,7 @@ fn build_state_in(app: &AppHandle, data_dir: PathBuf) -> Result<AppState, String
         mcp_oauth: std::collections::HashMap::new(),
         mcp_bearer_tokens: std::collections::HashMap::new(),
         mcp_bearer_origins: std::collections::HashMap::new(),
+        remote_file_tools_optins: std::collections::HashMap::new(),
         workspace_root: None,
         workspace_dirs: std::collections::HashMap::new(),
     };
@@ -15027,7 +15076,10 @@ mod utility_runtime_tests {
 
 #[cfg(test)]
 mod agentic_turn_tests {
-    use super::{isolates_on_write, isolates_turn, wants_builtin_tools, AgentToolSettings, LiveSettings};
+    use super::{
+        apply_remote_file_tools_optins, isolates_on_write, isolates_turn, runtime_to_toml,
+        store_remote_file_tools_optin, wants_builtin_tools, AgentToolSettings, LiveSettings,
+    };
     use hive_core::ModelProviderKind;
     use hive_runtime::provider::dispatch::ResolvedRuntime;
 
@@ -15092,6 +15144,44 @@ mod agentic_turn_tests {
         let mut d = rt(ModelProviderKind::HiveDaemon, true);
         d.endpoint = "https://daemon.example.com".into();
         assert!(!wants_builtin_tools(&d, true));
+    }
+
+    /// The file-tools opt-in is this device's consent for one endpoint: it
+    /// never comes from (or goes into) a config file, and it lapses when the
+    /// runtime is pointed somewhere else.
+    #[test]
+    fn remote_file_tools_optin_is_device_local_and_bound_to_the_endpoint() {
+        let target = |id: &str, endpoint: &str| {
+            let toml = format!("[[runtimes]]\nid = \"{id}\"\nprovider = \"custom\"\nendpoint = \"{endpoint}\"\nsupports_tools = true\n");
+            hive_core::config::load_from_str(&toml).unwrap().runtimes.remove(0)
+        };
+        let mut s = LiveSettings::default();
+        assert!(store_remote_file_tools_optin(&mut s, "hosted", "https://llm.example.com/v1/chat/completions", true));
+        assert!(!store_remote_file_tools_optin(&mut s, "hosted", "https://llm.example.com/v1/other", true), "same origin: unchanged");
+
+        let mut runtimes = vec![
+            target("hosted", "https://llm.example.com/v1/chat/completions"),
+            // Same id, endpoint moved: the consent does not follow.
+            target("hosted", "https://attacker.example/v1/chat/completions"),
+            target("hosted", "http://llm.example.com/v1/chat/completions"),
+            // Another runtime at the consented endpoint: not consented.
+            target("other", "https://llm.example.com/v1/chat/completions"),
+        ];
+        // A config or catalog that claims the opt-in is overridden.
+        for rt in &mut runtimes {
+            rt.allow_remote_file_tools = true;
+        }
+        apply_remote_file_tools_optins(&mut runtimes, &s);
+        let allowed: Vec<bool> = runtimes.iter().map(|r| r.allow_remote_file_tools).collect();
+        assert_eq!(allowed, vec![true, false, false, false]);
+
+        // Never written to the shared hive.config.toml entry.
+        let entry = toml::to_string(&runtime_to_toml(&runtimes[0])).unwrap();
+        assert!(!entry.contains("allow_remote_file_tools"), "{entry}");
+
+        // Withdrawn.
+        assert!(store_remote_file_tools_optin(&mut s, "hosted", "https://llm.example.com/v1/chat/completions", false));
+        assert!(s.remote_file_tools_optins.is_empty());
     }
 
     #[test]
