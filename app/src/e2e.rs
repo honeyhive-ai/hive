@@ -32,6 +32,10 @@
 //! `HIVE_APP_LIVE_RERANK_MODEL` (`bge-reranker-v2-m3`),
 //! `HIVE_APP_LIVE_KEEP=1` (keep the temp dirs).
 //!
+//! Without `HIVE_APP_LIVE_ENDPOINT` only the offline checks run (no network):
+//! the context meter's first poll on a fresh chat, which once deadlocked the
+//! app on the `service` mutex.
+//!
 //! Scenarios: (a) a planted bug fixed by `gemma4` with the built-in tools,
 //! captured as a fileDiff proposal that applies and passes the test, with no
 //! worktree left behind; (b) the same with `gpt-oss`; (c) an rdnamcp
@@ -993,12 +997,73 @@ listen on, and who is the release manager?",
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Run the live scenarios. Returns the number of failed scenarios; `0` when
-/// skipped (no `HIVE_APP_LIVE_ENDPOINT`). Must be called on the main thread.
+/// The app's own config and context, minus its window; the app is built
+/// (managers, plugins, event system) but its event loop never runs. A real
+/// [`AppState`] over `data_dir` is managed on it, with `repo` as the
+/// workspace. Must be called on the main thread.
+fn headless_app(data_dir: &Path, repo: &Path) -> tauri::App {
+    let mut context = crate::app_context();
+    context.config_mut().app.windows.clear();
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        .build(context)
+        .expect("build headless app");
+    let handle = app.handle().clone();
+    let state = crate::build_state_in(&handle, data_dir.to_path_buf()).expect("build_state_in");
+    handle.manage(state);
+    crate::set_workspace_root(handle.state::<AppState>(), repo.to_string_lossy().into_owned())
+        .expect("set_workspace_root");
+    app
+}
+
+/// Offline checks of the real app state, run even without a gateway: the
+/// context meter's first poll on a fresh chat (an empty summary cache) once
+/// deadlocked the whole app on the `service` mutex. Returns failures.
+fn run_offline() -> usize {
+    let root = std::env::temp_dir().join(format!("hive-app-offline-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    planted_repo(&repo);
+    std::env::set_current_dir(&repo).unwrap();
+    let app = headless_app(&root.join("data"), &repo);
+    let handle = app.handle().clone();
+    let mut failed = 0;
+
+    let sid = crate::create_chat(handle.state::<AppState>(), String::new()).expect("create_chat").id;
+    // Bounded: a deadlock must fail the run, not hang it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    {
+        let (handle, sid) = (handle.clone(), sid.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::get_context_telemetry(handle.state::<AppState>(), sid));
+        });
+    }
+    match rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(Ok(Some(t))) => eprintln!("PASS context meter on a fresh chat ({} messages)", t.message_count),
+        Ok(other) => {
+            eprintln!("FAIL context meter on a fresh chat: {other:?}");
+            failed += 1;
+        }
+        Err(_) => {
+            // The command thread is stuck holding the mutex; exit hard.
+            eprintln!("FAIL get_context_telemetry did not return within 20s (deadlock on the service mutex)");
+            std::process::exit(1);
+        }
+    }
+    drop(app);
+    let _ = std::fs::remove_dir_all(&root);
+    failed
+}
+
+/// Run the offline checks, then the live scenarios. Returns the number of
+/// failures; the live part is skipped without `HIVE_APP_LIVE_ENDPOINT`.
+/// Must be called on the main thread.
 pub fn run_live() -> usize {
+    let offline_failed = run_offline();
     let Some(cfg) = Config::from_env() else {
-        eprintln!("HIVE_APP_LIVE_ENDPOINT unset; skipping the in-app live test");
-        return 0;
+        eprintln!("HIVE_APP_LIVE_ENDPOINT unset; skipping the in-app live scenarios");
+        return offline_failed;
     };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -1018,19 +1083,8 @@ pub fn run_live() -> usize {
     // when the app is started from a project.
     std::env::set_current_dir(&repo).unwrap();
 
-    // The app's own config and context, minus its window; the app is built
-    // (managers, plugins, event system) but its event loop never runs.
-    let mut context = crate::app_context();
-    context.config_mut().app.windows.clear();
-    let app = tauri::Builder::default()
-        .plugin(tauri_plugin_notification::init())
-        .build(context)
-        .expect("build headless app");
+    let app = headless_app(&data_dir, &repo);
     let handle = app.handle().clone();
-    let state = crate::build_state_in(&handle, data_dir.clone()).expect("build_state_in");
-    handle.manage(state);
-    crate::set_workspace_root(handle.state::<AppState>(), repo.to_string_lossy().into_owned())
-        .expect("set_workspace_root");
     crate::set_agent_tool_settings(
         handle.state::<AppState>(),
         AgentToolSettings { enabled: true, write_in_place: false, run_command: false },
@@ -1135,7 +1189,7 @@ pub fn run_live() -> usize {
         // Holds settings.json (with the MCP token) — always removed.
         let _ = std::fs::remove_dir_all(&root);
     }
-    failed
+    failed + offline_failed
 }
 
 fn cfg_keep() -> bool {
