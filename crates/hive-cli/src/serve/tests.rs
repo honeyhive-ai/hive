@@ -273,6 +273,51 @@ async fn this_host(h: &Harness) -> String {
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 
+/// The phone's pairing check calls `GET /v1/agents`; a box whose workspace has
+/// no agents or config yet must answer with empty lists, not 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn empty_workspace_lists_are_empty_not_404() {
+    let tmp = tempfile::tempdir().unwrap();
+    let relay = spawn(test_relay::router()).await;
+    let room = format!("serve-empty-{}", Uuid::new_v4());
+    let dir = tmp.path().join("serve");
+    let opts = ServeOptions {
+        listen: "127.0.0.1:0".parse().unwrap(),
+        token_file: dir.join("serve.token"),
+        ntfy: None,
+        public_url: None,
+        label: "sff".into(),
+        name: Some("Phone".into()),
+        pair: false,
+        prometheus_url: "http://127.0.0.1:9".into(),
+        default_agent: None,
+        apply_on_approve: false,
+        sync_every: Duration::from_millis(300),
+    };
+    let handle = start(config(&dir, &relay, &room), opts).await.unwrap();
+    let base = format!("http://{}", handle.addr);
+    let client = reqwest::Client::new();
+    for (path, key) in [("/v1/agents", "agents"), ("/v1/hosts", "hosts"), ("/v1/chats", "chats"), ("/v1/proposals", "proposals")] {
+        let r = client.get(format!("{base}{path}")).bearer_auth(&handle.shared.token).send().await.unwrap();
+        assert_eq!(r.status(), 200, "{path}");
+        let v: Value = r.json().await.unwrap();
+        assert!(v[key].is_array(), "{path}: {v}");
+    }
+    assert_eq!(
+        client
+            .get(format!("{base}/v1/agents"))
+            .bearer_auth(&handle.shared.token)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap()["agents"],
+        json!([])
+    );
+    handle.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_is_required_except_for_bare_health() {
     let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;

@@ -67,7 +67,7 @@ final class EventStream: Sendable {
                         if let lastEventId { req.setValue(lastEventId, forHTTPHeaderField: "Last-Event-ID") }
                         let (bytes, response) = try await session.bytes(for: req)
                         guard let http = response as? HTTPURLResponse else { throw APIError.transport("not HTTP") }
-                        if http.statusCode == 401 || http.statusCode == 403 {
+                        if http.statusCode == 401 {
                             continuation.yield(.unauthorized)
                             continuation.finish()
                             return

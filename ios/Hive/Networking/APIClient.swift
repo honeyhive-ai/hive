@@ -163,7 +163,10 @@ actor APIClient {
     static func check(status: Int, data: Data) throws {
         switch status {
         case 200..<300: return
-        case 401, 403: throw APIError.unauthorized
+        // Only 401 means a bad token (re-pair). The server answers 403 when the
+        // token is fine but the workspace refuses the action (e.g. a vote below
+        // the proposal's role floor); that must not tell the user to re-pair.
+        case 401: throw APIError.unauthorized
         case 404: throw APIError.notFound
         default:
             var message = String(decoding: data.prefix(300), as: UTF8.self)

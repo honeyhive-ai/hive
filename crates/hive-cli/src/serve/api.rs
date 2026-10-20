@@ -350,12 +350,19 @@ impl Shared {
     }
 }
 
+/// The registered hosts and the workspace-config log. A workspace whose config
+/// log hasn't synced in yet has no agents: an empty log stands in, so
+/// `GET /v1/agents` answers `[]` rather than 404 (the phone's pairing check
+/// calls it).
 fn hosts_and_agents(s: &Shared) -> ApiResult<(Vec<hive_core::WorkspaceHost>, ChatSession)> {
     let svc = s.lock();
     let hosts = svc.list_hosts(s.ws)?;
-    let config = svc
-        .load(hive_core::workspace_config_session_id(s.ws))?
-        .ok_or_else(|| ApiError::not_found("workspace config"))?;
+    let config_id = hive_core::workspace_config_session_id(s.ws);
+    let config = svc.load(config_id)?.unwrap_or_else(|| {
+        let mut empty = ChatSession::new("", s.ws, "");
+        empty.id = config_id;
+        empty
+    });
     Ok((hosts, config))
 }
 

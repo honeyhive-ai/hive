@@ -75,6 +75,37 @@ import Testing
         await #expect(throws: APIError.unauthorized) { try await client.agents() }
     }
 
+    /// Payloads exactly as hive serve's Rust DTOs emit them: optional keys
+    /// absent (not null), nanosecond RFC 3339 stamps, an agent with no host id
+    /// but a host label (owner's device), a diff-less decision proposal.
+    @Test func decodesServerShapedPayloads() async throws {
+        let (client, _) = makeClient { req in
+            switch req.url?.path {
+            case "/v1/agents":
+                return .json(#"{"agents":[{"id":"a1","name":"coder","runtimeLabel":"gw","hostLabel":"Owner's device"}]}"#)
+            default:
+                return .json("""
+                {"proposals":[{"id":"p1","chatId":"c1","title":"Pick a model","body":"","kind":"decision",\
+                "status":"open","createdAt":"2026-10-20T12:00:00.987654321Z","author":"@coder"}]}
+                """)
+            }
+        }
+        let agents = try await client.agents()
+        #expect(agents.first?.hostId == nil && agents.first?.model == nil)
+        #expect(agents.first?.hostLabel == "Owner's device")
+        let p = try #require(try await client.proposals().first)
+        #expect(p.diff == nil && p.kind == "decision" && p.status == .open && p.author == "@coder")
+    }
+
+    /// hive serve answers 403 for a workspace permission refusal (token valid):
+    /// it surfaces the server's reason instead of asking the user to re-pair.
+    @Test func forbiddenIsNotUnauthorized() async {
+        let (client, _) = makeClient { _ in .json(#"{"error":"unauthorized: role below floor"}"#, status: 403) }
+        await #expect(throws: APIError.http(status: 403, message: "unauthorized: role below floor")) {
+            try await client.approve(proposalId: "p1")
+        }
+    }
+
     @Test func serverErrorCarriesMessage() async {
         let (client, _) = makeClient { _ in .json(#"{"error":"relay offline"}"#, status: 502) }
         await #expect(throws: APIError.http(status: 502, message: "relay offline")) { try await client.hosts() }
