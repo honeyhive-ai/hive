@@ -6880,7 +6880,7 @@ async fn try_tool_loop(
             let root = state.workspace_root.lock().unwrap().clone();
             let mut svc = state.service.lock().unwrap();
             let body = finalize_reply(
-                &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &text,
+                &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &text, false,
             )?;
             ("completed".to_string(), body)
         }
@@ -6931,6 +6931,7 @@ fn redact_workspace_path(body: &str, workspace_root: &str) -> String {
     body.replace(root, base)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_reply(
     svc: &mut ChatService,
     session_id: Uuid,
@@ -6939,6 +6940,7 @@ fn finalize_reply(
     author: &str,
     workspace_root: &str,
     full: &str,
+    edits_in_review: bool,
 ) -> Result<String, String> {
     let parsed = hive_runtime::directives::parse_reply_directives(full);
     let cleaned = redact_workspace_path(&parsed.cleaned, workspace_root);
@@ -6978,6 +6980,14 @@ fn finalize_reply(
     // here. The author is the responding agent, so the governance self-approval
     // guard applies — its own vote can't satisfy quorum.
     for proposed in &parsed.proposals {
+        // The turn's own file edits are already up for review as a real diff
+        // (`edits_in_review`); a `fileDiff` directive from the same reply can
+        // carry no diff, so it would only duplicate that proposal — and
+        // implementing it would send the agent to redo the edit.
+        if edits_in_review && proposed.kind == ProposalKind::FileDiff {
+            tracing::info!(target: "dispatch", title = %proposed.title, "skipping a fileDiff directive: the turn's edits are already in review");
+            continue;
+        }
         let mut proposal = hive_core::ActionProposal::new(&proposed.title, proposed.kind, author);
         proposal.body = proposed.body.clone();
         proposal.required_approvals = proposed.required_approvals;
@@ -7397,19 +7407,27 @@ async fn run_prepared_turn(
     match result {
         Ok(full) => {
             tracing::info!(target: "dispatch", chars = full.len(), "turn completed");
+            // The isolated worktree's changes, read before the reply is
+            // finalized so its directives know the edits are already in review.
+            let captured = worktree
+                .as_ref()
+                .and_then(|wt| wt.diff().ok())
+                .filter(|diff| !diff.trim().is_empty());
             let body = {
                 let root = state.workspace_root.lock().unwrap().clone();
                 let mut svc = state.service.lock().unwrap();
                 finalize_reply(
                     &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &full,
-                )?
+                    captured.is_some(),
+                )
             };
             // Capture the isolated worktree's changes as a review-gated proposal,
             // then remove the worktree — the stored diff is the portable artifact
             // (any reviewer sees it; Implement applies it to the workspace root).
+            // Done before `body?` so a finalize error never orphans the worktree.
             if let Some(wt) = worktree {
-                if let Ok(diff) = wt.diff() {
-                    if !diff.trim().is_empty() {
+                if body.is_ok() {
+                    if let Some(diff) = captured {
                         let files = wt.changed_files().unwrap_or_default();
                         let n = files.len();
                         let title = format!(
@@ -7435,6 +7453,7 @@ async fn run_prepared_turn(
                 }
                 let _ = wt.remove();
             }
+            let body = body?;
             let _ = app.emit(
                 ChatStreamEvent::EVENT,
                 ChatStreamEvent {
@@ -14488,7 +14507,7 @@ mod finalize_proposal_tests {
         let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude", None, None).unwrap();
 
         let body = "Done.\n[[propose: {\"title\": \"Bump timeout\", \"kind\": \"command\", \"body\": \"30s\", \"requiredApprovals\": 2}]]";
-        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", "/tmp/ws", body).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", "/tmp/ws", body, false).unwrap();
         assert_eq!(cleaned, "Done.");
 
         let session = svc.load(chat.id).unwrap().unwrap();
@@ -14503,6 +14522,33 @@ mod finalize_proposal_tests {
         assert_eq!(p.status, ProposalStatus::Open);
         // The agent's own approval can't satisfy quorum (self-approval guard).
         assert_eq!(p.qualifying_approvals(), 0);
+    }
+
+    #[test]
+    fn file_diff_directive_is_dropped_when_the_turns_edits_are_in_review() {
+        let mut svc = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "gw").unwrap();
+        let body = "Fixed it.\n[[propose: {\"title\": \"Fix apply_discount\", \"kind\": \"fileDiff\"}]]\n\
+[[propose: {\"title\": \"Ship it\", \"kind\": \"decision\"}]]";
+
+        // Edits captured as a diff proposal: the diff-less fileDiff directive
+        // would duplicate it; other kinds still land.
+        let mid = svc.begin_assistant_message(chat.id, wid, "Hive", "gw", None, None).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Hive", "/tmp/ws", body, true).unwrap();
+        assert_eq!(cleaned, "Fixed it.");
+        let titles: Vec<String> =
+            svc.load(chat.id).unwrap().unwrap().proposals.iter().map(|p| p.title.clone()).collect();
+        assert_eq!(titles, vec!["Ship it".to_string()]);
+
+        // No edits in review (e.g. a plain chat turn): the directive is the
+        // only record of the proposed change, so it is kept.
+        let chat2 = svc.create_chat("B", wid, "gw").unwrap();
+        let mid = svc.begin_assistant_message(chat2.id, wid, "Hive", "gw", None, None).unwrap();
+        finalize_reply(&mut svc, chat2.id, wid, mid, "Hive", "/tmp/ws", body, false).unwrap();
+        let session = svc.load(chat2.id).unwrap().unwrap();
+        assert_eq!(session.proposals.len(), 2);
+        assert!(session.proposals.iter().any(|p| p.kind == ProposalKind::FileDiff));
     }
 
     #[test]
