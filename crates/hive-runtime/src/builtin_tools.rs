@@ -944,7 +944,9 @@ async fn run_shell(command: &str, dir: &Path, timeout: Duration, max_output: usi
         Err(_) => {
             #[cfg(unix)]
             if let Some(pid) = pid {
-                let _ = std::process::Command::new("kill").arg("-KILL").arg(format!("-{pid}")).status();
+                // "--" is required: procps-ng kill reads "-<pgid>" after a
+                // signal as another option and exits 0 without killing.
+                let _ = std::process::Command::new("kill").args(["-KILL", "--"]).arg(format!("-{pid}")).status();
             }
             #[cfg(not(unix))]
             let _ = pid;
