@@ -9803,7 +9803,7 @@ fn build_state_in(app: &AppHandle, data_dir: PathBuf) -> Result<AppState, String
     // NB: chunk-row pruning (one-time DB shrink) is deferred to a background
     // thread after the window is live — see `run()`. Running it here scanned
     // the events table on every launch and blocked first paint.
-    let mut service = ChatService::new(store, stored.device.id, device_kp, account_kp, stored.account.actor());
+    let service = ChatService::new(store, stored.device.id, device_kp, account_kp, stored.account.actor());
 
     // Restore the folder the user last chose (persisted by `set_workspace_root`);
     // failing that, adopt the process cwd ONLY when it's clearly a project we were
