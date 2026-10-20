@@ -375,6 +375,13 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
     // log instead of seeding a competing one.
     if cfg.relay_url.is_some() {
         if let Err(e) = sync_once(&cfg).await {
+            // With no local copy of the workspace config yet, registering would
+            // seed a competing config log naming this box Owner. Fail instead;
+            // systemd restarts us until the relay is reachable.
+            let ws_config = workspace_config_session_id(ws);
+            if open_service(&cfg)?.load(ws_config)?.is_none() {
+                bail!("initial sync failed and this box has no copy of the workspace yet: {e}");
+            }
             eprintln!("serve: initial sync failed (continuing, will retry): {e}");
         }
     }

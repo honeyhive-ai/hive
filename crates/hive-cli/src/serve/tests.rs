@@ -737,6 +737,23 @@ async fn a_stale_refresh_never_rolls_the_differ_back() {
     h.handle.shutdown();
 }
 
+/// A fresh box whose first sync fails must not seed its own workspace config
+/// log (naming itself Owner); it refuses to start until the relay answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fresh_box_with_unreachable_relay_refuses_to_start() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("serve");
+    let room = format!("serve-offline-{}", Uuid::new_v4());
+    let cfg = config(&dir, "http://127.0.0.1:9", &room);
+    let mut opts = ServeOptions::from_flags(&cfg, Some("127.0.0.1:0".into()), None, None, None, None, Some("sff".into()), None, false)
+        .unwrap();
+    opts.prometheus_url = "http://127.0.0.1:9".into();
+    let err = start(cfg.clone(), opts).await.err().expect("must not start");
+    assert!(err.to_string().contains("no copy of the workspace"), "{err}");
+    let ws = crate::uuid_of_room(&room);
+    assert!(open_service(&cfg).unwrap().load(workspace_config_session_id(ws)).unwrap().is_none(), "no config log seeded");
+}
+
 #[test]
 fn serve_options_refuse_public_binds_and_need_both_ntfy_parts() {
     let cfg = Config {
