@@ -1,0 +1,82 @@
+name: Hive
+options:
+  bundleIdPrefix: com.zazulam.hive
+  deploymentTarget:
+    iOS: "26.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: Config/Shared.xcconfig
+  Release: Config/Shared.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+    CODE_SIGN_STYLE: Automatic
+targets:
+  Hive:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Hive
+    settings:
+      base:
+        PRODUCT_NAME: Hive
+        PRODUCT_BUNDLE_IDENTIFIER: com.zazulam.hive.lab
+        TARGETED_DEVICE_FAMILY: "1"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        INFOPLIST_FILE: Hive/Support/Info.plist
+        SUPPORTS_MACCATALYST: NO
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+    info:
+      path: Hive/Support/Info.plist
+      properties:
+        CFBundleDisplayName: Hive
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSRequiresIPhoneOS: true
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UIUserInterfaceStyle: Dark
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        NSCameraUsageDescription: Hive uses the camera to scan the pairing QR code printed by hive serve --pair.
+        NSLocalNetworkUsageDescription: Hive connects to your home host over your private network.
+        # The home host is plain HTTP on a Tailscale 100.x address (or a
+        # MagicDNS name). ATS exception domains cannot express IP ranges, so
+        # this personal app allows arbitrary loads. Do NOT add
+        # NSAllowsLocalNetworking alongside it: when both are present the
+        # local-networking key wins and arbitrary HTTP is blocked again.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.zazulam.hive.lab
+            CFBundleURLSchemes:
+              - hive
+        ITSAppUsesNonExemptEncryption: false
+    scheme:
+      testTargets:
+        - HiveTests
+  HiveTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: HiveTests
+    dependencies:
+      - target: Hive
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.zazulam.hive.lab.tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Hive.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Hive
+        BUNDLE_LOADER: $(TEST_HOST)

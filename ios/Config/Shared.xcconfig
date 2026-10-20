@@ -1,0 +1,6 @@
+// Shared build settings for the Hive iOS app.
+//
+// The signing team is personal, so it lives in an untracked Local.xcconfig
+// next to this file (copy Local.xcconfig.example and fill in your Team ID,
+// i.e. the OU= field of your "Apple Development" certificate).
+#include? "Local.xcconfig"
