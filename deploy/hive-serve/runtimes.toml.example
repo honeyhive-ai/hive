@@ -1,0 +1,22 @@
+# This host's own runtimes ($HIVE_DATA_DIR/runtimes.toml). Never synced.
+#
+# An agent created in the desktop app is bound to one of the desktop's
+# device-local runtimes; its id means nothing here. When such an agent is sent
+# to this host, the worker looks its runtime id up here, and falls back to the
+# `id = "*"` entry. Workspace runtimes (`hive runtimes`) with the same id win.
+
+[[runtime]]
+id = "*"
+name = "Lab gateway"
+provider = "custom"            # OpenAI-compatible endpoint (llama.cpp gateway)
+model = "gpt-oss:20b"          # agent loops; gemma4:12b for chat
+endpoint = "http://100.x.y.z:8080/v1/chat/completions"
+credential = { kind = "none" } # keyless: allowed only for a LAN / tailnet endpoint
+
+# Map a specific desktop runtime id to a different model:
+# [[runtime]]
+# id = "<runtime id from the desktop>"
+# name = "Gemma (lab)"
+# provider = "custom"
+# model = "gemma4:12b"
+# endpoint = "http://100.x.y.z:8080/v1/chat/completions"

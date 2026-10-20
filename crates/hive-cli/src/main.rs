@@ -21,6 +21,8 @@
 //!   hive tail <chat-id>      print a chat's transcript (add --watch to follow)
 //!   hive send <chat-id> <…>  post a message (add --push to sync it out)
 //!   hive sync                run one sync round with the relay (add --watch to loop)
+//!   hive serve               home host for the iOS app: sync + agent worker +
+//!                            HTTP/SSE API on a tailnet address (see serve/)
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -39,7 +41,11 @@ use uuid::Uuid;
 
 mod mcp_config;
 mod reply;
+mod repos;
+mod serve;
+mod worker;
 
+#[derive(Clone)]
 struct Config {
     data_dir: PathBuf,
     relay_url: Option<String>,
@@ -755,66 +761,13 @@ fn cmd_set_agent_host(cfg: &Config, agent_name: &str, host_id: &str) -> Result<(
     Ok(())
 }
 
-/// Build a ResolvedRuntime for an agent from its workspace runtime. A detached
-/// agent MUST use a workspace runtime (§12.5) — this returns an error if the
-/// agent's runtime isn't a workspace-owned one, so a worker never runs on a
-/// personal key.
-/// Claude Code permission args for a headless worker. **Read-only by default** —
-/// a worker that can write files (and, with bypass, run shell commands) is
-/// powerful, so write access is opt-in via
-/// `HIVE_WORKER_PERMISSION_MODE=acceptEdits|bypassPermissions`. Only then does a
-/// worker's claude turn actually edit files (and get worktree-isolated + turned
-/// into a review-gated proposal).
-fn worker_claude_args() -> Vec<String> {
-    match std::env::var("HIVE_WORKER_PERMISSION_MODE").as_deref() {
-        Ok("acceptEdits") => vec!["--permission-mode".into(), "acceptEdits".into()],
-        Ok("bypassPermissions") => vec!["--permission-mode".into(), "bypassPermissions".into()],
-        _ => Vec::new(),
-    }
-}
-
-fn agent_workspace_runtime(
-    runtimes: &[WorkspaceRuntime],
-    agent: &WorkspaceAgent,
-) -> Result<(ResolvedRuntime, String)> {
-    let wr = runtimes
-        .iter()
-        .find(|r| r.id == agent.runtime_id)
-        .ok_or_else(|| anyhow!("@{} is not bound to a workspace runtime ('{}')", agent.name, agent.runtime_id))?;
-    let api_key = resolve_workspace_credential(&wr.credential);
-    if api_key.is_none() && wr.provider != ModelProviderKind::Ollama {
-        bail!("workspace runtime '{}' has no secret on this box (provision HIVE_WS_SECRET_…)", wr.name);
-    }
-    // claude-code honors --permission-mode; other providers ignore args here.
-    let args = if wr.provider == ModelProviderKind::ClaudeCode {
-        worker_claude_args()
-    } else {
-        Vec::new()
-    };
-    let rt = ResolvedRuntime {
-        provider: wr.provider,
-        model: wr.model.clone(),
-        endpoint: wr.endpoint.clone(),
-        api_key,
-        args,
-        model_provider_id: None,
-        model_base_url: None,
-        context_window_tokens: None,
-        keep_alive: None,
-        think: None,
-        tools: false,
-        max_tool_rounds: None,
-        allow_remote_file_tools: false,
-    };
-    Ok((rt, wr.id.clone()))
-}
-
 /// The worker daemon (spec §12.4-12.5). Registers this box as a worker host and
 /// heartbeats its presence, then continuously drains **queued work** for the
 /// agents bound to it: every unanswered `@mention` (backlog included, so it
 /// catches up on work addressed while it was down, and picks up an agent freshly
 /// reassigned to it) is answered via that agent's workspace runtime and synced
-/// back. A failing turn is isolated and not retried in a tight loop.
+/// back. A failing turn is isolated and not retried in a tight loop. See
+/// `worker.rs` for the turn itself (tool loop, worktrees, proposals).
 async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
     let ws = uuid_of_room(&cfg.room);
     // Same label `cmd_register_worker` publishes, reused for the identity block
@@ -828,6 +781,14 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
         let _ = sync_once(cfg).await;
     }
     println!("worker {my_host} online — draining queued mentions for its agents. Ctrl-C to stop.");
+    let svc = std::sync::Mutex::new(open_service(cfg)?);
+    let ctx = worker::WorkerCtx {
+        cfg,
+        ws,
+        my_host: &my_host,
+        host_label: &host_label,
+        settings: reply::ToolSettings::from_env(),
+    };
     // Mentions whose reply hard-failed, so we don't retry them every tick.
     let mut failed: HashSet<Uuid> = HashSet::new();
     // Exponential backoff on repeated relay-sync failures, so a relay outage
@@ -839,7 +800,7 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
                 Ok(_) => sync_fails = 0,
                 Err(e) => {
                     sync_fails = sync_fails.saturating_add(1);
-                    let secs = (3u64 << sync_fails.min(5)).min(120); // 6,12,24,48,96,120…
+                    let secs = sync_backoff_secs(sync_fails);
                     eprintln!("sync: {e} — retrying in {secs}s");
                     tokio::time::sleep(Duration::from_secs(secs)).await;
                     continue;
@@ -848,7 +809,7 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
         }
         // A transient store/DB error inside a tick must NOT kill the daemon —
         // log it and retry on the next tick (bare `?` here used to abort the loop).
-        if let Err(e) = drain_worker_tick(cfg, ws, &my_host, &host_label, &mut failed).await {
+        if let Err(e) = worker::drain_tick(&ctx, &svc, &mut failed, &worker::NoSink).await {
             eprintln!("worker: tick failed (retrying): {e}");
         }
         if cfg.relay_url.is_some() {
@@ -865,6 +826,11 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
             }
         }
     }
+}
+
+/// Backoff after `fails` consecutive relay-sync failures: 6,12,24,48,96,120… s.
+fn sync_backoff_secs(fails: u32) -> u64 {
+    (3u64 << fails.min(5)).min(120)
 }
 
 /// Resolves when the process receives SIGTERM (orchestrator stop/redeploy) or
@@ -889,195 +855,6 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
-}
-
-/// One drain pass: answer every queued mention for an agent this worker hosts
-/// that another device hasn't already claimed. Returns `Err` only on a
-/// tick-fatal store error (the caller logs and retries) — per-mention failures
-/// are isolated so one bad mention can't abort the whole pass.
-async fn drain_worker_tick(
-    cfg: &Config,
-    ws: Uuid,
-    my_host: &str,
-    host_label: &str,
-    failed: &mut HashSet<Uuid>,
-) -> Result<()> {
-    let mut svc = open_service(cfg)?;
-    // Heartbeat presence (throttled), so peers see this worker as online.
-    let _ = svc.touch_host(ws, my_host, 60);
-    let hosted: HashSet<Uuid> = svc
-        .load(workspace_config_session_id(ws))?
-        .map(|s| s.workspace_agents)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|a| a.host_id == my_host)
-        .map(|a| a.id)
-        .collect();
-    let runtimes = svc.list_workspace_runtimes(ws)?;
-    for id in svc.store().list_session_ids()? {
-        // Skip a session that fails to load rather than aborting the whole tick.
-        let s = match svc.load(id) {
-            Ok(Some(s)) => s,
-            Ok(None) => continue,
-            Err(e) => {
-                eprintln!("worker: load {id} failed: {e}");
-                continue;
-            }
-        };
-        if id == workspace_config_session_id(s.workspace_id) {
-            continue;
-        }
-        // Bound the hard-failed set over a long uptime — past a generous cap,
-        // drop it so transiently-failed mentions get another chance and memory
-        // can't creep unbounded.
-        if failed.len() >= 8192 {
-            failed.clear();
-        }
-        for pm in pending_mentions(&s) {
-            if !hosted.contains(&pm.agent_id) || failed.contains(&pm.message_id) {
-                continue;
-            }
-            let Some(agent) = s.workspace_agents.iter().find(|a| a.id == pm.agent_id) else {
-                continue;
-            };
-            // Claim the turn so a worker and the agent-owner's desktop (or another
-            // worker) don't both answer the same mention. Back off if we lost.
-            match svc.claim_turn(s.id, s.workspace_id, pm.message_id) {
-                Ok(true) => {}
-                Ok(false) => continue,
-                Err(e) => {
-                    eprintln!("worker: claim {} failed: {e}", pm.message_id);
-                    continue;
-                }
-            }
-            let (rt, rt_label) = match agent_workspace_runtime(&runtimes, agent) {
-                Ok(v) => v,
-                Err(e) => {
-                    eprintln!("skip @{}: {e}", agent.name);
-                    failed.insert(pm.message_id);
-                    continue;
-                }
-            };
-            let mut turns = turns_for(&s, Some(agent.id), &agent.name);
-            materialize_turns(cfg, &mut turns).await;
-            let system = format!(
-                "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.\n\n{}",
-                agent.name,
-                hive_runtime::prompt::runtime_identity_block(&rt, &format!("worker {host_label}"))
-            );
-            print!("↳ @{} replying in {} … ", agent.name, s.id);
-            // H1 gate: resolve the triggering message's author + role and only
-            // execute MCP tools when they clear HIVE_MCP_MIN_ROLE (default
-            // Contributor). Unresolved author → fail closed.
-            let author_role = s
-                .messages
-                .iter()
-                .find(|m| m.id == pm.message_id)
-                .and_then(|m| m.actor_identity.as_ref())
-                .map(|a| s.role_of(&a.id));
-            let min_role = reply::mcp_min_role();
-            let allow_mcp = reply::mcp_allowed_for(author_role, min_role);
-            if !allow_mcp {
-                eprintln!(
-                    "withholding MCP tools for message {} — author role {:?} below minimum {:?}",
-                    pm.message_id, author_role, min_role
-                );
-            }
-            // Isolate a file-mutating subprocess turn in its own git worktree
-            // (like the desktop), so a pool of workers draining the same checkout
-            // can't clobber each other's tree, and the edits return as a
-            // review-gated proposal instead of landing silently. API turns and
-            // non-git roots run in place.
-            let repo = std::env::current_dir().ok();
-            // Only isolate turns that can actually write: a write-mode claude
-            // (per HIVE_WORKER_PERMISSION_MODE) or aider/pi. A read-only claude
-            // turn produces no diff, so a worktree would just be overhead.
-            let write_capable = match rt.provider {
-                ModelProviderKind::ClaudeCode => rt
-                    .args
-                    .iter()
-                    .any(|a| a == "acceptEdits" || a == "bypassPermissions"),
-                ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes => true,
-                _ => false,
-            };
-            let isolate = write_capable
-                && repo
-                    .as_deref()
-                    .map(hive_runtime::git_worktree::is_git_repo)
-                    .unwrap_or(false);
-            let worktree = match (isolate, repo.as_deref()) {
-                (true, Some(root)) => {
-                    match hive_runtime::git_worktree::Worktree::create(root, &pm.message_id.to_string()) {
-                        Ok(wt) => Some(wt),
-                        Err(e) => {
-                            eprintln!("worker: worktree unavailable, running in place: {e}");
-                            None
-                        }
-                    }
-                }
-                _ => None,
-            };
-            let work_dir = worktree.as_ref().map(|w| w.path.to_string_lossy().into_owned());
-
-            match reply::generate_reply(&rt, &system, &turns, allow_mcp, work_dir.as_deref()).await {
-                Ok(reply) => {
-                    // Persist the reply defensively — a begin/complete failure logs
-                    // and moves on instead of tearing down the daemon.
-                    match svc.begin_assistant_message(
-                        s.id,
-                        s.workspace_id,
-                        agent.name.clone(),
-                        rt_label.clone(),
-                        Some(agent.id),
-                        // Stamp the mention this reply answers, so pending_mentions
-                        // correlates it precisely (Phase 1) even when several
-                        // concurrent tasks target the same agent.
-                        Some(pm.message_id),
-                    ) {
-                        Ok(mid) => {
-                            if let Err(e) =
-                                svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)
-                            {
-                                eprintln!("worker: complete failed: {e}");
-                            } else {
-                                println!("done");
-                            }
-                        }
-                        Err(e) => eprintln!("worker: begin failed: {e}"),
-                    }
-                    // Surface the isolated worktree's changes as a review-gated
-                    // proposal, then remove the worktree.
-                    if let Some(wt) = worktree {
-                        if let Ok(diff) = wt.diff() {
-                            if !diff.trim().is_empty() {
-                                let files = wt.changed_files().unwrap_or_default();
-                                let n = files.len();
-                                let title = format!(
-                                    "@{} proposed changes to {} file{}",
-                                    agent.name,
-                                    n,
-                                    if n == 1 { "" } else { "s" }
-                                );
-                                let prop = hive_core::ActionProposal::file_diff(title, "", diff, files);
-                                if let Err(e) = svc.upsert_proposal(s.id, s.workspace_id, prop) {
-                                    eprintln!("worker: proposal failed: {e}");
-                                }
-                            }
-                        }
-                        let _ = wt.remove();
-                    }
-                }
-                Err(e) => {
-                    if let Some(wt) = worktree {
-                        let _ = wt.remove();
-                    }
-                    println!("failed: {e}");
-                    failed.insert(pm.message_id);
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Show queued work — unanswered agent mentions — and whether each agent's host
@@ -1152,7 +929,12 @@ fn usage() -> ! {
          hive register-worker [--label <name>]   register this box as a worker host\n  \
          hive set-agent-host <agent> <host-id>   bind an agent to a host\n  \
          hive worker [--label <name>]   run the worker daemon (host detached agents, §12.4)\n  \
-         hive queue                     show queued work (unanswered mentions + host status)\n\n\
+         hive queue                     show queued work (unanswered mentions + host status)\n  \
+         hive serve [--listen ADDR] [--pair] [--token-file PATH] [--label NAME]\n                                       \
+         run the home host for the iOS app (sync + worker + HTTP/SSE API)\n  \
+         hive bind-repo <name|path> [--chat <id>] | --clear   bind a checkout for agent file tools\n  \
+         hive repos                     show the repos dir and bindings\n  \
+         hive pair [--listen ADDR] [--public-url URL]   show the phone pairing QR code\n\n\
          Setup:\n  \
          hive enroll <hivews1:invite> [--token <hrt1>]   one-shot: save the workspace connection\n  \
          hive join <invite-code>        redeem a relay invite to self-enroll this box's identity\n  \
@@ -1185,7 +967,21 @@ fn run() -> Result<()> {
     };
     // Positional args exclude flags and any value immediately after a known
     // value-flag (so `agent bot --runtime ws1` → positional = [bot]).
-    let value_flags = ["--runtime", "--endpoint", "--secret-ref", "--secret", "--label", "--host"];
+    let value_flags = [
+        "--runtime",
+        "--endpoint",
+        "--secret-ref",
+        "--secret",
+        "--label",
+        "--host",
+        "--chat",
+        "--listen",
+        "--token-file",
+        "--ntfy-url",
+        "--ntfy-topic",
+        "--public-url",
+        "--name",
+    ];
     let mut positional: Vec<&String> = Vec::new();
     let mut skip = false;
     for a in rest {
@@ -1300,6 +1096,41 @@ fn run() -> Result<()> {
         }
         "worker" => rt()?.block_on(cmd_worker(&cfg, flag_val("--label"))),
         "queue" => cmd_queue(&cfg),
+        "serve" => {
+            let opts = serve::ServeOptions::from_flags(
+                &cfg,
+                flag_val("--listen"),
+                flag_val("--token-file"),
+                flag_val("--ntfy-url"),
+                flag_val("--ntfy-topic"),
+                flag_val("--public-url"),
+                flag_val("--label"),
+                flag_val("--name"),
+                has("--pair"),
+            )?;
+            serve::cmd_serve(cfg, opts)
+        }
+        "pair" => {
+            let opts = serve::ServeOptions::from_flags(
+                &cfg,
+                flag_val("--listen"),
+                flag_val("--token-file"),
+                None,
+                None,
+                flag_val("--public-url"),
+                None,
+                None,
+                true,
+            )?;
+            serve::cmd_pair(&opts)
+        }
+        "bind-repo" => repos::cmd_bind_repo(
+            &cfg.data_dir,
+            positional.first().map(|s| s.as_str()),
+            flag_val("--chat").as_deref(),
+            has("--clear"),
+        ),
+        "repos" => repos::cmd_repos(&cfg.data_dir),
         "agent" => {
             let name = positional.first().map(|s| s.as_str()).unwrap_or("assistant").to_string();
             let runtime_id = flag_val("--runtime").or_else(|| env_opt("HIVE_RUNTIME"));

@@ -1,0 +1,35 @@
+# systemd *user* unit for `hive serve` — the home host the Hive iOS app talks to.
+#
+# Install (see README.md in this directory):
+#   install -Dm644 hive-serve.service ~/.config/systemd/user/hive-serve.service
+#   install -Dm600 hive-serve.env.example ~/.config/hive-serve/hive-serve.env   # then edit it
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now hive-serve
+#   sudo loginctl enable-linger "$USER"     # keep it running without a login session
+#
+# The API binds to the address in HIVE_SERVE_LISTEN (the box's Tailscale IP),
+# never 0.0.0.0. If tailscaled isn't up yet at boot, the bind fails and
+# Restart=always retries until the address exists.
+
+[Unit]
+Description=Hive home host (hive serve) for the iOS app
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# Secrets (workspace key, relay token, ntfy token, MCP tokens) live only here,
+# mode 0600, never in the unit or the repo.
+EnvironmentFile=%h/.config/hive-serve/hive-serve.env
+ExecStart=%h/.local/bin/hive serve
+Restart=always
+RestartSec=5
+# Files it creates (token, state, worktrees) are private to the user.
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+# SIGTERM stops it between turns; give a streaming turn a moment to settle.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target
