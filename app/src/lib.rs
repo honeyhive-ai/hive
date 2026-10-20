@@ -3404,8 +3404,11 @@ fn get_context_telemetry(
     session_id: String,
 ) -> Result<Option<ContextTelemetryDto>, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let svc = state.service.lock().unwrap();
-    let Some(session) = svc.load(id).map_err(map_err)? else {
+    // Release `service` before planning: the snapshot reads the saved
+    // compaction state through it, and std's Mutex is not reentrant (holding
+    // it here deadlocked the whole app on the first telemetry poll).
+    let session = state.service.lock().unwrap().load(id).map_err(map_err)?;
+    let Some(session) = session else {
         return Ok(None);
     };
     let responder = responder_for(&state, &session, None);
