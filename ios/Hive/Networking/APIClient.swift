@@ -145,7 +145,7 @@ actor APIClient {
         do {
             (data, response) = try await session.data(for: req)
         } catch let error as URLError {
-            throw APIError.transport(error.localizedDescription)
+            throw APIError.transport(Self.describe(error))
         } catch {
             throw APIError.transport(String(describing: error))
         }
@@ -158,6 +158,20 @@ actor APIClient {
         } catch {
             throw APIError.decoding(Self.describe(error))
         }
+    }
+
+    /// The URL error plus what iOS says underneath it (the failing URL, the
+    /// POSIX/network code and the network path), so a failed connection says
+    /// *why*: a local-network denial, a VPN route or a refused port.
+    static func describe(_ error: URLError) -> String {
+        var parts = ["\(error.localizedDescription) (\(error.code.rawValue))"]
+        if let url = error.failingURL { parts.append(url.absoluteString) }
+        let info = (error as NSError).userInfo
+        if let under = info[NSUnderlyingErrorKey] as? NSError {
+            parts.append("\(under.domain) \(under.code)")
+        }
+        if let path = info["_NSURLErrorNWPathKey"] { parts.append("path: \(path)") }
+        return parts.joined(separator: " · ")
     }
 
     static func check(status: Int, data: Data) throws {
