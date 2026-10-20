@@ -68,3 +68,9 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphic
 default = ["p2p"]
 # Direct peer-to-peer (iroh).
 p2p = ["hive-runtime/p2p"]
+# The in-app live test (`tests/app_live.rs`): exposes `hive_app_lib::e2e`.
+e2e = []
+
+[[test]]
+name = "app_live"
+harness = false

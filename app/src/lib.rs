@@ -39,6 +39,10 @@ use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
 
 mod workflows;
+/// In-app live test support (see `tests/app_live.rs`); not in release builds.
+#[cfg(feature = "e2e")]
+#[doc(hidden)]
+pub mod e2e;
 
 #[cfg(target_os = "macos")]
 use tauri::{
@@ -9530,6 +9534,12 @@ const RESET_SENTINEL: &str = ".reset-pending";
 
 fn build_state(app: &AppHandle) -> Result<AppState, String> {
     let data_dir: PathBuf = app.path().app_data_dir().map_err(map_err)?;
+    build_state_in(app, data_dir)
+}
+
+/// [`build_state`] against an explicit data dir. The app uses the OS app-data
+/// dir; the in-app live test (`e2e`) points it at a temp dir.
+fn build_state_in(app: &AppHandle, data_dir: PathBuf) -> Result<AppState, String> {
     std::fs::create_dir_all(&data_dir).map_err(map_err)?;
 
     // A factory reset was requested last run: the previous process wrote the
@@ -13422,8 +13432,15 @@ pub fn run() {
             presence_ping,
             presence_list
         ])
-        .run(tauri::generate_context!())
+        .run(app_context())
         .expect("error while running Hive");
+}
+
+/// The app's compiled Tauri context (config, assets, icons). One expansion of
+/// `generate_context!` per binary: it embeds the Info.plist under a fixed
+/// symbol, so `run()` and the in-app live test (`e2e`) share this.
+fn app_context() -> tauri::Context {
+    tauri::generate_context!()
 }
 
 #[cfg(test)]
