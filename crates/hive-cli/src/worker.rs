@@ -381,20 +381,34 @@ async fn run_turn(
         _ => false,
     };
     // Subprocess agents fall back to the process's cwd when nothing is bound
-    // (the pre-binding behavior of `hive worker`).
+    // (the pre-binding behavior of `hive worker`); a writing one must still get
+    // a worktree there (checked below).
     let subprocess_root = repo_root.clone().or_else(|| std::env::current_dir().ok());
     let eager = match subprocess_root.as_deref() {
         Some(root) if write_capable && hive_runtime::git_worktree::is_git_repo(root) => {
             match hive_runtime::git_worktree::cut_turn_worktree(root, &s.id.to_string(), &mid.to_string()) {
                 Ok(wt) => Some(wt),
                 Err(e) => {
-                    eprintln!("worker: worktree unavailable, running in place: {e}");
+                    eprintln!("worker: worktree unavailable: {e}");
                     None
                 }
             }
         }
         _ => None,
     };
+    // Never run a writing agent in place: on the always-on box that would be
+    // the bound checkout itself, or the service's working directory (its home),
+    // with no review-gated proposal in between.
+    if write_capable && eager.is_none() {
+        let e = anyhow!(
+            "@{} can edit files, so it only runs in an isolated worktree of a repository bound on this host \
+             (`hive bind-repo`), and none could be cut for this chat",
+            agent.name
+        );
+        let _ = lock(svc).complete_assistant_message(s.id, s.workspace_id, mid, format!("[error] {e}"));
+        sink.changed();
+        return Err(e);
+    }
     let work_dir = eager.as_ref().map(|w| w.path.to_string_lossy().into_owned());
     let files = TurnFiles { repo_root, chat_id: s.id.to_string(), turn_key: mid.to_string() };
 
