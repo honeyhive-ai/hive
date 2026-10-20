@@ -28,7 +28,8 @@ RestartSec=5
 UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
-# SIGTERM stops it between turns; give a streaming turn a moment to settle.
+# SIGTERM lets a turn in flight finish for up to 15 s; a longer one is
+# finished as "interrupted" on the next start (ask again to retry).
 TimeoutStopSec=20
 
 [Install]

@@ -256,6 +256,47 @@ pub async fn drain_tick(
     Ok(())
 }
 
+/// The note a reply cut off by a restart ends with.
+pub const INTERRUPTED_NOTE: &str = "[interrupted: the host restarted before this reply finished. Ask again to retry.]";
+
+/// Startup recovery, run before the worker loop: finish every reply *this
+/// device* was still streaming when the process stopped (a restart or Ctrl-C
+/// mid-turn). The placeholder is stamped `reply_to` the mention, so
+/// `pending_mentions` already counts it as the answer and the turn would never
+/// run again; left alone it would also stay `streaming` forever on every peer.
+/// Each one is completed with the text checkpointed so far plus
+/// [`INTERRUPTED_NOTE`], so the asker sees it failed and can ask again.
+/// Returns `(chat, message)` for each reply finished this way.
+pub fn recover_interrupted_turns(svc: &mut ChatService) -> Result<Vec<(Uuid, Uuid)>> {
+    let me = svc.device_id();
+    let mut out = Vec::new();
+    for id in svc.store().list_session_ids()? {
+        let s = match svc.load(id) {
+            Ok(Some(s)) => s,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("worker: recovery skipped {id}: {e}");
+                continue;
+            }
+        };
+        if id == workspace_config_session_id(s.workspace_id) {
+            continue;
+        }
+        for m in s.messages.iter().filter(|m| m.is_streaming && m.origin_device_id == Some(me)) {
+            let body = if m.body.trim().is_empty() {
+                format!("[error] {INTERRUPTED_NOTE}")
+            } else {
+                format!("{}\n\n{INTERRUPTED_NOTE}", m.body.trim_end())
+            };
+            match svc.complete_assistant_message(s.id, s.workspace_id, m.id, body) {
+                Ok(()) => out.push((s.id, m.id)),
+                Err(e) => eprintln!("worker: finishing interrupted reply {} failed: {e}", m.id),
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Total wall-clock backstop for one turn (the provider's idle timeout is the
 /// real "wedged" gate), as in the app: `HIVE_TURN_TIMEOUT_SECS`, default 1 h.
 fn turn_timeout() -> Duration {

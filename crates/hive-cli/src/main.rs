@@ -829,7 +829,15 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
         let _ = sync_once(cfg).await;
     }
     println!("worker {my_host} online — draining queued mentions for its agents. Ctrl-C to stop.");
-    let svc = std::sync::Mutex::new(open_service(cfg)?);
+    let mut svc = open_service(cfg)?;
+    // Finish replies a previous run was streaming when it stopped (see
+    // `worker::recover_interrupted_turns`).
+    match worker::recover_interrupted_turns(&mut svc) {
+        Ok(done) if !done.is_empty() => println!("worker: finished {} reply(s) interrupted by the last stop", done.len()),
+        Ok(_) => {}
+        Err(e) => eprintln!("worker: interrupted-turn recovery failed: {e}"),
+    }
+    let svc = std::sync::Mutex::new(svc);
     let ctx = worker::WorkerCtx {
         cfg,
         ws,

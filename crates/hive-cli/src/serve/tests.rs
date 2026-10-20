@@ -639,6 +639,58 @@ async fn apply_on_approve_never_overrides_a_rejection() {
     h.handle.shutdown();
 }
 
+/// A turn cut off by a restart (placeholder still streaming, stamped as the
+/// mention's reply) is finished as interrupted on the next start instead of
+/// staying "streaming" forever and never being answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_finishes_a_reply_cut_off_mid_stream() {
+    let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let h = harness(&endpoint, "m", &[("README.md", "x\n")]).await;
+    let chat = h.send(reqwest::Method::POST, "/v1/chats", None).await;
+    let chat_id = Uuid::parse_str(chat["chat"]["id"].as_str().unwrap()).unwrap();
+    let posted = h.send(reqwest::Method::POST, &format!("/v1/chats/{chat_id}/messages"), Some(json!({ "body": "@coder hi" }))).await;
+    let mention = Uuid::parse_str(posted["message"]["id"].as_str().unwrap()).unwrap();
+    let ws = h.handle.shared.ws;
+    let reply = {
+        let mut svc = h.handle.shared.lock();
+        let mid = svc
+            .begin_assistant_message(chat_id, ws, "coder".to_string(), "gw".to_string(), Some(h.agent_id), Some(mention))
+            .unwrap();
+        svc.append_chunk(chat_id, ws, mid, "partial answer".to_string()).unwrap();
+        mid
+    };
+    assert!(h.handle.stop(Duration::from_secs(5)).await, "an idle worker stops at once");
+
+    // Same box, same data dir: start again.
+    let serve_cfg = config(&h._tmp.path().join("serve"), h.desktop.relay_url.as_deref().unwrap(), &h.desktop.room);
+    let mut opts = ServeOptions::from_flags(&serve_cfg, Some("127.0.0.1:0".into()), None, None, None, None, Some("sff".into()), None, false)
+        .unwrap();
+    opts.prometheus_url = "http://127.0.0.1:9".into();
+    let again = start(serve_cfg, opts).await.unwrap();
+    {
+        let svc = again.shared.lock();
+        let s = svc.load(chat_id).unwrap().unwrap();
+        let m = s.messages.iter().find(|m| m.id == reply).unwrap();
+        assert!(!m.is_streaming, "still streaming after a restart");
+        assert!(m.body.starts_with("partial answer"), "{}", m.body);
+        assert!(m.body.ends_with(crate::worker::INTERRUPTED_NOTE), "{}", m.body);
+    }
+    let base = format!("http://{}", again.addr);
+    let msgs: Value = h
+        .client
+        .get(format!("{base}/v1/chats/{chat_id}/messages"))
+        .bearer_auth(&again.shared.token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let m = msgs["messages"].as_array().unwrap().iter().find(|m| m["id"] == json!(reply)).unwrap().clone();
+    assert_eq!(m["streaming"], json!(false));
+    again.shutdown();
+}
+
 #[test]
 fn serve_options_refuse_public_binds_and_need_both_ntfy_parts() {
     let cfg = Config {

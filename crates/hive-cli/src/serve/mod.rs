@@ -38,6 +38,9 @@ pub mod pair;
 #[cfg(test)]
 mod tests;
 
+/// How long `hive serve` waits for a turn in flight on SIGTERM / Ctrl-C.
+const STOP_GRACE: Duration = Duration::from_secs(15);
+
 /// Default listen address: loopback only. On the home host the systemd unit
 /// passes the box's Tailscale IP.
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
@@ -293,6 +296,7 @@ pub struct ServeHandle {
     pub addr: SocketAddr,
     pub shared: Arc<Shared>,
     shutdown: watch::Sender<bool>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServeHandle {
@@ -301,6 +305,30 @@ impl ServeHandle {
         let _ = self.shutdown.send(true);
         self.shared.worker_kick.notify_one();
         self.shared.sync_kick.notify_one();
+    }
+
+    /// Stop, then give a turn in flight up to `grace` to finish (the worker
+    /// checks `stopping` between turns). Returns whether the worker stopped in
+    /// time; if not, the next start finishes the cut-off reply
+    /// ([`worker::recover_interrupted_turns`]).
+    pub async fn stop(&self, grace: Duration) -> bool {
+        self.shutdown();
+        let Some(worker) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            return true;
+        };
+        let deadline = tokio::time::Instant::now() + grace;
+        while !worker.is_finished() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let _ = worker.join();
+        // The finished turn's last writes go out before we exit.
+        if self.shared.cfg.relay_url.is_some() {
+            let _ = tokio::time::timeout(Duration::from_secs(3), sync_once(&self.shared.cfg)).await;
+        }
+        true
     }
 }
 
@@ -335,6 +363,13 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         svc.set_author_display_name(name.clone());
     }
     let host_id = svc.device_id().to_string();
+    // A turn cut off by the last stop would otherwise stay "streaming" forever
+    // and never be answered (its placeholder counts as the reply).
+    match worker::recover_interrupted_turns(&mut svc) {
+        Ok(done) if !done.is_empty() => eprintln!("serve: finished {} reply(s) interrupted by the last stop", done.len()),
+        Ok(_) => {}
+        Err(e) => eprintln!("serve: interrupted-turn recovery failed: {e}"),
+    }
     // Announce this box in the workspace roster and publish its identity so
     // peers verify its events, then register it as an always-on host.
     if let Err(e) = svc.ensure_self_member(workspace_config_session_id(ws), ws) {
@@ -390,9 +425,9 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
     if shared.cfg.relay_url.is_some() {
         tokio::spawn(sync_loop(shared.clone(), rx.clone()));
     }
-    spawn_worker(shared.clone())?;
+    let worker = spawn_worker(shared.clone())?;
     shared.sync_kick.notify_one();
-    Ok(ServeHandle { addr, shared, shutdown })
+    Ok(ServeHandle { addr, shared, shutdown, worker: Mutex::new(Some(worker)) })
 }
 
 /// Relay sync: every few seconds, and immediately after a local write.
@@ -427,8 +462,8 @@ async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
 /// The worker runs on its own thread with a current-thread runtime: a turn's
 /// tool executors (MCP clients, the lazy worktree) never have to be `Send`, and
 /// a long turn never starves the API.
-fn spawn_worker(shared: Arc<Shared>) -> Result<()> {
-    std::thread::Builder::new().name("hive-serve-worker".into()).spawn(move || {
+fn spawn_worker(shared: Arc<Shared>) -> Result<std::thread::JoinHandle<()>> {
+    Ok(std::thread::Builder::new().name("hive-serve-worker".into()).spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
             Ok(rt) => rt,
             Err(e) => {
@@ -456,8 +491,7 @@ fn spawn_worker(shared: Arc<Shared>) -> Result<()> {
                 }
             }
         });
-    })?;
-    Ok(())
+    })?)
 }
 
 /// Print the pairing QR code and link.
@@ -488,7 +522,11 @@ pub fn cmd_serve(cfg: Config, opts: ServeOptions) -> Result<()> {
         }
         crate::shutdown_signal().await;
         println!("hive serve: stopping.");
-        handle.shutdown();
+        // Under the unit's TimeoutStopSec (20 s): let a turn in flight finish
+        // if it can; a longer one is finished as interrupted on the next start.
+        if !handle.stop(STOP_GRACE).await {
+            eprintln!("hive serve: a turn was still running; it will be marked interrupted on the next start.");
+        }
         Ok(())
     })
 }
