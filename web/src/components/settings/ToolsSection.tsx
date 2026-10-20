@@ -199,6 +199,14 @@ export function ToolsSection() {
             {!s.hasBearerToken && s.oauthConnected && (
               <span className="ml-2 text-xs opacity-70">· connected</span>
             )}
+            {s.secretForOtherUrl && (
+              <span
+                className="ml-2 text-xs opacity-70"
+                title="This server's URL changed since its token was saved, so the token is not sent. Set the token again or reconnect."
+              >
+                · token saved for a different URL
+              </span>
+            )}
           </span>
           <span className="flex items-center gap-3">
             {s.transport === "http" && (

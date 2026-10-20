@@ -17,4 +17,10 @@ hasBearerToken: boolean,
 /**
  * An OAuth token (Connect flow) is stored for this server on this device.
  */
-oauthConnected: boolean, };
+oauthConnected: boolean, 
+/**
+ * A token or OAuth connection is saved under this server's id, but for
+ * a different URL origin, so it is withheld from this server. Set the
+ * token again or reconnect to use it here.
+ */
+secretForOtherUrl: boolean, };

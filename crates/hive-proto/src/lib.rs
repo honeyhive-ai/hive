@@ -397,6 +397,11 @@ pub struct McpServerDto {
     /// An OAuth token (Connect flow) is stored for this server on this device.
     #[serde(default)]
     pub oauth_connected: bool,
+    /// A token or OAuth connection is saved under this server's id, but for
+    /// a different URL origin, so it is withheld from this server. Set the
+    /// token again or reconnect to use it here.
+    #[serde(default)]
+    pub secret_for_other_url: bool,
 }
 
 /// A reference-material vault source mounted in the workspace.
