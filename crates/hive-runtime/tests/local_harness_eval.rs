@@ -90,7 +90,7 @@
 //!   (23 calls) and end on leaked `<|tool_call>` markup. Now a repeated read
 //!   is answered from the first result, and a run that still loops ends after
 //!   the third repeat (13-15 calls) with a correct diagnosis in text.
-//! - * web_search: during the "after" runs the rdnamcp search backend answered
+//! - web_search: during the "after" runs the rdnamcp search backend answered
 //!   "No results." to nearly every query; the "before" build re-run at the
 //!   same time also scored 0/2. gemma4 searched until the round budget ran
 //!   out and then (5 of 6 runs) said it could not find the version; gpt-oss

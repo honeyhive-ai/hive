@@ -14124,7 +14124,7 @@ mod compaction_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("hive.db");
         let history: Vec<ChatMessage> =
-            (0..6).map(|i| ChatMessage::new(MessageRole::User, "u", &format!("message {i}"))).collect();
+            (0..6).map(|i| ChatMessage::new(MessageRole::User, "u", format!("message {i}"))).collect();
         let session = Uuid::new_v4();
         let entry = SummaryCacheEntry {
             boundary: Some(history[4].id),
