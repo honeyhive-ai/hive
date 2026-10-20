@@ -113,7 +113,7 @@ supports_tools = true
 
 | Role | Model | Why (measured) |
 |---|---|---|
-| Agent loops | **gpt-oss 20B** | 2.2× gemma4's speed in agent loops, and it kept 100% of the facts through compaction. |
+| Agent loops | **gpt-oss 20B** | 2.2× gemma4's speed, and it fixed the eval's planted bug 3 of 3 times. |
 | Chat | **gemma4 12B** | Good everyday model. With `web_search` and `fetch_url` it went from **0/11 to 9/11** on questions about current versions. |
 | Quick jobs (titles, classification) | **LFM2 8B-A1B** on CPU | Answers in **0.2–0.4 s** without touching the GPU. |
 | Quality | **Qwen3.6 35B-A3B** | Use it when the answer matters more than speed. |
@@ -269,7 +269,9 @@ minutes, whichever comes first. Each failure in a row doubles the wait,
 up to 16 turns or 30 minutes.
 
 Summaries are written by the chat's own runtime. Use a strong model for
-chats that run long; gpt-oss 20B kept every fact through compaction.
+chats that run long, and check recall on your own chats: in Hive's eval,
+gemma4 12B kept all five planted facts through compaction (3 of 3 runs),
+while gpt-oss 20B dropped one of the five in every run.
 
 ## Retrieval
 
