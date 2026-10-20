@@ -90,6 +90,11 @@ pub struct RuntimeTarget {
     /// in a `[[runtimes]]` block.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tool_rounds: Option<u32>,
+    /// Offer Hive's built-in workspace file tools even though the endpoint's
+    /// host isn't local or private — the user accepts that file contents are
+    /// sent to it. Set via `allow_remote_file_tools` in a `[[runtimes]]` block.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_remote_file_tools: bool,
     #[serde(default)]
     pub estimated_performance_score: f64,
     #[serde(default)]
@@ -138,6 +143,7 @@ mod tests {
             request_keep_alive: None,
             think: None,
             max_tool_rounds: None,
+            allow_remote_file_tools: false,
             estimated_performance_score: 0.0,
             estimated_cost_per_1m_input_tokens_usd: 0.0,
             capabilities: RuntimeCapabilities::default(),

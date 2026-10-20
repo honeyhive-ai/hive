@@ -213,6 +213,84 @@ impl Worktree {
     }
 }
 
+/// Cut a turn's ephemeral worktree from the chat's persistent base branch
+/// `hive/chat/<chat_id>` (Phase 2a: the captured diff is vs the chat branch,
+/// and applying advances only that chat), ensuring the chat's base worktree
+/// first. If that fails (e.g. a repo with no `HEAD`) the turn is cut from
+/// `HEAD`; an `Err` means isolation is unavailable and the caller runs in place.
+pub fn cut_turn_worktree(repo_root: &Path, chat_id: &str) -> io::Result<Worktree> {
+    match chat_worktree(repo_root, chat_id) {
+        Ok(_) => Worktree::create_from(repo_root, chat_id, &format!("hive/chat/{chat_id}")),
+        Err(e) => {
+            tracing::warn!(target: "worktree", "chat base worktree unavailable, cutting turn from HEAD: {e}");
+            Worktree::create(repo_root, chat_id)
+        }
+    }
+}
+
+/// A turn's worktree, cut only when the turn first writes. An HTTP model
+/// turn with built-in file tools reads the chat's own dir; its first
+/// `write_file` / `edit_file` / `run_command` calls [`cut_turn_worktree`]
+/// (through [`crate::builtin_tools::WriteRoot`]) and the rest of the turn
+/// runs there. Plain Q&A never creates (or removes) a worktree.
+///
+/// After the turn, [`LazyTurnWorktree::finish`] hands back the worktree, if
+/// one was cut, for diff capture and removal — and closes this so a write
+/// still racing the end of the turn can't cut a new one that nobody removes.
+#[derive(Debug)]
+pub struct LazyTurnWorktree {
+    repo_root: PathBuf,
+    chat_id: String,
+    state: std::sync::Mutex<LazyTurnState>,
+}
+
+#[derive(Debug)]
+struct LazyTurnState {
+    worktree: Option<Worktree>,
+    closed: bool,
+}
+
+impl LazyTurnWorktree {
+    pub fn new(repo_root: impl Into<PathBuf>, chat_id: impl Into<String>) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+            chat_id: chat_id.into(),
+            state: std::sync::Mutex::new(LazyTurnState { worktree: None, closed: false }),
+        }
+    }
+
+    /// The worktree cut so far, if any (without taking it).
+    pub fn current(&self) -> Option<Worktree> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).worktree.clone()
+    }
+
+    /// Close and take the worktree this turn cut, if it wrote at all. Waits
+    /// for a cut in progress to finish, so its worktree is never orphaned.
+    pub fn finish(&self) -> Option<Worktree> {
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.closed = true;
+        st.worktree.take()
+    }
+}
+
+impl crate::builtin_tools::WriteRoot for LazyTurnWorktree {
+    fn write_root(&self) -> Result<PathBuf, String> {
+        // Held across the cut: `finish` waits for it rather than missing it.
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(wt) = &st.worktree {
+            return Ok(wt.path.clone());
+        }
+        if st.closed {
+            return Err("the turn has ended".into());
+        }
+        let wt = cut_turn_worktree(&self.repo_root, &self.chat_id).map_err(|e| format!("isolation unavailable: {e}"))?;
+        tracing::info!(target: "worktree", path = %wt.path.display(), "turn wrote: cut its worktree");
+        let path = wt.path.clone();
+        st.worktree = Some(wt);
+        Ok(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

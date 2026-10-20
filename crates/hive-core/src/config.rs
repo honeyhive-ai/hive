@@ -224,6 +224,8 @@ struct RawRuntime {
     think: Option<bool>,
     max_tool_rounds: Option<u32>,
     #[serde(default)]
+    allow_remote_file_tools: bool,
+    #[serde(default)]
     supports_embeddings: bool,
     #[serde(default)]
     supports_tools: bool,
@@ -465,6 +467,7 @@ impl RawRuntime {
             request_keep_alive: self.keep_alive,
             think: self.think,
             max_tool_rounds: self.max_tool_rounds.filter(|n| *n > 0),
+            allow_remote_file_tools: self.allow_remote_file_tools,
             estimated_performance_score: self.performance_score,
             estimated_cost_per_1m_input_tokens_usd: self.cost_per_1m_input_tokens_usd,
             capabilities: RuntimeCapabilities {
@@ -544,6 +547,25 @@ max_tool_rounds = 0
         let cfg = load_from_str(toml).unwrap();
         assert_eq!(cfg.runtimes[0].max_tool_rounds, Some(40));
         assert_eq!(cfg.runtimes[1].max_tool_rounds, None);
+    }
+
+    #[test]
+    fn allow_remote_file_tools_parses_and_defaults_off() {
+        let toml = r#"
+[[runtimes]]
+id = "hosted-gateway"
+provider = "custom"
+endpoint = "https://llm.example.com/v1/chat/completions"
+allow_remote_file_tools = true
+
+[[runtimes]]
+id = "other"
+provider = "custom"
+endpoint = "https://llm.example.com/v1/chat/completions"
+"#;
+        let cfg = load_from_str(toml).unwrap();
+        assert!(cfg.runtimes[0].allow_remote_file_tools);
+        assert!(!cfg.runtimes[1].allow_remote_file_tools);
     }
 
     #[test]

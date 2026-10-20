@@ -29,6 +29,19 @@ pub enum EventStoreError {
 
 pub type Result<T> = std::result::Result<T, EventStoreError>;
 
+/// A chat responder's compaction state as kept on this device: the first
+/// kept message (`boundary`), the ids the `summary` covers (everything before
+/// the boundary when it was made) and their
+/// [`hive_core::context_budget::messages_fingerprint`], which the reader
+/// checks against the live transcript before reusing the summary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredCompaction {
+    pub boundary: Option<Uuid>,
+    pub covered: Vec<Uuid>,
+    pub fingerprint: String,
+    pub summary: String,
+}
+
 /// An append-only, per-session-sequenced event log over SQLite.
 pub struct EventStore {
     conn: Connection,
@@ -91,6 +104,21 @@ impl EventStore {
                 workspace TEXT NOT NULL,
                 event_id  TEXT NOT NULL,
                 PRIMARY KEY (workspace, event_id)
+            );
+
+            -- Device-local compaction state, never synced: per chat and
+            -- responder runtime, the batch boundary plus the summary of
+            -- everything before it, the ids it covers and their fingerprint
+            -- (see StoredCompaction). Lets an app restart reuse a summary
+            -- instead of spending tens of seconds re-summarizing.
+            CREATE TABLE IF NOT EXISTS compaction_state (
+                session_id   TEXT NOT NULL,
+                runtime_id   TEXT NOT NULL,
+                boundary     TEXT,
+                covered_json TEXT NOT NULL,
+                fingerprint  TEXT NOT NULL,
+                summary      TEXT NOT NULL,
+                PRIMARY KEY (session_id, runtime_id)
             );
             "#,
         )?;
@@ -396,7 +424,78 @@ impl EventStore {
             "DELETE FROM events WHERE session_id = ?1",
             [session_id.to_string()],
         )?;
+        self.delete_compaction(session_id, None)?;
         Ok(n)
+    }
+
+    // --- Device-local compaction state (`compaction_state`). Not part of the
+    // event log: nothing here is synced or projected. ---
+
+    /// The stored compaction state for a chat's responder runtime, if any. A
+    /// row that no longer parses is treated as absent.
+    pub fn compaction(&self, session_id: Uuid, runtime_id: &str) -> Result<Option<StoredCompaction>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT boundary, covered_json, fingerprint, summary FROM compaction_state \
+                 WHERE session_id = ?1 AND runtime_id = ?2",
+                rusqlite::params![session_id.to_string(), runtime_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((boundary, covered_json, fingerprint, summary)) = row else {
+            return Ok(None);
+        };
+        let boundary = match boundary.as_deref().map(Uuid::parse_str) {
+            None => None,
+            Some(Ok(id)) => Some(id),
+            Some(Err(_)) => return Ok(None),
+        };
+        let Ok(covered) = serde_json::from_str::<Vec<Uuid>>(&covered_json) else {
+            return Ok(None);
+        };
+        Ok(Some(StoredCompaction { boundary, covered, fingerprint, summary }))
+    }
+
+    /// Save (replace) a chat responder's compaction state.
+    pub fn save_compaction(&self, session_id: Uuid, runtime_id: &str, state: &StoredCompaction) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO compaction_state (session_id, runtime_id, boundary, covered_json, fingerprint, summary) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(session_id, runtime_id) DO UPDATE SET boundary = excluded.boundary, \
+             covered_json = excluded.covered_json, fingerprint = excluded.fingerprint, summary = excluded.summary",
+            rusqlite::params![
+                session_id.to_string(),
+                runtime_id,
+                state.boundary.map(|b| b.to_string()),
+                serde_json::to_string(&state.covered)?,
+                state.fingerprint,
+                state.summary,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a chat's compaction state: one responder runtime's, or every
+    /// runtime's when `runtime_id` is `None`.
+    pub fn delete_compaction(&self, session_id: Uuid, runtime_id: Option<&str>) -> Result<()> {
+        match runtime_id {
+            Some(rt) => self.conn.execute(
+                "DELETE FROM compaction_state WHERE session_id = ?1 AND runtime_id = ?2",
+                rusqlite::params![session_id.to_string(), rt],
+            )?,
+            None => self
+                .conn
+                .execute("DELETE FROM compaction_state WHERE session_id = ?1", [session_id.to_string()])?,
+        };
+        Ok(())
     }
 
     /// Distinct session ids known to the store, in first-seen order.
@@ -793,6 +892,45 @@ mod tests {
         want.sort();
         assert_eq!(ids, want, "pushed set persisted, deduped");
         assert!(store.pushed_ids(b).unwrap().is_empty(), "pushed set is per workspace");
+    }
+
+    #[test]
+    fn compaction_state_survives_reopen_is_keyed_per_runtime_and_stays_out_of_the_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.db");
+        let sid = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let state = StoredCompaction {
+            boundary: Some(Uuid::new_v4()),
+            covered: vec![Uuid::new_v4(), Uuid::new_v4()],
+            fingerprint: "abc".into(),
+            summary: "They agreed on X.".into(),
+        };
+        {
+            let store = EventStore::open(&path).unwrap();
+            assert_eq!(store.compaction(sid, "gateway").unwrap(), None);
+            store.save_compaction(sid, "gateway", &state).unwrap();
+            let mut first = state.clone();
+            first.summary = "older".into();
+            store.save_compaction(sid, "hosted", &first).unwrap();
+            store.save_compaction(other, "gateway", &first).unwrap();
+            // Upsert.
+            store.save_compaction(sid, "hosted", &StoredCompaction { boundary: None, ..state.clone() }).unwrap();
+        }
+        let store = EventStore::open(&path).unwrap();
+        assert_eq!(store.compaction(sid, "gateway").unwrap().as_ref(), Some(&state), "survived a restart");
+        assert_eq!(store.compaction(sid, "hosted").unwrap().unwrap().boundary, None);
+        // Device-local: nothing reached the event log.
+        assert!(store.list(sid).unwrap().is_empty());
+        assert!(store.list_session_ids().unwrap().is_empty());
+
+        store.delete_compaction(sid, Some("hosted")).unwrap();
+        assert!(store.compaction(sid, "hosted").unwrap().is_none());
+        assert!(store.compaction(sid, "gateway").unwrap().is_some());
+        // Deleting the chat drops its state; other chats keep theirs.
+        store.delete_session(sid).unwrap();
+        assert!(store.compaction(sid, "gateway").unwrap().is_none());
+        assert!(store.compaction(other, "gateway").unwrap().is_some());
     }
 
     #[test]

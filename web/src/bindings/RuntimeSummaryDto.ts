@@ -28,4 +28,9 @@ think?: boolean | null,
 /**
  * Model rounds per tool-using turn (HTTP runtimes). None = Hive default (24).
  */
-maxToolRounds?: number | null, };
+maxToolRounds?: number | null, 
+/**
+ * Offer the built-in workspace file tools even though the endpoint isn't
+ * local or private. None = off.
+ */
+allowRemoteFileTools?: boolean | null, };

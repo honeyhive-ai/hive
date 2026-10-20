@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { RuntimeSummaryDto } from "@/bindings/RuntimeSummaryDto";
 import {
   addRuntime,
+  endpointIsPrivate,
   getAppSettings,
   getClaudeCodeModel,
   setClaudeCodeModel,
@@ -602,6 +603,8 @@ function RuntimesSection() {
   const [runtimeThink, setRuntimeThink] = useState(false);
   // HTTP model runtimes: model rounds per tool-using turn ("" = default 24).
   const [runtimeMaxToolRounds, setRuntimeMaxToolRounds] = useState("");
+  // Offer the built-in file tools to an endpoint that isn't local/private.
+  const [runtimeAllowRemoteFileTools, setRuntimeAllowRemoteFileTools] = useState(false);
   const thinkProviders = ["ollama", "custom", "hive-daemon"];
   const httpProviders = ["ollama", "openAI", "openRouter", "azure", "custom", "hive-daemon"];
   // Providers whose "Supports tools" runs Hive's agent tool loop (MCP + file
@@ -643,6 +646,7 @@ function RuntimesSection() {
     setRuntimeKeepAlive("");
     setRuntimeThink(false);
     setRuntimeMaxToolRounds("");
+    setRuntimeAllowRemoteFileTools(false);
     setRuntimeSupportsTools(true);
     setRuntimeSupportsEmbeddings(false);
   }
@@ -659,6 +663,7 @@ function RuntimesSection() {
     setRuntimeKeepAlive(runtime.keepAlive ?? "");
     setRuntimeThink(runtime.think ?? false);
     setRuntimeMaxToolRounds(runtime.maxToolRounds ? String(runtime.maxToolRounds) : "");
+    setRuntimeAllowRemoteFileTools(runtime.allowRemoteFileTools ?? false);
     setRuntimeSupportsTools(runtime.supportsTools);
     setRuntimeSupportsEmbeddings(runtime.supportsEmbeddings);
     formRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
@@ -684,6 +689,7 @@ function RuntimesSection() {
         agentToolProviders.includes(runtimeProvider) && Number(runtimeMaxToolRounds) > 0
           ? Number(runtimeMaxToolRounds)
           : null,
+        agentToolProviders.includes(runtimeProvider) && runtimeAllowRemoteFileTools ? true : null,
       ),
     onSuccess: () => {
       resetRuntimeForm();
@@ -724,6 +730,7 @@ function RuntimesSection() {
         runtime.keepAlive ?? null,
         runtime.think ?? null,
         runtime.maxToolRounds ?? null,
+        runtime.allowRemoteFileTools ?? null,
       ),
     onSuccess: (_d, { model }) => {
       toast.success(`Runtime now uses ${model}.`);
@@ -753,6 +760,17 @@ function RuntimesSection() {
     staleTime: Infinity,
   });
   const profile = formModel ? modelProfile.data ?? null : null;
+  // Built-in file tools go only to local/private endpoints unless opted in.
+  // Native Ollama with no endpoint talks to localhost.
+  const fileToolsEndpoint = formEndpoint || (runtimeProvider === "ollama" ? "http://localhost:11434" : "");
+  const endpointPrivate = useQuery({
+    queryKey: ["endpoint-private", fileToolsEndpoint],
+    queryFn: () => endpointIsPrivate(fileToolsEndpoint),
+    enabled: agentToolProviders.includes(runtimeProvider) && fileToolsEndpoint !== "",
+    staleTime: Infinity,
+  });
+  // Known-public endpoint: show the opt-in (unknown/empty: nothing to say yet).
+  const endpointIsRemote = fileToolsEndpoint !== "" && endpointPrivate.data === false;
   const formModels = useQuery({
     queryKey: ["ollama-models", "form", formEndpoint],
     queryFn: () => listOllamaModels({ endpoint: formEndpoint || null }),
@@ -1046,6 +1064,23 @@ function RuntimesSection() {
               How many times the model may call tools before it must answer. Tools also stop being
               offered when the conversation nears the context window.
             </p>
+            {(endpointIsRemote || runtimeAllowRemoteFileTools) && (
+              <div className="space-y-1">
+                <div className="flex items-center gap-2 text-sm opacity-75">
+                  <Switch
+                    on={runtimeAllowRemoteFileTools}
+                    onChange={setRuntimeAllowRemoteFileTools}
+                    label="Allow workspace file tools for this endpoint"
+                  />
+                  <span>Allow workspace file tools for this endpoint</span>
+                </div>
+                <p className="text-xs" style={{ color: "var(--hive-warn)" }}>
+                  This endpoint isn't on this machine or a private network (LAN, Tailscale). With this
+                  on, Hive's file tools send the contents of files the model reads from your workspace
+                  to it. Off: the model here only gets your MCP tools.
+                </p>
+              </div>
+            )}
           </>
         )}
         <div className="flex items-center gap-2 text-sm opacity-75">

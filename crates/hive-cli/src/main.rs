@@ -372,6 +372,7 @@ fn resolve_runtime_from_env() -> Result<(ResolvedRuntime, String)> {
         think: None,
         tools: false,
         max_tool_rounds: None,
+        allow_remote_file_tools: false,
     };
     Ok((rt, format!("{provider_str}/{model}")))
 }
@@ -579,6 +580,7 @@ fn resolve_agent_runtime(cfg: &Config, runtime_id: Option<&str>) -> Result<(Reso
         think: None,
         tools: false,
         max_tool_rounds: None,
+        allow_remote_file_tools: false,
     };
     Ok((rt, format!("workspace:{}", wr.name)))
 }
@@ -802,6 +804,7 @@ fn agent_workspace_runtime(
         think: None,
         tools: false,
         max_tool_rounds: None,
+        allow_remote_file_tools: false,
     };
     Ok((rt, wr.id.clone()))
 }

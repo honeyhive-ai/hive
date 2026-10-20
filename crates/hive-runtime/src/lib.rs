@@ -65,7 +65,7 @@ pub use identity_verifier::{
     gate_ingest, shared_cache, FetchOutcome, IdentityCache, IdentityMode, IdentityVerdict,
     IngestAction, SharedIdentityCache,
 };
-pub use event_store::{EventStore, EventStoreError};
+pub use event_store::{EventStore, EventStoreError, StoredCompaction};
 pub use identity_store::{
     FileKeyVault, IdentityError, IdentityStore, KeyVault, StoredIdentity,
 };

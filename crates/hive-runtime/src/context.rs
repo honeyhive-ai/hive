@@ -4,6 +4,12 @@
 //! messages that fit the budget (via `hive_core::context_budget`), and condense
 //! the overflow into a cached summary that is refreshed incrementally as the
 //! thread grows (only newly-aged-out turns are re-summarized).
+//!
+//! Not on any live path: the desktop app (`windowed_context`) plans with
+//! [`hive_core::context_budget::plan_with_hysteresis`] directly, with
+//! per-runtime, persisted state and summarizer backoff, and the `hive` CLI
+//! worker doesn't compact at all. This sliding planner is kept as a small
+//! library type, covered by its own tests.
 
 use hive_core::context_budget::{self};
 use hive_core::ChatMessage;
