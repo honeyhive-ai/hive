@@ -27,6 +27,8 @@ enum StreamUpdate: Sendable, Equatable {
     case connecting
     case connected
     case event(ServerEvent)
+    /// The id of the event just received, for `Last-Event-ID` on a new stream.
+    case cursor(String)
     /// Connection dropped; `retryIn` seconds until the next attempt.
     case disconnected(reason: String, retryIn: Double)
     case unauthorized
@@ -38,11 +40,15 @@ final class EventStream: Sendable {
     private let client: APIClient
     private let session: URLSession
     private let initialBackoff: Backoff
+    private let resumeFrom: String?
 
-    init(client: APIClient, session: URLSession, backoff: Backoff = Backoff()) {
+    /// `lastEventId` resumes after an earlier stream's last event (best effort:
+    /// the server keeps a bounded buffer, and a restarted server forgets it).
+    init(client: APIClient, session: URLSession, backoff: Backoff = Backoff(), lastEventId: String? = nil) {
         self.client = client
         self.session = session
         self.initialBackoff = backoff
+        self.resumeFrom = lastEventId
     }
 
     /// Runs until the consumer stops iterating (or the task is cancelled).
@@ -50,10 +56,11 @@ final class EventStream: Sendable {
         let client = self.client
         let session = self.session
         let initialBackoff = self.initialBackoff
+        let resumeFrom = self.resumeFrom
         return AsyncStream { continuation in
             let task = Task {
                 var backoff = initialBackoff
-                var lastEventId: String?
+                var lastEventId: String? = resumeFrom
                 var serverRetry: Double?
                 while !Task.isCancelled {
                     continuation.yield(.connecting)
@@ -80,7 +87,10 @@ final class EventStream: Sendable {
                         var parser = SSEParser()
                         for try await byte in bytes {
                             guard let ev = parser.feed(byte: byte) else { continue }
-                            if let id = ev.id { lastEventId = id }
+                            if let id = ev.id {
+                                lastEventId = id
+                                continuation.yield(.cursor(id))
+                            }
                             if let retry = ev.retry { serverRetry = Double(retry) / 1000 }
                             if let decoded = try? ServerEvent.decode(ev) {
                                 continuation.yield(.event(decoded))

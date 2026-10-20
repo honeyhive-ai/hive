@@ -319,10 +319,14 @@ async fn run_turn(
     pm: &PendingMention,
     sink: &dyn TurnSink,
 ) -> Result<()> {
+    // `Queued` was already reported: every exit must end in Done or Error, or
+    // the phone's turn strip waits forever.
     let Some(s) = lock(svc).load(pm.session_id)? else {
+        sink.status(pm.session_id, pm.agent_id, TurnState::Done, Some("chat no longer exists"));
         return Ok(());
     };
     let Some(agent) = s.workspace_agents.iter().find(|a| a.id == pm.agent_id).cloned() else {
+        sink.status(pm.session_id, pm.agent_id, TurnState::Done, Some("agent no longer exists"));
         return Ok(());
     };
     let (rt, rt_label) = agent_workspace_runtime(runtimes, &agent)?;

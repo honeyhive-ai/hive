@@ -66,6 +66,12 @@ final class AppModel {
     private let store: ServerStore
     private let session: URLSession
     private var eventsTask: Task<Void, Never>?
+    /// The last event id seen, carried into a new stream as `Last-Event-ID`.
+    private(set) var lastEventId: String?
+    /// Refetch on the next connect: set after a drop or a return to the
+    /// foreground, when events may have been missed (the server's replay
+    /// buffer is bounded and forgotten on restart).
+    private var resyncOnConnect = false
     let launch: LaunchOptions
 
     init(launch: LaunchOptions = .current(), store: ServerStore = ServerStore()) {
@@ -146,7 +152,11 @@ final class AppModel {
             pendingPair = cfg
         case let .chat(id)?:
             tab = .chats
+            // Usually a notification tap: the chat may already be on screen
+            // (same path, so its view won't reload), and the reply landed
+            // while the app was in the background.
             chatPath = [id]
+            if client != nil { Task { await self.loadMessages(chatId: id) } }
         case nil:
             banner = "Unrecognised link: \(url.absoluteString)"
         }
@@ -154,10 +164,11 @@ final class AppModel {
 
     // MARK: Events
 
-    func startEvents() {
+    func startEvents(resync: Bool = false) {
         guard let client else { return }
         eventsTask?.cancel()
-        let stream = EventStream(client: client, session: session)
+        resyncOnConnect = resync
+        let stream = EventStream(client: client, session: session, lastEventId: lastEventId)
         eventsTask = Task { [weak self] in
             for await update in stream.updates() {
                 guard let self else { return }
@@ -166,12 +177,34 @@ final class AppModel {
         }
     }
 
-    /// Restart the stream when returning to the foreground.
+    /// Restart the stream when returning to the foreground; once it connects,
+    /// refetch what may have changed meanwhile (including the open chat).
     func resume() {
         guard isPaired else { return }
         if case .live = streamState { return }
-        startEvents()
-        Task { await refreshAll() }
+        startEvents(resync: true)
+    }
+
+    /// Refetch after events may have been missed: lists, the open chat, and
+    /// the turn strip (a missed `turn.status done` must not leave an agent
+    /// "working" for the life of the app).
+    func resync() async {
+        await refreshAll()
+        if let open = chatPath.last { await loadMessages(chatId: open) }
+        reconcileTurns()
+    }
+
+    /// Keep a queued/running turn only where it is still visible: the agent
+    /// has a streaming reply in a chat whose messages were just reloaded.
+    /// Elsewhere the next `turn.status` brings it back if it is still going.
+    /// Failed turns clear themselves.
+    func reconcileTurns() {
+        let fresh = chatPath.last
+        for (chatId, perChat) in turns {
+            let streaming = Set((chatId == fresh ? messages[chatId] ?? [] : []).filter(\.streaming).compactMap(\.agentId))
+            let kept = perChat.filter { _, t in t.state == .error || streaming.contains(t.agentId) }
+            turns[chatId] = kept.isEmpty ? nil : kept
+        }
     }
 
     func suspend() {
@@ -180,14 +213,21 @@ final class AppModel {
         streamState = .idle
     }
 
-    private func apply(_ update: StreamUpdate) {
+    func apply(_ update: StreamUpdate) {
         switch update {
         case .connecting:
             if streamState != .live { streamState = .connecting }
         case .connected:
             streamState = .live
+            if resyncOnConnect {
+                resyncOnConnect = false
+                Task { await self.resync() }
+            }
         case let .disconnected(reason, retryIn):
+            resyncOnConnect = true
             streamState = .offline("\(reason) Retrying in \(Int(retryIn.rounded()))s.")
+        case let .cursor(id):
+            lastEventId = id
         case .unauthorized:
             streamState = .offline("Token rejected. Re-pair this phone.")
         case let .event(ev):
@@ -203,6 +243,12 @@ final class AppModel {
         case let .messageDone(m):
             upsert(m)
             bumpChat(for: m)
+            // The reply is finished, so its agent isn't "working" on it any
+            // more, even if the turn's own done status was missed.
+            if m.role.isAgent, let agentId = m.agentId, turns[m.chatId]?[agentId]?.state != .error {
+                turns[m.chatId]?[agentId] = nil
+                if turns[m.chatId]?.isEmpty == true { turns[m.chatId] = nil }
+            }
             // A reply that finished while its chat is on screen has been read:
             // re-fetch the page, which also advances the server's read mark —
             // otherwise the next chat.updated / chats refresh counts it unread.
@@ -222,6 +268,8 @@ final class AppModel {
             if let i = chats.firstIndex(where: { $0.id == c.id }) { chats[i] = c } else { chats.append(c) }
             chats.sort { $0.updatedAt > $1.updatedAt }
         case let .proposalCreated(p):
+            // The Review inbox lists open proposals only.
+            guard p.status == .open else { break }
             if let i = proposals.firstIndex(where: { $0.id == p.id }) { proposals[i] = p } else { proposals.insert(p, at: 0) }
         case let .turnStatus(t):
             var perChat = turns[t.chatId] ?? [:]
@@ -298,14 +346,29 @@ final class AppModel {
     func loadMessages(chatId: String) async {
         await run { client in
             let page = try await client.messages(chatId: chatId)
-            // Keep any locally-streamed text newer than the page.
-            var merged = page
-            for local in self.messages[chatId] ?? [] where !page.contains(where: { $0.id == local.id }) {
-                if local.createdAt > (page.last?.createdAt ?? .distantPast) { merged.append(local) }
-            }
-            self.messages[chatId] = merged
+            self.messages[chatId] = Self.merge(page: page, local: self.messages[chatId] ?? [])
             if let i = self.chats.firstIndex(where: { $0.id == chatId }) { self.chats[i].unread = 0 }
         }
+    }
+
+    /// A fetched page merged with what the stream already delivered. The
+    /// server stores a streaming reply as a throttled checkpoint, so a page can
+    /// trail the deltas already applied here: while a reply is still streaming
+    /// keep the local body if it extends the page's. Local messages newer than
+    /// the page (sent or streamed after it was read) are kept too.
+    static func merge(page: [Message], local: [Message]) -> [Message] {
+        var merged = page.map { m -> Message in
+            guard m.streaming, let mine = local.first(where: { $0.id == m.id }),
+                  mine.body.count > m.body.count, mine.body.hasPrefix(m.body) else { return m }
+            var m = m
+            m.body = mine.body
+            return m
+        }
+        let newest = page.last?.createdAt ?? .distantPast
+        for mine in local where !page.contains(where: { $0.id == mine.id }) && mine.createdAt > newest {
+            merged.append(mine)
+        }
+        return merged
     }
 
     func send(chatId: String, body: String) async -> Bool {

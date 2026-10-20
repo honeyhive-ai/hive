@@ -153,6 +153,22 @@ import Testing
         #expect(reqs[1].value(forHTTPHeaderField: "Last-Event-ID") == "4")
     }
 
+    /// A new stream (after backgrounding) resumes from the previous one's last id.
+    @Test func newStreamResumesFromAGivenEventId() async throws {
+        let body = "id: 8\nevent: turn.status\ndata: {\"chatId\":\"c1\",\"agentId\":\"a1\",\"state\":\"done\"}\n\n"
+        let (client, token) = makeClient { _ in
+            StubProtocol.Reply(status: 200, headers: ["Content-Type": "text/event-stream"], body: Data(body.utf8))
+        }
+        let stream = EventStream(client: client, session: StubProtocol.session(),
+                                 backoff: Backoff(base: 0.05, cap: 0.05, jitter: 0), lastEventId: "7")
+        var cursor: String?
+        for await update in stream.updates() {
+            if case let .cursor(id) = update { cursor = id; break }
+        }
+        #expect(cursor == "8")
+        #expect(StubProtocol.requests(token: token).first?.value(forHTTPHeaderField: "Last-Event-ID") == "7")
+    }
+
     @Test func stopsOnUnauthorized() async {
         let (client, _) = makeClient { _ in .json("{}", status: 401) }
         let stream = EventStream(client: client, session: StubProtocol.session(),
