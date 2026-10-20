@@ -1,6 +1,6 @@
 {
-  "tag": "v1.14.1",
-  "name": "Hive 1.14.1",
+  "tag": "v1.15.0",
+  "name": "Hive 1.15.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes and polish: the sole user stays the Owner of their private Home workspace after an identity change (a GitHub sign-in or reset no longer leaves you unauthorized in your own workspace), Claude Code narration around tool calls stays on separate lines instead of running together, and messages, attachments and the sidebar get themed right-click menus (copy, quote, regenerate, open, copy path, rename)."
+  "notes": "Run coding agents fully offline on local models: Custom and Ollama runtimes get a real agent tool loop with built-in file tools and MCP, each turn's edits isolated in a worktree for review, cache-friendly compaction, model-family profiles, Vault retrieval and a Quick tasks model. HTTP MCP servers accept static bearer tokens stored on-device. New `hive serve` home-host mode (HTTP + SSE API, worker, push notifications) with an experimental self-built iOS client. Note: saved MCP OAuth connections need reconnecting once."
 }
