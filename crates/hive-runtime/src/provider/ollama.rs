@@ -15,8 +15,14 @@
 //! in and the probe says the model can call tools, each round streams as
 //! usual, and any `message.tool_calls` the model emits are executed through a
 //! [`ToolExecutor`] and fed back as `role: "tool"` messages until the model
-//! answers in text. The last permitted round goes out without tools so a
-//! model that keeps calling them still ends on an answer.
+//! answers in text. A call identical to one already made this turn is
+//! answered from the earlier result ([`RepeatGuard`]). The final round (the
+//! round budget, the context guard, or a call repeated too often) goes out
+//! without tools — `/api/chat` has no `tool_choice` — with
+//! a trailing [`crate::tool_loop::FINAL_ROUND_NUDGE`] user message, so a model that keeps
+//! calling tools still ends on an answer. A round's `thinking` rides back on
+//! the assistant message that carries its tool calls, as Ollama's agent-loop
+//! examples do.
 //!
 //! Wire shape (NDJSON, one object per line):
 //! ```text
@@ -50,7 +56,7 @@ use super::http::{self, Peer};
 use super::openai::endpoint_host;
 use super::thinking::ThinkFilter;
 use super::turn_idle_timeout;
-use crate::tool_loop::ToolExecutor;
+use crate::tool_loop::{nudge_final_round, RepeatGuard, ToolExecutor};
 
 const PROVIDER: &str = "ollama";
 const DEFAULT_BASE: &str = "http://localhost:11434";
@@ -586,9 +592,13 @@ impl OllamaClient {
     /// ([`StreamActivity::Tool`]), run through `executor`, its result reported
     /// ([`StreamActivity::ToolResult`]) and appended as a `role: "tool"`
     /// message, and the next round begins. The loop ends when a round makes no
-    /// tool call; the last of `max_rounds` goes out *without* tools so the
-    /// model must answer in text. The returned text is exactly what was
-    /// streamed: the rounds' replies, blank-line separated.
+    /// tool call; the final round — the last of `max_rounds`, the first near
+    /// the window, or the one after a call was repeated more than
+    /// [`crate::tool_loop::REPEAT_CALL_LIMIT`] times — goes out *without*
+    /// tools and ends with a [`crate::tool_loop::FINAL_ROUND_NUDGE`] user
+    /// message, so the model must answer in text. A repeated call is answered from its earlier result
+    /// ([`RepeatGuard`]). The returned text is exactly what was streamed: the
+    /// rounds' replies, blank-line separated.
     #[allow(clippy::too_many_arguments)]
     pub async fn stream_chat_with_tools<E: ToolExecutor>(
         &self,
@@ -606,6 +616,7 @@ impl OllamaClient {
         let mut messages = seed_messages(system, turns);
         let mut state = RoundState { think: opts.think, ..Default::default() };
         let mut out = ChatOutcome::default();
+        let mut guard = RepeatGuard::default();
         let rounds = max_rounds.max(1);
         for round in 0..rounds {
             let last = round + 1 == rounds;
@@ -615,7 +626,14 @@ impl OllamaClient {
             if !fits && !last && !state.tools_rejected {
                 tracing::info!(target: "dispatch", host = %self.host(), model, round, window = ?opts.num_ctx, "context nearly full; final round goes out without tools");
             }
-            let offered: &[Value] = if last || state.tools_rejected || !fits { &[] } else { &defs };
+            if guard.tripped() && !last && fits {
+                tracing::info!(target: "dispatch", host = %self.host(), model, round, "tool call repeated more than {} times; final round goes out without tools", crate::tool_loop::REPEAT_CALL_LIMIT);
+            }
+            let final_round = last || !fits || guard.tripped();
+            if final_round {
+                nudge_final_round(&mut messages);
+            }
+            let offered: &[Value] = if final_round || state.tools_rejected { &[] } else { &defs };
             // Separate this round's text from the previous round's with a blank
             // line — in the stream and in the body alike, so they match.
             let mut need_sep = !out.text.is_empty();
@@ -662,7 +680,7 @@ impl OllamaClient {
                 calls = r.tool_calls.len(),
                 "ollama tool round"
             );
-            messages.push(assistant_message(&r.outcome.text, &r.tool_calls));
+            messages.push(assistant_message(&r.outcome.text, &r.thinking, &r.tool_calls));
             for (idx, call) in r.tool_calls.iter().enumerate() {
                 let id = call.id.clone().unwrap_or_else(|| format!("call_{round}_{idx}"));
                 on_activity(StreamActivity::Tool {
@@ -670,7 +688,17 @@ impl OllamaClient {
                     name: call.name.clone(),
                     input_json: call.arguments.to_string(),
                 });
-                let (content, is_error) = executor.call(&call.name, &call.arguments).await;
+                let (content, is_error) = match guard.check(&call.name, &call.arguments) {
+                    Some(reply) => {
+                        tracing::info!(target: "dispatch", host = %self.host(), model, tool = %call.name, "repeated tool call answered from its earlier result");
+                        (reply, false)
+                    }
+                    None => {
+                        let (content, is_error) = executor.call(&call.name, &call.arguments).await;
+                        guard.record(&call.name, &call.arguments, &content, is_error);
+                        (content, is_error)
+                    }
+                };
                 let content = clip_tool_result(content);
                 on_activity(StreamActivity::ToolResult { call_id: id, is_error, content: content.clone() });
                 messages.push(tool_message(call, content));
@@ -733,6 +761,7 @@ impl OllamaClient {
                 ..Default::default()
             },
             tool_calls: Vec::new(),
+            thinking: String::new(),
         };
         let mut buffer = String::new();
         let mut filter = ThinkFilter::new();
@@ -803,6 +832,8 @@ struct RoundState {
 struct Round {
     outcome: ChatOutcome,
     tool_calls: Vec<ToolCall>,
+    /// The `message.thinking` the round streamed (not inline `<think>`).
+    thinking: String,
 }
 
 /// Fold one frame into the round: thinking to its sink, content through the
@@ -815,6 +846,7 @@ fn absorb(
     on_thinking: &mut impl FnMut(String),
 ) {
     if !frame.thinking.is_empty() {
+        round.thinking.push_str(&frame.thinking);
         on_thinking(frame.thinking);
     }
     if !frame.content.is_empty() {
@@ -846,9 +878,10 @@ pub fn seed_messages(system: Option<&str>, turns: &[ChatTurn]) -> Vec<Value> {
     messages
 }
 
-/// The assistant turn to echo back into history after a tool round: its text
-/// and the calls it made, in the shape Ollama's chat templates expect.
-fn assistant_message(text: &str, calls: &[ToolCall]) -> Value {
+/// The assistant turn to echo back into history after a tool round: its text,
+/// its `thinking` (when it had any) and the calls it made, in the shape
+/// Ollama's chat templates expect.
+fn assistant_message(text: &str, thinking: &str, calls: &[ToolCall]) -> Value {
     let tool_calls: Vec<Value> = calls
         .iter()
         .map(|c| {
@@ -859,7 +892,11 @@ fn assistant_message(text: &str, calls: &[ToolCall]) -> Value {
             v
         })
         .collect();
-    json!({ "role": "assistant", "content": text, "tool_calls": tool_calls })
+    let mut msg = json!({ "role": "assistant", "content": text, "tool_calls": tool_calls });
+    if !thinking.is_empty() {
+        msg["thinking"] = json!(thinking);
+    }
+    msg
 }
 
 /// A tool's result as the `role: "tool"` message that answers `call`.
@@ -1611,8 +1648,38 @@ mod wire {
         assert!(s.chat_bodies[1].get("tools").is_some());
         assert!(s.chat_bodies[2].get("tools").is_none(), "the final round forces a text answer");
         // Every earlier round's calls and results are in the last request's history.
-        let roles: Vec<&str> = s.chat_bodies[2]["messages"].as_array().unwrap().iter().map(|m| m["role"].as_str().unwrap()).collect();
-        assert_eq!(roles, ["user", "assistant", "tool", "assistant", "tool"]);
+        let msgs = s.chat_bodies[2]["messages"].as_array().unwrap();
+        let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant", "tool", "user"]);
+        // A trailing user message asks for the answer.
+        assert!(crate::tool_loop::is_final_round_nudge(&msgs[5]));
+    }
+
+    #[tokio::test]
+    async fn repeated_calls_are_not_rerun_and_end_the_loop_early() {
+        let mut f = fake(vec![frame("unused"), done()]);
+        let same = || vec![think_frame("read it again"), tool_call_frame("search", json!({"q": "stock"})), done()];
+        f.rounds = Arc::new(vec![same(), same(), same(), same(), vec![frame("answer"), done()]]);
+        let (base, seen) = serve(f).await;
+        let exec = Recorder { calls: Mutex::new(vec![]) };
+        let mut results = Vec::new();
+        let out = OllamaClient::new(&base)
+            .stream_chat_with_tools("m", None, &[ChatTurn::user("go")], &ChatOptions::default(), &search_tool(), &exec, 24, |_| {}, |a| {
+                if let StreamActivity::ToolResult { content, .. } = a {
+                    results.push(content)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "answer");
+        assert_eq!(exec.calls.lock().unwrap().len(), 1, "the repeats were answered from the first result");
+        assert!(results[1].starts_with("Not run again"), "{}", results[1]);
+        let s = seen.lock().unwrap();
+        assert_eq!(s.chat_bodies.len(), 5, "the third repeat made the next round the last");
+        assert!(s.chat_bodies[3].get("tools").is_some());
+        assert!(s.chat_bodies[4].get("tools").is_none());
+        // The round's thinking rides back with its calls.
+        assert_eq!(s.chat_bodies[1]["messages"][1]["thinking"], "read it again");
     }
 
     #[tokio::test]
@@ -1658,7 +1725,9 @@ mod wire {
         assert_eq!(f.tool_calls[1].arguments, json!({"path": "a.rs"}));
         assert_eq!(f.tool_calls[2].arguments, json!({"input": "not json"}));
         // A server-assigned id is echoed on both sides of the exchange.
-        let a = assistant_message("", &f.tool_calls[..1]);
+        let a = assistant_message("", "", &f.tool_calls[..1]);
+        assert!(a.get("thinking").is_none());
+        assert_eq!(assistant_message("", "plan", &f.tool_calls[..1])["thinking"], "plan");
         assert_eq!(a["tool_calls"][0]["id"], "call_9");
         let t = tool_message(&f.tool_calls[0], "r".into());
         assert_eq!(t["tool_call_id"], "call_9");

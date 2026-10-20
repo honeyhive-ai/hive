@@ -320,3 +320,123 @@ async fn second_turn_reuses_the_cached_prefix() {
         }
     }
 }
+
+/// A weather lookup the model must call; one city per call.
+struct Weather;
+impl hive_runtime::tool_loop::ToolExecutor for Weather {
+    async fn call(&self, _name: &str, input: &Value) -> (String, bool) {
+        let city = input.get("city").and_then(Value::as_str).unwrap_or("?");
+        (format!("{city}: 21 C, sunny, wind 12 km/h"), false)
+    }
+}
+
+/// The tool loop's final round, measured: a turn that wants three weather
+/// lookups gets a budget of two rounds, so round 2 may not call tools. With
+/// `tool_choice: "none"` (the default) round 2 keeps the tools field, so the
+/// server reuses round 1's whole prompt from its cache; dropping the tools
+/// re-renders the prompt from where the template put them. Either way the
+/// last tool result carries the final-round nudge, and the reply must be text
+/// (no tool call, no raw call markup). `HIVE_PREFIX_LIVE_RUNS` (default 2)
+/// repeats both variants.
+///
+/// Results on the lab gateway (2026-10-19, llama.cpp; round 2 of each turn):
+///
+/// ```text
+/// model        variant            round-2 cache_n / prompt     reply
+/// gemma4:12b   tool_choice none   2526-2533 / ~2620 (99.8%)    text, 3/3
+/// gemma4:12b   drop tools         1 / ~2580 (0%)               text, 3/3
+/// gpt-oss:20b  tool_choice none   2585-2591 / ~2675 (100%)     text, 3/3
+/// gpt-oss:20b  drop tools         0-1419 / ~2630 (0-55%)       text, 3/3
+/// ```
+///
+/// Both templates render the tools ahead of the conversation (gemma4 inside
+/// the system turn, gpt-oss in the developer message), so dropping them on the
+/// final round re-prefills the whole history. llama.cpp honours
+/// `tool_choice: "none"` on both: no `tool_calls` came back. Without the
+/// nudge, though, the request alone isn't enough: with this system prompt
+/// gemma4 wrote the call it wanted as raw `<|tool_call>call:get_weather…`
+/// text 5/5 times (and gpt-oss tends to answer with nothing), which is why the
+/// loop sends the nudge as a trailing user message.
+#[tokio::test]
+async fn final_round_keeps_the_tool_prefix_cached() {
+    use hive_runtime::provider::openai::OpenAiClient;
+    let Ok(raw) = std::env::var("HIVE_PREFIX_LIVE_ENDPOINT") else {
+        eprintln!("HIVE_PREFIX_LIVE_ENDPOINT unset; skipping live final-round test");
+        return;
+    };
+    let model = std::env::var("HIVE_PREFIX_LIVE_MODEL").unwrap_or_else(|_| "gemma4:12b".into());
+    let (proxy_url, seen) = start_proxy(chat_url(&raw)).await;
+    let rt = runtime(proxy_url.clone(), model.clone());
+    let session = session();
+    let tools = vec![serde_json::json!({
+        "name": "get_weather",
+        "description": "Current weather for one city.",
+        "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+    })];
+    let system = prompt::with_tools_offered_for(
+        &format!("{}\n\n{}", prompt::primary_system_prompt(&session), prompt::runtime_identity_block(&rt, "Lab Mac (this device)")),
+        &tools,
+    );
+    let runs: usize = std::env::var("HIVE_PREFIX_LIVE_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    for run in 0..runs {
+        for variant in ["tool_choice_none", "drop_tools"] {
+            let mut hist = vec![ChatMessage::new(MessageRole::User, "Mara", format!("Session tag: {variant}-{}", Uuid::new_v4()))];
+            hist.push(ChatMessage::new(MessageRole::Assistant, "Hive", "Noted."));
+            hist.extend(history());
+            hist.push(ChatMessage::new(
+                MessageRole::User,
+                "Mara",
+                "Compare the weather in Lisbon, Porto and Faro right now. Call get_weather for one city at a time.",
+            ));
+            let turns = turns_with_summary(&hist, None, "Hive", None);
+            let client = OpenAiClient::new(&proxy_url)
+                .with_extra_body(dispatch::openai_request_extras(&rt))
+                .with_final_tool_choice(variant == "tool_choice_none");
+            let before = seen.lock().unwrap().len();
+            let out = client
+                .stream_chat_with_tools(None, &model, Some(&system), &turns, &tools, &Weather, 2, |_| {}, |_| {})
+                .await
+                .expect("turn completes");
+            let all = seen.lock().unwrap()[before..].to_vec();
+            if all.len() < 2 {
+                eprintln!("{variant}: the model answered without calling the tool; nothing to measure");
+                continue;
+            }
+            let (r1, r2) = (&all[0], &all[1]);
+            let r1_prompt = r1.cache_n.unwrap_or(0) + r1.prompt_n.unwrap_or(0);
+            let r2_prompt = r2.cache_n.unwrap_or(0) + r2.prompt_n.unwrap_or(0);
+            let leaked = ["<|tool_call>", "<tool_call>", "<|channel|>", "to=functions"].iter().any(|m| out.text.contains(m));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "check": "final_round",
+                    "model": model,
+                    "variant": variant,
+                    "run": run,
+                    "requests": all.len(),
+                    "round1_prompt": r1_prompt,
+                    "round2_prompt": r2_prompt,
+                    "round2_cache_n": r2.cache_n,
+                    "round2_prompt_n": r2.prompt_n,
+                    "round2_reuse_of_round1": r2.cache_n.map(|c| ((c as f64 / r1_prompt.max(1) as f64) * 1000.0).round() / 1000.0),
+                    "round2_tool_choice": r2.body.get("tool_choice"),
+                    "round2_has_tools": r2.body.get("tools").is_some(),
+                    "reply_chars": out.text.len(),
+                    "leaked_markup": leaked,
+                    "reply": out.text.chars().take(160).collect::<String>(),
+                })
+            );
+            assert!(!out.text.trim().is_empty(), "{variant}: the final round produced no answer");
+            assert!(!leaked, "{variant}: the reply is raw tool-call markup: {}", out.text);
+            if variant == "tool_choice_none" {
+                assert_eq!(r2.body["tool_choice"], "none", "the final round forbids tools");
+                assert_eq!(r2.body.get("tools"), r1.body.get("tools"), "the tools field is unchanged");
+                if let Some(c) = r2.cache_n {
+                    assert!(c as f64 >= 0.9 * r1_prompt as f64, "round 2 reused only {c} of round 1's {r1_prompt} tokens");
+                }
+            } else {
+                assert!(r2.body.get("tools").is_none());
+            }
+        }
+    }
+}

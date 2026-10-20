@@ -15,10 +15,23 @@
 //! {name, description, parameters}}]`; streamed `delta.tool_calls` fragments
 //! are assembled by `index` (id and name arrive once, `arguments` in pieces),
 //! run through a [`ToolExecutor`], and answered with one `role: "tool"`
-//! message per call (`tool_call_id` matching the call). The last permitted
-//! round goes out without tools so a model that keeps calling them still ends
-//! on an answer. A server that rejects the `tools` field (400/422 naming
-//! tools) is retried once without it and the turn finishes as plain chat.
+//! message per call (`tool_call_id` matching the call). A call identical to
+//! one already made this turn is answered from the earlier result instead of
+//! being run again ([`RepeatGuard`]). The last permitted round (the round
+//! budget, the context guard, or a call repeated more than
+//! [`crate::tool_loop::REPEAT_CALL_LIMIT`] times) keeps the tools in the
+//! request but sends `tool_choice: "none"`, so llama.cpp's cached prompt prefix — where the tools are rendered — is still
+//! reused, and a trailing [`crate::tool_loop::FINAL_ROUND_NUDGE`] user
+//! message makes the model answer rather than emit the call as text. A server that rejects
+//! `tool_choice`, or ignores it and calls a tool anyway with no text, gets that
+//! round again without tools. A server that rejects the `tools` field
+//! (400/422 naming tools) is retried once without it and the turn finishes as
+//! plain chat.
+//!
+//! Reasoning echo: the reasoning a round streamed in the `reasoning_content`
+//! / `reasoning` field rides back on the assistant message that carries its
+//! tool calls (as `reasoning_content`), which llama.cpp renders into the
+//! template (gpt-oss's analysis channel) on the next round.
 //!
 //! Context probe ([`OpenAiClient::probe_context_window`]): `llama-server`
 //! reports its per-slot window at `GET <base>/props`
@@ -42,7 +55,7 @@ use super::http::{self, Peer};
 use super::ollama::{clip_tool_result, seed_messages};
 use super::thinking::ThinkFilter;
 use super::turn_idle_timeout;
-use crate::tool_loop::ToolExecutor;
+use crate::tool_loop::{nudge_final_round, RepeatGuard, ToolExecutor};
 
 /// OpenAI-compatible chat client. The endpoint is the full
 /// `/chat/completions` URL (so OpenRouter / Ollama / custom gateways all work).
@@ -69,6 +82,12 @@ pub struct OpenAiClient {
     extra_body: Map<String, Value>,
     /// The context window the tool loop guards against (tokens); 0 = unknown.
     context_window: u32,
+    /// The tool loop's final round keeps the tools and sends `tool_choice:
+    /// "none"` (`true`, the default) instead of dropping the tools field.
+    final_tool_choice: bool,
+    /// Echo a round's streamed reasoning on the assistant message that carries
+    /// its tool calls (default `true`).
+    echo_reasoning: bool,
 }
 
 /// The assembled result of a chat with tools on offer.
@@ -243,12 +262,17 @@ struct RoundState {
     tools_rejected: bool,
     /// The server refused one of the `extra_body` fields.
     extras_rejected: bool,
+    /// The server refused `tool_choice` (or ignored it): final rounds go out
+    /// without tools instead.
+    tool_choice_rejected: bool,
 }
 
 /// One round's result: the streamed text plus any tool calls the model made.
 #[derive(Debug, Default)]
 struct Round {
     text: String,
+    /// Reasoning the server streamed in its own field (not inline `<think>`).
+    reasoning: String,
     calls: Vec<AssembledCall>,
 }
 
@@ -272,6 +296,10 @@ impl RoundAssembly {
         on_thinking: &mut impl FnMut(String),
     ) {
         if !parts.reasoning.is_empty() {
+            // A whole message after streamed deltas repeats the reasoning too.
+            if !parts.whole_message || self.round.reasoning.is_empty() {
+                self.round.reasoning.push_str(&parts.reasoning);
+            }
             on_thinking(parts.reasoning);
         }
         // A whole message after streamed deltas repeats them; only take its
@@ -311,11 +339,13 @@ impl RoundAssembly {
 /// arguments (or why they didn't parse).
 type PreparedCall<'a> = (String, &'a AssembledCall, Result<Value, String>);
 
-/// The assistant turn to echo back after a tool round: its text and the calls
-/// it made, each under the id its result will answer. `arguments` must be a
-/// string on this wire; a malformed one goes back as `{}` (its error result
-/// carries the raw text) so a server that re-parses history doesn't choke.
-fn assistant_message(text: &str, calls: &[PreparedCall<'_>]) -> Value {
+/// The assistant turn to echo back after a tool round: its text, its
+/// reasoning (when echoed; as `reasoning_content`, the field llama.cpp reads
+/// back into the template) and the calls it made, each under the id its
+/// result will answer. `arguments` must be a string on this wire; a malformed
+/// one goes back as `{}` (its error result carries the raw text) so a server
+/// that re-parses history doesn't choke.
+fn assistant_message(text: &str, reasoning: &str, calls: &[PreparedCall<'_>]) -> Value {
     let tool_calls: Vec<Value> = calls
         .iter()
         .map(|(id, call, args)| {
@@ -326,7 +356,16 @@ fn assistant_message(text: &str, calls: &[PreparedCall<'_>]) -> Value {
             json!({ "id": id, "type": "function", "function": { "name": call.name, "arguments": arguments } })
         })
         .collect();
-    json!({ "role": "assistant", "content": text, "tool_calls": tool_calls })
+    let mut msg = json!({ "role": "assistant", "content": text, "tool_calls": tool_calls });
+    if !reasoning.is_empty() {
+        msg["reasoning_content"] = json!(reasoning);
+    }
+    msg
+}
+
+/// Whether a non-2xx body is the server refusing `tool_choice`.
+fn rejects_tool_choice(status: u16, body: &str) -> bool {
+    matches!(status, 400 | 422) && body.to_lowercase().contains("tool_choice")
 }
 
 /// Whether a non-2xx body is the server refusing the `tools` field (as
@@ -413,7 +452,22 @@ impl OpenAiClient {
             connect_retries: 1,
             extra_body: Map::new(),
             context_window: 0,
+            final_tool_choice: true,
+            echo_reasoning: true,
         }
+    }
+
+    /// `false`: the tool loop's final round drops the tools field instead of
+    /// sending `tool_choice: "none"` (see `final_tool_choice`).
+    pub fn with_final_tool_choice(mut self, yes: bool) -> Self {
+        self.final_tool_choice = yes;
+        self
+    }
+
+    /// `false`: don't echo a round's reasoning back with its tool calls.
+    pub fn with_reasoning_echo(mut self, yes: bool) -> Self {
+        self.echo_reasoning = yes;
+        self
     }
 
     /// Merge these top-level fields into every request (see `extra_body`).
@@ -489,7 +543,7 @@ impl OpenAiClient {
         let messages = seed_messages(system, turns);
         let mut state = RoundState::default();
         let round = self
-            .stream_round(api_key, model, &messages, &[], &mut state, on_delta, on_thinking)
+            .stream_round(api_key, model, &messages, &[], false, &mut state, on_delta, on_thinking)
             .await?;
         Ok(round.text)
     }
@@ -502,9 +556,14 @@ impl OpenAiClient {
     /// whose arguments aren't a JSON object gets an error result instead, so
     /// the model can retry), its result reported
     /// ([`StreamActivity::ToolResult`]) and appended as a `role: "tool"`
-    /// message, and the next round begins. The loop ends when a round makes
-    /// no tool call; the last of `max_rounds` goes out *without* tools so the
-    /// model must answer in text.
+    /// message, and the next round begins. A call repeating one already made
+    /// (and not invalidated by an action since) is answered from the earlier
+    /// result ([`RepeatGuard`]). The loop ends when a round makes no tool
+    /// call; the final round — the last of `max_rounds`, the first one near
+    /// the context window, or the one after a call was repeated too often —
+    /// may not call tools (`tool_choice: "none"`, or no tools) and its
+    /// request ends with a [`crate::tool_loop::FINAL_ROUND_NUDGE`] user
+    /// message so the model answers in text.
     #[allow(clippy::too_many_arguments)]
     pub async fn stream_chat_with_tools<E: ToolExecutor>(
         &self,
@@ -523,6 +582,7 @@ impl OpenAiClient {
         let mut messages = seed_messages(system, turns);
         let mut state = RoundState::default();
         let mut out = ToolChatOutcome::default();
+        let mut guard = RepeatGuard::default();
         let rounds = max_rounds.max(1);
         for round in 0..rounds {
             let last = round + 1 == rounds;
@@ -530,29 +590,52 @@ impl OpenAiClient {
             // must answer from what the earlier rounds gathered.
             let fits = crate::agent_tools::tools_fit_context(&messages, &defs, self.context_window);
             if !fits && !last && !state.tools_rejected {
-                tracing::info!(target: "dispatch", host = %self.host(), model, round, window = self.context_window, "context nearly full; final round goes out without tools");
+                tracing::info!(target: "dispatch", host = %self.host(), model, round, window = self.context_window, "context nearly full; final round may not call tools");
             }
-            let offered: &[Value] = if last || state.tools_rejected || !fits { &[] } else { &defs };
-            // Separate this round's text from the previous round's with a blank
-            // line — in the stream and in the body alike, so they match.
-            let mut need_sep = !out.text.is_empty();
-            let r = self
-                .stream_round(
-                    api_key,
-                    model,
-                    &messages,
-                    offered,
-                    &mut state,
-                    |t| {
-                        if need_sep {
-                            need_sep = false;
-                            on_delta("\n\n".into());
-                        }
-                        on_delta(t)
-                    },
-                    |text| on_activity(StreamActivity::Thinking { text }),
-                )
-                .await?;
+            if guard.tripped() && !last && fits {
+                tracing::info!(target: "dispatch", host = %self.host(), model, round, "tool call repeated more than {} times; final round may not call tools", crate::tool_loop::REPEAT_CALL_LIMIT);
+            }
+            let final_round = last || !fits || guard.tripped();
+            if final_round {
+                nudge_final_round(&mut messages);
+            }
+            // The final round keeps the tools (the server's cached prefix has
+            // them) and forbids calling them, unless the server can't do that.
+            let keep_tools = !state.tools_rejected && (!final_round || (self.final_tool_choice && !state.tool_choice_rejected));
+            let mut offered: &[Value] = if keep_tools { &defs } else { &[] };
+            let r = loop {
+                let choice_none = final_round && !offered.is_empty();
+                // Separate this round's text from the previous round's with a
+                // blank line — in the stream and in the body alike.
+                let mut need_sep = !out.text.is_empty();
+                let r = self
+                    .stream_round(
+                        api_key,
+                        model,
+                        &messages,
+                        offered,
+                        choice_none,
+                        &mut state,
+                        |t| {
+                            if need_sep {
+                                need_sep = false;
+                                on_delta("\n\n".into());
+                            }
+                            on_delta(t)
+                        },
+                        |text| on_activity(StreamActivity::Thinking { text }),
+                    )
+                    .await?;
+                // A server that ignored `tool_choice: "none"` and answered with
+                // nothing but a call: ask again with no tools to call.
+                if choice_none && !r.calls.is_empty() && r.text.trim().is_empty() {
+                    tracing::warn!(target: "dispatch", host = %self.host(), model, round, "server ignored tool_choice none; final round again without tools");
+                    state.tool_choice_rejected = true;
+                    offered = &[];
+                    continue;
+                }
+                break r;
+            };
             out.rounds = round + 1;
             out.tools_unsupported |= state.tools_rejected;
             if !r.text.is_empty() {
@@ -561,9 +644,9 @@ impl OpenAiClient {
                 }
                 out.text.push_str(&r.text);
             }
-            // No calls — or calls the server made anyway on a tool-less round,
-            // which there's no tool to answer — end the turn.
-            if r.calls.is_empty() || offered.is_empty() {
+            // No calls — or calls on a round that may not make them, which
+            // there's no tool to answer — end the turn.
+            if r.calls.is_empty() || final_round || offered.is_empty() {
                 return Ok(out);
             }
             tracing::debug!(
@@ -583,7 +666,8 @@ impl OpenAiClient {
                     (id, c, c.parsed_arguments())
                 })
                 .collect();
-            messages.push(assistant_message(&r.text, &calls));
+            let reasoning = if self.echo_reasoning { r.reasoning.as_str() } else { "" };
+            messages.push(assistant_message(&r.text, reasoning, &calls));
             for (id, call, args) in &calls {
                 on_activity(StreamActivity::Tool {
                     id: id.clone(),
@@ -594,7 +678,17 @@ impl OpenAiClient {
                     },
                 });
                 let (content, is_error) = match args {
-                    Ok(v) => executor.call(&call.name, v).await,
+                    Ok(v) => match guard.check(&call.name, v) {
+                        Some(reply) => {
+                            tracing::info!(target: "dispatch", host = %self.host(), model, tool = %call.name, "repeated tool call answered from its earlier result");
+                            (reply, false)
+                        }
+                        None => {
+                            let (content, is_error) = executor.call(&call.name, v).await;
+                            guard.record(&call.name, v, &content, is_error);
+                            (content, is_error)
+                        }
+                    },
                     Err(why) => {
                         let raw: String = call.arguments.chars().take(MALFORMED_ECHO_CHARS).collect();
                         tracing::info!(target: "dispatch", host = %self.host(), model, tool = %call.name, "malformed tool arguments: {why}");
@@ -626,6 +720,7 @@ impl OpenAiClient {
         model: &str,
         messages: &[Value],
         tools: &[Value],
+        tool_choice_none: bool,
         state: &mut RoundState,
         mut on_delta: impl FnMut(String),
         mut on_thinking: impl FnMut(String),
@@ -637,8 +732,14 @@ impl OpenAiClient {
                     body[k] = v.clone();
                 }
             }
-            if !tools.is_empty() && !state.tools_rejected {
+            // A final round on a server without `tool_choice` drops the tools.
+            let choice_none = tool_choice_none && !state.tool_choice_rejected;
+            let send_tools = !tools.is_empty() && !state.tools_rejected && (choice_none || !tool_choice_none);
+            if send_tools {
                 body["tools"] = json!(tools);
+                if choice_none {
+                    body["tool_choice"] = json!("none");
+                }
             }
             let body = serde_json::to_vec(&body)
                 .map_err(|e| ProviderError::Decode(format!("encode request: {e}")))?;
@@ -661,7 +762,20 @@ impl OpenAiClient {
                 state.extras_rejected = true;
                 continue;
             }
-            if !tools.is_empty() && !state.tools_rejected && rejects_tools(status, &text) {
+            if choice_none && send_tools && rejects_tool_choice(status, &text) {
+                tracing::warn!(
+                    target: "dispatch",
+                    provider = self.provider_label,
+                    host = %self.host(),
+                    model,
+                    status,
+                    "server rejected tool_choice ({}); final rounds go out without tools",
+                    text.trim()
+                );
+                state.tool_choice_rejected = true;
+                continue;
+            }
+            if send_tools && rejects_tools(status, &text) {
                 tracing::warn!(
                     target: "dispatch",
                     provider = self.provider_label,
@@ -1247,6 +1361,7 @@ mod tool_parts {
 #[cfg(test)]
 mod tool_wire {
     use super::*;
+    use crate::tool_loop::is_final_round_nudge;
     use axum::body::Body;
     use axum::extract::State;
     use axum::routing::{get, post};
@@ -1263,6 +1378,8 @@ mod tool_wire {
         reject_tools: bool,
         /// 400 any request that carries `chat_template_kwargs`.
         reject_extras: bool,
+        /// 400 any request that carries `tool_choice`.
+        reject_tool_choice: bool,
         /// `/props` body; `None` ⇒ 404 (a gateway without the route).
         props: Option<Value>,
         props_hits: Arc<Mutex<usize>>,
@@ -1298,6 +1415,12 @@ mod tool_wire {
             return axum::response::Response::builder()
                 .status(400)
                 .body(Body::from(r#"{"error":{"code":400,"message":"Unrecognized request argument supplied: chat_template_kwargs"}}"#))
+                .unwrap();
+        }
+        if f.reject_tool_choice && v.get("tool_choice").is_some() {
+            return axum::response::Response::builder()
+                .status(400)
+                .body(Body::from(r#"{"error":{"code":400,"message":"Unsupported param: tool_choice"}}"#))
                 .unwrap();
         }
         if f.reject_tools && v.get("tools").is_some() {
@@ -1408,6 +1531,7 @@ mod tool_wire {
         let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["system", "user", "assistant", "tool"]);
         assert_eq!(msgs[2]["content"], "Let me check.");
+        assert_eq!(msgs[2]["reasoning_content"], "need to search", "the round's reasoning rides back with its calls");
         assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_abc");
         assert_eq!(msgs[2]["tool_calls"][0]["type"], "function");
         assert_eq!(msgs[2]["tool_calls"][0]["function"]["name"], "search");
@@ -1416,6 +1540,24 @@ mod tool_wire {
         assert_eq!(msgs[3]["tool_call_id"], "call_abc");
         assert_eq!(msgs[3]["content"], "result for search: 42");
         assert!(b[1].get("tools").is_some(), "tools stay on offer until the last round");
+        assert!(b[1].get("tool_choice").is_none(), "an ordinary round lets the model choose");
+        assert_eq!(msgs.len(), 4, "no nudge on an ordinary round");
+    }
+
+    #[tokio::test]
+    async fn reasoning_echo_can_be_turned_off() {
+        let mut first = vec![delta(json!({"reasoning": "plan"}))];
+        first.extend(streamed_call(0, "c", "search", r#"{"q":"rust"}"#));
+        let f = Fake { rounds: Arc::new(vec![first, vec![text("ok")]]), ..Default::default() };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        OpenAiClient::new(&url)
+            .with_reasoning_echo(false)
+            .stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &recorder(), 4, |_| {}, |_| {})
+            .await
+            .unwrap();
+        let b = bodies.lock().unwrap();
+        assert!(b[1]["messages"][1].get("reasoning_content").is_none());
     }
 
     #[tokio::test]
@@ -1460,7 +1602,7 @@ mod tool_wire {
     }
 
     #[tokio::test]
-    async fn last_round_goes_out_without_tools_so_a_looping_model_still_answers() {
+    async fn last_round_forbids_tools_so_a_looping_model_still_answers() {
         let f = Fake {
             rounds: Arc::new(vec![
                 streamed_call(0, "a", "search", r#"{"q":"1"}"#),
@@ -1482,7 +1624,115 @@ mod tool_wire {
         assert_eq!(b.len(), 3);
         assert!(b[0].get("tools").is_some());
         assert!(b[1].get("tools").is_some());
-        assert!(b[2].get("tools").is_none(), "the final round forces a text answer");
+        // The final round keeps the tools (the server's cached prefix renders
+        // them) and forbids calling them.
+        assert_eq!(b[2]["tools"], b[1]["tools"], "the tools field is unchanged on the final round");
+        assert_eq!(b[2]["tool_choice"], "none", "the final round forces a text answer");
+        assert!(b[1].get("tool_choice").is_none());
+        // The nudge is appended after the newest tool result: everything
+        // before it is the prefix the server already has.
+        let (m1, m2) = (b[1]["messages"].as_array().unwrap(), b[2]["messages"].as_array().unwrap());
+        assert_eq!(&m2[..m1.len()], &m1[..]);
+        assert_eq!(m2.len(), m1.len() + 3, "assistant, tool, nudge");
+        assert_eq!(m2[m2.len() - 2]["content"], "result for search: 42");
+        assert!(is_final_round_nudge(m2.last().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn final_round_drops_tools_when_configured_to() {
+        let f = Fake {
+            rounds: Arc::new(vec![streamed_call(0, "a", "search", r#"{"q":"1"}"#), vec![text("done")]]),
+            ..Default::default()
+        };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        let out = OpenAiClient::new(&url)
+            .with_final_tool_choice(false)
+            .stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &recorder(), 2, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.text, "done");
+        let b = bodies.lock().unwrap();
+        assert!(b[1].get("tools").is_none() && b[1].get("tool_choice").is_none());
+        assert!(is_final_round_nudge(b[1]["messages"].as_array().unwrap().last().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn rejected_tool_choice_falls_back_to_dropping_tools() {
+        let f = Fake {
+            // Request 1 (tool_choice) is rejected; its script slot is never served.
+            rounds: Arc::new(vec![streamed_call(0, "a", "search", r#"{"q":"1"}"#), vec![], vec![text("done")]]),
+            reject_tool_choice: true,
+            ..Default::default()
+        };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        let out = OpenAiClient::new(&url)
+            .stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &recorder(), 2, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.text, "done");
+        assert!(!out.tools_unsupported, "the tools themselves were fine");
+        let b = bodies.lock().unwrap();
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[1]["tool_choice"], "none");
+        assert!(b[2].get("tools").is_none() && b[2].get("tool_choice").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_server_that_ignores_tool_choice_is_asked_again_without_tools() {
+        let f = Fake {
+            rounds: Arc::new(vec![
+                streamed_call(0, "a", "search", r#"{"q":"1"}"#),
+                // Final round: a call anyway, and no text.
+                streamed_call(0, "b", "search", r#"{"q":"2"}"#),
+                vec![text("answer")],
+            ]),
+            ..Default::default()
+        };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        let exec = recorder();
+        let out = OpenAiClient::new(&url)
+            .stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &exec, 2, |_| {}, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(out.text, "answer");
+        assert_eq!(out.rounds, 2);
+        assert_eq!(exec.calls.lock().unwrap().len(), 1, "the ignored call never runs");
+        let b = bodies.lock().unwrap();
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[1]["tool_choice"], "none");
+        assert!(b[2].get("tools").is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_calls_are_answered_from_the_first_result_then_the_loop_winds_up() {
+        let same = || streamed_call(0, "x", "search", r#"{"q": "stock.py"}"#);
+        let f = Fake { rounds: Arc::new(vec![same(), same(), same(), same(), vec![text("the bug is in stock.py")]]), ..Default::default() };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        let exec = recorder();
+        let mut results = Vec::new();
+        let out = OpenAiClient::new(&url)
+            .stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &exec, 24, |_| {}, |a| {
+                if let StreamActivity::ToolResult { content, .. } = a {
+                    results.push(content)
+                }
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.text, "the bug is in stock.py");
+        assert_eq!(out.rounds, 5, "four tool rounds, then the answer - not 24");
+        assert_eq!(exec.calls.lock().unwrap().len(), 1, "the repeats were not run again");
+        assert_eq!(results[0], "result for search: 42");
+        assert!(results[1].starts_with("Not run again") && results[1].contains("result for search: 42"), "{}", results[1]);
+        assert!(results[2].contains("Take the next step"), "{}", results[2]);
+        assert!(results[3].contains("final answer"), "{}", results[3]);
+        let b = bodies.lock().unwrap();
+        assert!(b[3].get("tool_choice").is_none(), "two repeats don't end the loop");
+        assert_eq!(b[4]["tool_choice"], "none", "the third repeat does");
+        assert!(is_final_round_nudge(b[4]["messages"].as_array().unwrap().last().unwrap()));
     }
 
     fn extras() -> Map<String, Value> {
@@ -1568,7 +1818,7 @@ mod tool_wire {
         assert_eq!(out.rounds, 2, "the guard made round 2 the last");
         let b = bodies.lock().unwrap();
         assert!(b[0].get("tools").is_some());
-        assert!(b[1].get("tools").is_none(), "near the window the round goes out tool-less");
+        assert_eq!(b[1]["tool_choice"], "none", "near the window the round may not call tools");
     }
 
     #[tokio::test]

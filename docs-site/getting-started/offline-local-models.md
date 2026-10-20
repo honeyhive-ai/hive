@@ -163,6 +163,23 @@ The tool loop allows 24 rounds by default (set **Max tool rounds** on
 the runtime). When the conversation gets close to the context window,
 Hive stops offering tools so the model has to answer.
 
+Small models sometimes repeat a call they have already made, such as
+reading the same file again. Hive doesn't run a repeated call again: it
+returns the earlier result and asks the model to move on. Anything that
+changes the workspace, like an edit or a command, counts as a change, so
+reading a file again after editing it works as normal. If the model
+repeats one call three times, Hive ends the loop and asks for an
+answer.
+
+On the last round, Hive tells the model the tool budget is used up and
+asks for an answer from what it has. With an OpenAI-compatible server,
+that round still lists the tools but sends `tool_choice: "none"`, so
+llama.cpp can reuse its cached prompt instead of processing the whole
+conversation again. For models that return their reasoning separately,
+like gpt-oss, Hive sends each round's reasoning back with that round's
+tool calls. In lab tests this helped gpt-oss keep track of ids across
+steps.
+
 A useful MCP server for offline work offers:
 
 | Tool | Use |
