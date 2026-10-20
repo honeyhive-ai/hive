@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use hive_core::{workspace_config_session_id, ChatSession, HostKind, MessageRole, WorkspaceHost};
+use hive_core::{workspace_config_session_id, ChatSession, HostKind, MessageRole, Timestamp, WorkspaceHost};
 use hive_runtime::ChatService;
 use serde_json::json;
 use tokio::sync::{watch, Notify};
@@ -40,6 +40,9 @@ mod tests;
 
 /// How long `hive serve` waits for a turn in flight on SIGTERM / Ctrl-C.
 const STOP_GRACE: Duration = Duration::from_secs(15);
+
+/// Replies and proposals created this long before serve started don't push.
+const NOTIFY_HISTORY_MINUTES: i64 = 10;
 
 /// Default listen address: loopback only. On the home host the systemd unit
 /// passes the box's Tailscale IP.
@@ -138,6 +141,8 @@ pub struct Shared {
     pub sync_kick: Notify,
     pub worker_kick: Notify,
     stopping: AtomicBool,
+    /// When this process started (see [`Shared::fresh`]).
+    started_at: Timestamp,
     pub http: reqwest::Client,
     rt: tokio::runtime::Handle,
 }
@@ -239,7 +244,7 @@ impl Shared {
                         let Some(m) = s.messages.iter().find(|m| m.id == message) else { continue };
                         let name = if done { "message.done" } else { "message.created" };
                         self.hub.emit(name, hub::wrap("message", api::message_dto(chat, m)));
-                        if done && matches!(m.role, MessageRole::Assistant | MessageRole::Agent) {
+                        if done && matches!(m.role, MessageRole::Assistant | MessageRole::Agent) && self.fresh(m.created_at) {
                             notices.push(ntfy::reply_notice(&m.author, &s.title, chat, m.body.starts_with("[error]")));
                         }
                     }
@@ -247,7 +252,9 @@ impl Shared {
                         let Some(s) = sessions.iter().find(|s| s.id == chat) else { continue };
                         let Some(p) = s.proposals.iter().find(|p| p.id == proposal) else { continue };
                         self.hub.emit("proposal.created", hub::wrap("proposal", api::proposal_dto(s, p)));
-                        notices.push(ntfy::proposal_notice(&p.title, &s.title, chat));
+                        if self.fresh(p.created_at) {
+                            notices.push(ntfy::proposal_notice(&p.title, &s.title, chat));
+                        }
                     }
                     Change::ChatUpdated { chat } => {
                         let Some(s) = sessions.iter().find(|s| s.id == chat) else { continue };
@@ -264,6 +271,13 @@ impl Shared {
                 self.rt.spawn(async move { n.send(&client, &notice).await });
             }
         }
+    }
+
+    /// Whether something created at `at` is news worth a push: not history
+    /// that synced in late (an outage, or a first sync that failed and seeded
+    /// the differ from an incomplete store). The phone still lists it.
+    fn fresh(&self, at: Timestamp) -> bool {
+        at.inner() >= self.started_at.inner() - time::Duration::minutes(NOTIFY_HISTORY_MINUTES)
     }
 
     /// After a local write: tell the phone, wake the worker, push to the relay.
@@ -395,6 +409,7 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         sync_kick: Notify::new(),
         worker_kick: Notify::new(),
         stopping: AtomicBool::new(false),
+        started_at: Timestamp::now(),
         http: reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).build()?,
         rt: tokio::runtime::Handle::current(),
         cfg,

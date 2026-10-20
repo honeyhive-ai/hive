@@ -14,7 +14,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
-use hive_core::{ChatSession, MessageRole, ProposalStatus};
+use hive_core::{ActionProposal, ChatSession, MessageRole, ProposalStatus};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -105,6 +105,11 @@ fn snap(s: &ChatSession) -> ChatSnap {
     }
 }
 
+/// A proposal still waiting for review.
+pub fn is_open(p: &ActionProposal) -> bool {
+    p.status == ProposalStatus::Open && !p.dismissed && p.superseded_by.is_none()
+}
+
 fn is_reply(role: MessageRole) -> bool {
     matches!(role, MessageRole::Assistant | MessageRole::Agent)
 }
@@ -147,10 +152,14 @@ impl Differ {
             }
             for p in &s.proposals {
                 match before.proposals.get(&p.id) {
-                    None => {
+                    // Only open work is "created" for the phone's review inbox;
+                    // one first seen already settled (synced in after an outage)
+                    // just updates its chat.
+                    None if is_open(p) => {
                         touched = true;
                         out.push(Change::ProposalCreated { chat: s.id, proposal: p.id });
                     }
+                    None => touched = true,
                     Some(st) if *st != p.status => touched = true,
                     _ => {}
                 }
@@ -229,6 +238,22 @@ mod tests {
                 Change::ChatUpdated { chat: s.id },
             ]
         );
+    }
+
+    #[test]
+    fn settled_proposal_first_seen_is_not_created() {
+        let mut d = Differ::default();
+        let mut s = chat();
+        d.seed(std::slice::from_ref(&s));
+        let mut settled = ActionProposal::new("old", hive_core::ProposalKind::FileDiff, "");
+        settled.status = ProposalStatus::Applied;
+        let mut hidden = ActionProposal::new("hidden", hive_core::ProposalKind::FileDiff, "");
+        hidden.dismissed = true;
+        let open = ActionProposal::new("new", hive_core::ProposalKind::FileDiff, "");
+        let oid = open.id;
+        s.proposals = vec![settled, hidden, open];
+        let c = d.diff(std::slice::from_ref(&s));
+        assert_eq!(c, vec![Change::ProposalCreated { chat: s.id, proposal: oid }, Change::ChatUpdated { chat: s.id }]);
     }
 
     #[test]
