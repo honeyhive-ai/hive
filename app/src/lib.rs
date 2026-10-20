@@ -364,6 +364,13 @@ struct LiveSettings {
     /// Injected as the bearer when assembling the registry; refreshed on expiry.
     #[serde(default)]
     mcp_oauth: std::collections::HashMap<String, McpOAuthEntry>,
+    /// Static bearer tokens for HTTP MCP servers, keyed by server id (Settings
+    /// → Tools). Device-local like `provider_keys`: lives only in settings.json,
+    /// NEVER in hive.config.toml / `.hive/mcp-servers.json` / portable exports /
+    /// the relay, and never sent back to the UI (only a "set" flag). Wins over
+    /// an OAuth token for the same server (see `hive_runtime::resolve_bearer`).
+    #[serde(default)]
+    mcp_bearer_tokens: std::collections::HashMap<String, String>,
     /// The workspace folder the user last chose (via `set_workspace_root`), so a
     /// GUI launch reopens it instead of starting with no workspace. `None` = never
     /// chosen; restored only if still a valid, non-shallow/-system dir at launch.
@@ -504,6 +511,7 @@ impl Default for LiveSettings {
             local_workspace_icon: None,
             schedules: Vec::new(),
             mcp_oauth: std::collections::HashMap::new(),
+            mcp_bearer_tokens: std::collections::HashMap::new(),
             workspace_root: None,
             workspace_dirs: std::collections::HashMap::new(),
         }
@@ -854,6 +862,44 @@ fn merge_mcp_servers(base: &[McpServerSpec], managed: &[McpServerSpec]) -> Vec<M
         }
     }
     merged
+}
+
+/// Resolve each HTTP server's bearer from this device's secrets so the
+/// registry authenticates: a saved static token, else the spec's own `auth`,
+/// else a stored OAuth token (see `hive_runtime::resolve_bearer`). Stdio
+/// servers never carry a bearer.
+fn apply_mcp_auth(servers: &mut [McpServerSpec], settings: &LiveSettings) {
+    for spec in servers {
+        if !matches!(spec.transport, McpTransport::Http { .. }) {
+            spec.auth = None;
+            continue;
+        }
+        spec.auth = hive_runtime::resolve_bearer(
+            settings.mcp_bearer_tokens.get(&spec.id).map(String::as_str),
+            spec.auth.as_deref(),
+            settings.mcp_oauth.get(&spec.id).map(|e| e.access_token.as_str()),
+        );
+    }
+}
+
+/// Save (or clear, when blank) the static bearer token for one MCP server in
+/// the device-local settings. Returns whether a token is now set. Errors never
+/// echo the token.
+fn store_mcp_bearer_token(
+    settings: &mut LiveSettings,
+    server_id: &str,
+    raw: &str,
+) -> Result<bool, String> {
+    match hive_runtime::normalize_bearer_token(raw)? {
+        Some(token) => {
+            settings.mcp_bearer_tokens.insert(server_id.to_string(), token);
+            Ok(true)
+        }
+        None => {
+            settings.mcp_bearer_tokens.remove(server_id);
+            Ok(false)
+        }
+    }
 }
 
 fn ensure_workspace_hive_dir(workspace_root: &str) -> Result<PathBuf, String> {
@@ -2639,16 +2685,7 @@ impl AppState {
         let base = self.base_mcp.lock().unwrap();
         let managed = self.managed_mcp.lock().unwrap();
         let mut merged = merge_mcp_servers(&base, &managed);
-        // Inject stored OAuth bearer tokens (remote authenticated servers) so
-        // the registry authenticates. A spec's own `auth` (if any) wins.
-        let settings = self.settings.lock().unwrap();
-        for spec in &mut merged {
-            if spec.auth.is_none() {
-                if let Some(entry) = settings.mcp_oauth.get(&spec.id) {
-                    spec.auth = Some(entry.access_token.clone());
-                }
-            }
-        }
+        apply_mcp_auth(&mut merged, &self.settings.lock().unwrap());
         merged
     }
 
@@ -4222,8 +4259,9 @@ fn remove_skill(state: State<AppState>, session_id: String, skill_id: String) ->
 
 #[tauri::command]
 fn list_mcp_servers(state: State<AppState>) -> Result<Vec<McpServerDto>, String> {
-    Ok(state
-        .combined_mcp_servers()
+    let servers = state.combined_mcp_servers();
+    let settings = state.settings.lock().unwrap();
+    Ok(servers
         .iter()
         .map(|s| {
             let (transport, detail) = match &s.transport {
@@ -4238,6 +4276,12 @@ fn list_mcp_servers(state: State<AppState>) -> Result<Vec<McpServerDto>, String>
                 detail: detail.trim().to_string(),
                 enabled: s.enabled,
                 is_managed: true,
+                // Flags only — the token values never leave the backend.
+                has_bearer_token: settings.mcp_bearer_tokens.contains_key(&s.id),
+                oauth_connected: settings
+                    .mcp_oauth
+                    .get(&s.id)
+                    .is_some_and(|e| !e.access_token.is_empty()),
             }
         })
         .collect())
@@ -4379,6 +4423,14 @@ fn remove_mcp_server(state: State<AppState>, server_id: String) -> Result<(), St
     };
     save_managed_mcp(&root, &servers)?;
     state.reload_workspace_catalogs(&root);
+    // Forget its static bearer token too, unless the server is still
+    // configured elsewhere (e.g. the other config file).
+    if !state.combined_mcp_servers().iter().any(|s| s.id == server_id) {
+        let mut s = state.settings.lock().unwrap();
+        if s.mcp_bearer_tokens.remove(&server_id).is_some() {
+            save_settings(&state.data_dir, &s);
+        }
+    }
     if !removed_from_config && servers.is_empty() {
         return Err(format!("unknown MCP server {server_id}"));
     }
@@ -4388,8 +4440,18 @@ fn remove_mcp_server(state: State<AppState>, server_id: String) -> Result<(), St
 /// Add (or update) a remote HTTP MCP server by URL — used by presets like
 /// Linear's hosted server. Disabled until the user enables it (the gate); a
 /// protected server is then connected via [`authorize_mcp_server`].
+///
+/// `bearer_token` (optional) is a static token for servers protected by a
+/// fixed API token rather than OAuth; it is stored device-locally (see
+/// [`set_mcp_bearer_token`]), never in the workspace config. `None` leaves any
+/// saved token alone; `Some("")` clears it.
 #[tauri::command]
-fn add_remote_mcp_server(state: State<AppState>, id: String, url: String) -> Result<(), String> {
+fn add_remote_mcp_server(
+    state: State<AppState>,
+    id: String,
+    url: String,
+    bearer_token: Option<String>,
+) -> Result<(), String> {
     let id = id.trim().to_string();
     let url = url.trim().to_string();
     if id.is_empty() || url.is_empty() {
@@ -4397,6 +4459,17 @@ fn add_remote_mcp_server(state: State<AppState>, id: String, url: String) -> Res
     }
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("MCP server url must be http(s)".into());
+    }
+    // Validate the token before touching any config, so a bad paste doesn't
+    // leave a half-added server.
+    let token = match bearer_token.as_deref() {
+        Some(raw) => Some(hive_runtime::normalize_bearer_token(raw)?),
+        None => None,
+    };
+    if let Some(token) = token {
+        let mut s = state.settings.lock().unwrap();
+        store_mcp_bearer_token(&mut s, &id, token.as_deref().unwrap_or(""))?;
+        save_settings(&state.data_dir, &s);
     }
     let server = McpServerSpec {
         id: id.clone(),
@@ -4476,6 +4549,31 @@ async fn authorize_mcp_server(
         save_settings(&state.data_dir, &settings);
     }
     Ok(())
+}
+
+/// Save (or clear, with a blank `token`) a static bearer token for an HTTP MCP
+/// server — for servers protected by a fixed API token instead of OAuth. The
+/// token is stored device-locally in settings.json (like provider API keys),
+/// never in hive.config.toml / the workspace catalog / exports / the relay, and
+/// is never returned to the UI (`list_mcp_servers` reports only
+/// `hasBearerToken`). It takes precedence over an OAuth token for the server.
+#[tauri::command]
+fn set_mcp_bearer_token(
+    state: State<AppState>,
+    server_id: String,
+    token: String,
+) -> Result<bool, String> {
+    let is_http = state
+        .combined_mcp_servers()
+        .iter()
+        .any(|s| s.id == server_id && matches!(s.transport, McpTransport::Http { .. }));
+    if !is_http {
+        return Err("bearer tokens apply only to a configured HTTP MCP server".into());
+    }
+    let mut s = state.settings.lock().unwrap();
+    let set = store_mcp_bearer_token(&mut s, &server_id, &token)?;
+    save_settings(&state.data_dir, &s);
+    Ok(set)
 }
 
 /// Store the OAuth client credentials for a remote MCP server (e.g. a Linear
@@ -9378,6 +9476,7 @@ fn build_state(app: &AppHandle) -> Result<AppState, String> {
         local_workspace_icon: None,
         schedules: Vec::new(),
         mcp_oauth: std::collections::HashMap::new(),
+        mcp_bearer_tokens: std::collections::HashMap::new(),
         workspace_root: None,
         workspace_dirs: std::collections::HashMap::new(),
     };
@@ -12334,7 +12433,8 @@ fn import_config(state: State<AppState>, toml_text: String) -> Result<String, St
     }
     for m in cfg.mcp_servers {
         if let McpTransport::Http { url } = &m.transport {
-            match add_remote_mcp_server(state.clone(), m.id.clone(), url.clone()) {
+            // Never import a secret: tokens are set per device after import.
+            match add_remote_mcp_server(state.clone(), m.id.clone(), url.clone(), None) {
                 Ok(()) => mcp += 1,
                 Err(e) => warnings.push(format!("mcp {}: {e}", m.id)),
             }
@@ -13044,6 +13144,7 @@ pub fn run() {
             add_remote_mcp_server,
             authorize_mcp_server,
             set_mcp_oauth_client,
+            set_mcp_bearer_token,
             linear_issues_context,
             install_mcp_server,
             remove_mcp_server,
@@ -14490,5 +14591,188 @@ mod agentic_turn_tests {
         let wire: AgentToolSettings =
             serde_json::from_str(r#"{"enabled":true,"writeInPlace":false,"runCommand":true}"#).unwrap();
         assert!(wire.enabled && wire.run_command && !wire.write_in_place);
+    }
+}
+
+#[cfg(test)]
+mod mcp_bearer_tests {
+    use super::{
+        apply_mcp_auth, load_or_seed_settings, mcp_spec_to_toml, portable_version,
+        save_managed_mcp, save_settings, store_mcp_bearer_token, LiveSettings, McpOAuthEntry,
+        PortableConfig, PortableDefaults,
+    };
+    use hive_runtime::{McpRegistry, McpServerSpec, McpTransport};
+
+    const SECRET: &str = "static-s3cret-token-xyz";
+
+    fn http(id: &str, auth: Option<&str>) -> McpServerSpec {
+        McpServerSpec {
+            id: id.into(),
+            transport: McpTransport::Http { url: format!("http://127.0.0.1:1/{id}") },
+            enabled: true,
+            auth: auth.map(str::to_string),
+        }
+    }
+
+    fn oauth(token: &str) -> McpOAuthEntry {
+        McpOAuthEntry { access_token: token.into(), ..Default::default() }
+    }
+
+    fn tmp(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir()
+            .join(format!("hive-mcp-bearer-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn store_sets_normalizes_clears_and_rejects() {
+        let mut s = LiveSettings::default();
+        assert!(store_mcp_bearer_token(&mut s, "rdna", &format!(" Bearer {SECRET}\n")).unwrap());
+        assert_eq!(s.mcp_bearer_tokens.get("rdna").map(String::as_str), Some(SECRET));
+        // A rejected value leaves the saved token untouched and isn't echoed.
+        let err = store_mcp_bearer_token(&mut s, "rdna", "bad\nvalue").unwrap_err();
+        assert!(!err.contains("bad"));
+        assert_eq!(s.mcp_bearer_tokens.get("rdna").map(String::as_str), Some(SECRET));
+        // Blank clears.
+        assert!(!store_mcp_bearer_token(&mut s, "rdna", "  ").unwrap());
+        assert!(s.mcp_bearer_tokens.is_empty());
+    }
+
+    #[test]
+    fn static_token_wins_over_oauth_and_oauth_still_works_alone() {
+        let mut s = LiveSettings::default();
+        s.mcp_bearer_tokens.insert("a".into(), SECRET.into());
+        s.mcp_bearer_tokens.insert("e".into(), "never-for-stdio".into());
+        s.mcp_oauth.insert("a".into(), oauth("oauth-a"));
+        s.mcp_oauth.insert("b".into(), oauth("oauth-b"));
+        let mut servers = vec![
+            http("a", None),
+            http("b", None),
+            http("c", Some("legacy-spec")),
+            http("d", None),
+            McpServerSpec {
+                id: "e".into(),
+                transport: McpTransport::Stdio { command: "x".into(), args: vec![] },
+                enabled: true,
+                auth: None,
+            },
+        ];
+        apply_mcp_auth(&mut servers, &s);
+        let auth: Vec<Option<&str>> = servers.iter().map(|m| m.auth.as_deref()).collect();
+        assert_eq!(auth, vec![Some(SECRET), Some("oauth-b"), Some("legacy-spec"), None, None]);
+    }
+
+    #[test]
+    fn settings_round_trip_and_old_settings_load_unchanged() {
+        let dir = tmp("settings");
+        let mut s = LiveSettings::default();
+        store_mcp_bearer_token(&mut s, "rdna", SECRET).unwrap();
+        save_settings(&dir, &s);
+        let back = load_or_seed_settings(&dir, LiveSettings::default());
+        assert_eq!(back.mcp_bearer_tokens.get("rdna").map(String::as_str), Some(SECRET));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A settings.json written before this field existed still loads (and
+        // keeps its other values), with no tokens.
+        let old: LiveSettings =
+            serde_json::from_str(r#"{"sync_room":"r1","builtin_tools":false}"#).unwrap();
+        assert!(old.mcp_bearer_tokens.is_empty());
+        assert_eq!(old.sync_room, "r1");
+        assert!(!old.builtin_tools);
+    }
+
+    #[test]
+    fn token_never_reaches_shared_config() {
+        // Even a spec carrying a resolved bearer (as the registry's do) must
+        // not leak it into any shared/committed artifact.
+        let mut s = LiveSettings::default();
+        s.mcp_bearer_tokens.insert("rdna".into(), SECRET.into());
+        let mut servers = vec![http("rdna", None)];
+        apply_mcp_auth(&mut servers, &s);
+        assert_eq!(servers[0].auth.as_deref(), Some(SECRET));
+
+        // hive.config.toml entry.
+        let entry = toml::to_string(&mcp_spec_to_toml(&servers[0])).unwrap();
+        assert!(!entry.contains(SECRET), "{entry}");
+        assert!(entry.contains("rdna"));
+
+        // Workspace catalog (.hive/mcp-servers.json).
+        let root = tmp("catalog");
+        save_managed_mcp(root.to_str().unwrap(), &servers).unwrap();
+        let catalog =
+            std::fs::read_to_string(root.join(".hive").join("mcp-servers.json")).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(!catalog.contains(SECRET), "{catalog}");
+        assert!(catalog.contains("rdna"));
+
+        // Portable export.
+        let cfg = PortableConfig {
+            version: portable_version(),
+            defaults: PortableDefaults::default(),
+            runtimes: Vec::new(),
+            agents: Vec::new(),
+            mcp_servers: servers.clone(),
+        };
+        let exported = toml::to_string_pretty(&cfg).unwrap();
+        assert!(!exported.contains(SECRET), "{exported}");
+
+        // Logs (Debug) redact it.
+        assert!(!format!("{servers:?}").contains(SECRET));
+    }
+
+    /// LIVE: resolve a stored static token through the same path the app uses
+    /// (settings.json → `apply_mcp_auth` → `McpRegistry`), then list tools and
+    /// call one on a real token-protected server. Skipped unless
+    /// `HIVE_MCP_LIVE_URL` and `HIVE_MCP_LIVE_TOKEN_FILE` (a file holding the
+    /// token) are set. Optional: `HIVE_MCP_LIVE_TOOL` (default `search_docs`)
+    /// and `HIVE_MCP_LIVE_ARGS` (JSON arguments; for the rdnamcp lab server use
+    /// `{"query":"…","collection":"rdna-docs"}`). The token is never printed.
+    #[tokio::test]
+    async fn live_static_bearer_through_registry() {
+        let (Ok(url), Ok(token_file)) =
+            (std::env::var("HIVE_MCP_LIVE_URL"), std::env::var("HIVE_MCP_LIVE_TOKEN_FILE"))
+        else {
+            eprintln!("skipping: set HIVE_MCP_LIVE_URL + HIVE_MCP_LIVE_TOKEN_FILE");
+            return;
+        };
+        let raw = std::fs::read_to_string(&token_file).expect("read token file");
+        let dir = tmp("live");
+        let mut s = LiveSettings::default();
+        store_mcp_bearer_token(&mut s, "live", &raw).expect("valid token");
+        // A stale OAuth token for the same server must lose to the static one.
+        s.mcp_oauth.insert("live".into(), oauth("stale-oauth-token"));
+        save_settings(&dir, &s);
+        let loaded = load_or_seed_settings(&dir, LiveSettings::default());
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let spec = McpServerSpec {
+            id: "live".into(),
+            transport: McpTransport::Http { url },
+            enabled: true,
+            auth: None,
+        };
+        // Without a token the server must refuse — proves the bearer matters.
+        let open = McpRegistry::new(vec![spec.clone()]);
+        let denied = open.list_tools("live").await;
+        eprintln!("without token: {}", if denied.is_err() { "rejected" } else { "accepted" });
+        assert!(denied.is_err(), "server accepted an unauthenticated request");
+
+        let mut servers = vec![spec];
+        apply_mcp_auth(&mut servers, &loaded);
+        let registry = McpRegistry::new(servers);
+        let tools = registry.list_tools("live").await.expect("tools/list with static bearer");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        eprintln!("tools: {names:?}");
+        assert!(!tools.is_empty());
+
+        let tool = std::env::var("HIVE_MCP_LIVE_TOOL").unwrap_or_else(|_| "search_docs".into());
+        let args: serde_json::Value = std::env::var("HIVE_MCP_LIVE_ARGS")
+            .ok()
+            .and_then(|a| serde_json::from_str(&a).ok())
+            .unwrap_or_else(|| serde_json::json!({ "query": "RDNA wave32 vs wave64" }));
+        let out = registry.call_tool("live", &tool, &args).await.expect("tools/call");
+        let preview: String = out.chars().take(400).collect();
+        eprintln!("{tool} -> {} chars: {preview}", out.len());
+        assert!(!out.trim().is_empty());
     }
 }

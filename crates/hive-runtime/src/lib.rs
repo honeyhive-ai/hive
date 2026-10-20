@@ -43,7 +43,9 @@ pub use chat_service::{
     ChatService, PendingMention, SUMMARY_TURN_HEADER,
 };
 pub use context::{Compactor, CompactionResult, Summarizer};
-pub use mcp::{McpRegistry, McpServerSpec, McpTool, McpTransport};
+pub use mcp::{
+    normalize_bearer_token, resolve_bearer, McpRegistry, McpServerSpec, McpTool, McpTransport,
+};
 pub use mentions::{parse_mentions, MentionTargets};
 pub use relay_client::{
     AccountDevice, AccountIdentity, FetchedEnvelope, Friend, FriendPresence, FriendRequestOutcome,

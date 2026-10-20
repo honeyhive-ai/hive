@@ -177,11 +177,10 @@ Streamable HTTP. Add it as an `http` MCP server; see
 [MCP servers](../addons/mcp.md).
 
 !!! note "Static bearer tokens"
-    Hive currently sends a bearer token to an HTTP MCP server only when
-    the token came from the OAuth flow. There is no setting yet for a
-    static token. To use a token-protected server, put an OAuth front
-    end in front of it, or keep it reachable only on your private network
-    and run it without a token.
+    For a server protected by a fixed token, use **Settings → Tools →
+    Add HTTP server** and fill in **Bearer token (optional)**, or click
+    **Set token** on an existing HTTP server. The token stays on this
+    device; see [MCP servers](../addons/mcp.md#static-bearer-tokens).
 
 ## Quick tasks model
 
