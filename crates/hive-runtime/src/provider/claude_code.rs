@@ -59,6 +59,27 @@ pub fn extract_text_delta(line: &str) -> Option<String> {
     Some(delta.get("text")?.as_str()?.to_string())
 }
 
+/// True if `line` is a `content_block_start` for a TEXT block — the boundary
+/// between narration segments around tool calls. Used to re-insert the separator
+/// the block split otherwise drops.
+pub fn is_text_block_start(line: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+        return false;
+    };
+    if v.get("type").and_then(Value::as_str) != Some("stream_event") {
+        return false;
+    }
+    let Some(event) = v.get("event") else { return false };
+    if event.get("type").and_then(Value::as_str) != Some("content_block_start") {
+        return false;
+    }
+    event
+        .get("content_block")
+        .and_then(|b| b.get("type"))
+        .and_then(Value::as_str)
+        == Some("text")
+}
+
 /// Extract the final assembled text from a `result` line (fallback path).
 pub fn extract_result(line: &str) -> Option<String> {
     let v: Value = serde_json::from_str(line.trim()).ok()?;
@@ -237,6 +258,15 @@ pub async fn stream_reply(
                 )));
             }
         };
+        // A turn that interleaves narration with tool calls produces SEPARATE text
+        // content blocks ("…download." before a tool, "Reading…" after its result).
+        // Their deltas would otherwise concatenate with no separator, running the
+        // two sentences together ("download.Reading"). Insert a newline at each new
+        // text block so the narration segments stay on their own lines.
+        if is_text_block_start(&line) && !assembled.is_empty() && !assembled.ends_with('\n') {
+            assembled.push('\n');
+            on_delta("\n".to_string());
+        }
         if let Some(text) = extract_text_delta(&line) {
             assembled.push_str(&text);
             on_delta(text);
@@ -351,6 +381,38 @@ mod tests {
         assert!(extract_activity(r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}}"#).is_empty());
         assert!(extract_activity(r#"{"type":"result","result":"done"}"#).is_empty());
         assert!(extract_activity("not json").is_empty());
+    }
+
+    #[test]
+    fn detects_text_block_start_and_separates_narration() {
+        let start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}}"#;
+        assert!(is_text_block_start(start));
+        // A tool_use block start is NOT a text boundary.
+        let tool = r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t","name":"Read"}}}"#;
+        assert!(!is_text_block_start(tool));
+        // A delta / result / junk line is not a block start.
+        assert!(!is_text_block_start(r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}}"#));
+        assert!(!is_text_block_start("not json"));
+
+        // Simulate the interleaved sequence: text "download." → tool → NEW text
+        // block "Reading". The boundary re-inserts the dropped newline.
+        let lines = [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"…download."}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t","name":"Read"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Reading…"}}}"#,
+        ];
+        let mut assembled = String::new();
+        for l in lines {
+            if is_text_block_start(l) && !assembled.is_empty() && !assembled.ends_with('\n') {
+                assembled.push('\n');
+            }
+            if let Some(t) = extract_text_delta(l) {
+                assembled.push_str(&t);
+            }
+        }
+        assert_eq!(assembled, "…download.\nReading…", "boundary newline re-inserted");
     }
 
     #[test]
