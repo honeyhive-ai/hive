@@ -39,6 +39,10 @@ use tauri_plugin_notification::NotificationExt;
 use uuid::Uuid;
 
 mod workflows;
+/// In-app live test support (see `tests/app_live.rs`); not in release builds.
+#[cfg(feature = "e2e")]
+#[doc(hidden)]
+pub mod e2e;
 
 #[cfg(target_os = "macos")]
 use tauri::{
@@ -2894,8 +2898,10 @@ impl AppState {
             // the compiled default runtime is `anthropic`. Fall back to the
             // bring-your-own Claude Code CLI (a subscription, no key) so the agent
             // actually responds. A configured key (per-provider/global/env) is
-            // always honored; subprocess/local providers never need one.
-            if provider_needs_key(provider) && api_key.is_none() {
+            // always honored; subprocess/local providers never need one, and
+            // neither does an OpenAI-wire runtime on a private endpoint (a
+            // keyless local server, e.g. the "Local gateway" preset).
+            if runtime_needs_key(provider, &endpoint) && api_key.is_none() {
                 tracing::info!(
                     target: "dispatch",
                     runtime = %runtime_id,
@@ -3398,8 +3404,11 @@ fn get_context_telemetry(
     session_id: String,
 ) -> Result<Option<ContextTelemetryDto>, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let svc = state.service.lock().unwrap();
-    let Some(session) = svc.load(id).map_err(map_err)? else {
+    // Release `service` before planning: the snapshot reads the saved
+    // compaction state through it, and std's Mutex is not reentrant (holding
+    // it here deadlocked the whole app on the first telemetry poll).
+    let session = state.service.lock().unwrap().load(id).map_err(map_err)?;
+    let Some(session) = session else {
         return Ok(None);
     };
     let responder = responder_for(&state, &session, None);
@@ -5850,6 +5859,15 @@ fn deferred_turn_unanswered(session: &ChatSession, trigger_id: Uuid) -> bool {
 /// dispatch, so `resolve_runtime` falls back to the keyless Claude Code CLI.
 /// Subprocess/local providers (Claude Code, Codex, Aider, Pi, Hermes, Ollama,
 /// HiveDaemon) never need a supplied key.
+/// Whether a configured runtime must carry a key to be dispatched to (else
+/// [`AppState::resolve_runtime`] falls back to the Claude Code CLI). A hosted
+/// API needs one; the same wire pointed at loopback, a LAN or the tailnet is
+/// a local server (llama.cpp, LM Studio, a gateway), which is keyless — the
+/// "Local gateway" preset adds exactly that, with no key.
+fn runtime_needs_key(provider: ModelProviderKind, endpoint: &str) -> bool {
+    provider_needs_key(provider) && !hive_core::endpoint::endpoint_is_private(endpoint)
+}
+
 fn provider_needs_key(provider: ModelProviderKind) -> bool {
     matches!(
         provider,
@@ -6862,7 +6880,7 @@ async fn try_tool_loop(
             let root = state.workspace_root.lock().unwrap().clone();
             let mut svc = state.service.lock().unwrap();
             let body = finalize_reply(
-                &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &text,
+                &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &text, false,
             )?;
             ("completed".to_string(), body)
         }
@@ -6913,6 +6931,7 @@ fn redact_workspace_path(body: &str, workspace_root: &str) -> String {
     body.replace(root, base)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finalize_reply(
     svc: &mut ChatService,
     session_id: Uuid,
@@ -6921,6 +6940,7 @@ fn finalize_reply(
     author: &str,
     workspace_root: &str,
     full: &str,
+    edits_in_review: bool,
 ) -> Result<String, String> {
     let parsed = hive_runtime::directives::parse_reply_directives(full);
     let cleaned = redact_workspace_path(&parsed.cleaned, workspace_root);
@@ -6960,6 +6980,14 @@ fn finalize_reply(
     // here. The author is the responding agent, so the governance self-approval
     // guard applies — its own vote can't satisfy quorum.
     for proposed in &parsed.proposals {
+        // The turn's own file edits are already up for review as a real diff
+        // (`edits_in_review`); a `fileDiff` directive from the same reply can
+        // carry no diff, so it would only duplicate that proposal — and
+        // implementing it would send the agent to redo the edit.
+        if edits_in_review && proposed.kind == ProposalKind::FileDiff {
+            tracing::info!(target: "dispatch", title = %proposed.title, "skipping a fileDiff directive: the turn's edits are already in review");
+            continue;
+        }
         let mut proposal = hive_core::ActionProposal::new(&proposed.title, proposed.kind, author);
         proposal.body = proposed.body.clone();
         proposal.required_approvals = proposed.required_approvals;
@@ -7379,19 +7407,27 @@ async fn run_prepared_turn(
     match result {
         Ok(full) => {
             tracing::info!(target: "dispatch", chars = full.len(), "turn completed");
+            // The isolated worktree's changes, read before the reply is
+            // finalized so its directives know the edits are already in review.
+            let captured = worktree
+                .as_ref()
+                .and_then(|wt| wt.diff().ok())
+                .filter(|diff| !diff.trim().is_empty());
             let body = {
                 let root = state.workspace_root.lock().unwrap().clone();
                 let mut svc = state.service.lock().unwrap();
                 finalize_reply(
                     &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &full,
-                )?
+                    captured.is_some(),
+                )
             };
             // Capture the isolated worktree's changes as a review-gated proposal,
             // then remove the worktree — the stored diff is the portable artifact
             // (any reviewer sees it; Implement applies it to the workspace root).
+            // Done before `body?` so a finalize error never orphans the worktree.
             if let Some(wt) = worktree {
-                if let Ok(diff) = wt.diff() {
-                    if !diff.trim().is_empty() {
+                if body.is_ok() {
+                    if let Some(diff) = captured {
                         let files = wt.changed_files().unwrap_or_default();
                         let n = files.len();
                         let title = format!(
@@ -7417,6 +7453,7 @@ async fn run_prepared_turn(
                 }
                 let _ = wt.remove();
             }
+            let body = body?;
             let _ = app.emit(
                 ChatStreamEvent::EVENT,
                 ChatStreamEvent {
@@ -8760,15 +8797,6 @@ async fn probe_provider(
         .or_else(|| provider_keys.get(cfg).cloned().filter(|s| !s.is_empty()))
         .or(settings_key)
         .or_else(|| api_key_for(provider));
-    if provider_needs_key(provider) && api_key.is_none() {
-        return Ok(RuntimeTestDto {
-            ok: false,
-            latency_ms: 0,
-            reply: String::new(),
-            error: Some("No API key set for this provider — save one first.".to_string()),
-            capabilities: None,
-        });
-    }
     // A passed base URL wins (test-before-save from onboarding); else the stored one.
     let base = base_url
         .map(|b| b.trim().to_string())
@@ -8796,6 +8824,16 @@ async fn probe_provider(
             }
         }
     };
+    // Checked against the endpoint: a keyless local server needs none.
+    if runtime_needs_key(provider, &endpoint) && api_key.is_none() {
+        return Ok(RuntimeTestDto {
+            ok: false,
+            latency_ms: 0,
+            reply: String::new(),
+            error: Some("No API key set for this provider — save one first.".to_string()),
+            capabilities: None,
+        });
+    }
     let model = model
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty())
@@ -9530,6 +9568,12 @@ const RESET_SENTINEL: &str = ".reset-pending";
 
 fn build_state(app: &AppHandle) -> Result<AppState, String> {
     let data_dir: PathBuf = app.path().app_data_dir().map_err(map_err)?;
+    build_state_in(app, data_dir)
+}
+
+/// [`build_state`] against an explicit data dir. The app uses the OS app-data
+/// dir; the in-app live test (`e2e`) points it at a temp dir.
+fn build_state_in(app: &AppHandle, data_dir: PathBuf) -> Result<AppState, String> {
     std::fs::create_dir_all(&data_dir).map_err(map_err)?;
 
     // A factory reset was requested last run: the previous process wrote the
@@ -13422,8 +13466,15 @@ pub fn run() {
             presence_ping,
             presence_list
         ])
-        .run(tauri::generate_context!())
+        .run(app_context())
         .expect("error while running Hive");
+}
+
+/// The app's compiled Tauri context (config, assets, icons). One expansion of
+/// `generate_context!` per binary: it embeds the Info.plist under a fixed
+/// symbol, so `run()` and the in-app live test (`e2e`) share this.
+fn app_context() -> tauri::Context {
+    tauri::generate_context!()
 }
 
 #[cfg(test)]
@@ -13802,6 +13853,30 @@ mod runtime_fallback_tests {
         for p in [P::Anthropic, P::OpenAI, P::OpenRouter, P::Azure, P::Custom] {
             assert!(provider_needs_key(p), "{p:?} should require a key");
         }
+    }
+
+    #[test]
+    fn openai_wire_runtimes_on_a_private_endpoint_need_no_key() {
+        use super::runtime_needs_key;
+        // A keyless local server — the "Local gateway" preset — must not be
+        // swapped for the Claude Code CLI.
+        for ep in [
+            "http://127.0.0.1:8080/v1/chat/completions",
+            "http://localhost:1234/v1/chat/completions",
+            "http://192.168.1.20:8080/v1/chat/completions",
+            "http://100.100.10.20:8080/v1/chat/completions",
+            "http://gateway.tail1234.ts.net:8080/v1/chat/completions",
+        ] {
+            assert!(!runtime_needs_key(P::Custom, ep), "{ep}");
+            assert!(!runtime_needs_key(P::OpenAI, ep), "{ep}");
+        }
+        // Hosted endpoints still need one.
+        assert!(runtime_needs_key(P::Custom, "https://api.groq.com/openai/v1/chat/completions"));
+        assert!(runtime_needs_key(P::OpenAI, "https://api.openai.com/v1/chat/completions"));
+        assert!(runtime_needs_key(P::OpenRouter, "https://openrouter.ai/api/v1/chat/completions"));
+        // Anthropic's endpoint is implicit (empty) — always hosted.
+        assert!(runtime_needs_key(P::Anthropic, ""));
+        assert!(!runtime_needs_key(P::Ollama, ""));
     }
 
     #[test]
@@ -14432,7 +14507,7 @@ mod finalize_proposal_tests {
         let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude", None, None).unwrap();
 
         let body = "Done.\n[[propose: {\"title\": \"Bump timeout\", \"kind\": \"command\", \"body\": \"30s\", \"requiredApprovals\": 2}]]";
-        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", "/tmp/ws", body).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", "/tmp/ws", body, false).unwrap();
         assert_eq!(cleaned, "Done.");
 
         let session = svc.load(chat.id).unwrap().unwrap();
@@ -14447,6 +14522,33 @@ mod finalize_proposal_tests {
         assert_eq!(p.status, ProposalStatus::Open);
         // The agent's own approval can't satisfy quorum (self-approval guard).
         assert_eq!(p.qualifying_approvals(), 0);
+    }
+
+    #[test]
+    fn file_diff_directive_is_dropped_when_the_turns_edits_are_in_review() {
+        let mut svc = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "gw").unwrap();
+        let body = "Fixed it.\n[[propose: {\"title\": \"Fix apply_discount\", \"kind\": \"fileDiff\"}]]\n\
+[[propose: {\"title\": \"Ship it\", \"kind\": \"decision\"}]]";
+
+        // Edits captured as a diff proposal: the diff-less fileDiff directive
+        // would duplicate it; other kinds still land.
+        let mid = svc.begin_assistant_message(chat.id, wid, "Hive", "gw", None, None).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Hive", "/tmp/ws", body, true).unwrap();
+        assert_eq!(cleaned, "Fixed it.");
+        let titles: Vec<String> =
+            svc.load(chat.id).unwrap().unwrap().proposals.iter().map(|p| p.title.clone()).collect();
+        assert_eq!(titles, vec!["Ship it".to_string()]);
+
+        // No edits in review (e.g. a plain chat turn): the directive is the
+        // only record of the proposed change, so it is kept.
+        let chat2 = svc.create_chat("B", wid, "gw").unwrap();
+        let mid = svc.begin_assistant_message(chat2.id, wid, "Hive", "gw", None, None).unwrap();
+        finalize_reply(&mut svc, chat2.id, wid, mid, "Hive", "/tmp/ws", body, false).unwrap();
+        let session = svc.load(chat2.id).unwrap().unwrap();
+        assert_eq!(session.proposals.len(), 2);
+        assert!(session.proposals.iter().any(|p| p.kind == ProposalKind::FileDiff));
     }
 
     #[test]

@@ -198,6 +198,12 @@ impl ToolCallAssembler {
         self.push(calls);
     }
 
+    /// The name of a call whose streamed arguments have fallen into a loop
+    /// (see [`is_looping_arguments`]), if any.
+    pub fn looping(&self) -> Option<&str> {
+        self.calls.values().find(|c| is_looping_arguments(&c.arguments)).map(|c| c.name.as_str())
+    }
+
     /// The calls, in index order; entries that never got a name are dropped.
     pub fn finish(self) -> Vec<AssembledCall> {
         self.calls.into_values().filter(|c| !c.name.is_empty()).collect()
@@ -385,6 +391,30 @@ fn rejects_extras(status: u16, body: &str, extra: &Map<String, Value>) -> bool {
 
 /// Longest slice of a malformed argument string echoed back to the model.
 const MALFORMED_ECHO_CHARS: usize = 500;
+
+/// Streamed tool-call arguments are checked for a loop once this long.
+const LOOP_CHECK_BYTES: usize = 8 * 1024;
+/// How much of the arguments' tail must repeat to count as a loop.
+const LOOP_TAIL_BYTES: usize = 4 * 1024;
+/// Longest repeating unit looked for.
+const LOOP_MAX_PERIOD: usize = 256;
+
+/// Whether streamed tool-call arguments have degenerated into a loop: past
+/// [`LOOP_CHECK_BYTES`], their last [`LOOP_TAIL_BYTES`] bytes are one unit of
+/// at most [`LOOP_MAX_PERIOD`] bytes repeated (endless whitespace, a phrase
+/// over and over). The OpenAI wire sends no output cap, so a local model
+/// stuck like this generates until its slot is full — measured at 11 minutes
+/// for one `list_dir` call through the app — with nothing on screen, since
+/// arguments aren't streamed to the UI. Real arguments, even a large file
+/// being written, don't repeat a short unit for 4 KiB.
+fn is_looping_arguments(args: &str) -> bool {
+    let b = args.as_bytes();
+    if b.len() < LOOP_CHECK_BYTES {
+        return false;
+    }
+    let tail = &b[b.len() - LOOP_TAIL_BYTES..];
+    (1..=LOOP_MAX_PERIOD).any(|p| tail[p..].iter().zip(tail).all(|(x, y)| x == y))
+}
 
 /// Process-wide cache of `/props` probes: `Some(n_ctx)` is kept for the
 /// process (a server's slot size only changes on restart); a failed probe is
@@ -824,6 +854,22 @@ impl OpenAiClient {
                 let line = buffer[..idx].trim_end_matches('\r').to_string();
                 buffer.drain(..=idx);
                 self.absorb_line(&line, &mut asm, &mut on_delta, &mut on_thinking)?;
+            }
+            // Cut a looping call short: dropping the stream closes the
+            // connection, which stops the server generating. The truncated
+            // arguments then fail to parse, and the model is told so and
+            // can call again.
+            if let Some(name) = asm.calls.looping() {
+                tracing::warn!(
+                    target: "dispatch",
+                    provider = self.provider_label,
+                    host = %self.host(),
+                    model,
+                    tool = %name,
+                    "tool-call arguments are looping; cutting the round short"
+                );
+                buffer.clear();
+                break;
             }
         }
         // A final line without a trailing newline.
@@ -1430,6 +1476,17 @@ mod tool_wire {
                 .unwrap();
         }
         let lines = f.rounds.get(n).or_else(|| f.rounds.last()).cloned().unwrap_or_default();
+        // A round ending in `STALL` sends its lines, then keeps the stream
+        // open without finishing — a server still generating.
+        if lines.last().is_some_and(|l| l == "STALL") {
+            let sent: Vec<Result<String, std::io::Error>> =
+                lines[..lines.len() - 1].iter().map(|l| Ok(format!("{l}\n\n"))).collect();
+            let stream = futures_util::StreamExt::chain(futures_util::stream::iter(sent), futures_util::stream::pending());
+            return axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap();
+        }
         if lines.len() == 1 && lines[0].starts_with('{') {
             return axum::response::Response::builder()
                 .header("content-type", "application/json")
@@ -1764,6 +1821,58 @@ mod tool_wire {
             assert_eq!(body["reasoning_effort"], "low");
             assert!(body.get("max_tokens").is_none(), "no output cap on the OpenAI wire");
         }
+    }
+
+    #[test]
+    fn looping_arguments_are_detected() {
+        let open = r#"{"path": "."#;
+        assert!(!is_looping_arguments(&format!("{open}{}", " ".repeat(LOOP_CHECK_BYTES - 64))), "too short to judge");
+        assert!(is_looping_arguments(&format!("{open}{}", " ".repeat(LOOP_CHECK_BYTES))));
+        assert!(is_looping_arguments(&format!("{open}{}", "/src/lib".repeat(2000))));
+        // A unit longer than the period limit is not judged a loop.
+        let long_unit: String = (0..LOOP_MAX_PERIOD + 7).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+        assert!(!is_looping_arguments(&format!("{open}{}", long_unit.repeat(40))));
+        // A big, ordinary file write is not a loop.
+        let file: String = (0..800).map(|i| format!("    total_{i} = price_{i} * (1 - rate_{i})\n")).collect();
+        let args = json!({ "path": "shop/big.py", "content": file }).to_string();
+        assert!(args.len() > LOOP_CHECK_BYTES * 2);
+        assert!(!is_looping_arguments(&args));
+    }
+
+    #[tokio::test]
+    async fn a_looping_tool_call_is_cut_short_and_reported() {
+        // The server streams a call whose arguments loop on whitespace and
+        // never finishes. Without the guard the round waits on the server
+        // (here: forever; live: until its slot fills).
+        let mut looping = vec![delta(
+            json!({"tool_calls": [{"index": 0, "id": "a", "type": "function", "function": {"name": "search", "arguments": "{\"q\": \"x"}}]}),
+        )];
+        for _ in 0..(LOOP_CHECK_BYTES / 64 + 8) {
+            looping.push(delta(json!({"tool_calls": [{"index": 0, "function": {"arguments": " ".repeat(64)}}]})));
+        }
+        looping.push("STALL".into());
+        let f = Fake { rounds: Arc::new(vec![looping, vec![text("done")]]), ..Default::default() };
+        let bodies = f.bodies.clone();
+        let url = serve(f).await;
+        let exec = recorder();
+        let mut results = Vec::new();
+        let out = tokio::time::timeout(
+            Duration::from_secs(20),
+            OpenAiClient::new(&url).stream_chat_with_tools(None, "m", None, &[ChatTurn::user("go")], &search_tool(), &exec, 4, |_| {}, |a| {
+                if let StreamActivity::ToolResult { is_error, content, .. } = a {
+                    results.push((is_error, content));
+                }
+            }),
+        )
+        .await
+        .expect("the looping round was cut short")
+        .unwrap();
+        assert_eq!(out.text, "done");
+        assert!(exec.calls.lock().unwrap().is_empty(), "the truncated call never ran");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].0, "reported to the model as an error: {:?}", results[0]);
+        assert!(results[0].1.contains("not valid JSON"), "{}", results[0].1);
+        assert_eq!(bodies.lock().unwrap().len(), 2, "the model got another round");
     }
 
     #[tokio::test]

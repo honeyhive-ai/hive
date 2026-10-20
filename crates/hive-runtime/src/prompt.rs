@@ -265,9 +265,8 @@ This is saved for human review — it is NOT auto-executed. It appears in the Re
 /// System prompt for the primary runtime: it coordinates and may act directly.
 pub fn primary_system_prompt(session: &ChatSession) -> String {
     let base = format!(
-        "You are the primary runtime for the Hive workspace \"{title}\". You \
+        "You are the primary runtime for this Hive workspace. You \
 coordinate the conversation and may take actions or answer directly.\n\n{roster}\n\n{guide}\n\n{transcript}\n\n{paths}\n\n{wf}\n\n{prop}",
-        title = session.title,
         roster = workspace_roster(session),
         guide = mention_guidance(),
         transcript = transcript_guidance(),
@@ -286,12 +285,11 @@ pub fn agent_system_prompt(session: &ChatSession, agent: &WorkspaceAgent) -> Str
         format!("the workspace's {}", agent.role)
     };
     let base = format!(
-        "You are {name}, {role}, collaborating in the Hive workspace \"{title}\". \
+        "You are {name}, {role}, collaborating in this Hive workspace. \
 Stay in character as {name}; you are distinct from the primary runtime and the \
 other agents.\n\n{roster}\n\n{guide}\n\n{transcript}\n\n{paths}\n\n{wf}\n\n{prop}",
         name = agent.name,
         role = role,
-        title = session.title,
         roster = workspace_roster(session),
         guide = mention_guidance(),
         transcript = transcript_guidance(),
@@ -342,7 +340,20 @@ mod tests {
         let p = agent_system_prompt(&s, &agent);
         assert!(p.contains("You are Scout"));
         assert!(p.contains("distinct from the primary runtime"));
-        assert!(p.contains("Launch"));
+    }
+
+    #[test]
+    fn system_prompts_do_not_change_when_the_chat_is_renamed() {
+        // The chat is auto-titled after its first turn; a title in the system
+        // prompt changed its first line then and threw away the server's
+        // prompt cache for the whole conversation from turn 2 on.
+        let s = session();
+        let mut renamed = s.clone();
+        renamed.title = "Nightly Backup Schedule Details".into();
+        let agent = s.workspace_agents[0].clone();
+        assert_eq!(primary_system_prompt(&s), primary_system_prompt(&renamed));
+        assert_eq!(agent_system_prompt(&s, &agent), agent_system_prompt(&renamed, &agent));
+        assert!(!primary_system_prompt(&s).contains("Launch"));
     }
 
     #[test]
