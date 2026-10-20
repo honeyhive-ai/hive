@@ -144,6 +144,15 @@ struct Harness {
 /// Custom runtime at `endpoint` / `model`, synced through the relay; then a
 /// serve host joined to it with a repo bound.
 async fn harness(endpoint: &str, model: &str, repo_files: &[(&str, &str)]) -> Harness {
+    harness_with(endpoint, model, repo_files, |_| {}).await
+}
+
+async fn harness_with(
+    endpoint: &str,
+    model: &str,
+    repo_files: &[(&str, &str)],
+    tweak: impl FnOnce(&mut ServeOptions),
+) -> Harness {
     let tmp = tempfile::tempdir().unwrap();
     let relay = spawn(test_relay::router()).await;
     let room = format!("serve-test-{}", Uuid::new_v4());
@@ -184,6 +193,8 @@ async fn harness(endpoint: &str, model: &str, repo_files: &[(&str, &str)]) -> Ha
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
     };
+    let mut opts = opts;
+    tweak(&mut opts);
     let handle = start(serve_cfg, opts).await.unwrap();
     let base = format!("http://{}", handle.addr);
     let token = handle.shared.token.clone();
@@ -577,6 +588,54 @@ async fn reject_with_reason_and_last_event_id_replay() {
     let p = seen.iter().find(|(n, _, _)| n == "proposal.created").expect("replayed proposal.created");
     assert_eq!(p.1["proposal"]["id"], json!(pid));
     assert!(seen[0].2 >= 1);
+    h.handle.shutdown();
+}
+
+/// Approving from the phone must not apply a proposal a qualifying reviewer
+/// already rejected: quorum stays met after a reject, but the folded status is
+/// Rejected, and Applied would be terminal on every peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn apply_on_approve_never_overrides_a_rejection() {
+    let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let h = harness_with(&endpoint, "m", &[("README.md", "x\n")], |o| o.apply_on_approve = true).await;
+    let chat = h.send(reqwest::Method::POST, "/v1/chats", None).await;
+    let chat_id = Uuid::parse_str(chat["chat"]["id"].as_str().unwrap()).unwrap();
+    let ws = h.handle.shared.ws;
+    let diff = |name: &str| {
+        format!("diff --git a/{name} b/{name}\nnew file mode 100644\n--- /dev/null\n+++ b/{name}\n@@ -0,0 +1 @@\n+hi\n")
+    };
+    let file = |name: &str| {
+        let mut p = hive_core::ActionProposal::file_diff(format!("add {name}"), "", diff(name), vec![name.into()]);
+        p.producing_agent_id = Some(h.agent_id);
+        p
+    };
+    let (rejected, control) = (file("rejected.txt"), file("approved.txt"));
+    let (rid, cid) = (rejected.id, control.id);
+    {
+        let mut svc = h.handle.shared.lock();
+        svc.upsert_proposal(chat_id, ws, rejected).unwrap();
+        svc.upsert_proposal(chat_id, ws, control).unwrap();
+        // An Admin rejected it on the desktop (synced in).
+        svc.vote_on_proposal(chat_id, ws, rid, "desktop-admin", hive_core::WorkspaceRole::Admin, false).unwrap();
+    }
+    h.handle.shared.after_write();
+
+    let res = h.send(reqwest::Method::POST, &format!("/v1/proposals/{rid}/approve"), None).await;
+    assert_eq!(res["proposal"]["status"], "rejected", "{res}");
+    let wt = h._tmp.path().join("repo").join(".hive").join("worktrees").join(format!("chat-{chat_id}"));
+    assert!(!wt.join("rejected.txt").exists(), "a rejected proposal was applied");
+    {
+        let svc = h.handle.shared.lock();
+        let s = svc.load(chat_id).unwrap().unwrap();
+        let p = s.proposals.iter().find(|p| p.id == rid).unwrap();
+        assert_eq!(p.status, hive_core::ProposalStatus::Rejected);
+    }
+
+    // Control: the same flow without a rejection applies and commits.
+    let res = h.send(reqwest::Method::POST, &format!("/v1/proposals/{cid}/approve"), None).await;
+    assert_eq!(res["proposal"]["status"], "applied", "{res}");
+    assert!(wt.join("approved.txt").exists(), "the approved proposal was applied in the chat worktree");
+    assert!(!wt.join("rejected.txt").exists());
     h.handle.shutdown();
 }
 

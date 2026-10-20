@@ -511,7 +511,11 @@ fn vote(s: &Shared, chat: &ChatSession, pid: Uuid, approved: bool) -> ApiResult<
 async fn approve_proposal(State(s): S, Path(id): Path<String>) -> ApiResult<Json<Value>> {
     let (chat, p) = find_proposal(&s, &id)?;
     let mut updated = vote(&s, &chat, p.id, true)?;
-    if s.opts.apply_on_approve && updated.is_quorum_met() && updated.status != ProposalStatus::Applied {
+    // Only a proposal whose folded status is Approved: quorum alone stays met
+    // after a qualifying reject, and Applied is terminal on every peer, so
+    // applying on quorum would override a rejection for good. Dismissed and
+    // superseded versions aren't open work either.
+    if s.opts.apply_on_approve && updated.ready_to_apply() && !updated.dismissed {
         if let Some(applied) = apply_on_this_host(&s, &chat, &updated)? {
             updated = applied;
         }

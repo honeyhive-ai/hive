@@ -5225,7 +5225,15 @@ async fn implement_proposal(
     if proposal.status == ProposalStatus::Applied {
         return Err("this proposal was already implemented".into());
     }
-    if !proposal.is_quorum_met() {
+    if proposal.status == ProposalStatus::Rejected {
+        return Err("this proposal was rejected".into());
+    }
+    if proposal.superseded_by.is_some() {
+        return Err("a newer version of this proposal superseded it".into());
+    }
+    // The folded status, not quorum alone: `is_quorum_met` stays true after a
+    // qualifying reject, and Applied is terminal, so it would override it.
+    if !proposal.ready_to_apply() {
         return Err("not approved yet — it needs quorum before it can be implemented".into());
     }
 

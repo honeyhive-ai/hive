@@ -201,6 +201,14 @@ impl ActionProposal {
         self.required_approvals > 0 && self.qualifying_approvals() >= self.required_approvals as usize
     }
 
+    /// Whether the proposal may be carried out now: its folded status is
+    /// `Approved` (quorum met and no qualifying rejection — `is_quorum_met`
+    /// alone stays true after a reject) and no newer version superseded it.
+    /// Never true once `Applied`.
+    pub fn ready_to_apply(&self) -> bool {
+        self.status == ProposalStatus::Approved && self.superseded_by.is_none()
+    }
+
     /// A qualifying down-vote rejects the proposal outright.
     fn has_qualifying_rejection(&self) -> bool {
         let floor = self.approval_role_floor.rank();
@@ -253,6 +261,22 @@ mod tests {
         assert_eq!(p.qualifying_approvals(), 2);
         assert!(p.is_quorum_met());
         assert_eq!(p.status, ProposalStatus::Approved);
+    }
+
+    #[test]
+    fn rejected_proposal_with_quorum_is_not_ready_to_apply() {
+        let mut p = ActionProposal::new("X", ProposalKind::FileDiff, "");
+        p.cast_vote(vote("admin", WorkspaceRole::Admin, false));
+        p.cast_vote(vote("phone", WorkspaceRole::Contributor, true));
+        assert!(p.is_quorum_met(), "the up-vote alone meets quorum");
+        assert_eq!(p.status, ProposalStatus::Rejected);
+        assert!(!p.ready_to_apply());
+
+        let mut ok = ActionProposal::new("Y", ProposalKind::FileDiff, "");
+        ok.cast_vote(vote("phone", WorkspaceRole::Contributor, true));
+        assert!(ok.ready_to_apply());
+        ok.superseded_by = Some(Uuid::new_v4());
+        assert!(!ok.ready_to_apply(), "a superseded version is history");
     }
 
     #[test]
