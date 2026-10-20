@@ -169,7 +169,14 @@ this machine or a private network:
 - RFC 1918 addresses (`10.x`, `172.16–31.x`, `192.168.x`)
 - Tailscale addresses (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`)
 - link-local addresses
-- `*.local`, `*.ts.net`, and single-label host names
+- `*.local`, `*.internal`, and `*.home.arpa` names
+
+Tailscale MagicDNS names (`*.ts.net`) and single-label names (`gpu-box`)
+don't count, because a `*.ts.net` name can be public through Tailscale
+Funnel and a single label can be a public domain. Use the machine's
+Tailscale or LAN IP address instead, or turn on the opt-in below. Hive
+reads the host the same way its HTTP client does, so an endpoint such as
+`http://example.com\@127.0.0.1/` counts as `example.com`.
 
 For any other endpoint, turn on **Allow workspace file tools for this
 endpoint** on the runtime (`allow_remote_file_tools = true` in

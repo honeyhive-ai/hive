@@ -5983,7 +5983,7 @@ fn deferred_turn_unanswered(session: &ChatSession, trigger_id: Uuid) -> bool {
 /// a local server (llama.cpp, LM Studio, a gateway), which is keyless — the
 /// "Local gateway" preset adds exactly that, with no key.
 fn runtime_needs_key(provider: ModelProviderKind, endpoint: &str) -> bool {
-    provider_needs_key(provider) && !hive_core::endpoint::endpoint_is_private(endpoint)
+    provider_needs_key(provider) && !hive_core::endpoint::endpoint_is_local_server(endpoint)
 }
 
 fn provider_needs_key(provider: ModelProviderKind) -> bool {
@@ -13991,6 +13991,7 @@ mod runtime_fallback_tests {
             "http://192.168.1.20:8080/v1/chat/completions",
             "http://100.100.10.20:8080/v1/chat/completions",
             "http://gateway.tail1234.ts.net:8080/v1/chat/completions",
+            "http://gpu-box:8080/v1/chat/completions",
         ] {
             assert!(!runtime_needs_key(P::Custom, ep), "{ep}");
             assert!(!runtime_needs_key(P::OpenAI, ep), "{ep}");
@@ -15077,7 +15078,11 @@ mod agentic_turn_tests {
         };
         assert!(at("http://100.100.10.20:8080/v1/chat/completions", false), "Tailscale");
         assert!(at("http://localhost:8080/v1/chat/completions", false));
-        assert!(at("http://gateway.tail1234.ts.net/v1/chat/completions", false));
+        // MagicDNS names can be public (Funnel), so they need the opt-in.
+        assert!(!at("http://gateway.tail1234.ts.net/v1/chat/completions", false));
+        assert!(at("http://gateway.tail1234.ts.net/v1/chat/completions", true));
+        // The host the client connects to is the one classified.
+        assert!(!at("http://evil.example\\@127.0.0.1:8080/v1/chat/completions", false));
         assert!(!at("https://llm.example.com/v1/chat/completions", false), "public host, no opt-in");
         assert!(at("https://llm.example.com/v1/chat/completions", true), "public host, opted in");
         // Native Ollama with no endpoint set talks to localhost.

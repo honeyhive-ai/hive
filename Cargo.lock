@@ -2491,6 +2491,7 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
  "toml 0.8.2",
+ "url",
  "uuid",
  "x25519-dalek",
 ]

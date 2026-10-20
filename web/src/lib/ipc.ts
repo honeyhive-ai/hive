@@ -158,7 +158,8 @@ export const addRuntime = (
   });
 
 /// Whether an endpoint's host is local or private (loopback, LAN, Tailscale,
-/// link-local, *.local, *.ts.net) — Hive's built-in file tools are only offered
+/// link-local, *.local; not *.ts.net names, which Funnel can make public) —
+/// Hive's built-in file tools are only offered
 /// to other endpoints with the runtime's explicit opt-in.
 export const endpointIsPrivate = (endpoint: string) => invoke<boolean>("endpoint_is_private", { endpoint });
 
