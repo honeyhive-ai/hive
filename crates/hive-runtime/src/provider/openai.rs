@@ -201,7 +201,7 @@ impl ToolCallAssembler {
     /// The name of a call whose streamed arguments have fallen into a loop
     /// (see [`is_looping_arguments`]), if any.
     pub fn looping(&self) -> Option<&str> {
-        self.calls.values().find(|c| is_looping_arguments(&c.arguments)).map(|c| c.name.as_str())
+        self.calls.values().find(|c| is_looping_call(&c.name, &c.arguments)).map(|c| c.name.as_str())
     }
 
     /// The calls, in index order; entries that never got a name are dropped.
@@ -398,6 +398,30 @@ const LOOP_CHECK_BYTES: usize = 8 * 1024;
 const LOOP_TAIL_BYTES: usize = 4 * 1024;
 /// Longest repeating unit looked for.
 const LOOP_MAX_PERIOD: usize = 256;
+/// For calls that carry file content, the arguments are checked only once
+/// this long...
+const CONTENT_LOOP_CHECK_BYTES: usize = 64 * 1024;
+/// ...and this much of the tail must repeat: a real file can hold a few KiB
+/// of identical rows (a CSV fixture, a zero-filled table, a rule of `=`),
+/// but not 32 KiB of them.
+const CONTENT_LOOP_TAIL_BYTES: usize = 32 * 1024;
+
+/// Whether a call's arguments carry file content, which can legitimately be
+/// large and repetitive.
+fn carries_content(name: &str) -> bool {
+    use crate::builtin_tools::{EDIT_FILE, WRITE_FILE};
+    name == WRITE_FILE || name == EDIT_FILE || name.ends_with("__write_file") || name.ends_with("__edit_file")
+}
+
+/// [`is_looping_arguments`], with the looser bounds for calls that carry
+/// file content.
+fn is_looping_call(name: &str, args: &str) -> bool {
+    if carries_content(name) {
+        is_periodic_tail(args.as_bytes(), CONTENT_LOOP_CHECK_BYTES, CONTENT_LOOP_TAIL_BYTES)
+    } else {
+        is_looping_arguments(args)
+    }
+}
 
 /// Whether streamed tool-call arguments have degenerated into a loop: past
 /// [`LOOP_CHECK_BYTES`], their last [`LOOP_TAIL_BYTES`] bytes are one unit of
@@ -408,11 +432,14 @@ const LOOP_MAX_PERIOD: usize = 256;
 /// arguments aren't streamed to the UI. Real arguments, even a large file
 /// being written, don't repeat a short unit for 4 KiB.
 fn is_looping_arguments(args: &str) -> bool {
-    let b = args.as_bytes();
-    if b.len() < LOOP_CHECK_BYTES {
+    is_periodic_tail(args.as_bytes(), LOOP_CHECK_BYTES, LOOP_TAIL_BYTES)
+}
+
+fn is_periodic_tail(b: &[u8], check_from: usize, tail_len: usize) -> bool {
+    if b.len() < check_from {
         return false;
     }
-    let tail = &b[b.len() - LOOP_TAIL_BYTES..];
+    let tail = &b[b.len() - tail_len..];
     (1..=LOOP_MAX_PERIOD).any(|p| tail[p..].iter().zip(tail).all(|(x, y)| x == y))
 }
 
@@ -1837,6 +1864,36 @@ mod tool_wire {
         let args = json!({ "path": "shop/big.py", "content": file }).to_string();
         assert!(args.len() > LOOP_CHECK_BYTES * 2);
         assert!(!is_looping_arguments(&args));
+    }
+
+    /// A file write with a long repetitive stretch is real content, not a
+    /// loop: identical CSV rows, a zero-filled C table, a rule of `=`.
+    #[test]
+    fn repetitive_file_content_is_not_cut_off() {
+        let rows = format!("id,name\n{}", "0,placeholder,0,0,0\n".repeat(600));
+        let table = format!("static const unsigned char t[] = {{\n{}}};\n", "0x00, ".repeat(2000));
+        let rule = format!("# Title\n{}\n", "=".repeat(9000));
+        // The guard runs on every streamed chunk, so check every prefix.
+        let prefixes = |args: &str| -> Vec<String> {
+            (1..=args.len() / 64).map(|i| args[..i * 64].to_string()).chain([args.to_string()]).collect()
+        };
+        for (path, content) in [("fixture.csv", rows), ("table.c", table), ("README.md", rule)] {
+            let args = json!({ "path": path, "content": format!("{}{content}", "header line\n".repeat(800)) }).to_string();
+            assert!(args.len() > LOOP_CHECK_BYTES, "{path}");
+            let streamed = prefixes(&args);
+            assert!(streamed.iter().any(|p| is_looping_arguments(p)), "the tight check would cut {path}");
+            for name in ["write_file", "fs__write_file"] {
+                assert!(!streamed.iter().any(|p| is_looping_call(name, p)), "{name} {path}");
+            }
+            let edit = json!({ "path": path, "old_string": "x", "new_string": content }).to_string();
+            assert!(!prefixes(&edit).iter().any(|p| is_looping_call("edit_file", p)), "{path}");
+        }
+        // A write that really runs away is still cut, just later.
+        let runaway = format!(r#"{{"path": "a.txt", "content": "{}"#, "ab".repeat(CONTENT_LOOP_CHECK_BYTES));
+        assert!(is_looping_call("write_file", &runaway));
+        // Other tools keep the tight bound.
+        let looping_dir = format!(r#"{{"path": "{}"#, "/src/lib".repeat(2000));
+        assert!(is_looping_call("list_dir", &looping_dir));
     }
 
     #[tokio::test]
