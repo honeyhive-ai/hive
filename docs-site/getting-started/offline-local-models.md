@@ -186,6 +186,13 @@ can't turn it on, and pointing the runtime at another endpoint turns it
 off.
 Hosted APIs (OpenAI, OpenRouter, Azure) never get the tool loop.
 
+Once a turn has read project files (with `read_file`, `search` or
+`run_command`), Hive refuses MCP calls for the rest of that turn. A
+file in the workspace, such as a cloned README, could tell the model to
+send what it read to a web address, and every MCP call's arguments
+leave this machine. MCP lookups made before the first read work as
+normal.
+
 The tool loop allows 24 rounds by default (set **Max tool rounds** on
 the runtime). When the conversation gets close to the context window,
 Hive stops offering tools so the model has to answer.
