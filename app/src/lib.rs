@@ -5352,6 +5352,9 @@ struct Responder {
     /// Account that owns this responder (agent owner, or the chat creator for
     /// the primary). Only that device dispatches the turn; empty ⇒ local.
     owner_actor_id: String,
+    /// The host the agent was sent to (`WorkspaceAgent::host_id`, a device id);
+    /// empty for the primary and for an agent on its owner's device.
+    host_id: String,
 }
 
 struct ContextSnapshot {
@@ -5651,6 +5654,7 @@ fn responder_for(state: &AppState, session: &ChatSession, agent: Option<&Workspa
                 runtime_id: a.runtime_id.clone(),
                 runtime,
                 owner_actor_id: a.owner_actor_id.clone(),
+                host_id: a.host_id.clone(),
             }
         }
         None => {
@@ -5662,6 +5666,7 @@ fn responder_for(state: &AppState, session: &ChatSession, agent: Option<&Workspa
                 runtime_id: session.runtime_id.clone(),
                 runtime,
                 owner_actor_id: session.creator_actor_id.clone(),
+                host_id: String::new(),
             }
         }
     }
@@ -5671,6 +5676,11 @@ impl AppState {
     /// The local account id (used for cross-device dispatch ownership checks).
     fn local_actor_id(&self) -> String {
         self.service.lock().unwrap().author().id.clone()
+    }
+
+    /// This device's id as a workspace host id (`WorkspaceHost::id`).
+    fn local_host_id(&self) -> String {
+        self.service.lock().unwrap().device_id().to_string()
     }
 
     /// Relay access token (entitlement) for a gated/paid hosted relay. `None`
@@ -5910,8 +5920,49 @@ fn owns_responder(local_actor_id: &str, responder: &Responder) -> bool {
 ///   - `solo`: a relay *is* configured but there's ≤1 human — a room you made
 ///     that no one else has joined. Still no other device to defer to.
 /// Only a real, synced, multi-human room falls back to the ownership check.
-fn turn_runs_here(local_only: bool, solo: bool, local: &str, owner: &str) -> bool {
-    local_only || solo || crate::workflows::stage_owner_runs_here(local, owner)
+///
+/// An agent sent to a host (`binding`) runs on that host only — the worker
+/// there answers every mention for it (`hive worker` / `hive serve`). Deciding
+/// on ownership alone answered it here too: a solo user's desktop always runs
+/// its own agents, so an agent sent to the home host was answered twice.
+fn turn_runs_here(local_only: bool, solo: bool, local: &str, owner: &str, binding: HostBinding) -> bool {
+    match binding {
+        _ if local_only => true,
+        HostBinding::ThisDevice => true,
+        HostBinding::Elsewhere => false,
+        HostBinding::Unbound => solo || crate::workflows::stage_owner_runs_here(local, owner),
+    }
+}
+
+/// Where a responder's host binding puts its turns, seen from this device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostBinding {
+    /// No host: the owner's device answers.
+    Unbound,
+    /// Sent to this device.
+    ThisDevice,
+    /// Sent to another host (a worker, the home host).
+    Elsewhere,
+}
+
+fn host_binding(host_id: &str, this_device: &str) -> HostBinding {
+    if host_id.is_empty() {
+        HostBinding::Unbound
+    } else if host_id == this_device {
+        HostBinding::ThisDevice
+    } else {
+        HostBinding::Elsewhere
+    }
+}
+
+/// Whether the host `host_id` has heartbeated recently (as the Hosts list
+/// shows it). Unknown hosts count as offline.
+fn host_online(state: &AppState, workspace_id: Uuid, host_id: &str) -> bool {
+    let svc = state.service.lock().unwrap();
+    let now = hive_core::Timestamp::now();
+    svc.list_hosts(workspace_id)
+        .map(|hosts| hosts.iter().any(|h| h.id == host_id && h.is_online(&now, 90)))
+        .unwrap_or(false)
 }
 
 /// How long a deferred turn waits for its owner's device to pick it up before
@@ -7821,6 +7872,13 @@ async fn run_deferred_claim_fallback(
         }
     };
     let Some(responder) = responder else { return Ok(()) };
+    // The agent's host came online (or the agent was sent to one) while we
+    // waited: it answers.
+    if host_binding(&responder.host_id, &state.local_host_id()) == HostBinding::Elsewhere
+        && host_online(&state, workspace_id, &responder.host_id)
+    {
+        return Ok(());
+    }
 
     // Same double-dispatch guard `maybe_respond` takes — a sync tick may be
     // dispatching this very chat right now.
@@ -7909,20 +7967,26 @@ async fn send_message(
         // dispatch. Mirrors `maybe_respond`; both gates must use `turn_runs_here`.
         let local_only = state.is_local_only_ws(workspace_id);
         let solo = human_member_count(&session) <= 1;
-        if !turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id) {
+        let binding = host_binding(&responder.host_id, &state.local_host_id());
+        if !turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id, binding) {
             tracing::info!(
                 target: "dispatch",
                 responder = %responder.author,
                 owner = %responder.owner_actor_id,
+                host = %responder.host_id,
                 local = %local_actor_id,
-                "send_message: responder owned by another device — deferring"
+                "send_message: responder runs on another device or host — deferring"
             );
             // Bounded, not indefinite. If no device claims or answers the trigger
             // within DEFERRED_CLAIM_TIMEOUT, answer it here — otherwise an owner
             // no live device can satisfy means permanent silence. Only the initial
             // user turn is claimable; a cascaded turn (depth > 0) is a
             // single-device continuation with no trigger of its own to fall back on.
-            if depth == 0 {
+            // An agent sent to a host that is online is that host's work: no
+            // fallback, or a slow turn there would be answered twice.
+            let host_live = binding == HostBinding::Elsewhere
+                && host_online(&state, workspace_id, &responder.host_id);
+            if depth == 0 && !host_live {
                 arm_deferred_claim_fallback(&app, sid, workspace_id, trigger_id, stop.clone());
             }
             break;
@@ -8073,6 +8137,7 @@ async fn maybe_respond(
 ) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
     let local_actor_id = state.local_actor_id();
+    let local_host_id = state.local_host_id();
 
     // Decide whether there's an unanswered user message we own the response to.
     let plan: Option<(Uuid, Responder, Uuid)> = {
@@ -8096,7 +8161,8 @@ async fn maybe_respond(
         let local_only = state.is_local_only_ws(session.workspace_id);
         let solo = human_member_count(&session) <= 1;
         let runs_here = |responder: &Responder| {
-            turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id)
+            let binding = host_binding(&responder.host_id, &local_host_id);
+            turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id, binding)
         };
         match last {
             Some(m) if m.role == MessageRole::User => match dispatch_target(&m.body, &session, local_only) {
@@ -8115,7 +8181,7 @@ async fn maybe_respond(
                             responder = %responder.author,
                             owner = %responder.owner_actor_id,
                             local = %local_actor_id,
-                            "skipping turn: responder owned by another device"
+                            "skipping turn: responder runs on another device or host"
                         );
                     }
                     owns.then_some((session.workspace_id, responder, m.id))
@@ -13822,7 +13888,32 @@ mod per_workspace_dir_tests {
 
 #[cfg(test)]
 mod dispatch_ownership_tests {
-    use super::turn_runs_here;
+    use super::{host_binding, HostBinding};
+
+    /// The pre-host-binding gate: an agent on its owner's device.
+    fn turn_runs_here(local_only: bool, solo: bool, local: &str, owner: &str) -> bool {
+        super::turn_runs_here(local_only, solo, local, owner, HostBinding::Unbound)
+    }
+
+    #[test]
+    fn agent_sent_to_another_host_never_runs_here() {
+        // The double answer: a solo user's own agent, sent to the home host.
+        // Ownership and solo both say "here"; the binding says the host.
+        let elsewhere = host_binding("sff-device", "this-desktop");
+        assert_eq!(elsewhere, HostBinding::Elsewhere);
+        assert!(!super::turn_runs_here(false, true, "me", "me", elsewhere));
+        assert!(!super::turn_runs_here(false, false, "me", "me", elsewhere));
+        // Relay-less: nothing syncs to the host, so this device still answers.
+        assert!(super::turn_runs_here(true, false, "me", "me", elsewhere));
+    }
+
+    #[test]
+    fn agent_sent_to_this_device_runs_here() {
+        let here = host_binding("this-desktop", "this-desktop");
+        assert_eq!(here, HostBinding::ThisDevice);
+        assert!(super::turn_runs_here(false, false, "me", "teammate", here));
+        assert_eq!(host_binding("", "this-desktop"), HostBinding::Unbound);
+    }
 
     #[test]
     fn solo_workspace_always_runs_here_even_on_owner_mismatch() {

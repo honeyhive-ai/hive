@@ -439,7 +439,10 @@ async fn prepare_stage(
 
     // Remote-owned stage: dispatch it over the existing cross-device path by
     // posting a prompt that @mentions its agent, then wait for the reply.
-    if !crate::turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id) {
+    // An agent sent to another host runs there: a Remote stage, answered by
+    // that host's worker like any other mention.
+    let binding = crate::host_binding(&responder.host_id, &state.local_host_id());
+    if !crate::turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id, binding) {
         let prompt = format!(
             "{} **[Workflow · {} → {}]**\n\n{rendered}",
             stage_mention_token(agent.as_ref()),
