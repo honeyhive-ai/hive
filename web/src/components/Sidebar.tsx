@@ -8,6 +8,7 @@ import {
   createChannel,
   createChatInChannel,
   deleteChat,
+  renameChat,
   getAppSettings,
   getGitStatus,
   listAgents,
@@ -28,6 +29,7 @@ import { toast, errMsg } from "@/components/Toast";
 import { SkeletonRows } from "@/components/Skeleton";
 import { Avatar } from "@/components/Avatar";
 import { confirmDialog, promptDialog } from "@/components/Dialog";
+import { useContextMenu } from "@/components/ContextMenu";
 import { confirmThen } from "@/lib/confirm";
 import { groupProposals } from "@/lib/proposals";
 import { relTime } from "@/lib/time";
@@ -153,6 +155,7 @@ export function Sidebar({
   const [filter, setFilter] = useState<ChatFilter | null>(null);
   const [search, setSearch] = useState("");
   const [menuFor, setMenuFor] = useState<string | null>(null);
+  const chatCtx = useContextMenu();
   const menuAnchor = useRef<HTMLElement | null>(null);
   const [channelMenuFor, setChannelMenuFor] = useState<string | null>(null);
   const channelMenuAnchor = useRef<HTMLElement | null>(null);
@@ -335,6 +338,21 @@ export function Sidebar({
       qc.invalidateQueries({ queryKey: ["chats"] });
     } catch (e) {
       toast.error(`Couldn't ${c.archived ? "unarchive" : "archive"} chat: ${errMsg(e)}`);
+    }
+  }
+
+  async function handleRenameChat(c: ChatSummaryDto) {
+    setMenuFor(null);
+    const next = await promptDialog("Rename chat", {
+      placeholder: "Chat title",
+      defaultValue: c.title ?? "",
+    });
+    if (next === null || !next.trim()) return;
+    try {
+      await renameChat(c.id, next.trim());
+      qc.invalidateQueries({ queryKey: ["chats"] });
+    } catch (e) {
+      toast.error(`Couldn't rename chat: ${errMsg(e)}`);
     }
   }
 
@@ -592,6 +610,15 @@ export function Sidebar({
                     menuAnchor.current = el;
                     setMenuFor(c.id);
                   }}
+                  onContextMenu={(e) =>
+                    chatCtx.open(e, [
+                      { label: "Open", onClick: () => onSelect(c.id) },
+                      { label: "Rename…", onClick: () => void handleRenameChat(c) },
+                      { label: c.archived ? "Restore" : "Archive", onClick: () => void handleArchive(c) },
+                      { type: "separator" },
+                      { label: "Delete…", danger: true, onClick: () => void handleDelete(c) },
+                    ])
+                  }
                 />
               ))}
               {visible.length === 0 && search.trim() && (
@@ -791,10 +818,12 @@ export function Sidebar({
       {/* Chat options menu — one shared Popover for whichever row is open. */}
       {menuChat && (
         <Popover anchorRef={menuAnchor} align="right" minWidth={150} onDismiss={() => setMenuFor(null)}>
+          <PopoverItem label="Rename…" onSelect={() => handleRenameChat(menuChat)} />
           <PopoverItem label={menuChat.archived ? "Restore" : "Archive"} onSelect={() => handleArchive(menuChat)} />
           <PopoverItem label="Delete…" danger onSelect={() => handleDelete(menuChat)} />
         </Popover>
       )}
+      {chatCtx.menu}
 
       {/* Channel options menu — Rename / Archive (spec §11 rules 4, 7). */}
       {menuChannel && (

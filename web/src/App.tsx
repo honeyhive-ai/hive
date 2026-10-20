@@ -171,6 +171,21 @@ export function App() {
   useEffect(() => {
     window.localStorage.setItem("hive.sidebarVisible", sidebarVisible ? "1" : "0");
   }, [sidebarVisible]);
+  // Suppress the webview's default right-click menu (Reload/Inspect in dev; a bare
+  // menu in prod) on app chrome, so our own themed context menus are the only ones
+  // that appear. Text inputs / contenteditable keep the native menu (copy/paste),
+  // and any element that opens its own menu calls preventDefault first (this runs
+  // last, so it never double-fires).
+  useEffect(() => {
+    const onCtx = (e: MouseEvent) => {
+      if (e.defaultPrevented) return; // a component already handled it
+      const t = e.target as HTMLElement | null;
+      if (t?.closest("input, textarea, [contenteditable='true'], [contenteditable='']")) return;
+      e.preventDefault();
+    };
+    document.addEventListener("contextmenu", onCtx);
+    return () => document.removeEventListener("contextmenu", onCtx);
+  }, []);
   const [uiScale, setUiScale] = useState(loadUiScale);
   const [menuPaneWidth, setMenuPaneWidth] = useState(() =>
     loadPaneWidth(

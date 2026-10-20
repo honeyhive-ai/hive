@@ -14,6 +14,7 @@ import {
   shareAttachment,
   resolveAttachmentBlob,
   readImageDataUrl,
+  openExternal,
   readWorkspaceFile,
   listWorkspaceFiles,
   sendMessage,
@@ -31,6 +32,7 @@ import {
   type WorkspaceAgentDto,
 } from "@/lib/ipc";
 import { splitAttachments, fileBaseName, isImagePath, isImageType, type BlobAttachmentRef } from "@/lib/attachments";
+import { useContextMenu } from "@/components/ContextMenu";
 import { relTime, absTime, clockTime, dayKey, dayLabel } from "@/lib/time";
 import { PRIMARY_NAME, PRIMARY_HANDLE } from "@/lib/agent";
 import {
@@ -119,6 +121,7 @@ export function ChatView({
   // messageId → accumulated text. A Map (not a single slot) because workflow
   // fan-out streams several assistant messages into the chat concurrently.
   const [streams, setStreams] = useState<Map<string, string>>(new Map());
+  const msgCtx = useContextMenu();
   // Live, ephemeral "background processing" per streaming message: the tool
   // calls the agent (Claude Code) is making, their results, and whether it's
   // thinking. Fed into the generating bubble's tool cards; cleared when the turn
@@ -1056,6 +1059,23 @@ export function ChatView({
                   toolResults={m.toolResults}
                   onReact={handleReact}
                   onRegenerate={m.id === lastAssistantId && !sending && streams.size === 0 ? handleRegenerate : undefined}
+                  onContextMenu={(e) => {
+                    const canRegen = m.id === lastAssistantId && !sending && streams.size === 0;
+                    const { text } = splitAttachments(m.body);
+                    msgCtx.open(e, [
+                      { label: "Copy text", onClick: () => void navigator.clipboard?.writeText(text || m.body) },
+                      {
+                        label: "Copy as quote",
+                        onClick: () =>
+                          void navigator.clipboard?.writeText(
+                            (text || m.body).split("\n").map((l) => `> ${l}`).join("\n"),
+                          ),
+                      },
+                      ...(canRegen
+                        ? ([{ type: "separator" }, { label: "Regenerate", onClick: () => void handleRegenerate() }] as const)
+                        : []),
+                    ]);
+                  }}
                   />
                 </Fragment>
               );
@@ -1161,6 +1181,7 @@ export function ChatView({
             </div>
           )}
         </div>
+          {msgCtx.menu}
           {/* Scroll-to-newest. Shown whenever the reader is away from the bottom,
               not only when new content arrived — scrolling up to re-read
               something otherwise left no way back but dragging (lib/autoscroll).
@@ -1639,6 +1660,14 @@ export function extractFileRefs(body: string): string[] {
 function MessageBody({ body }: { body: string }) {
   const { text, paths, blobs } = splitAttachments(body);
   const fileRefs = extractFileRefs(text);
+  const attCtx = useContextMenu();
+  const attItems = (path: string): import("@/components/ContextMenu").MenuItemSpec[] => [
+    { label: "Open", onClick: () => editorStore.requestOpen(path) },
+    { label: "Open with default app", onClick: () => void openExternal(`file://${path}`) },
+    { type: "separator" },
+    { label: "Copy filename", onClick: () => void navigator.clipboard?.writeText(fileBaseName(path)) },
+    { label: "Copy path", onClick: () => void navigator.clipboard?.writeText(path) },
+  ];
   return (
     <>
       {text && <Markdown content={text} />}
@@ -1665,18 +1694,21 @@ function MessageBody({ body }: { body: string }) {
       )}
       {(paths.length > 0 || blobs.length > 0) && (
         <div className="mt-2 flex flex-wrap gap-2">
-          {paths.map((p, i) =>
-            isImagePath(p) ? (
-              <ImageAttachment key={`${p}-${i}`} path={p} />
-            ) : (
-              <AttachmentChip key={`${p}-${i}`} path={p} />
-            ),
-          )}
+          {paths.map((p, i) => (
+            <div key={`${p}-${i}`} onContextMenu={(e) => attCtx.open(e, attItems(p))}>
+              {isImagePath(p) ? <ImageAttachment path={p} /> : <AttachmentChip path={p} />}
+            </div>
+          ))}
           {blobs.map((b) => (
-            <BlobAttachment key={b.id} blob={b} />
+            <BlobAttachment
+              key={b.id}
+              blob={b}
+              onMenu={(e, path) => attCtx.open(e, attItems(path))}
+            />
           ))}
         </div>
       )}
+      {attCtx.menu}
     </>
   );
 }
@@ -1684,7 +1716,13 @@ function MessageBody({ body }: { body: string }) {
 /// A relay-shared attachment: resolves the blob reference to a local file (cache
 /// hit or download+decrypt), then renders it like a local attachment. Falls back
 /// to a filename chip while resolving or if it can't be fetched.
-function BlobAttachment({ blob }: { blob: BlobAttachmentRef }) {
+function BlobAttachment({
+  blob,
+  onMenu,
+}: {
+  blob: BlobAttachmentRef;
+  onMenu?: (e: React.MouseEvent, path: string) => void;
+}) {
   const resolved = useQuery({
     queryKey: ["blob-attachment", blob.id],
     queryFn: () => resolveAttachmentBlob(blob.id, blob.name),
@@ -1707,7 +1745,12 @@ function BlobAttachment({ blob }: { blob: BlobAttachmentRef }) {
       </span>
     );
   }
-  return isImage ? <ImageAttachment path={resolved.data} /> : <AttachmentChip path={resolved.data} />;
+  const path = resolved.data;
+  return (
+    <div onContextMenu={onMenu ? (e) => onMenu(e, path) : undefined}>
+      {isImage ? <ImageAttachment path={path} /> : <AttachmentChip path={path} />}
+    </div>
+  );
 }
 
 /// A filename chip for a non-image attachment (or an image not available locally).
@@ -1849,6 +1892,7 @@ const Bubble = memo(function Bubble({
   thinking = false,
   onReact,
   onRegenerate,
+  onContextMenu,
 }: {
   messageId?: string;
   role: string;
@@ -1877,6 +1921,7 @@ const Bubble = memo(function Bubble({
   thinking?: boolean;
   onReact?: (messageId: string, emoji: string) => void;
   onRegenerate?: () => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
 }) {
   // One formatter, one timezone (§F3): relative age in-thread, absolute local
   // time on hover. `relTime`/`absTime` normalize a designator-less timestamp to
@@ -1959,7 +2004,7 @@ const Bubble = memo(function Bubble({
     // Left-aligned turn row: a whisper of tint + avatar shape carry identity.
     // `content-visibility: auto` lets the engine skip layout/paint for off-screen
     // rows — cheap virtualization for long logs.
-    <div className={`group tt ${kindClass}`} style={rowStyle}>
+    <div className={`group tt ${kindClass}`} style={rowStyle} onContextMenu={onContextMenu}>
       <div className="tt-av">
         <Avatar
           name={author}

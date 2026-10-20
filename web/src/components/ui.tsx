@@ -360,6 +360,7 @@ export function ChatRow({
   active = false,
   onClick,
   onOptions,
+  onContextMenu,
   menu,
   avatars,
   sub,
@@ -370,12 +371,13 @@ export function ChatRow({
   active?: boolean;
   onClick?: () => void;
   onOptions?: (anchor: HTMLElement) => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
   menu?: ReactNode;
   avatars?: ReactNode;
   sub?: ReactNode;
 }) {
   return (
-    <div className="group/crow relative">
+    <div className="group/crow relative" onContextMenu={onContextMenu}>
       <button
         onClick={onClick}
         className="flex min-h-[46px] w-full flex-col justify-center gap-[3px] rounded-xl px-2.5 py-1.5 text-left transition-colors hover:bg-[color:var(--hive-overlay)]"
