@@ -16,6 +16,7 @@ vi.mock("@/lib/ipc", () => ({
       isManaged: true,
       hasBearerToken: true,
       oauthConnected: false,
+      secretForOtherUrl: false,
     },
     {
       id: "linear",
@@ -25,7 +26,9 @@ vi.mock("@/lib/ipc", () => ({
       isManaged: true,
       hasBearerToken: false,
       oauthConnected: true,
+      secretForOtherUrl: false,
     },
+
     {
       id: "fs",
       transport: "stdio",
@@ -34,6 +37,7 @@ vi.mock("@/lib/ipc", () => ({
       isManaged: true,
       hasBearerToken: false,
       oauthConnected: false,
+      secretForOtherUrl: false,
     },
   ]),
   installMcpServer: vi.fn(async () => {}),
@@ -70,9 +74,29 @@ describe("ToolsSection bearer tokens", () => {
     renderSection();
     expect(await screen.findByText("· token set")).toBeTruthy();
     expect(screen.getByText("· connected")).toBeTruthy();
+    expect(screen.queryByText("· token saved for a different URL")).toBeNull();
     // Token controls only on HTTP servers.
     expect(screen.getByRole("button", { name: "Clear token" })).toBeTruthy();
     expect(screen.getAllByRole("button", { name: "Set token" })).toHaveLength(1);
+  });
+
+  it("flags a token saved for a different URL under the same id", async () => {
+    vi.mocked(ipc.listMcpServers).mockResolvedValueOnce([
+      {
+        id: "docs",
+        transport: "http",
+        detail: "https://elsewhere.example/mcp",
+        enabled: true,
+        isManaged: true,
+        hasBearerToken: true,
+        oauthConnected: false,
+        secretForOtherUrl: true,
+      },
+    ]);
+    renderSection();
+    expect(await screen.findByText("· token saved for a different URL")).toBeTruthy();
+    // It can still be cleared or replaced.
+    expect(screen.getByRole("button", { name: "Clear token" })).toBeTruthy();
   });
 
   it("adds an HTTP server with a password-type bearer field", async () => {
