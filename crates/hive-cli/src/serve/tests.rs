@@ -318,6 +318,25 @@ async fn empty_workspace_lists_are_empty_not_404() {
     handle.shutdown();
 }
 
+/// The phone's URLSession only returns the response once body bytes arrive, so
+/// a quiet event stream must send something at once — not wait for the 15 s
+/// heartbeat (the app showed "Connecting" that long after every connect).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn event_stream_sends_bytes_immediately() {
+    let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let h = harness(&endpoint, "m", &[("README.md", "x\n")]).await;
+    let resp = h.client.get(format!("{}/v1/events", h.base)).bearer_auth(&h.token).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.bytes_stream();
+    let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+        .await
+        .expect("a first frame within 2 s")
+        .expect("stream open")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first).starts_with(':'), "an SSE comment: {first:?}");
+    h.handle.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn auth_is_required_except_for_bare_health() {
     let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;

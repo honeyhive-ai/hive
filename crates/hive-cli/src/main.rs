@@ -275,6 +275,51 @@ fn cmd_chats(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// `hive proposals` — every proposal in the workspace's chats, newest first,
+/// with its status and the votes cast on it (who, at what role).
+fn cmd_proposals(cfg: &Config) -> Result<()> {
+    let svc = open_service(cfg)?;
+    let ws = uuid_of_room(&cfg.room);
+    let mut rows = Vec::new();
+    for id in svc.store().list_session_ids()? {
+        if id == workspace_config_session_id(ws) {
+            continue;
+        }
+        let Some(s) = svc.load(id)? else { continue };
+        if s.workspace_id != ws || id == workspace_config_session_id(s.workspace_id) {
+            continue;
+        }
+        for p in &s.proposals {
+            let name_of = |actor: &str| {
+                s.members
+                    .iter()
+                    .find(|m| m.id == actor)
+                    .map(|m| m.actor.display_name.clone())
+                    .unwrap_or_else(|| actor.to_string())
+            };
+            let votes: Vec<String> = p
+                .approvals
+                .iter()
+                .map(|a| format!("{} {} ({:?})", if a.approved { "+" } else { "-" }, name_of(&a.actor_id), a.role))
+                .collect();
+            let status = format!("{:?}", p.status).to_lowercase();
+            let mut line = format!("{}  {:<9} {}  [chat {}]", p.id, status, truncate(&p.title, 48), s.id);
+            if !votes.is_empty() {
+                line.push_str(&format!("\n    votes: {}", votes.join(", ")));
+            }
+            rows.push((p.created_at, line));
+        }
+    }
+    if rows.is_empty() {
+        println!("(no proposals)");
+    }
+    rows.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
+    for (_, line) in rows {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn print_transcript(svc: &ChatService, chat_id: Uuid, from: usize) -> Result<usize> {
     let Some(s) = svc.load(chat_id)? else {
         bail!("unknown chat {chat_id}");
@@ -389,7 +434,10 @@ fn provider_kind(s: &str) -> Result<ModelProviderKind> {
         "openai" => ModelProviderKind::OpenAI,
         "openrouter" => ModelProviderKind::OpenRouter,
         "ollama" => ModelProviderKind::Ollama,
-        other => bail!("unknown provider '{other}' (anthropic|openai|openrouter|ollama)"),
+        // Any OpenAI-compatible server (a llama.cpp gateway): keyless when the
+        // endpoint is local / LAN / tailnet, and runs the agent tool loop.
+        "custom" => ModelProviderKind::Custom,
+        other => bail!("unknown provider '{other}' (anthropic|openai|openrouter|ollama|custom)"),
     })
 }
 
@@ -928,6 +976,7 @@ fn usage() -> ! {
          hive hosts                     list workspace hosts (devices + workers)\n  \
          hive register-worker [--label <name>]   register this box as a worker host\n  \
          hive set-agent-host <agent> <host-id>   bind an agent to a host\n  \
+         hive proposals                 list the workspace's proposals with status + votes\n  \
          hive worker [--label <name>]   run the worker daemon (host detached agents, §12.4)\n  \
          hive queue                     show queued work (unanswered mentions + host status)\n  \
          hive serve [--listen ADDR] [--pair] [--token-file PATH] [--label NAME]\n                                       \
@@ -946,6 +995,13 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
+/// Whether the command line asks for help (`-h` / `--help` / `help` anywhere
+/// before a `--` separator).
+fn wants_help(args: &[String]) -> bool {
+    args.first().is_some_and(|a| a == "help")
+        || args.iter().take_while(|a| *a != "--").any(|a| a == "--help" || a == "-h")
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("error: {e:#}");
@@ -958,6 +1014,11 @@ fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = &args[args.len().min(1)..];
+    // `hive <cmd> --help` prints usage instead of running the command (a bare
+    // `hive serve --help` used to start a real server on the default data dir).
+    if wants_help(&args) {
+        usage();
+    }
     let has = |flag: &str| rest.iter().any(|a| a == flag);
     let flag_val = |flag: &str| {
         rest.iter()
@@ -981,6 +1042,7 @@ fn run() -> Result<()> {
         "--ntfy-topic",
         "--public-url",
         "--name",
+        "--role",
     ];
     let mut positional: Vec<&String> = Vec::new();
     let mut skip = false;
@@ -1076,6 +1138,7 @@ fn run() -> Result<()> {
             _ => bail!("usage: hive config <export|import <file.toml>>"),
         },
         "agents" => cmd_agents(&cfg),
+        "proposals" => cmd_proposals(&cfg),
         "add-agent" => {
             if positional.len() < 2 {
                 bail!("usage: hive add-agent <name> <runtime-id> [--host <id>] [--role <role>]");
@@ -1137,5 +1200,30 @@ fn run() -> Result<()> {
             rt()?.block_on(cmd_agent(&cfg, name, runtime_id))
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn argv(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn help_flags_never_run_the_command() {
+        assert!(wants_help(&argv(&["serve", "--help"])));
+        assert!(wants_help(&argv(&["serve", "-h"])));
+        assert!(wants_help(&argv(&["help"])));
+        assert!(!wants_help(&argv(&["serve", "--pair"])));
+        assert!(!wants_help(&argv(&["send", "c", "--", "--help"])));
+    }
+
+    #[test]
+    fn custom_provider_is_accepted() {
+        assert_eq!(provider_kind("custom").unwrap(), ModelProviderKind::Custom);
+        assert_eq!(provider_kind("Custom").unwrap(), ModelProviderKind::Custom);
+        assert!(provider_kind("nope").is_err());
     }
 }

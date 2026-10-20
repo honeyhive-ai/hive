@@ -628,7 +628,11 @@ fn to_event(ev: super::hub::SseEvent) -> Event {
 async fn events(State(s): S, headers: HeaderMap) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let last = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
     let (backlog, rx) = s.hub.subscribe(last);
-    let backlog = stream::iter(backlog.into_iter().map(|e| Ok(to_event(e))));
+    // Open with a comment so the client sees body bytes at once: URLSession
+    // (the phone) doesn't hand back the response until the first body byte, so
+    // without this a quiet stream looked "connecting" until the 15 s heartbeat.
+    let hello = stream::once(async { Ok(Event::default().comment("connected")) });
+    let backlog = hello.chain(stream::iter(backlog.into_iter().map(|e| Ok(to_event(e)))));
     let live = stream::unfold(rx, |mut rx| async move {
         loop {
             match rx.recv().await {
