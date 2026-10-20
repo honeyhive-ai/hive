@@ -212,18 +212,24 @@ impl Shared {
 
     /// Diff the projection against the last look and publish the difference
     /// (SSE events, plus ntfy for finished agent replies and new proposals).
+    ///
+    /// The sync loop, the worker thread and API handlers all call this. The
+    /// projection is loaded while holding the differ lock, so each diff runs on
+    /// a snapshot at least as new as the one before it; loading first let a
+    /// slow caller diff a stale snapshot after a newer one, rolling the differ
+    /// back and re-emitting `message.done` (and its ntfy push).
     pub fn refresh(&self) {
-        let sessions = match self.workspace_chats() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("serve: refresh failed: {e}");
-                return;
-            }
-        };
         let me = self.my_actor_id();
         let mut notices = Vec::new();
         {
             let mut differ = self.differ.lock().unwrap_or_else(|e| e.into_inner());
+            let sessions = match self.workspace_chats() {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("serve: refresh failed: {e}");
+                    return;
+                }
+            };
             for change in differ.diff(&sessions) {
                 use hub::Change;
                 match change {

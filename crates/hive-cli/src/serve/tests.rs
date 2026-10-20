@@ -691,6 +691,52 @@ async fn restart_finishes_a_reply_cut_off_mid_stream() {
     again.shutdown();
 }
 
+/// refresh() runs at once from the sync loop, the worker and API handlers. A
+/// refresh that loaded its projection before a newer one was diffed must not
+/// roll the differ back, or the next refresh re-emits message.done (and a
+/// second ntfy push). Deterministic: the test holds the differ lock while a
+/// refresh is in flight and advances the differ itself in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stale_refresh_never_rolls_the_differ_back() {
+    let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let h = harness(&endpoint, "m", &[("README.md", "x\n")]).await;
+    let chat = h.send(reqwest::Method::POST, "/v1/chats", None).await;
+    let chat_id = Uuid::parse_str(chat["chat"]["id"].as_str().unwrap()).unwrap();
+    let shared = h.handle.shared.clone();
+    let ws = shared.ws;
+    let mid = shared
+        .lock()
+        .begin_assistant_message(chat_id, ws, "coder".to_string(), "gw".to_string(), Some(h.agent_id), None)
+        .unwrap();
+    shared.refresh(); // the differ knows the reply is streaming
+
+    let (_, mut rx) = shared.hub.subscribe(None);
+    let guard = shared.differ.lock().unwrap();
+    // A: a refresh that starts while the reply is still streaming.
+    let slow = {
+        let shared = shared.clone();
+        std::thread::spawn(move || shared.refresh())
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    // The reply completes and a newer refresh diffs it first.
+    shared.lock().complete_assistant_message(chat_id, ws, mid, "done").unwrap();
+    let mut differ = guard;
+    let changes = differ.diff(&shared.workspace_chats().unwrap());
+    assert!(changes.contains(&hub::Change::MessageDone { chat: chat_id, message: mid }));
+    drop(differ);
+    slow.join().unwrap();
+    shared.refresh();
+
+    let mut repeats = 0;
+    while let Ok(ev) = rx.try_recv() {
+        if ev.name == "message.done" && ev.data["message"]["id"] == json!(mid) {
+            repeats += 1;
+        }
+    }
+    assert_eq!(repeats, 0, "message.done was emitted again after the differ had seen it");
+    h.handle.shutdown();
+}
+
 #[test]
 fn serve_options_refuse_public_binds_and_need_both_ntfy_parts() {
     let cfg = Config {
