@@ -1,6 +1,6 @@
 {
-  "tag": "v1.15.0",
-  "name": "Hive 1.15.0",
+  "tag": "v1.15.1",
+  "name": "Hive 1.15.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Run coding agents fully offline on local models: Custom and Ollama runtimes get a real agent tool loop with built-in file tools and MCP, each turn's edits isolated in a worktree for review, cache-friendly compaction, model-family profiles, Vault retrieval and a Quick tasks model. HTTP MCP servers accept static bearer tokens stored on-device. New `hive serve` home-host mode (HTTP + SSE API, worker, push notifications) with an experimental self-built iOS client. Note: saved MCP OAuth connections need reconnecting once."
+  "notes": "Fixes: a timed-out run_command now stops the command and everything it started on Linux too (previously its child processes kept running), and TLS certificate dependencies are updated for security advisories (rustls-webpki, webpki-roots)."
 }
