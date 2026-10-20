@@ -49,6 +49,20 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
     Ok(token)
 }
 
+/// Read the token `hive serve` already created at `path`. `hive pair` must
+/// not mint one: a fresh token in the wrong data dir pairs the phone with a
+/// token the running server has never seen.
+pub fn load_existing_token(path: &Path) -> Result<String> {
+    let t = std::fs::read_to_string(path).map(|s| s.trim().to_string()).unwrap_or_default();
+    if t.is_empty() {
+        bail!(
+            "no serve token at {}: start `hive serve` first, or point HIVE_DATA_DIR / --token-file at the server's data dir",
+            path.display()
+        );
+    }
+    Ok(t)
+}
+
 /// Constant-time token comparison (no early exit on the first differing byte).
 pub fn token_matches(expected: &str, given: &str) -> bool {
     let (a, b) = (expected.as_bytes(), given.as_bytes());
@@ -74,6 +88,18 @@ pub fn bind_allowed(ip: IpAddr) -> bool {
 /// The base URL the phone should use for a server listening on `addr`.
 pub fn default_server_url(addr: SocketAddr) -> String {
     format!("http://{addr}")
+}
+
+/// Whether a phone could never reach `server_url` because it names the
+/// loopback interface (on the phone that is the phone itself).
+pub fn is_loopback_url(server_url: &str) -> bool {
+    let rest = server_url.split_once("://").map_or(server_url, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Render `text` as a QR code for a terminal: two module rows per text line
@@ -125,6 +151,26 @@ mod tests {
         assert_eq!(String::from_utf8(decoded).unwrap(), "http://100.101.102.104:8787");
         assert_eq!(token.as_deref(), Some("abc123"));
         assert!(!link.contains('='.to_string().repeat(2).as_str()), "no base64 padding");
+    }
+
+    #[test]
+    fn loopback_urls_are_unreachable_from_a_phone() {
+        for u in ["http://127.0.0.1:8787", "http://localhost:8787/", "http://[::1]:8787", "http://127.1.2.3"] {
+            assert!(is_loopback_url(u), "{u}");
+        }
+        for u in ["http://100.101.102.104:8787", "http://192.168.1.20:8787", "https://hive.example.ts.net", "http://[fd7a:115c:a1e0::1]:8787"] {
+            assert!(!is_loopback_url(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn pair_never_mints_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("serve.token");
+        assert!(load_existing_token(&p).is_err());
+        assert!(!p.exists());
+        let t = load_or_create_token(&p).unwrap();
+        assert_eq!(load_existing_token(&p).unwrap(), t);
     }
 
     #[test]

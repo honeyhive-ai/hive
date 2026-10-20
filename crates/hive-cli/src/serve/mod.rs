@@ -562,6 +562,14 @@ pub fn cmd_serve(cfg: Config, opts: ServeOptions) -> Result<()> {
 /// `hive pair` — show the pairing code for a configured (possibly already
 /// running) `hive serve`, without starting one.
 pub fn cmd_pair(opts: &ServeOptions) -> Result<()> {
-    let token = pair::load_or_create_token(&opts.token_file)?;
-    print_pairing(&opts.server_url(), &token)
+    let url = opts.server_url();
+    if pair::is_loopback_url(&url) {
+        anyhow::bail!(
+            "the pairing link would point the phone at {url}, which on the phone is the phone itself. \
+             Run with the server's settings (HIVE_SERVE_LISTEN / HIVE_DATA_DIR, e.g. from its env file), \
+             or pass --listen <tailnet-ip:port> or --public-url <url>"
+        );
+    }
+    let token = pair::load_existing_token(&opts.token_file)?;
+    print_pairing(&url, &token)
 }
