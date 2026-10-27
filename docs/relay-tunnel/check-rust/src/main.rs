@@ -136,4 +136,30 @@ fn main() {
     ini.write_message(b"{\"v\":1}", &mut buf).unwrap();
     assert!(ini.read_message(&h(&neg["sessionMsg2TamperedHex"]), &mut out).is_err(), "tampered msg2 must fail");
     println!("ok: negative vectors rejected");
+    check_all_zero_dh(&keys["phoneStaticPrivHex"], &s["protocol"], &s["prologueHex"]);
+}
+
+/// Spec 7.1: an all-zero DH output (low-order peer key) MUST abort the
+/// handshake. snow 0.9.6's default resolver does NOT do this: a handshake
+/// against an all-zero peer static writes msg1 without error. Implementations
+/// MUST check every DH result themselves; this shows the hazard and the check.
+fn check_all_zero_dh(priv_hex: &Value, proto: &Value, prologue_hex: &Value) {
+    let k = h(priv_hex);
+    let mut ini = snow::Builder::new(proto.as_str().unwrap().parse().unwrap())
+        .local_private_key(&k)
+        .remote_public_key(&[0u8; 32])
+        .prologue(&h(prologue_hex))
+        .build_initiator()
+        .unwrap();
+    let mut buf = vec![0u8; 65535];
+    let unchecked = ini.write_message(b"{\"v\":1}", &mut buf).is_ok();
+    // The check every implementation needs: refuse a non-contributory DH.
+    let secret = x25519_dalek::StaticSecret::from(<[u8; 32]>::try_from(k).unwrap());
+    let shared = secret.diffie_hellman(&x25519_dalek::PublicKey::from([0u8; 32]));
+    assert!(shared.as_bytes().iter().all(|b| *b == 0) && !shared.was_contributory(), "DH with a zero point is all-zero");
+    if unchecked {
+        println!("ok: all-zero DH detected (note: this snow accepts it unchecked; implementations MUST check)");
+    } else {
+        println!("ok: all-zero DH detected (this snow rejects it itself)");
+    }
 }

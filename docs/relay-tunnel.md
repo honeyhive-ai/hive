@@ -182,7 +182,8 @@ gives `unauthorized` (4001), except where noted:
 4. The claims parse. `hid`, `pid` and `pk` are present and well-formed
    (`pk` is 32 bytes). No duplicate keys.
 5. `iat ≤ now + 300`, `exp > now` (else `credential_expired` 4002), and
-   `exp − iat ≤ 400 days` (relay cap).
+   `exp − iat ≤ 400 days` (relay cap). The comparison is strict and has no
+   skew allowance: a credential whose `exp` equals `now` is expired.
 6. `(hid, pid)` isn't revoked (else `revoked` 4003).
 
 The host issues credentials with `exp = iat + 90 days` by default. Renewal is
@@ -202,7 +203,11 @@ URL.
   bytes; above that, the relay closes with code 1009.
 - **Errors:** before closing, the relay sends
   `{"t":"error","code":"<code>","message":"<human text>"}` and then a close
-  frame with the matching close code from §12 (reason = `code`).
+  frame with the matching close code from §12 (reason = `code`). The relay
+  sends at most one `error` text frame per connection, and MAY send it even
+  after `ready` (it is the only text frame allowed in that direction then).
+  Clients MUST treat the close code as authoritative and the `error` frame as
+  optional, since it can be lost when the socket closes.
 - Unknown `t` values MUST be ignored by both peers.
 
 ### 6.0 Discovery: `GET /v1/tunnel/info` (plain HTTPS)
@@ -316,6 +321,13 @@ The relay checks that an open window with that `eid` exists for the host, that
 5 attempts. The host status may be `pending`. Then it runs steps 4, 5, 7 and 8
 of §6.4.1 with `open{mode:"enroll", eid}`.
 
+A missing, expired, closed (`enrollClose`) or used-up window (more than 5
+attempts), a wrong tag, and a malformed `enroll` all close with
+`unauthorized` (4001). The relay can't tell these apart for the phone without
+helping an attacker probe windows, so the phone MUST NOT present 4001 during
+enrollment as "re-pair" or "bad credential". It presents **"pairing code
+expired or already used"** and asks the owner to run `hive pair` again.
+
 The relay MUST cap an enrollment-mode splice at 5 minutes and 4 MiB in total,
 so a `pending` host can't use enrollment as a free tunnel. The phone then
 reconnects in session mode.
@@ -360,6 +372,15 @@ reconnects in session mode.
 - **DH output:** an all-zero output (a low-order peer key) MUST abort the
   handshake.
 
+  > **Implementation note.** Not every Noise library does this for you.
+  > `snow` 0.9.6's default X25519 resolver does **not** reject an all-zero DH
+  > output: a handshake against a low-order key completes. Implementations
+  > MUST check every DH result themselves (in Rust, wrap the resolver's `Dh`
+  > and fail with `snow::Error::Dh` when the output is 32 zero bytes; in
+  > Swift, CryptoKit's `sharedSecretFromKeyAgreement` must be checked the same
+  > way). [`check-rust`](relay-tunnel/check-rust/src/main.rs) demonstrates the
+  > hazard and the check.
+
 Why IK: the phone always knows the host key, so the handshake takes one round
 trip. Both statics are authenticated, and the phone's static is encrypted on
 the wire. Why `psk1` for enrollment: the psk is mixed into message 1, so the
@@ -382,8 +403,11 @@ Host rules:
   different static on a later attempt is rejected.
 - **E3.** The host creates the record `{pid, name, authPub = pk, staticPub,
   pushKey = HKDF(h,"push-key",32), enrolledAt}`, where `h` is the final
-  handshake hash. It issues `cred` for `pk`. If the static is already paired,
-  the existing record is replaced and keeps its `pid`.
+  handshake hash. It issues `cred` for `pk`. If the static is already paired
+  to an **active** record, that record is replaced and keeps its `pid`. If
+  the only record with that static was revoked, the phone gets a **new**
+  `pid`: the revoked `pid` stays revoked at the relay until its `exp` (§13.2),
+  so reusing it would lock the re-paired phone out.
 - **E4.** The record becomes **active** only when the first valid transport
   message from the phone arrives. Only then does the host consume `ps` and
   send `enrollClose`. A replayed msg1 (for example, from the relay) can't
@@ -455,7 +479,11 @@ Each Noise transport plaintext is **exactly one frame**:
   window is 262 144 bytes. DATA payload bytes consume it; WINDOW adds to it.
   Heads and control frames aren't counted. A receiver SHOULD send WINDOW once
   it has consumed half the window. DATA beyond the window gets RESET
-  `flow_control`. There's no session-level window: the transport's ordered
+  `flow_control`. A sender MAY split a body into DATA frames of any size
+  from 1 byte up to 16 384 bytes to fit the remaining window; it MUST NOT send
+  an empty DATA frame and waits for WINDOW when the window is 0. A WINDOW that
+  would raise the send window above 2³¹−1 is a flow-control error: the
+  receiver of that WINDOW sends RESET `flow_control` on the stream. There's no session-level window: the transport's ordered
   backpressure (§6.5) bounds the total.
 - **Limits.** At most 32 concurrent open streams per session. An OPEN beyond
   that gets RESET `refused`.
@@ -481,6 +509,9 @@ Response head (RESPONSE):
 {"status":200,"headers":[["content-type","text/event-stream"]]}
 ```
 
+- `path` is the request target: the path **and the query string**, if any
+  (`/v1/events?since=42`), percent-encoded as in an HTTP/1.1 request line.
+  There is no separate query member and no fragment.
 - Header names are lowercase. Repeated names are allowed. Values are strings.
 - Hop-by-hop headers (`connection`, `keep-alive`, `transfer-encoding`, `te`,
   `upgrade`, `host`, `proxy-*`) MUST NOT be sent and MUST be dropped on
@@ -519,8 +550,8 @@ are unchanged.
 | What | Value |
 |---|---|
 | Relay WebSocket ping | every 20 s on every tunnel socket. A peer silent (no frame, no pong) for 60 s is closed (`timeout`) |
-| Phone end-to-end PING | when nothing has been received for 25 s. No PONG within 10 s → drop the session and reconnect. This detects a relay that black-holes traffic |
-| Host idle | close a session after 90 s with no frame from the phone |
+| End-to-end PING | either side PINGs once it has received nothing **and** sent nothing for 25 s (the phone MUST; the host MAY, since its idle rule below covers it). No PONG within 10 s → drop the session (the phone reconnects). This detects a relay that black-holes traffic. Both sides MUST answer PING with PONG |
+| Host idle | close a session with GOAWAY `normal` after 90 s with no frame from the phone, **only while it has no open streams**. An open SSE stream is not idle |
 | Handshake | must complete within 10 s of `ready` (both ends) |
 | `hello` / `auth` after challenge | 10 s |
 | `open` → accept attached | 10 s |
@@ -571,6 +602,7 @@ Relay close codes, sent with `{"t":"error","code":…}` first:
 | 4026 | `unsupported_version` | `v` not supported | update the app or host |
 | 4029 | `rate_limited` | §11 | back off ≥ 30 s |
 | 1009 | (WS standard) | message too big | bug |
+| 1011 | `internal` (WS standard) | relay-side failure, e.g. its store is unreachable | treat like 4011: retry with backoff |
 
 Mux RESET codes: 0 `cancel`, 1 `refused`, 2 `protocol`, 3 `flow_control`,
 4 `internal`.
@@ -579,6 +611,48 @@ GOAWAY codes: 0 `normal`, 1 `revoked`, 2 `protocol`, 3 `lifetime`,
 4 `shutting_down`.
 
 HTTP status codes inside streams are the API's own ([ios-app.md](ios-app.md)).
+
+### 12.1 Relay behaviour where v1 was silent
+
+The reference relay ([`honeyhive-ai/relay`](https://github.com/honeyhive-ai/relay),
+Go) made these choices where the text above didn't decide. Other relays
+SHOULD behave the same, and clients MUST tolerate them:
+
+- **Store failure.** If the relay can't read or write its tunnel store while
+  admitting a host or phone, it closes with **1011** `internal`. A failing
+  `revoke` or `deregister` write is acked `ok:false, code:"internal"`, and the
+  host retries.
+- **Enrollment caps (§6.4.2).** When an enrollment-mode splice reaches its
+  time cap, both sides are closed with **4012** `timeout`; at its byte cap,
+  with **4029** `rate_limited`. Either way the phone reconnects in session
+  mode with the credential it just received.
+- **Enrollment window acks.** `enroll` is acked `ok:false` with
+  `window_too_long` (`exp` beyond now + 15 min, past skew), `expired` (`exp`
+  not in the future), `rate_limited` (2 windows already open) or `protocol`
+  (malformed). Re-sending an open `eid` updates it and keeps its attempt count.
+- **Deregister.** The relay forgets the host and closes its live phone
+  sessions with **4004** `host_unknown`, acks, then closes the control
+  connection with 1000. Later connects for that `host_id` get 4004 until it
+  registers again.
+- **Admission policy.** A host the policy doesn't admit (for example, not on
+  the `allowlist`, or `Register` refused) is closed with **4001**
+  `unauthorized` on the control connection; a host stops on 4001 (§12). A
+  phone enrolling with such a host gets 4006.
+- **Version.** A `hello` with `v` missing is treated like an unsupported `v`:
+  **4026**.
+- **Bad `host` parameter.** A `connect` whose `host` isn't a well-formed
+  `host_id` gets 4004.
+- **Close-code passthrough (§6.5).** 1000 and 1001 pass through as 1000.
+  Codes 3000–4999 and 1002, 1003, 1007, 1008, 1009 and 1011 pass through with
+  their reason. Anything else, including a connection dropped without a close
+  frame, is relayed as 1000. A message over the size limit closes the sender
+  with 1009 and the other side with 1009.
+- **Times.** `exp > now` checks are strict (`exp == now` is expired). A
+  `revoke` whose `exp` is already past isn't stored, but the phone's push
+  token is still deleted and its live splices are still closed with 4003.
+- **Error frame.** The relay sends at most one `{"t":"error"}` text frame
+  before a close, including on a spliced connection after `ready`. It is
+  advisory; the close code decides.
 
 ## 13. Renewal and revocation
 
@@ -704,6 +778,23 @@ instance, or route `/v1/tunnel/connect?host=H` and `/v1/tunnel/accept` to the
 instance that holds H's control connection. On Fly that can be `fly-replay`
 from a Postgres `host_id → machine` row. That's a later phase, and the wire
 protocol doesn't change.
+
+### 15.5 Applying a policy change at once (optional)
+
+The relay caches `TunnelPolicy.Status` for up to 60 s, so by default a
+change (a purchase bound to a host, a subscription that lapsed, a refund, an
+operator editing an allowlist) takes effect within a minute. An operator
+whose policy changes out of band can call
+
+```go
+func (s *Server) RefreshTunnelStatus(hostID string)
+```
+
+after the change. It drops the cached status, so the next phone connect asks
+the policy again, and re-checks a connected host at once, sending it
+`{"t":"status"}` if the status changed. It's a no-op when the tunnel is off,
+safe from any goroutine, and doesn't change the wire protocol. A hosted build
+calls it right after binding or unbinding a subscription.
 
 ## 16. Host changes (`hive serve`), summary
 
