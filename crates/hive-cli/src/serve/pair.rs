@@ -49,6 +49,14 @@ pub fn load_or_create_token(path: &Path) -> Result<String> {
     Ok(token)
 }
 
+/// Replace the token at `path` with a fresh one (0600). `hive phones revoke`
+/// does this by default, because a stolen phone holds the token too; a
+/// running `hive serve` picks the new one up within seconds.
+pub fn rotate_token(path: &Path) -> Result<String> {
+    std::fs::write(path, b"").with_context(|| format!("clearing {}", path.display()))?;
+    load_or_create_token(path)
+}
+
 /// Read the token `hive serve` already created at `path`. `hive pair` must
 /// not mint one: a fresh token in the wrong data dir pairs the phone with a
 /// token the running server has never seen.

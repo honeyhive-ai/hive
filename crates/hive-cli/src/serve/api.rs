@@ -28,6 +28,7 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
+use super::tunnel::TunnelPeer;
 use super::{lab, pair, Shared};
 
 type S = State<Arc<Shared>>;
@@ -198,7 +199,16 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 async fn auth(State(s): S, mut req: Request, next: Next) -> Response {
-    let ok = bearer(req.headers()).is_some_and(|t| pair::token_matches(&s.token, t));
+    // Through the relay tunnel (§9): the phone proved its Noise static; re-check
+    // on every request that it is still paired, so a revocation bites at once.
+    if let Some(peer) = req.extensions().get::<TunnelPeer>() {
+        if !s.tunnel.as_ref().is_some_and(|t| t.registry.is_active(&peer.pid)) {
+            return ApiError(StatusCode::UNAUTHORIZED, "this phone's pairing was revoked".into()).into_response();
+        }
+        req.extensions_mut().insert(Authorized(true));
+        return next.run(req).await;
+    }
+    let ok = bearer(req.headers()).is_some_and(|t| pair::token_matches(&s.token(), t));
     if !ok && req.uri().path() != "/v1/health" {
         return ApiError(StatusCode::UNAUTHORIZED, "missing or invalid bearer token".into()).into_response();
     }
@@ -219,6 +229,8 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/proposals/:id/reject", post(reject_proposal))
         .route("/v1/lab/status", get(lab_status))
         .route("/v1/events", get(events))
+        .route("/v1/tunnel/credential", post(tunnel_credential))
+        .route("/v1/tunnel/push", put(tunnel_push))
         .layer(middleware::from_fn_with_state(shared.clone(), auth))
         .with_state(shared)
 }
@@ -619,6 +631,36 @@ fn git_commit(dir: &std::path::Path, message: &str) -> Result<(), String> {
         return Err(format!("git commit: {}", text.trim()));
     }
     Ok(())
+}
+
+// ── Tunnel-only routes (§9): 404 unless the request came through the tunnel ──
+
+fn tunnel_phone(s: &Shared, peer: Option<Extension<TunnelPeer>>) -> ApiResult<(Arc<super::tunnel::TunnelHost>, super::tunnel::PhoneRecord)> {
+    let (Some(Extension(peer)), Some(t)) = (peer, s.tunnel.clone()) else { return Err(ApiError::not_found("route")) };
+    let rec = t.registry.get(&peer.pid).filter(|r| r.is_active()).ok_or_else(|| ApiError::not_found("phone"))?;
+    Ok((t, rec))
+}
+
+/// `POST /v1/tunnel/credential`: a fresh `hpc1` for the same pid and key (§13.1).
+async fn tunnel_credential(State(s): S, peer: Option<Extension<TunnelPeer>>) -> ApiResult<Json<Value>> {
+    let (t, rec) = tunnel_phone(&s, peer)?;
+    let pk: [u8; 32] = super::tunnel::b64u_fixed(&rec.auth_pub)?;
+    let (credential, exp) = super::tunnel::cred::issue(&t.keys, &rec.pid, &pk, super::tunnel::now());
+    t.registry.set_cred_exp(&rec.pid, exp)?;
+    Ok(Json(json!({ "credential": credential, "exp": exp })))
+}
+
+#[derive(Deserialize)]
+struct PushPref {
+    enabled: bool,
+}
+
+/// `PUT /v1/tunnel/push {"enabled": bool}`.
+async fn tunnel_push(State(s): S, peer: Option<Extension<TunnelPeer>>, body: Bytes) -> ApiResult<Json<Value>> {
+    let (t, rec) = tunnel_phone(&s, peer)?;
+    let pref: PushPref = serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?;
+    t.registry.set_push(&rec.pid, pref.enabled)?;
+    Ok(Json(json!({ "enabled": pref.enabled })))
 }
 
 async fn lab_status(State(s): S) -> Json<Value> {

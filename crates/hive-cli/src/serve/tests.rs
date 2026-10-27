@@ -192,12 +192,13 @@ async fn harness_with(
         default_agent: None,
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
+        remote: None,
     };
     let mut opts = opts;
     tweak(&mut opts);
     let handle = start(serve_cfg, opts).await.unwrap();
     let base = format!("http://{}", handle.addr);
-    let token = handle.shared.token.clone();
+    let token = handle.shared.token();
     Harness { _tmp: tmp, desktop, handle, base, token, client: reqwest::Client::new(), agent_id, ntfy }
 }
 
@@ -304,12 +305,13 @@ async fn empty_workspace_lists_are_empty_not_404() {
         default_agent: None,
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
+        remote: None,
     };
     let handle = start(config(&dir, &relay, &room), opts).await.unwrap();
     let base = format!("http://{}", handle.addr);
     let client = reqwest::Client::new();
     for (path, key) in [("/v1/agents", "agents"), ("/v1/hosts", "hosts"), ("/v1/chats", "chats"), ("/v1/proposals", "proposals")] {
-        let r = client.get(format!("{base}{path}")).bearer_auth(&handle.shared.token).send().await.unwrap();
+        let r = client.get(format!("{base}{path}")).bearer_auth(handle.shared.token()).send().await.unwrap();
         assert_eq!(r.status(), 200, "{path}");
         let v: Value = r.json().await.unwrap();
         assert!(v[key].is_array(), "{path}: {v}");
@@ -317,7 +319,7 @@ async fn empty_workspace_lists_are_empty_not_404() {
     assert_eq!(
         client
             .get(format!("{base}/v1/agents"))
-            .bearer_auth(&handle.shared.token)
+            .bearer_auth(handle.shared.token())
             .send()
             .await
             .unwrap()
@@ -679,7 +681,7 @@ async fn restart_finishes_a_reply_cut_off_mid_stream() {
     let msgs: Value = h
         .client
         .get(format!("{base}/v1/chats/{chat_id}/messages"))
-        .bearer_auth(&again.shared.token)
+        .bearer_auth(again.shared.token())
         .send()
         .await
         .unwrap()
@@ -826,3 +828,6 @@ async fn live_gateway_turn_reads_a_file() {
         h.handle.shutdown();
     }
 }
+
+#[path = "tunnel/e2e_tests.rs"]
+mod tunnel_e2e;

@@ -988,10 +988,14 @@ fn usage() -> ! {
          hive worker [--label <name>]   run the worker daemon (host detached agents, §12.4)\n  \
          hive queue                     show queued work (unanswered mentions + host status)\n  \
          hive serve [--listen ADDR] [--pair] [--token-file PATH] [--label NAME]\n                                       \
-         run the home host for the iOS app (sync + worker + HTTP/SSE API)\n  \
+         run the home host for the iOS app (sync + worker + HTTP/SSE API);\n                                       \
+         --remote-relay URL / HIVE_REMOTE_RELAY also serves it through a relay\n  \
          hive bind-repo <name|path> [--chat <id>] | --clear   bind a checkout for agent file tools\n  \
          hive repos                     show the repos dir and bindings\n  \
-         hive pair [--listen ADDR] [--public-url URL]   show the phone pairing QR code\n\n\
+         hive pair [--listen ADDR] [--public-url URL] [--relay-only]   show the phone pairing QR code\n  \
+         hive remote enable --relay URL [--reg-token T] | status | disable | reset\n                                       \
+         phone remote access through a relay tunnel (off by default)\n  \
+         hive phones list | revoke <pid|name> [--keep-token]   phones paired over the relay\n\n\
          Setup:\n  \
          hive enroll <hivews1:invite> [--token <hrt1>]   one-shot: save the workspace connection\n  \
          hive join <invite-code>        redeem a relay invite to self-enroll this box's identity\n  \
@@ -1051,6 +1055,9 @@ fn run() -> Result<()> {
         "--public-url",
         "--name",
         "--role",
+        "--relay",
+        "--reg-token",
+        "--remote-relay",
     ];
     let mut positional: Vec<&String> = Vec::new();
     let mut skip = false;
@@ -1179,6 +1186,13 @@ fn run() -> Result<()> {
                 flag_val("--name"),
                 has("--pair"),
             )?;
+            let mut opts = opts;
+            opts.remote = serve::tunnel::RelaySettings::resolve(
+                &cfg.data_dir,
+                flag_val("--remote-relay"),
+                flag_val("--reg-token"),
+                has("--insecure-relay"),
+            )?;
             serve::cmd_serve(cfg, opts)
         }
         "pair" => {
@@ -1193,7 +1207,38 @@ fn run() -> Result<()> {
                 None,
                 true,
             )?;
-            serve::cmd_pair(&opts)
+            let mut opts = opts;
+            opts.remote = serve::tunnel::RelaySettings::resolve(
+                &cfg.data_dir,
+                flag_val("--remote-relay"),
+                flag_val("--reg-token"),
+                has("--insecure-relay"),
+            )?;
+            serve::cmd_pair(&cfg.data_dir, &opts, has("--relay-only"))
+        }
+        "remote" => {
+            use serve::tunnel::cli;
+            match positional.first().map(|s| s.as_str()) {
+                Some("enable") => cli::remote_enable(&cfg.data_dir, flag_val("--relay"), flag_val("--reg-token"), has("--insecure-relay")),
+                Some("disable") => cli::remote_disable(&cfg.data_dir),
+                Some("status") | None => cli::remote_status(&cfg.data_dir),
+                Some("reset") => cli::remote_reset(&cfg.data_dir),
+                Some(other) => bail!("unknown `hive remote {other}`: use enable|status|disable|reset"),
+            }
+        }
+        "phones" => {
+            use serve::tunnel::cli;
+            match positional.first().map(|s| s.as_str()) {
+                Some("list") | None => cli::phones_list(&cfg.data_dir),
+                Some("revoke") => {
+                    let token_file = flag_val("--token-file")
+                        .or_else(|| env_opt("HIVE_SERVE_TOKEN_FILE"))
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| cfg.data_dir.join("serve.token"));
+                    cli::phones_revoke(&cfg.data_dir, positional.get(1).map(|s| s.as_str()), &token_file, has("--keep-token"))
+                }
+                Some(other) => bail!("unknown `hive phones {other}`: use list|revoke"),
+            }
         }
         "bind-repo" => repos::cmd_bind_repo(
             &cfg.data_dir,

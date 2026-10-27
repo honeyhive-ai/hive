@@ -129,6 +129,12 @@ it in the unit, because the journal would keep the token. To revoke the phone,
 delete `$HIVE_DATA_DIR/serve.token` and restart. A new token is generated, and
 you pair again.
 
+Optional, remote access without Tailscale: `hive remote enable --relay
+https://<relay>` (with the unit's env loaded), restart the unit, then `hive
+pair` prints a v2 link that also pairs over the relay. Phones paired that way
+are listed by `hive phones list` and revoked with `hive phones revoke <name>`.
+See [`docs/ios-app.md`](../../docs/ios-app.md#remote-access-through-a-relay-optional-off-by-default).
+
 ## Sending agents here
 
 From the phone, open **Agents**, pick an agent and choose this host

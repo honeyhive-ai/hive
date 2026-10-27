@@ -9,13 +9,15 @@
 //! 3. exposes a small JSON API + a Server-Sent Events stream to the phone,
 //!    bound to a loopback/LAN/tailnet address and gated by a bearer token
 //!    (`api.rs`; the contract is in `docs/ios-app.md`),
-//! 4. pushes notifications through a self-hosted ntfy (`ntfy.rs`).
+//! 4. pushes notifications through a self-hosted ntfy (`ntfy.rs`),
+//! 5. optionally keeps a relay tunnel open so the phone reaches the API
+//!    without a VPN (`tunnel/`, spec `docs/relay-tunnel.md`; off by default).
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -34,6 +36,7 @@ pub mod hub;
 pub mod lab;
 pub mod ntfy;
 pub mod pair;
+pub mod tunnel;
 
 #[cfg(test)]
 mod tests;
@@ -68,6 +71,8 @@ pub struct ServeOptions {
     pub apply_on_approve: bool,
     /// Relay sync cadence.
     pub sync_every: Duration,
+    /// Remote access through a relay tunnel (`None` = off, the default).
+    pub remote: Option<tunnel::RelaySettings>,
 }
 
 impl ServeOptions {
@@ -117,6 +122,7 @@ impl ServeOptions {
             default_agent: env_opt("HIVE_SERVE_DEFAULT_AGENT").map(|a| a.trim().trim_start_matches('@').to_string()),
             apply_on_approve: env_flag("HIVE_SERVE_APPLY_ON_APPROVE", false),
             sync_every: Duration::from_secs(3),
+            remote: None,
         })
     }
 
@@ -131,8 +137,10 @@ pub struct Shared {
     pub cfg: Config,
     pub opts: ServeOptions,
     pub ws: Uuid,
-    pub token: String,
+    token: RwLock<String>,
     pub host_id: String,
+    /// The relay tunnel, when remote access is enabled.
+    pub tunnel: Option<Arc<tunnel::TunnelHost>>,
     pub svc: Mutex<ChatService>,
     pub hub: hub::Hub,
     differ: Mutex<hub::Differ>,
@@ -155,6 +163,21 @@ fn state_path(cfg: &Config) -> PathBuf {
 impl Shared {
     pub fn lock(&self) -> MutexGuard<'_, ChatService> {
         self.svc.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The current direct-path bearer token (`hive phones revoke` rotates it).
+    pub fn token(&self) -> String {
+        self.token.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Re-read the token file; a rotated token takes effect at once.
+    fn reload_token(&self) {
+        let Ok(t) = std::fs::read_to_string(&self.opts.token_file) else { return };
+        let t = t.trim();
+        if t.len() >= 32 && *self.token.read().unwrap_or_else(|e| e.into_inner()) != t {
+            *self.token.write().unwrap_or_else(|e| e.into_inner()) = t.to_string();
+            println!("hive serve: the bearer token changed on disk; using the new one.");
+        }
     }
 
     pub fn stopping(&self) -> bool {
@@ -245,7 +268,7 @@ impl Shared {
                         let name = if done { "message.done" } else { "message.created" };
                         self.hub.emit(name, hub::wrap("message", api::message_dto(chat, m)));
                         if done && matches!(m.role, MessageRole::Assistant | MessageRole::Agent) && self.fresh(m.created_at) {
-                            notices.push(ntfy::reply_notice(&m.author, &s.title, chat, m.body.starts_with("[error]")));
+                            notices.push(("message.done", ntfy::reply_notice(&m.author, &s.title, chat, m.body.starts_with("[error]"))));
                         }
                     }
                     Change::ProposalCreated { chat, proposal } => {
@@ -253,7 +276,7 @@ impl Shared {
                         let Some(p) = s.proposals.iter().find(|p| p.id == proposal) else { continue };
                         self.hub.emit("proposal.created", hub::wrap("proposal", api::proposal_dto(s, p)));
                         if self.fresh(p.created_at) {
-                            notices.push(ntfy::proposal_notice(&p.title, &s.title, chat));
+                            notices.push(("proposal.created", ntfy::proposal_notice(&p.title, &s.title, chat)));
                         }
                     }
                     Change::ChatUpdated { chat } => {
@@ -264,8 +287,13 @@ impl Shared {
                 }
             }
         }
+        if let Some(t) = &self.tunnel {
+            for (kind, n) in &notices {
+                t.push_all(kind, Some(&n.chat_id.to_string()), &n.title, &n.body);
+            }
+        }
         if let Some(n) = self.opts.ntfy.clone() {
-            for notice in notices {
+            for (_, notice) in notices {
                 let n = n.clone();
                 let client = self.http.clone();
                 self.rt.spawn(async move { n.send(&client, &notice).await });
@@ -405,10 +433,15 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
     svc.register_host(ws, WorkspaceHost::new(host_id.clone(), HostKind::Worker, opts.label.clone()))
         .context("registering this box as a workspace host")?;
 
+    let tunnel = match &opts.remote {
+        Some(settings) => Some(tunnel::TunnelHost::open(&cfg.data_dir, settings.clone()).context("opening the relay tunnel state")?),
+        None => None,
+    };
     let shared = Arc::new(Shared {
         ws,
-        token,
+        token: RwLock::new(token),
         host_id,
+        tunnel,
         svc: Mutex::new(svc),
         hub: hub::Hub::new(),
         differ: Mutex::new(hub::Differ::default()),
@@ -453,9 +486,24 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
     if shared.cfg.relay_url.is_some() {
         tokio::spawn(sync_loop(shared.clone(), rx.clone()));
     }
+    tokio::spawn(token_watch(shared.clone(), rx.clone()));
+    if let Some(t) = shared.tunnel.clone() {
+        tokio::spawn(tunnel::pending_loop(t.clone(), rx.clone()));
+        tokio::spawn(tunnel::control::run(t, api::router(shared.clone()), rx.clone(), Default::default()));
+    }
     let worker = spawn_worker(shared.clone())?;
     shared.sync_kick.notify_one();
     Ok(ServeHandle { addr, shared, shutdown, worker: Mutex::new(Some(worker)) })
+}
+
+/// Pick up a token rotated by `hive phones revoke` (§13.2 step 4).
+async fn token_watch(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(tunnel::PENDING_POLL) => shared.reload_token(),
+            _ = stop.wait_for(|s| *s) => return,
+        }
+    }
 }
 
 /// Relay sync: every few seconds, and immediately after a local write.
@@ -522,13 +570,38 @@ fn spawn_worker(shared: Arc<Shared>) -> Result<std::thread::JoinHandle<()>> {
     })?)
 }
 
-/// Print the pairing QR code and link.
-pub fn print_pairing(server_url: &str, token: &str) -> Result<()> {
-    let link = pair::pairing_url(server_url, token);
+/// Print the pairing QR code and link. With remote access enabled the link is
+/// v2 (§4): it also opens a one-time enrollment window (10 min) that a
+/// running `hive serve` announces to the relay. `direct` = `None` prints a
+/// relay-only link (no `url`/`token`).
+pub fn print_pairing(data_dir: &std::path::Path, direct: Option<(&str, &str)>, remote: Option<&tunnel::RelaySettings>) -> Result<()> {
+    let link = match remote {
+        Some(r) => {
+            r.validate()?;
+            let dir = tunnel::tunnel_dir(data_dir);
+            let Some(keys) = tunnel::HostKeys::load(&dir)? else {
+                bail!(
+                    "remote access is enabled but there are no host keys in {}: run `hive remote enable` or start `hive serve` first",
+                    dir.display()
+                );
+            };
+            let (secret, exp) = tunnel::create_window(&dir, tunnel::PAIR_WINDOW_SECS)?;
+            tunnel::pairing_link_v2(direct, &keys, &r.relay, &secret.ps, exp)
+        }
+        None => {
+            let Some((url, token)) = direct else { bail!("nothing to pair: no direct URL and remote access is off") };
+            pair::pairing_url(url, token)
+        }
+    };
     println!("\nScan with the iPhone camera (or the Hive app) to pair:\n");
     print!("{}", pair::render_qr(&link)?);
     println!("\n{link}\n");
-    println!("This link carries the API token: share it only with your own phone.");
+    if direct.is_some() {
+        println!("This link carries the API token: share it only with your own phone.");
+    }
+    if remote.is_some() {
+        println!("The remote pairing secret in it works once, for 10 minutes, while `hive serve` is running.");
+    }
     Ok(())
 }
 
@@ -543,8 +616,13 @@ pub fn cmd_serve(cfg: Config, opts: ServeOptions) -> Result<()> {
             "hive serve: listening on http://{} — workspace '{}', host {} ('{}'). Ctrl-C to stop.",
             handle.addr, handle.shared.cfg.room, handle.shared.host_id, handle.shared.opts.label
         );
+        if let Some(t) = &handle.shared.tunnel {
+            println!("hive serve: remote access through {} (host id {}).", t.settings.relay, t.host_id());
+        }
         if pair_now {
-            print_pairing(&server_url, &handle.shared.token)?;
+            let token = handle.shared.token();
+            let direct = (!pair::is_loopback_url(&server_url) || handle.shared.tunnel.is_none()).then_some((server_url.as_str(), token.as_str()));
+            print_pairing(&handle.shared.cfg.data_dir, direct, handle.shared.opts.remote.as_ref())?;
         } else {
             println!("Run `hive pair` to show the phone pairing code.");
         }
@@ -561,8 +639,22 @@ pub fn cmd_serve(cfg: Config, opts: ServeOptions) -> Result<()> {
 
 /// `hive pair` — show the pairing code for a configured (possibly already
 /// running) `hive serve`, without starting one.
-pub fn cmd_pair(opts: &ServeOptions) -> Result<()> {
+pub fn cmd_pair(data_dir: &std::path::Path, opts: &ServeOptions, relay_only: bool) -> Result<()> {
     let url = opts.server_url();
+    if let Some(remote) = &opts.remote {
+        // A loopback direct URL is useless on the phone: the link goes relay-only.
+        if relay_only || pair::is_loopback_url(&url) {
+            if !relay_only {
+                println!("(The direct URL {url} is loopback; printing a relay-only link.)");
+            }
+            return print_pairing(data_dir, None, Some(remote));
+        }
+        let token = pair::load_existing_token(&opts.token_file)?;
+        return print_pairing(data_dir, Some((&url, &token)), Some(remote));
+    }
+    if relay_only {
+        bail!("--relay-only needs remote access: `hive remote enable --relay <url>` first");
+    }
     if pair::is_loopback_url(&url) {
         anyhow::bail!(
             "the pairing link would point the phone at {url}, which on the phone is the phone itself. \
@@ -571,5 +663,5 @@ pub fn cmd_pair(opts: &ServeOptions) -> Result<()> {
         );
     }
     let token = pair::load_existing_token(&opts.token_file)?;
-    print_pairing(&url, &token)
+    print_pairing(data_dir, Some((&url, &token)), None)
 }

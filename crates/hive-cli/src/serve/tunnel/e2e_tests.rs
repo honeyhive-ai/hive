@@ -1,0 +1,234 @@
+//! End to end: a real `hive serve` with remote access on, a minimal fake
+//! relay, and a fake phone (snow initiator) pairing, then GET + SSE through
+//! the tunnel, renewal, and revocation (included from `serve/tests.rs` for
+//! its harness).
+//!
+//! Set `HIVE_TUNNEL_INTEROP_RELAY=http://127.0.0.1:<port>` to run
+//! `interop_against_a_real_relay` against a real relay binary started with
+//! `HIVE_RELAY_TUNNEL=open`.
+
+use std::time::Duration;
+
+use serde_json::json;
+
+use super::*;
+use crate::serve::tunnel::frame::{self, Frame, ResponseHead};
+use crate::serve::tunnel::testkit::{self, FakeRelay, HostInfo, PhoneKeys};
+use crate::serve::tunnel::{self as tun, cred, PairingSecret, RelaySettings};
+
+async fn serve_with_relay(relay: &str) -> Harness {
+    let (endpoint, _) = spawn_model(vec![]).await;
+    let relay = relay.to_string();
+    harness_with(&endpoint, "m", &[("README.md", "hi\n")], move |o| {
+        o.remote = Some(RelaySettings::new(&relay, None, true).unwrap());
+    })
+    .await
+}
+
+fn host_info(h: &Harness, relay: &str) -> HostInfo {
+    let t = h.handle.shared.tunnel.as_ref().expect("tunnel on");
+    HostInfo { relay: relay.to_string(), host_id: t.host_id().to_string(), hs: *t.keys.static_pub() }
+}
+
+/// The phone's side of a v2 link: (relay, hid, hs, ps).
+fn parse_link(link: &str) -> (String, String, [u8; 32], PairingSecret) {
+    let param = |k: &str| link.split(['?', '&']).find_map(|kv| kv.strip_prefix(&format!("{k}="))).unwrap().to_string();
+    assert_eq!(param("v"), "2");
+    let relay = String::from_utf8(tun::b64u_decode(&param("relay")).unwrap()).unwrap();
+    (relay, param("hid"), tun::b64u_fixed(&param("hs")).unwrap(), PairingSecret::from_bytes(tun::b64u_fixed(&param("ps")).unwrap()))
+}
+
+/// A v2 link the way `hive pair` makes one: window file + link.
+fn pair_link(h: &Harness) -> String {
+    let t = h.handle.shared.tunnel.as_ref().unwrap();
+    let (secret, exp) = tun::create_window(&t.dir, tun::PAIR_WINDOW_SECS).unwrap();
+    tun::pairing_link_v2(Some(("http://100.101.102.104:8787", &h.token)), &t.keys, &t.settings.relay, &secret.ps, exp)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_end_to_end_pair_get_sse_renew_revoke() {
+    let relay = FakeRelay::start().await;
+    let h = serve_with_relay(&relay.url).await;
+    relay.wait_connected(Duration::from_secs(10)).await.unwrap();
+    let t = h.handle.shared.tunnel.clone().unwrap();
+
+    // Pair: `hive pair` leaves a window in pending/, serve announces it.
+    let link = pair_link(&h);
+    let (relay_url, hid, hs, ps) = parse_link(&link);
+    assert_eq!((relay_url.as_str(), hid.as_str(), hs), (relay.url.as_str(), t.host_id(), *t.keys.static_pub()));
+    let announced = relay.wait_for("enroll", |m| m["eid"] == ps.eid, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(announced["tagHash"], json!(ps.tag_hash()));
+    let info = host_info(&h, &relay.url);
+    let phone = PhoneKeys::generate();
+    let (mut c, pid, credential) = testkit::phone_enroll(&info, &phone, &ps, "Test iPhone").await.unwrap();
+    assert!(t.registry.is_active(&pid));
+    relay.wait_for("enrollClose", |m| m["eid"] == ps.eid, Duration::from_secs(5)).await.unwrap();
+    assert!(!tun::pending_dir(&t.dir).join(format!("enroll-{}.json", ps.eid)).exists());
+    // The enrollment connection already carries the API.
+    let health = c.request("GET", "/v1/health", None).await.unwrap();
+    assert_eq!(health.status, 200);
+    assert_eq!(health.json()["workspace"], json!(h.handle.shared.cfg.room), "tunnel peer counts as authorized");
+    drop(c);
+
+    // The same ps can't enroll twice (T-qr-reuse).
+    assert!(testkit::phone_enroll(&info, &PhoneKeys::generate(), &ps, "again").await.is_err());
+
+    // Session: GET.
+    let mut c = testkit::phone_session(&info, &phone, &credential).await.unwrap();
+    let chats = c.request("GET", "/v1/chats", None).await.unwrap();
+    assert_eq!(chats.status, 200, "{}", String::from_utf8_lossy(&chats.body));
+    assert!(chats.json()["chats"].is_array());
+
+    // SSE: the hub's events arrive as DATA on an open stream.
+    let sse = c.open("GET", "/v1/events", &[("accept", "text/event-stream")], None, true).await.unwrap();
+    let head = c.recv_timeout(Duration::from_secs(5)).await.unwrap();
+    assert_eq!((head.ty, head.stream), (frame::RESPONSE, sse));
+    let head: ResponseHead = serde_json::from_slice(&head.payload).unwrap();
+    assert_eq!(head.status, 200);
+    assert!(head.headers.iter().any(|(k, v)| k == "content-type" && v.starts_with("text/event-stream")));
+    h.handle.shared.hub.emit("turn.status", json!({ "canary": "tunnel-sse" }));
+    let mut text = String::new();
+    while !text.contains("tunnel-sse") {
+        let f = c.recv_timeout(Duration::from_secs(5)).await.unwrap();
+        if f.ty == frame::DATA && f.stream == sse {
+            text.push_str(&String::from_utf8_lossy(&f.payload));
+        }
+    }
+    assert!(text.contains("event: turn.status"), "{text}");
+    c.send(Frame::reset(sse, frame::reset::CANCEL, "")).await.unwrap();
+
+    // Renewal (tunnel-only): a fresh credential for the same pid and key.
+    let renewed = c.request("POST", "/v1/tunnel/credential", None).await.unwrap();
+    assert_eq!(renewed.status, 200);
+    let new_cred = renewed.json()["credential"].as_str().unwrap().to_string();
+    let claims = cred::verify(&new_cred, t.host_id(), Some((t.host_id(), &t.keys.sign_pub())), tun::now()).unwrap();
+    assert_eq!((claims.pid.as_str(), claims.pk), (pid.as_str(), phone.auth.verifying_key().to_bytes()));
+    assert_eq!(c.request("PUT", "/v1/tunnel/push", Some(json!({ "enabled": true }))).await.unwrap().status, 200);
+    assert!(t.registry.get(&pid).unwrap().push_enabled);
+    // …and 404 on the direct path, even with the right bearer token.
+    let direct = h.client.post(format!("{}/v1/tunnel/credential", h.base)).bearer_auth(&h.token).send().await.unwrap();
+    assert_eq!(direct.status(), 404);
+
+    // Revocation from another process (`hive phones revoke`): the live SSE
+    // session gets GOAWAY revoked within ~1 s of serve noticing (≤ 2 s poll).
+    let sse = c.open("GET", "/v1/events", &[], None, true).await.unwrap();
+    let _ = c.recv_timeout(Duration::from_secs(5)).await.unwrap();
+    let data_dir = h.handle.shared.cfg.data_dir.clone();
+    tun::cli::phones_revoke(&data_dir, Some(&pid), &h.handle.shared.opts.token_file, false).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    loop {
+        let f = tokio::time::timeout_at(deadline, c.recv()).await.expect("GOAWAY").unwrap();
+        if f.ty == frame::GOAWAY {
+            assert_eq!(f.code(), Some(frame::goaway::REVOKED));
+            break;
+        }
+        assert_eq!(f.stream, sse);
+    }
+    let rv = relay.wait_for("revoke", |m| m["pid"] == json!(pid), Duration::from_secs(5)).await.unwrap();
+    assert!(rv["exp"].as_u64().unwrap() >= claims.exp, "revocation lasts until the latest credential's exp");
+    // Acked → the pending file is gone; reconnect is refused at the relay.
+    for _ in 0..50 {
+        if !tun::pending_dir(&t.dir).join(format!("revoke-{pid}.json")).exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!tun::pending_dir(&t.dir).join(format!("revoke-{pid}.json")).exists());
+    let err = testkit::phone_session(&info, &phone, &new_cred).await.err().expect("revoked");
+    assert_eq!(testkit::close_code(&err), Some(4003));
+    // The direct-path token was rotated, and serve picked it up.
+    let old_token = h.token.clone();
+    let mut refused = false;
+    for _ in 0..40 {
+        let r = h.client.get(format!("{}/v1/chats", h.base)).bearer_auth(&old_token).send().await.unwrap();
+        if r.status() == 401 {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(refused, "old bearer token still accepted after revoke");
+    let new_token = h.handle.shared.token();
+    assert_ne!(new_token, old_token);
+    assert_eq!(h.client.get(format!("{}/v1/chats", h.base)).bearer_auth(&new_token).send().await.unwrap().status(), 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tunnel_request_after_revocation_on_open_session_gets_401() {
+    // The per-request re-check (§9), independent of the GOAWAY: a request
+    // racing the revocation is refused by the auth middleware.
+    let relay = FakeRelay::start().await;
+    let h = serve_with_relay(&relay.url).await;
+    relay.wait_connected(Duration::from_secs(10)).await.unwrap();
+    let t = h.handle.shared.tunnel.clone().unwrap();
+    let (_, _, _, ps) = parse_link(&pair_link(&h));
+    relay.wait_for("enroll", |m| m["eid"] == ps.eid, Duration::from_secs(5)).await.unwrap();
+    let info = host_info(&h, &relay.url);
+    let phone = PhoneKeys::generate();
+    let (_c, pid, _) = testkit::phone_enroll(&info, &phone, &ps, "p").await.unwrap();
+    // Mark revoked in the registry only (no broadcast yet), then call the
+    // router the way the connector does.
+    t.registry.revoke(&pid).unwrap();
+    let req = axum::http::Request::builder().uri("/v1/chats").body(axum::body::Body::empty()).unwrap();
+    let mut req = req;
+    req.extensions_mut().insert(tun::TunnelPeer { pid });
+    use tower::ServiceExt;
+    let resp = crate::serve::api::router(h.handle.shared.clone()).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 401);
+}
+
+/// Interop with a real relay (the Go `honeyhive-ai/relay` with
+/// `HIVE_RELAY_TUNNEL=open`). Ignored unless `HIVE_TUNNEL_INTEROP_RELAY` is set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interop_against_a_real_relay() {
+    let Ok(relay) = std::env::var("HIVE_TUNNEL_INTEROP_RELAY") else {
+        eprintln!("skipped: set HIVE_TUNNEL_INTEROP_RELAY=http://127.0.0.1:<port>");
+        return;
+    };
+    let h = serve_with_relay(&relay).await;
+    let t = h.handle.shared.tunnel.clone().unwrap();
+    for _ in 0..100 {
+        if t.live_status().connected {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(t.live_status().connected, "host never connected: {:?}", t.live_status());
+    let (_, _, _, ps) = parse_link(&pair_link(&h));
+    // Let serve pick up and announce the window.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let info = host_info(&h, &relay);
+    let phone = PhoneKeys::generate();
+    let (mut c, pid, credential) = testkit::phone_enroll(&info, &phone, &ps, "Interop").await.expect("enroll via the real relay");
+    assert_eq!(c.request("GET", "/v1/health", None).await.unwrap().status, 200);
+    drop(c);
+    let mut c = testkit::phone_session(&info, &phone, &credential).await.expect("session via the real relay");
+    assert_eq!(c.request("GET", "/v1/chats", None).await.unwrap().status, 200);
+    let sse = c.open("GET", "/v1/events", &[], None, true).await.unwrap();
+    let _ = c.recv_timeout(Duration::from_secs(5)).await.unwrap();
+    h.handle.shared.hub.emit("turn.status", json!({ "canary": "interop" }));
+    let mut text = String::new();
+    while !text.contains("interop") {
+        let f = c.recv_timeout(Duration::from_secs(5)).await.unwrap();
+        if f.ty == frame::DATA && f.stream == sse {
+            text.push_str(&String::from_utf8_lossy(&f.payload));
+        }
+    }
+    t.revoke(&pid).unwrap();
+    loop {
+        let f = c.recv_timeout(Duration::from_secs(5)).await.unwrap();
+        if f.ty == frame::GOAWAY {
+            assert_eq!(f.code(), Some(frame::goaway::REVOKED));
+            break;
+        }
+    }
+    for _ in 0..50 {
+        if t.pending_revocations().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(t.pending_revocations().is_empty(), "relay never acked the revoke");
+    let err = testkit::phone_session(&info, &phone, &credential).await.err().expect("revoked at the relay");
+    assert_eq!(testkit::close_code(&err), Some(4003), "{err:#}");
+}

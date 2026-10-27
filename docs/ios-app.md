@@ -136,11 +136,46 @@ its own, so it can't hand the phone one the server doesn't accept. The link is
 scheme is `hive`: `hive://pair?…` and `hive://chat/<id>`. ntfy notifications
 carry `Click: hive://chat/<chatId>`.
 
-Remote access without Tailscale (planned) adds parameters to this link
-(`v=2&hid=…&hs=…&relay=…&ps=…&exp=…`) while staying readable by v1 apps; the
-phone then reaches `hive serve` through a relay over an end-to-end encrypted,
-mutually authenticated tunnel. The protocol is
-[`relay-tunnel.md`](relay-tunnel.md).
+### Remote access through a relay (optional, off by default)
+
+`hive serve` can also be reached without Tailscale, through a relay, over an
+end-to-end encrypted and mutually authenticated tunnel (protocol:
+[`relay-tunnel.md`](relay-tunnel.md), `hive-tunnel/1`). The host keeps one
+outbound WebSocket to the relay and opens no inbound port. Each phone request
+is dispatched into the same axum router in process, so the API and SSE
+contract above is unchanged. The relay sees only ciphertext.
+
+```sh
+hive remote enable --relay https://relay.example.com [--reg-token T]
+#   or per run: hive serve --remote-relay URL   (env HIVE_REMOTE_RELAY;
+#   HIVE_REMOTE_RELAY=off overrides relay.json; HIVE_REMOTE_REG_TOKEN)
+hive pair                  # v2 link: url/token plus v=2&hid&hs&relay&ps&exp
+hive pair --relay-only     # no url/token (also automatic when the direct URL is loopback)
+hive remote status         # relay, host id, live connection, phone count
+hive phones list
+hive phones revoke <pid|name> [--keep-token]
+hive remote disable | reset   # reset = new host keys: every phone re-pairs
+```
+
+- State is in `<HIVE_DATA_DIR>/tunnel/` (directory 0700, files 0600):
+  `keys.json` (Ed25519 signing key and X25519 Noise static), `phones.json`,
+  `relay.json`, `status.json`, and `pending/` for the hand-off from `hive pair`
+  and `hive phones revoke` to the running server (picked up within 2 s).
+- The relay URL must be `https`; `--insecure-relay` /
+  `HIVE_REMOTE_INSECURE_RELAY=1` allows `http` (tests, a loopback relay).
+- Each v2 link opens a one-time pairing window of 10 minutes. The phone gets a
+  per-phone credential (`hpc1`, 90 days) and renews it daily through
+  `POST /v1/tunnel/credential`. That route and `PUT /v1/tunnel/push
+  {"enabled": bool}` exist only through the tunnel and return 404 with a
+  bearer token.
+- `hive phones revoke` takes effect at once: the server ends the phone's live
+  sessions (GOAWAY), refuses its requests and handshakes, and tells the relay
+  (retried until acked). It also rotates `serve.token` unless `--keep-token`,
+  because a stolen phone holds that too. A running server picks up the new
+  token within 2 s.
+- Through the tunnel, requests carry no bearer token: the phone is
+  authenticated by its Noise static key, and every request re-checks that the
+  phone is still paired.
 
 ## Security model
 
@@ -205,7 +240,8 @@ mutually authenticated tunnel. The protocol is
 ## Limits
 
 - Single user, single workspace per `hive serve` process, and one phone per
-  token (the token isn't per-device).
+  token (the token isn't per-device). Phones paired over the relay are
+  per-device and can be revoked one by one.
 - The box is a separate member identity, not the phone owner's account. The
   desktop shows the phone's messages under `HIVE_SERVE_NAME`.
 - Agents run one at a time on the worker thread. A long turn delays the next
@@ -237,6 +273,8 @@ mutually authenticated tunnel. The protocol is
 hive serve --listen 100.x.y.z:8787 --label sff --pair
 hive pair                                     # show the pairing QR code again
 cargo test -p hive-cli                        # unit + integration (test relay, fake model, fake ntfy)
+HIVE_TUNNEL_INTEROP_RELAY=http://127.0.0.1:8443 \
+  cargo test -p hive-cli interop_against_a_real_relay   # tunnel against a relay run with HIVE_RELAY_TUNNEL=open
 HIVE_SERVE_LIVE_ENDPOINT=http://<gateway>:8080/v1/chat/completions \
 HIVE_SERVE_LIVE_MODELS=gpt-oss:20b,gemma4:12b \
   cargo test -p hive-cli serve::tests::live -- --nocapture
@@ -248,7 +286,10 @@ owns the workspace. They cover auth (401s), host assignment, a phone message
 that reaches a hosted agent, the streamed `message.delta` and `message.done`,
 a `write_file` tool call that becomes a `fileDiff` proposal, approval (also
 seen by the desktop after sync), rejection with a reason, `Last-Event-ID`
-replay, ntfy pushes, and the pairing link format. The live test runs one turn
+replay, ntfy pushes, and the pairing link format. The tunnel tests check the
+`relay-tunnel/vectors.json` vectors, the mux and flow control, and run an end
+to end pairing, GET, SSE stream, renewal and revocation through a fake relay
+and a fake phone. The live test runs one turn
 per model against the real gateway, in which the agent has to `read_file` a
 planted note to answer.
 
