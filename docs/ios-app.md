@@ -136,6 +136,12 @@ its own, so it can't hand the phone one the server doesn't accept. The link is
 scheme is `hive`: `hive://pair?…` and `hive://chat/<id>`. ntfy notifications
 carry `Click: hive://chat/<chatId>`.
 
+Remote access without Tailscale (planned) adds parameters to this link
+(`v=2&hid=…&hs=…&relay=…&ps=…&exp=…`) while staying readable by v1 apps; the
+phone then reaches `hive serve` through a relay over an end-to-end encrypted,
+mutually authenticated tunnel. The protocol is
+[`relay-tunnel.md`](relay-tunnel.md).
+
 ## Security model
 
 - **Tailnet only.** The API listens on loopback, a private LAN address or the

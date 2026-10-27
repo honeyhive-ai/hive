@@ -35,6 +35,7 @@ with the code, the code wins.
 
 - Agent model: [`hive-agent-architecture-matrix.md`](hive-agent-architecture-matrix.md) — agent modes, execution/state/tool/permission shape.
 - Relay protocol: [`hive-relay-api.md`](hive-relay-api.md) — the `/v1` wire contract (client ↔ relay).
+- Phone remote access: [`relay-tunnel.md`](relay-tunnel.md) — the open `hive-tunnel/1` protocol (host registration, phone credentials, Noise end-to-end session, stream mux, push). Golden vectors and their Go generator and Rust cross-checker are in [`relay-tunnel/`](relay-tunnel/). Where it's built: relay endpoints in [honeyhive-ai/relay](https://github.com/honeyhive-ai/relay), the host connector in `crates/hive-cli/src/serve/tunnel/`, the phone client in the private `hive-ios` repo, and billing/APNs in the private `honeyhive-ai/hive-cloud`.
 - Branding: [`hive-logo-system.md`](hive-logo-system.md) — logo/brand assets.
 
 The user-facing tiering / managed-service / pricing docs live on the published
