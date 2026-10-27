@@ -218,6 +218,10 @@ this to check a relay URL, to decide whether to offer push, and to decide
 whether `not_entitled` (4006) should lead to the in-app subscription
 (`appstore`) or to an "ask the relay operator" message (`none`).
 
+Only the hosted build (§15.3) reports `"billing":"appstore"`. The open build
+always reports `"none"`, so a self-hosted relay with `HIVE_RELAY_TUNNEL=open`
+offers the same tunnel for free and the app shows no paywall for it.
+
 ### 6.1 Host keys and registration
 
 There's no separate registration call. A host is registered the first time it
@@ -536,7 +540,11 @@ Host connector (`hive serve`):
   token they return `404`:
   - `POST /v1/tunnel/credential` → `{"credential":"hpc1…","exp":<s>}`: a fresh
     credential for the same `pid` and `pk` (§13.1);
-  - `PUT /v1/tunnel/push` `{"enabled":bool}`: whether this phone wants pushes.
+  - `PUT /v1/tunnel/push` `{"enabled":bool,"previews"?:bool}` →
+    `{"enabled":bool,"previews":bool}`: whether this phone wants pushes, and
+    whether they carry a message preview (§14). `previews` defaults to `true`
+    for a newly paired phone; when the field is absent the stored value is
+    kept.
 
 Phone client: the transport layer maps each `URLRequest` onto one stream and
 builds an `HTTPURLResponse` and body or byte sequence from the reply. In the
@@ -694,11 +702,32 @@ and the host falls back to ntfy if that's configured.
 
 ```
 plaintext = {"v":1,"seq":<u64>,"ts":<s>,"kind":"message.done"|"proposal.created"|"phone.paired"|"test",
-             "chatId"?:"…","proposalId"?:"…","title":"<≤64 chars>","body":"<≤512 bytes>"}
+             "chatId"?:"…","proposalId"?:"…","title":"<≤64 bytes>","body":"<≤512 bytes>",
+             "sender"?:"<≤64 bytes>","preview"?:true}
 nonce     = 12 random bytes
 ad        = ctx("push", host_id, pid)
 ct        = b64u(nonce ‖ ChaCha20-Poly1305(push_key, nonce, plaintext, ad))     (raw ≤ 2 048 bytes)
 ```
+
+**Previews (on by default).** Each phone has a `previews` preference (§9,
+`PUT /v1/tunnel/push`, default `true`). The NSE shows `title` and `body` as
+they are; the host decides what goes in them:
+
+- `previews` on: `body` is a short preview of the content: for
+  `message.done`, the first 120 characters of the message text (Unicode
+  scalar values; whitespace runs collapsed to one space, control characters
+  dropped, cut on a character boundary, `…` appended when cut, so at most
+  121 characters); for `proposal.created`, the proposal title, cut the same
+  way. `"preview":true` is set.
+- `previews` off (sender only): `body` is empty and `preview` is absent.
+  `title` still names the sender ("coder replied").
+
+`title` names the sender and the event ("coder replied", "coder hit an error",
+"Change ready for review") and `sender` is the agent or author name alone,
+both cut on a character boundary to 64 bytes. Neither ever contains message
+text. The preview is end-to-end encrypted like everything else: Apple and the
+relay see only `ct`. If the encrypted push would exceed 2 048 bytes, the host
+sends it without the preview instead.
 
 - `seq` increases strictly per `(host, pid)` and survives restarts.
 - The relay sends APNs `apns-push-type: alert`, priority 10 (`high`) or 5
@@ -716,6 +745,15 @@ ct        = b64u(nonce ‖ ChaCha20-Poly1305(push_key, nonce, plaintext, ad))   
   delay or replay pushes, but a replay shows only the generic text.
 - `collapse` is opaque. Hosts SHOULD use `b64u(HMAC-SHA256(push_key, chatId)[0..12])`
   so the relay can't link it to a chat id.
+
+**Self-hosted relays and push.** APNs accepts pushes for the App Store app
+only when they're signed with that app's APNs key, which only the publisher
+holds. A self-hosted open relay therefore has no `PushSender`, reports
+`"push":false`, and acks host pushes `push_unavailable`; hosts fall back to
+ntfy. A possible later addition (not part of v1): an optional push gateway on
+the hosted service that accepts the same `{hid, pid, token, env, ct, prio,
+collapse}` from a registered self-hosted relay and forwards it to APNs. It
+would see only ciphertext, as the hosted relay does today.
 
 ## 15. Relay seams and configuration
 
@@ -765,11 +803,17 @@ package and injects:
 
 - a `TunnelPolicy` backed by App Store entitlements. Hosts register as
   `pending`; a host becomes `active` while a subscription is bound to it;
-- an APNs `PushSender`.
+- an APNs `PushSender`;
+- its own bind and App Store routes under `/v1/remote/` and `/v1/appstore/`.
 
-It's deployed as its **own Fly app**. It MUST NOT be deployed to the existing
-open relay app, and the enterprise (fail-closed) binary MUST NOT be deployed
-to the open relay app either.
+It runs on the same deployment as the public open sync relay, so it MUST be
+a strict superset of the open binary:
+every open `/v1` route, the admin routes, `hrt1` tokens, storage and env
+behave exactly as in `cmd/hive-relay`. The relay enforces this through
+`relay.MainWith(Extension)`: an extension can only set the tunnel seams, add
+routes under unused `/v1/<name>/` prefixes and add subcommands, and a failing
+extension falls back to the open relay rather than failing closed. The
+enterprise (fail-closed) binary MUST NOT be deployed to that app.
 
 ### 15.4 One process per host
 
@@ -969,8 +1013,9 @@ They use the real Go relay binary, built from a pinned commit in CI.
 
 ## 20. Open questions
 
-1. The relay tunnel is `off` by default. Should the public open relay offer it
-   (`open`) for free, or should only the hosted service offer it?
+1. ~~Who offers the tunnel?~~ Decided: the hosted service offers it as the
+   paid add-on (on the shared public relay app); any self-hosted relay can
+   offer it for free with `HIVE_RELAY_TUNNEL=open` (`billing:"none"`).
 2. Multi-instance routing (§15.4): accept single-instance for the hosted v1,
    or build `fly-replay` routing before launch?
 3. Should the phone auth key move to a Secure Enclave P-256 key
@@ -979,7 +1024,8 @@ They use the real Go relay binary, built from a pinned commit in CI.
    then re-pairs after 90 days.
 5. Should rotating the direct-path token on revoke stay the default (§13.2)?
    It forces every direct-path phone to re-pair.
-6. Push previews: include message text (E2E, so Apple and the relay can't
-   read it) by default, or sender only?
+6. ~~Push previews?~~ Decided: on by default (sender + first 120
+   characters, end-to-end encrypted), with a per-phone `previews` preference
+   to switch to sender only (§9, §14).
 7. Traffic padding (for example, DATA padded to 256-byte buckets) as a v1.1
    option?
