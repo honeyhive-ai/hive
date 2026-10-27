@@ -1,5 +1,0 @@
-// Copy to Local.xcconfig (untracked) and set your Apple Developer Team ID.
-// Find it with:
-//   security find-certificate -c "Apple Development" -p | openssl x509 -noout -subject
-// and use the OU= field.
-DEVELOPMENT_TEAM = ABCDE12345

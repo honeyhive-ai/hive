@@ -1,6 +1,10 @@
 # Hive on iPhone: thin client + home host
 
-A single-user iOS app (not App Store) for one person's Hive workspace. The
+> The iPhone app's source now lives in a separate repository. This document
+> stays here as the design and **API contract of `hive serve`**, which any
+> client can implement.
+
+A single-user iOS app for one person's Hive workspace. The
 phone doesn't run Hive. It's a thin client over Tailscale to **`hive serve`**,
 a home-host process on an always-on box in the lab. The home host is a normal
 Hive device in the workspace: it keeps the E2EE keys, syncs with the relay,
