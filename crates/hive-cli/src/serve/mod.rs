@@ -268,7 +268,16 @@ impl Shared {
                         let name = if done { "message.done" } else { "message.created" };
                         self.hub.emit(name, hub::wrap("message", api::message_dto(chat, m)));
                         if done && matches!(m.role, MessageRole::Assistant | MessageRole::Agent) && self.fresh(m.created_at) {
-                            notices.push(("message.done", ntfy::reply_notice(&m.author, &s.title, chat, m.body.starts_with("[error]"))));
+                            let notice = ntfy::reply_notice(&m.author, &s.title, chat, m.body.starts_with("[error]"));
+                            let push = tunnel::PushContent {
+                                kind: "message.done".into(),
+                                chat_id: Some(chat.to_string()),
+                                title: notice.title.clone(),
+                                sender: Some(m.author.clone()),
+                                preview: Some(m.body.clone()),
+                                fixed_body: String::new(),
+                            };
+                            notices.push((notice, push));
                         }
                     }
                     Change::ProposalCreated { chat, proposal } => {
@@ -276,7 +285,16 @@ impl Shared {
                         let Some(p) = s.proposals.iter().find(|p| p.id == proposal) else { continue };
                         self.hub.emit("proposal.created", hub::wrap("proposal", api::proposal_dto(s, p)));
                         if self.fresh(p.created_at) {
-                            notices.push(("proposal.created", ntfy::proposal_notice(&p.title, &s.title, chat)));
+                            let notice = ntfy::proposal_notice(&p.title, &s.title, chat);
+                            let push = tunnel::PushContent {
+                                kind: "proposal.created".into(),
+                                chat_id: Some(chat.to_string()),
+                                title: notice.title.clone(),
+                                sender: None,
+                                preview: Some(p.title.clone()),
+                                fixed_body: String::new(),
+                            };
+                            notices.push((notice, push));
                         }
                     }
                     Change::ChatUpdated { chat } => {
@@ -288,12 +306,12 @@ impl Shared {
             }
         }
         if let Some(t) = &self.tunnel {
-            for (kind, n) in &notices {
-                t.push_all(kind, Some(&n.chat_id.to_string()), &n.title, &n.body);
+            for (_, push) in &notices {
+                t.push_all(push);
             }
         }
         if let Some(n) = self.opts.ntfy.clone() {
-            for (_, notice) in notices {
+            for (notice, _) in notices {
                 let n = n.clone();
                 let client = self.http.clone();
                 self.rt.spawn(async move { n.send(&client, &notice).await });

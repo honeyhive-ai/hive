@@ -540,3 +540,12 @@ async fn splice(a: WebSocketStream<TcpStream>, b: WebSocketStream<TcpStream>) {
     let _ = a_tx.send(Message::Close(None)).await;
     let _ = b_tx.send(Message::Close(None)).await;
 }
+
+/// Decrypt a sealed push (§14) with the spec's AD and parse the plaintext.
+pub fn open_push(key: &[u8; 32], hid: &str, pid: &str, ct: &[u8]) -> Value {
+    use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(key.into());
+    let ad = ctx("push", &[hid.as_bytes(), pid.as_bytes()]);
+    let pt = cipher.decrypt(ct[..12].into(), Payload { msg: &ct[12..], aad: &ad }).expect("push decrypts");
+    serde_json::from_slice(&pt).unwrap()
+}

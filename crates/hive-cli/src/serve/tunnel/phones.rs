@@ -31,11 +31,19 @@ pub struct PhoneRecord {
     pub revoked_at: Option<u64>,
     #[serde(default)]
     pub push_enabled: bool,
+    /// Whether pushes carry a message preview (§14). On by default, also for
+    /// records written before the preference existed.
+    #[serde(default = "default_true")]
+    pub push_previews: bool,
     /// Last push `seq` sent (strictly increasing, survives restarts).
     #[serde(default)]
     pub push_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<u64>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl PhoneRecord {
@@ -139,12 +147,19 @@ impl Registry {
         Ok(())
     }
 
-    pub fn set_push(&self, pid: &str, enabled: bool) -> Result<bool> {
+    /// Set the push preference; `previews: None` keeps the stored value.
+    /// Returns the resulting `(enabled, previews)`, or `None` for no such
+    /// active phone.
+    pub fn set_push(&self, pid: &str, enabled: bool, previews: Option<bool>) -> Result<Option<(bool, bool)>> {
         let mut phones = self.lock();
-        let Some(r) = phones.iter_mut().find(|r| r.pid == pid && r.is_active()) else { return Ok(false) };
+        let Some(r) = phones.iter_mut().find(|r| r.pid == pid && r.is_active()) else { return Ok(None) };
         r.push_enabled = enabled;
+        if let Some(p) = previews {
+            r.push_previews = p;
+        }
+        let out = (r.push_enabled, r.push_previews);
         self.save(&phones)?;
-        Ok(true)
+        Ok(Some(out))
     }
 
     pub fn touch(&self, pid: &str) {

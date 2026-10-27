@@ -678,25 +678,109 @@ impl TunnelHost {
 
     // ── Push (§14) ──
 
-    /// Encrypt and send a push to every active phone that wants pushes.
-    pub fn push_all(&self, kind: &str, chat_id: Option<&str>, title: &str, body: &str) {
+    /// Encrypt and send a push to every active phone that wants pushes. Each
+    /// phone gets the preview or not according to its `previews` preference.
+    pub fn push_all(&self, content: &PushContent) {
         if !self.push_available.load(Ordering::SeqCst) {
             return;
         }
         for rec in self.registry.list().into_iter().filter(|r| r.is_active() && r.push_enabled) {
             let Some((seq, key)) = self.registry.next_push_seq(&rec.pid) else { continue };
-            let mut pt = json!({ "v": 1, "seq": seq, "ts": now(), "kind": kind, "title": clip(title, 64), "body": clip(body, 512) });
-            if let Some(c) = chat_id {
-                pt["chatId"] = json!(c);
-            }
-            let ct = push_encrypt(&key, self.host_id(), &rec.pid, &random_bytes::<12>(), pt.to_string().as_bytes());
+            let ct = seal_push(&key, self.host_id(), &rec.pid, content, rec.push_previews, seq, now());
             let mut msg = json!({ "t": "push", "pid": rec.pid, "ct": b64u(ct), "prio": "high" });
-            if let Some(c) = chat_id {
+            if let Some(c) = &content.chat_id {
                 msg["collapse"] = json!(push_collapse(&key, c));
             }
             self.send_request(msg, Pending::Push);
         }
     }
+}
+
+/// The spec's cap on the raw encrypted push (nonce ‖ ciphertext ‖ tag).
+pub const PUSH_CT_MAX: usize = 2048;
+/// Preview length in characters (Unicode scalar values), before the `…`.
+pub const PREVIEW_CHARS: usize = 120;
+
+/// What a push is about (§14). `title` and `sender` never carry message
+/// text; `preview` is the content shown only to phones with previews on.
+#[derive(Debug, Clone, Default)]
+pub struct PushContent {
+    pub kind: String,
+    pub chat_id: Option<String>,
+    /// "coder replied", "Change ready for review", …
+    pub title: String,
+    /// The agent or author name alone.
+    pub sender: Option<String>,
+    /// The raw content to preview (message text, proposal title). Shortened
+    /// with [`preview_text`] when sealed.
+    pub preview: Option<String>,
+    /// A body that isn't content (for example a phone's name on
+    /// `phone.paired`): shown regardless of the preference, when there is
+    /// no preview.
+    pub fixed_body: String,
+}
+
+/// The first [`PREVIEW_CHARS`] characters of `s`: whitespace runs collapsed
+/// to one space, control characters dropped, cut on a character boundary,
+/// `…` appended when cut.
+pub fn preview_text(s: &str) -> String {
+    let mut out = String::new();
+    let mut n = 0;
+    let mut pending_space = false;
+    for c in s.chars() {
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if c.is_control() {
+            continue;
+        }
+        let extra = usize::from(pending_space) + 1;
+        if n + extra > PREVIEW_CHARS {
+            out.push('…');
+            return out;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+        n += extra;
+    }
+    out
+}
+
+/// The push plaintext for one phone (§14).
+pub fn push_plaintext(content: &PushContent, previews: bool, seq: u64, ts: u64) -> Value {
+    let preview = if previews { content.preview.as_deref().map(preview_text).filter(|p| !p.is_empty()) } else { None };
+    let body = match &preview {
+        Some(p) => p.clone(),
+        None if content.preview.is_some() => String::new(), // sender only
+        None => clip(&content.fixed_body, 512),
+    };
+    let mut pt = json!({ "v": 1, "seq": seq, "ts": ts, "kind": content.kind, "title": clip(&content.title, 64), "body": clip(&body, 512) });
+    if let Some(c) = &content.chat_id {
+        pt["chatId"] = json!(c);
+    }
+    if let Some(s) = &content.sender {
+        pt["sender"] = json!(clip(s, 64));
+    }
+    if preview.is_some() {
+        pt["preview"] = json!(true);
+    }
+    pt
+}
+
+/// Encrypt the push for one phone; drops the preview if the result would
+/// exceed [`PUSH_CT_MAX`].
+pub fn seal_push(key: &[u8; 32], host_id: &str, pid: &str, content: &PushContent, previews: bool, seq: u64, ts: u64) -> Vec<u8> {
+    let pt = push_plaintext(content, previews, seq, ts);
+    let ct = push_encrypt(key, host_id, pid, &random_bytes::<12>(), pt.to_string().as_bytes());
+    if ct.len() <= PUSH_CT_MAX || !previews {
+        return ct;
+    }
+    let pt = push_plaintext(content, false, seq, ts);
+    push_encrypt(key, host_id, pid, &random_bytes::<12>(), pt.to_string().as_bytes())
 }
 
 fn clip(s: &str, max_bytes: usize) -> String {

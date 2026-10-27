@@ -170,6 +170,7 @@ where
                     cred_exp: exp,
                     revoked_at: None,
                     push_enabled: false,
+                    push_previews: true,
                     push_seq: 0,
                     last_seen: None,
                 };
@@ -295,7 +296,12 @@ where
                     }
                     host.close_window(&p.eid);
                     println!("remote: new phone paired: {name} (pid {pid})");
-                    host.push_all("phone.paired", None, "New phone paired", &name);
+                    host.push_all(&super::PushContent {
+                        kind: "phone.paired".into(),
+                        title: "New phone paired".into(),
+                        fixed_body: name.clone(),
+                        ..Default::default()
+                    });
                 }
                 let Ok(f) = Frame::decode(&buf[..n]) else {
                     goaway_code = Some((goaway::PROTOCOL, "short frame"));

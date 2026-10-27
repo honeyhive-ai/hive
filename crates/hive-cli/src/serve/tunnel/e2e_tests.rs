@@ -103,8 +103,55 @@ async fn tunnel_end_to_end_pair_get_sse_renew_revoke() {
     let new_cred = renewed.json()["credential"].as_str().unwrap().to_string();
     let claims = cred::verify(&new_cred, t.host_id(), Some((t.host_id(), &t.keys.sign_pub())), tun::now()).unwrap();
     assert_eq!((claims.pid.as_str(), claims.pk), (pid.as_str(), phone.auth.verifying_key().to_bytes()));
-    assert_eq!(c.request("PUT", "/v1/tunnel/push", Some(json!({ "enabled": true }))).await.unwrap().status, 200);
-    assert!(t.registry.get(&pid).unwrap().push_enabled);
+    // Push preference: previews default on; "previews": false turns them off;
+    // a body without the field keeps the stored value.
+    let r = c.request("PUT", "/v1/tunnel/push", Some(json!({ "enabled": true }))).await.unwrap();
+    assert_eq!((r.status, r.json()), (200, json!({ "enabled": true, "previews": true })));
+    assert!(t.registry.get(&pid).unwrap().push_enabled && t.registry.get(&pid).unwrap().push_previews);
+    let r = c.request("PUT", "/v1/tunnel/push", Some(json!({ "enabled": true, "previews": false }))).await.unwrap();
+    assert_eq!(r.json(), json!({ "enabled": true, "previews": false }));
+    let r = c.request("PUT", "/v1/tunnel/push", Some(json!({ "enabled": true }))).await.unwrap();
+    assert_eq!(r.json(), json!({ "enabled": true, "previews": false }), "absent field keeps the stored value");
+    // A push to this phone is sender-only now; with previews back on it
+    // carries the first 120 characters, end-to-end encrypted.
+    t.push_available.store(true, std::sync::atomic::Ordering::SeqCst);
+    let key: [u8; 32] = tun::b64u_fixed(&t.registry.get(&pid).unwrap().push_key).unwrap();
+    let content = tun::PushContent {
+        kind: "message.done".into(),
+        chat_id: Some("c1".into()),
+        title: "coder replied".into(),
+        sender: Some("coder".into()),
+        preview: Some(format!("secret plan {}", "z".repeat(300))),
+        fixed_body: String::new(),
+    };
+    for (previews, want_preview) in [(false, false), (true, true)] {
+        c.request("PUT", "/v1/tunnel/push", Some(json!({ "enabled": true, "previews": previews }))).await.unwrap();
+        let seq = t.registry.get(&pid).unwrap().push_seq;
+        t.push_all(&content);
+        let m = relay
+            .wait_for(
+                "push",
+                |m| {
+                    let ct = tun::b64u_decode(m["ct"].as_str().unwrap_or_default()).unwrap_or_default();
+                    m["pid"] == json!(pid) && ct.len() > 28 && testkit::open_push(&key, t.host_id(), &pid, &ct)["seq"] == json!(seq + 1)
+                },
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let ct = tun::b64u_decode(m["ct"].as_str().unwrap()).unwrap();
+        assert!(ct.len() <= tun::PUSH_CT_MAX);
+        let pt = testkit::open_push(&key, t.host_id(), &pid, &ct);
+        assert_eq!(pt["sender"], "coder");
+        if want_preview {
+            assert!(pt["body"].as_str().unwrap().starts_with("secret plan zzz") && pt["body"].as_str().unwrap().ends_with('…'));
+            assert_eq!(pt["body"].as_str().unwrap().chars().count(), tun::PREVIEW_CHARS + 1);
+        } else {
+            assert_eq!(pt["body"], "");
+            assert!(!pt.to_string().contains("secret"));
+        }
+    }
+    t.push_available.store(false, std::sync::atomic::Ordering::SeqCst);
     // …and 404 on the direct path, even with the right bearer token.
     let direct = h.client.post(format!("{}/v1/tunnel/credential", h.base)).bearer_auth(&h.token).send().await.unwrap();
     assert_eq!(direct.status(), 404);

@@ -277,6 +277,75 @@ fn v_push_vector() {
     assert_eq!(push_collapse(&key, "chat").len(), 16);
 }
 
+// ── Push previews (§14) ──────────────────────────────────────────────────────
+
+use super::testkit::open_push;
+
+fn reply(text: &str) -> PushContent {
+    PushContent {
+        kind: "message.done".into(),
+        chat_id: Some("chat-1".into()),
+        title: "coder replied".into(),
+        sender: Some("coder".into()),
+        preview: Some(text.into()),
+        fixed_body: String::new(),
+    }
+}
+
+#[test]
+fn preview_text_cuts_on_char_boundaries() {
+    assert_eq!(preview_text("  hello\n\n  world\t! "), "hello world !");
+    assert_eq!(preview_text("a\u{0}b\u{7}c"), "abc");
+    let long = "é".repeat(200);
+    let p = preview_text(&long);
+    assert_eq!(p.chars().count(), PREVIEW_CHARS + 1);
+    assert!(p.ends_with('…') && p.starts_with("éé"));
+    let exact = "x".repeat(PREVIEW_CHARS);
+    assert_eq!(preview_text(&exact), exact, "no ellipsis when nothing is cut");
+    // Emoji (4-byte scalars) are never split.
+    let emoji = "🐝".repeat(150);
+    let p = preview_text(&emoji);
+    assert_eq!(p.chars().filter(|c| *c == '🐝').count(), PREVIEW_CHARS);
+    assert!(p.len() <= 512);
+}
+
+#[test]
+fn push_plaintext_previews_on_and_off() {
+    let c = reply("Done: refactored the parser.\nAll tests pass.");
+    let on = push_plaintext(&c, true, 7, 1_800_000_000);
+    assert_eq!(on["body"], "Done: refactored the parser. All tests pass.");
+    assert_eq!((on["title"].as_str(), on["sender"].as_str(), on["preview"].as_bool()), (Some("coder replied"), Some("coder"), Some(true)));
+    assert_eq!((on["seq"].as_u64(), on["chatId"].as_str(), on["kind"].as_str()), (Some(7), Some("chat-1"), Some("message.done")));
+    let off = push_plaintext(&c, false, 8, 1_800_000_000);
+    assert_eq!(off["body"], "", "sender only");
+    assert_eq!(off["title"], "coder replied");
+    assert_eq!(off["sender"], "coder");
+    assert!(off.get("preview").is_none());
+    assert!(!off.to_string().contains("parser"), "no message text with previews off");
+    // A non-content body (phone.paired) is shown either way.
+    let paired = PushContent { kind: "phone.paired".into(), title: "New phone paired".into(), fixed_body: "Ana's iPhone".into(), ..Default::default() };
+    assert_eq!(push_plaintext(&paired, false, 1, 0)["body"], "Ana's iPhone");
+    assert_eq!(push_plaintext(&paired, true, 1, 0)["body"], "Ana's iPhone");
+}
+
+#[test]
+fn sealed_push_stays_within_the_spec_limit() {
+    let key = [9u8; 32];
+    let (hid, pid) = ("2LGZFj2lCKlo49_pwPzGjw", "lg7S2X1oS18S3AUMgTzRgQ");
+    // Worst cases for JSON size: quotes/backslashes (escaped ×2), control
+    // characters in the title and sender (\u00XX, ×6), 4-byte scalars.
+    for text in ["\"\\".repeat(500), "🐝".repeat(1000), "\u{1}".repeat(1000) + &"x".repeat(1000)] {
+        let mut c = reply(&text);
+        c.title = "\u{1}".repeat(64);
+        c.sender = Some("\"".repeat(64));
+        let ct = seal_push(&key, hid, pid, &c, true, u64::MAX, u64::MAX);
+        assert!(ct.len() <= PUSH_CT_MAX, "{} bytes", ct.len());
+        let pt = open_push(&key, hid, pid, &ct);
+        assert_eq!(pt["preview"], true);
+        assert!(pt["body"].as_str().unwrap().chars().count() <= PREVIEW_CHARS + 1);
+    }
+}
+
 // ── Files ────────────────────────────────────────────────────────────────────
 
 #[cfg(unix)]
@@ -313,6 +382,7 @@ fn record(pid: &str, phone: &PhoneKeys) -> PhoneRecord {
         cred_exp: now() + CRED_LIFETIME_SECS,
         revoked_at: None,
         push_enabled: false,
+        push_previews: true,
         push_seq: 0,
         last_seen: None,
     }

@@ -653,14 +653,19 @@ async fn tunnel_credential(State(s): S, peer: Option<Extension<TunnelPeer>>) -> 
 #[derive(Deserialize)]
 struct PushPref {
     enabled: bool,
+    /// Message previews in pushes (§14). Absent = keep the stored value
+    /// (on by default).
+    #[serde(default)]
+    previews: Option<bool>,
 }
 
-/// `PUT /v1/tunnel/push {"enabled": bool}`.
+/// `PUT /v1/tunnel/push {"enabled": bool, "previews"?: bool}` →
+/// `{"enabled": bool, "previews": bool}`.
 async fn tunnel_push(State(s): S, peer: Option<Extension<TunnelPeer>>, body: Bytes) -> ApiResult<Json<Value>> {
     let (t, rec) = tunnel_phone(&s, peer)?;
     let pref: PushPref = serde_json::from_slice(&body).map_err(|e| ApiError::bad_request(format!("invalid JSON body: {e}")))?;
-    t.registry.set_push(&rec.pid, pref.enabled)?;
-    Ok(Json(json!({ "enabled": pref.enabled })))
+    let (enabled, previews) = t.registry.set_push(&rec.pid, pref.enabled, pref.previews)?.ok_or_else(|| ApiError::not_found("phone"))?;
+    Ok(Json(json!({ "enabled": enabled, "previews": previews })))
 }
 
 async fn lab_status(State(s): S) -> Json<Value> {
