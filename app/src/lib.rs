@@ -9810,6 +9810,28 @@ fn set_titlebar_color(
     Ok(())
 }
 
+/// Mirror the UI theme (palette family + appearance mode) to
+/// `<app data dir>/appearance.json`. The web view keeps the real setting in
+/// localStorage; this copy lets `hive serve` on the same machine tell a paired
+/// phone which theme to follow ("Match host", `GET /v1/appearance`). The
+/// frontend calls it on launch and on every theme change; best-effort.
+#[tauri::command]
+fn save_appearance(app: AppHandle, palette: String, mode: String) -> Result<(), String> {
+    const PALETTES: [&str; 6] = ["pollen", "studio", "harbor", "slate", "meadow", "obsidian"];
+    const MODES: [&str; 3] = ["auto", "light", "dark"];
+    if !PALETTES.contains(&palette.as_str()) || !MODES.contains(&mode.as_str()) {
+        return Err(format!("unknown theme {palette}/{mode}"));
+    }
+    let data_dir: PathBuf = app.path().app_data_dir().map_err(map_err)?;
+    std::fs::create_dir_all(&data_dir).map_err(map_err)?;
+    let body = serde_json::json!({ "palette": palette, "mode": mode });
+    let path = data_dir.join("appearance.json");
+    let tmp = data_dir.join("appearance.json.tmp");
+    std::fs::write(&tmp, body.to_string()).map_err(map_err)?;
+    std::fs::rename(&tmp, &path).map_err(map_err)?;
+    Ok(())
+}
+
 /// Factory reset: wipe every local data file (chats, identity, keys, settings,
 /// workspaces, attachments) and relaunch fresh.
 ///
@@ -13636,6 +13658,7 @@ pub fn run() {
             launch_health,
             open_file_access_settings,
             set_titlebar_color,
+            save_appearance,
             reset_local_data,
             check_for_update,
             install_update,

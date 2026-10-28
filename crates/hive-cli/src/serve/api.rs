@@ -229,6 +229,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/proposals/:id/reject", post(reject_proposal))
         .route("/v1/dashboard", get(dashboard_view))
         .route("/v1/lab/status", get(lab_status))
+        .route("/v1/appearance", get(appearance))
         .route("/v1/events", get(events))
         .route("/v1/tunnel/credential", post(tunnel_credential))
         .route("/v1/tunnel/push", put(tunnel_push))
@@ -632,6 +633,11 @@ fn git_commit(dir: &std::path::Path, message: &str) -> Result<(), String> {
         return Err(format!("git commit: {}", text.trim()));
     }
     Ok(())
+}
+
+/// The host's theme for a phone set to "Match host" (`appearance.rs`).
+async fn appearance(State(s): S) -> Json<Value> {
+    Json(super::appearance::resolve(&s.opts.appearance))
 }
 
 // ── Tunnel-only routes (§9): 404 unless the request came through the tunnel ──

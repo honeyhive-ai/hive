@@ -81,6 +81,7 @@ and public addresses unless `HIVE_SERVE_ALLOW_ANY_BIND=1`.
 | POST | `/v1/proposals/{id}/approve` | `{proposal}` |
 | POST | `/v1/proposals/{id}/reject` `{reason?}` | `{proposal}` |
 | GET | `/v1/dashboard` | `{title, source, refreshSeconds, sections: [{title, panels: [Panel]}], updatedAt, error?}`. Defined by the host's `dashboard.toml`; see [dashboard.md](dashboard.md) |
+| GET | `/v1/appearance` | `{palette, mode, source}`, the host's theme for a phone set to "Match host". `palette` is `pollen`, `studio`, `harbor`, `slate`, `meadow`, `obsidian` or `null`; `mode` is `auto`, `light`, `dark` or `null`; `source` is `config`, `desktop` or `none` |
 | GET | `/v1/lab/status` | **Deprecated** (`Deprecation: true`; use `/v1/dashboard`). `{workers: [{name, up}], powerWatts?, costPerHour?, ratePerKwh?, temps: [{name, celsius}], solar?, updatedAt}` |
 | GET | `/v1/events` | `text/event-stream` |
 
@@ -112,6 +113,12 @@ Field notes:
   (`sections: []`). The app hides its dashboard tab when the dashboard is
   empty, and falls back to `/v1/lab/status` only when `/v1/dashboard` is 404
   (an older host).
+- `/v1/appearance` resolves each field on its own: serve config first
+  (`HIVE_SERVE_PALETTE`, `HIVE_SERVE_APPEARANCE`), then the desktop app's
+  `appearance.json` on the same machine (`HIVE_DESKTOP_DATA_DIR`, default the
+  OS app-data dir of `com.hive.desktop`), which the desktop rewrites whenever
+  its theme changes. The file is read per request. A client treats `null` (or a
+  404 from an older server) as "use the default palette".
 - `/v1/lab/status` (deprecated) is best-effort. Prometheus (`HIVE_PROMETHEUS_URL`, default
   `http://127.0.0.1:9090`) gets each query with a 2 s timeout. A field whose
   query fails is left out. `workers` comes from `rdnagw_worker_up{worker}`,

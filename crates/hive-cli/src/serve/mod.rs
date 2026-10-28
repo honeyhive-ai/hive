@@ -33,6 +33,7 @@ use crate::worker::{self, TurnSink, TurnState, WorkerCtx};
 use crate::{env_opt, open_service, sync_once, uuid_of_room, Config};
 
 pub mod api;
+pub mod appearance;
 pub mod dashboard;
 pub mod hub;
 pub mod lab;
@@ -80,6 +81,8 @@ pub struct ServeOptions {
     pub sync_every: Duration,
     /// Remote access through a relay tunnel (`None` = off, the default).
     pub remote: Option<tunnel::RelaySettings>,
+    /// Where `GET /v1/appearance` finds the host's theme (`appearance.rs`).
+    pub appearance: appearance::AppearanceConfig,
 }
 
 impl ServeOptions {
@@ -132,6 +135,7 @@ impl ServeOptions {
             apply_on_approve: env_flag("HIVE_SERVE_APPLY_ON_APPROVE", false),
             sync_every: Duration::from_secs(3),
             remote: None,
+            appearance: appearance::AppearanceConfig::from_env(),
         })
     }
 
