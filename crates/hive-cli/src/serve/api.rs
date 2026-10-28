@@ -20,8 +20,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use futures_util::stream::{self, Stream, StreamExt};
+use hive_core::proposals::ProposalRefinement;
 use hive_core::{
-    ActionProposal, ChatMessage, ChatSession, MessageRole, ProposalKind, ProposalStatus, Timestamp,
+    ActionProposal, ChatMessage, ChatSession, MessageRole, ProposalKind, ProposalStatus, Timestamp, WorkspaceRole,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -183,6 +184,102 @@ pub fn proposal_dto(s: &ChatSession, p: &ActionProposal) -> Value {
     if let Some(d) = &p.diff {
         v["diff"] = json!(d);
     }
+    collab_fields(&mut v, s, p);
+    v
+}
+
+fn role_name(r: WorkspaceRole) -> &'static str {
+    match r {
+        WorkspaceRole::Owner => "owner",
+        WorkspaceRole::Admin => "admin",
+        WorkspaceRole::Contributor => "contributor",
+        WorkspaceRole::Viewer => "viewer",
+    }
+}
+
+/// A voter's or commenter's name, as the desktop's Review pane tags them: the
+/// roster name, else a workspace agent's `@name`, else a short id.
+fn actor_name(s: &ChatSession, actor_id: &str) -> String {
+    if let Some(m) = s.members.iter().find(|m| m.id == actor_id) {
+        if !m.actor.display_name.trim().is_empty() {
+            return m.actor.display_name.clone();
+        }
+    }
+    if let Some(a) = s.workspace_agents.iter().find(|a| a.id.to_string() == actor_id) {
+        return format!("@{}", a.name);
+    }
+    let short = actor_id.get(..8).unwrap_or(actor_id);
+    if short.is_empty() { "someone".into() } else { short.into() }
+}
+
+pub fn comment_dto(s: &ChatSession, r: &ProposalRefinement) -> Value {
+    json!({
+        "id": r.id,
+        "actorId": r.actor_id,
+        "author": actor_name(s, &r.actor_id),
+        "role": role_name(r.role),
+        "text": r.text,
+        "requestChanges": r.request_changes,
+        "createdAt": iso(r.created_at),
+    })
+}
+
+/// The collaboration state the desktop's Review card shows: quorum, who voted
+/// (name + role at the time of the vote), the refinement thread, and the
+/// revision chain. Additive to the base proposal JSON.
+fn collab_fields(v: &mut Value, s: &ChatSession, p: &ActionProposal) {
+    v["requiredApprovals"] = json!(p.required_approvals);
+    v["qualifyingApprovals"] = json!(p.qualifying_approvals());
+    v["quorumMet"] = json!(p.is_quorum_met());
+    v["approvalRoleFloor"] = json!(role_name(p.approval_role_floor));
+    v["votes"] = json!(p
+        .approvals
+        .iter()
+        .map(|a| json!({
+            "actorId": a.actor_id,
+            "voter": actor_name(s, &a.actor_id),
+            "role": role_name(a.role),
+            "approved": a.approved,
+            "createdAt": iso(a.created_at),
+        }))
+        .collect::<Vec<_>>());
+    v["comments"] = json!(p.refinements.iter().map(|r| comment_dto(s, r)).collect::<Vec<_>>());
+    v["commentCount"] = json!(p.refinements.len());
+    v["changeRequestCount"] = json!(p.refinements.iter().filter(|r| r.request_changes).count());
+    v["changedFiles"] = json!(p.changed_files);
+    v["dismissed"] = json!(p.dismissed);
+    if let Some(id) = p.parent_id {
+        v["parentId"] = json!(id);
+    }
+    if let Some(id) = p.superseded_by {
+        v["supersededBy"] = json!(id);
+    }
+}
+
+/// [`proposal_dto`] plus what this box's identity — the one the phone acts as
+/// — can do: its current vote and whether its role may vote or comment at all
+/// (the same content floor `authorize` applies to `ProposalVoteCast` /
+/// `ProposalRefined`, so a viewer sees disabled controls instead of a 403).
+pub fn proposal_dto_as(s: &ChatSession, p: &ActionProposal, me: &str) -> Value {
+    let mut v = proposal_dto(s, p);
+    let role = s.role_of(me);
+    v["myRole"] = json!(role_name(role));
+    v["myVote"] = match p.approvals.iter().find(|a| a.actor_id == me) {
+        Some(a) if a.approved => json!("approve"),
+        Some(_) => json!("reject"),
+        None => Value::Null,
+    };
+    let floor = hive_core::authorization::min_role_for(&hive_core::SessionEvent::ProposalVoteCast {
+        proposal_id: p.id,
+        approval: hive_core::proposals::ProposalApproval {
+            actor_id: me.to_string(),
+            role,
+            approved: true,
+            created_at: Timestamp::now(),
+        },
+    });
+    v["canVote"] = json!(role.rank() >= floor.rank());
+    v["isMine"] = json!(!p.author_actor_id.is_empty() && p.author_actor_id == me);
     v
 }
 
@@ -227,6 +324,9 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/proposals", get(list_proposals))
         .route("/v1/proposals/:id/approve", post(approve_proposal))
         .route("/v1/proposals/:id/reject", post(reject_proposal))
+        .route("/v1/proposals/:id", get(get_proposal))
+        .route("/v1/proposals/:id/comments", get(list_comments).post(post_comment))
+        .route("/v1/proposals/:id/request-changes", post(request_changes))
         .route("/v1/dashboard", get(dashboard_view))
         .route("/v1/lab/status", get(lab_status))
         .route("/v1/appearance", get(appearance))
@@ -487,12 +587,13 @@ async fn list_proposals(State(s): S, Query(f): Query<ProposalFilter>) -> ApiResu
         Some("all") => true,
         Some(other) => return Err(ApiError::bad_request(format!("status must be open or all (got '{other}')"))),
     };
+    let me = s.my_actor_id();
     let mut out: Vec<(Timestamp, Value)> = Vec::new();
     for chat in s.workspace_chats()? {
         for p in &chat.proposals {
             let open = p.status == ProposalStatus::Open && !p.dismissed && p.superseded_by.is_none();
             if all || open {
-                out.push((p.created_at, proposal_dto(&chat, p)));
+                out.push((p.created_at, proposal_dto_as(&chat, p, &me)));
             }
         }
     }
@@ -536,7 +637,7 @@ async fn approve_proposal(State(s): S, Path(id): Path<String>) -> ApiResult<Json
     }
     s.after_write();
     let chat = load_chat(&s, &chat.id.to_string()).unwrap_or(chat);
-    Ok(Json(json!({ "proposal": proposal_dto(&chat, &updated) })))
+    Ok(Json(json!({ "proposal": proposal_dto_as(&chat, &updated, &s.my_actor_id()) })))
 }
 
 #[derive(Deserialize, Default)]
@@ -558,7 +659,186 @@ async fn reject_proposal(State(s): S, Path(id): Path<String>, body: Bytes) -> Ap
     }
     let updated = vote(&s, &chat, p.id, false)?;
     s.after_write();
-    Ok(Json(json!({ "proposal": proposal_dto(&chat, &updated) })))
+    let chat = load_chat(&s, &chat.id.to_string()).unwrap_or(chat);
+    let updated = chat.proposals.iter().find(|q| q.id == updated.id).cloned().unwrap_or(updated);
+    Ok(Json(json!({ "proposal": proposal_dto_as(&chat, &updated, &s.my_actor_id()) })))
+}
+
+// ── Proposal collaboration: thread + request changes (desktop parity) ─────
+
+async fn get_proposal(State(s): S, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    let (chat, p) = find_proposal(&s, &id)?;
+    Ok(Json(json!({ "proposal": proposal_dto_as(&chat, &p, &s.my_actor_id()) })))
+}
+
+async fn list_comments(State(s): S, Path(id): Path<String>) -> ApiResult<Json<Value>> {
+    let (chat, p) = find_proposal(&s, &id)?;
+    Ok(Json(json!({ "comments": p.refinements.iter().map(|r| comment_dto(&chat, r)).collect::<Vec<_>>() })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NewComment {
+    text: String,
+    #[serde(default)]
+    request_changes: bool,
+}
+
+/// Append a note to the proposal's refinement thread as this box's identity at
+/// its real roster role — the desktop's `refine_proposal`. The core's authz
+/// gate (`ProposalRefined` needs a content-tier role) answers a viewer 403.
+fn add_note(s: &Shared, chat: &ChatSession, pid: Uuid, text: &str, request_changes: bool) -> ApiResult<ActionProposal> {
+    let mut svc = s.lock();
+    let actor = svc.author().id.clone();
+    let role = chat.role_of(&actor);
+    svc.refine_proposal(chat.id, chat.workspace_id, pid, actor, role, text, request_changes)?
+        .ok_or_else(|| ApiError::not_found("proposal"))
+}
+
+async fn post_comment(State(s): S, Path(id): Path<String>, Json(req): Json<NewComment>) -> ApiResult<Json<Value>> {
+    let text = req.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("a refinement note can't be empty"));
+    }
+    let (chat, p) = find_proposal(&s, &id)?;
+    let updated = add_note(&s, &chat, p.id, text, req.request_changes)?;
+    s.after_write();
+    let chat = load_chat(&s, &chat.id.to_string()).unwrap_or(chat);
+    let updated = chat.proposals.iter().find(|q| q.id == updated.id).cloned().unwrap_or(updated);
+    let comment = updated.refinements.last().map(|r| comment_dto(&chat, r)).unwrap_or(Value::Null);
+    Ok(Json(json!({ "comment": comment, "proposal": proposal_dto_as(&chat, &updated, &s.my_actor_id()) })))
+}
+
+/// A "Send to agent to revise" waiting for the agent's new version.
+#[derive(Debug, Clone)]
+pub struct PendingRevision {
+    pub chat: Uuid,
+    pub agent: Uuid,
+    pub requested_at: Timestamp,
+}
+
+#[derive(Deserialize, Default)]
+struct ChangesReq {
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// The desktop's `request_proposal_changes`: bundle the thread's change
+/// requests (else all notes) into an instruction, record "Sent to the agent to
+/// revise." on the thread, and post the instruction as this box's user message
+/// addressed to the agent that produced the proposal — so whichever device
+/// hosts that agent answers it, like any mention. The revision the turn files
+/// is linked back (`parentId` / `supersededBy`) when it arrives
+/// ([`Shared::link_revisions`]). An optional `note` is added first as a change
+/// request, so the phone can do both in one tap.
+async fn request_changes(State(s): S, Path(id): Path<String>, body: Bytes) -> ApiResult<Json<Value>> {
+    let req: ChangesReq = optional_json(&body)?;
+    let (chat, p) = find_proposal(&s, &id)?;
+    if p.superseded_by.is_some() {
+        return Err(ApiError(StatusCode::CONFLICT, "this proposal was already revised".into()));
+    }
+    if p.status == ProposalStatus::Applied {
+        return Err(ApiError(StatusCode::CONFLICT, "this proposal was already implemented".into()));
+    }
+    // Who revises it: the agent whose turn produced it. The chat's primary
+    // runtime (@hive) only runs on a desktop, so fall back to the configured
+    // default agent, else refuse rather than post a message nobody answers.
+    let agent = p
+        .producing_agent_id
+        .and_then(|aid| chat.workspace_agents.iter().find(|a| a.id == aid))
+        .or_else(|| {
+            let name = s.opts.default_agent.as_deref()?;
+            chat.workspace_agents.iter().find(|a| a.name.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .ok_or_else(|| {
+            ApiError(
+                StatusCode::CONFLICT,
+                "this proposal came from the chat's primary runtime — send it back from the desktop".into(),
+            )
+        })?;
+    let mut current = p.clone();
+    if let Some(note) = req.note.map(|n| n.trim().to_string()).filter(|n| !n.is_empty()) {
+        current = add_note(&s, &chat, p.id, &note, true)?;
+    }
+    // Prefer explicit change requests; fall back to all notes so a plain
+    // comment thread can still drive a revision (as the desktop does).
+    let mut notes: Vec<&ProposalRefinement> = current.refinements.iter().filter(|r| r.request_changes).collect();
+    if notes.is_empty() {
+        notes = current.refinements.iter().collect();
+    }
+    if notes.is_empty() {
+        return Err(ApiError::bad_request("add a refinement note before sending it back to the agent"));
+    }
+    let feedback = notes.iter().map(|r| format!("- {}", r.text.trim())).collect::<Vec<_>>().join("\n");
+    let instruction = format!(
+        "@{} Please revise your proposal \"{}\" based on this review feedback, then produce an updated proposal:\n\n{}",
+        agent.name, p.title, feedback
+    );
+    let requested_at = Timestamp::now();
+    add_note(&s, &chat, p.id, "Sent to the agent to revise.", true)?;
+    let message = {
+        let mut svc = s.lock();
+        svc.post_user_message(chat.id, chat.workspace_id, instruction)?
+    };
+    s.revisions
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(p.id, PendingRevision { chat: chat.id, agent: agent.id, requested_at });
+    s.mark_read_after_post(chat.id, message.id);
+    s.after_write();
+    let chat = load_chat(&s, &chat.id.to_string()).unwrap_or(chat);
+    let updated = chat.proposals.iter().find(|q| q.id == p.id).cloned().unwrap_or(current);
+    Ok(Json(json!({
+        "proposal": proposal_dto_as(&chat, &updated, &s.my_actor_id()),
+        "message": message_dto(chat.id, &message),
+    })))
+}
+
+impl Shared {
+    /// Link each newly-seen proposal that answers a pending "Send to agent to
+    /// revise" back to the version it revises, as the desktop does after its
+    /// revision turn: the new one gets `parent_id`, the original
+    /// `superseded_by`. Matches on the producing agent and the request time,
+    /// so it holds whichever device ran the turn. Returns whether it wrote.
+    pub(crate) fn link_revisions(&self, created: &[(Uuid, Uuid)]) -> bool {
+        let mut pending = self.revisions.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.is_empty() || created.is_empty() {
+            return false;
+        }
+        let mut wrote = false;
+        let mut svc = self.lock();
+        for (chat_id, new_id) in created {
+            let Ok(Some(chat)) = svc.load(*chat_id) else { continue };
+            let Some(child) = chat.proposals.iter().find(|p| p.id == *new_id) else { continue };
+            let parent_id = pending
+                .iter()
+                .filter(|(pid, r)| {
+                    r.chat == *chat_id
+                        && **pid != child.id
+                        && child.producing_agent_id == Some(r.agent)
+                        && child.created_at.inner() >= r.requested_at.inner()
+                })
+                .max_by_key(|(_, r)| r.requested_at)
+                .map(|(pid, _)| *pid);
+            let Some(parent_id) = parent_id else { continue };
+            pending.remove(&parent_id);
+            let mut child = child.clone();
+            child.parent_id = Some(parent_id);
+            if let Err(e) = svc.upsert_proposal(chat.id, chat.workspace_id, child) {
+                eprintln!("serve: linking revision failed: {e}");
+                continue;
+            }
+            if let Some(mut parent) = chat.proposals.iter().find(|p| p.id == parent_id).cloned() {
+                parent.superseded_by = Some(*new_id);
+                if let Err(e) = svc.upsert_proposal(chat.id, chat.workspace_id, parent) {
+                    eprintln!("serve: marking superseded failed: {e}");
+                }
+            }
+            wrote = true;
+        }
+        wrote
+    }
 }
 
 /// Opt-in (`HIVE_SERVE_APPLY_ON_APPROVE=1`): carry out an approved file-diff

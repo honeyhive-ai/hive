@@ -683,6 +683,262 @@ async fn reject_with_reason_and_last_event_id_replay() {
     h.handle.shutdown();
 }
 
+/// File a proposal on a fresh chat the way the worker does (authorless, from
+/// `@coder`), returning (chat, proposal).
+async fn filed_proposal(h: &Harness, producing: Option<Uuid>) -> (Uuid, Uuid) {
+    let chat = h.send(reqwest::Method::POST, "/v1/chats", None).await;
+    let chat_id = Uuid::parse_str(chat["chat"]["id"].as_str().unwrap()).unwrap();
+    let pid = {
+        let mut svc = h.handle.shared.lock();
+        let mut p = hive_core::ActionProposal::file_diff(
+            "@coder proposed changes to 1 file",
+            "",
+            "diff --git a/x b/x\n".into(),
+            vec!["x".into()],
+        );
+        p.producing_agent_id = producing;
+        let id = p.id;
+        svc.upsert_proposal(chat_id, h.handle.shared.ws, p).unwrap();
+        id
+    };
+    h.handle.shared.after_write();
+    (chat_id, pid)
+}
+
+async fn status_of(h: &Harness, method: reqwest::Method, path: &str, body: Option<Value>) -> (u16, Value) {
+    let mut req = h.client.request(method, format!("{}{path}", h.base)).bearer_auth(&h.token);
+    if let Some(b) = body {
+        req = req.json(&b);
+    }
+    let r = req.send().await.unwrap();
+    let code = r.status().as_u16();
+    (code, r.json().await.unwrap_or(Value::Null))
+}
+
+/// The desktop's Review card, from the phone: comments and change requests
+/// land on the proposal's refinement thread, a vote is tagged with the voter's
+/// name and role, and each change reaches the stream as `proposal.updated`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn comments_and_votes_show_who_and_stream_updates() {
+    let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let h = harness(&endpoint, "m", &[("README.md", "x\n")]).await;
+    let (_, pid) = filed_proposal(&h, Some(h.agent_id)).await;
+    let mut rx = h.events(None).await;
+
+    let listed = h.get("/v1/proposals").await["proposals"][0].clone();
+    assert_eq!(listed["commentCount"], 0);
+    assert_eq!(listed["requiredApprovals"], 1);
+    assert_eq!(listed["qualifyingApprovals"], 0);
+    assert_eq!(listed["votes"], json!([]));
+    assert_eq!(listed["myVote"], Value::Null);
+    assert_eq!(listed["canVote"], true);
+
+    let empty = status_of(&h, reqwest::Method::POST, &format!("/v1/proposals/{pid}/comments"), Some(json!({ "text": "  " }))).await;
+    assert_eq!(empty.0, 400);
+
+    let c = h
+        .send(reqwest::Method::POST, &format!("/v1/proposals/{pid}/comments"), Some(json!({ "text": "Looks close" })))
+        .await;
+    assert_eq!(c["comment"]["text"], "Looks close");
+    assert_eq!(c["comment"]["requestChanges"], false);
+    assert_eq!(c["comment"]["author"], "Phone");
+    assert_eq!(c["proposal"]["commentCount"], 1);
+    let cr = h
+        .send(
+            reqwest::Method::POST,
+            &format!("/v1/proposals/{pid}/comments"),
+            Some(json!({ "text": "Rename the helper", "requestChanges": true })),
+        )
+        .await;
+    assert_eq!(cr["proposal"]["changeRequestCount"], 1);
+    let thread = h.get(&format!("/v1/proposals/{pid}/comments")).await;
+    let texts: Vec<&str> = thread["comments"].as_array().unwrap().iter().map(|c| c["text"].as_str().unwrap()).collect();
+    assert_eq!(texts, vec!["Looks close", "Rename the helper"]);
+
+    let approved = h.send(reqwest::Method::POST, &format!("/v1/proposals/{pid}/approve"), None).await;
+    let p = &approved["proposal"];
+    assert_eq!(p["status"], "approved");
+    assert_eq!(p["myVote"], "approve");
+    assert_eq!(p["qualifyingApprovals"], 1);
+    assert_eq!(p["quorumMet"], true);
+    assert_eq!(p["votes"][0]["voter"], "Phone");
+    assert_eq!(p["votes"][0]["approved"], true);
+    assert!(["owner", "admin", "contributor"].contains(&p["votes"][0]["role"].as_str().unwrap()), "{p}");
+    // A later reject replaces this voter's vote (latest wins), as on the desktop.
+    let rejected = h.send(reqwest::Method::POST, &format!("/v1/proposals/{pid}/reject"), None).await;
+    assert_eq!(rejected["proposal"]["myVote"], "reject");
+    assert_eq!(rejected["proposal"]["votes"].as_array().unwrap().len(), 1);
+
+    let one = h.get(&format!("/v1/proposals/{pid}")).await;
+    assert_eq!(one["proposal"]["status"], "rejected");
+    assert_eq!(one["proposal"]["comments"].as_array().unwrap().len(), 2);
+
+    let seen = collect_until(&mut rx, 5, |evs| {
+        evs.iter().filter(|(n, d, _)| n == "proposal.updated" && d["proposal"]["id"] == json!(pid)).count() >= 4
+    })
+    .await;
+    let updates: Vec<&Value> = seen.iter().filter(|(n, _, _)| n == "proposal.updated").map(|(_, d, _)| &d["proposal"]).collect();
+    assert!(updates.len() >= 4, "{seen:?}");
+    assert_eq!(updates.last().unwrap()["status"], "rejected");
+
+    // And it synced: the desktop sees the thread and the vote.
+    sync_once(&h.desktop).await.unwrap();
+    let mut desktop_seen = false;
+    for _ in 0..30 {
+        sync_once(&h.desktop).await.unwrap();
+        let svc = open_service(&h.desktop).unwrap();
+        let found = svc
+            .store()
+            .list_session_ids()
+            .unwrap()
+            .into_iter()
+            .filter_map(|id| svc.load(id).ok().flatten())
+            .flat_map(|s| s.proposals)
+            .find(|p| p.id == pid);
+        if found.as_ref().is_some_and(|p| p.refinements.len() == 2 && p.approvals.len() == 1) {
+            desktop_seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(desktop_seen, "the desktop never saw the phone's notes and vote");
+    h.handle.shutdown();
+}
+
+/// "Send to agent to revise" from the phone: the change request rides the
+/// thread, the instruction is posted to the producing agent as a mention, and
+/// the revision that agent files comes back linked to the original.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_changes_asks_the_agent_and_links_the_revision() {
+    let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let h = harness(&endpoint, "m", &[("README.md", "x\n")]).await;
+    let (chat_id, pid) = filed_proposal(&h, Some(h.agent_id)).await;
+
+    // Nothing on the thread yet: nothing to forward.
+    let bare = status_of(&h, reqwest::Method::POST, &format!("/v1/proposals/{pid}/request-changes"), None).await;
+    assert_eq!(bare.0, 400, "{}", bare.1);
+
+    let res = h
+        .send(
+            reqwest::Method::POST,
+            &format!("/v1/proposals/{pid}/request-changes"),
+            Some(json!({ "note": "Use a constant, not a literal" })),
+        )
+        .await;
+    let body = res["message"]["body"].as_str().unwrap();
+    assert!(body.starts_with("@coder Please revise your proposal"), "{body}");
+    assert!(body.contains("- Use a constant, not a literal"), "{body}");
+    let thread: Vec<&str> =
+        res["proposal"]["comments"].as_array().unwrap().iter().map(|c| c["text"].as_str().unwrap()).collect();
+    assert_eq!(thread, vec!["Use a constant, not a literal", "Sent to the agent to revise."]);
+    assert!(res["proposal"]["comments"].as_array().unwrap().iter().all(|c| c["requestChanges"] == true));
+    {
+        let svc = h.handle.shared.lock();
+        let s = svc.load(chat_id).unwrap().unwrap();
+        let pending = hive_runtime::chat_service::pending_mentions(&s);
+        assert!(pending.iter().any(|m| m.agent_id == h.agent_id), "the revision request is queued work for @coder");
+    }
+
+    // The agent's turn files a new version (wherever it ran).
+    let mut rx = h.events(None).await;
+    let child = {
+        let mut svc = h.handle.shared.lock();
+        let mut p = hive_core::ActionProposal::file_diff(
+            "@coder proposed changes to 1 file",
+            "",
+            "diff --git a/y b/y\n".into(),
+            vec!["y".into()],
+        );
+        p.producing_agent_id = Some(h.agent_id);
+        let id = p.id;
+        svc.upsert_proposal(chat_id, h.handle.shared.ws, p).unwrap();
+        id
+    };
+    h.handle.shared.after_write();
+    let all = h.get("/v1/proposals?status=all").await;
+    let find = |id: Uuid| all["proposals"].as_array().unwrap().iter().find(|p| p["id"] == json!(id)).unwrap().clone();
+    assert_eq!(find(child)["parentId"], json!(pid));
+    assert_eq!(find(pid)["supersededBy"], json!(child));
+    let open: Vec<Value> = h.get("/v1/proposals").await["proposals"].as_array().unwrap().clone();
+    assert_eq!(open.len(), 1, "the superseded version left the inbox");
+    assert_eq!(open[0]["id"], json!(child));
+    let seen = collect_until(&mut rx, 5, |evs| {
+        evs.iter().any(|(n, d, _)| n == "proposal.updated" && d["proposal"]["supersededBy"] == json!(child))
+    })
+    .await;
+    assert!(seen.iter().any(|(n, _, _)| n == "proposal.created"), "{seen:?}");
+
+    // A revised proposal can't be sent back again.
+    let again = status_of(&h, reqwest::Method::POST, &format!("/v1/proposals/{pid}/request-changes"), Some(json!({ "note": "x" }))).await;
+    assert_eq!(again.0, 409);
+
+    // One from the chat's primary runtime has no agent the phone can address.
+    let (_, primary) = filed_proposal(&h, None).await;
+    let res = status_of(&h, reqwest::Method::POST, &format!("/v1/proposals/{primary}/request-changes"), Some(json!({ "note": "x" }))).await;
+    assert_eq!(res.0, 409, "{}", res.1);
+    h.handle.shutdown();
+}
+
+/// Role gates hold exactly as on the desktop: a viewer can't vote, comment or
+/// send a proposal back — the core's authz refuses the event and the phone
+/// gets 403 — and the proposal JSON says so up front (`canVote: false`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_viewer_cannot_vote_comment_or_request_changes() {
+    let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let h = harness(&endpoint, "m", &[("README.md", "x\n")]).await;
+    let (chat_id, pid) = filed_proposal(&h, Some(h.agent_id)).await;
+    let me = h.handle.shared.my_actor_id();
+    let ws = h.handle.shared.ws;
+
+    // Wait for the box's own membership to reach the desktop, then the owner
+    // demotes it to viewer.
+    let mut demoted = false;
+    for _ in 0..50 {
+        sync_once(&h.desktop).await.unwrap();
+        let mut svc = open_service(&h.desktop).unwrap();
+        let cfg = workspace_config_session_id(ws);
+        let known = svc.load(cfg).unwrap().is_some_and(|s| s.members.iter().any(|m| m.id == me));
+        if known {
+            svc.set_member_role(cfg, ws, me.clone(), hive_core::WorkspaceRole::Viewer).unwrap();
+            drop(svc);
+            sync_once(&h.desktop).await.unwrap();
+            demoted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(demoted, "the box never joined the desktop's roster");
+    let mut is_viewer = false;
+    for _ in 0..50 {
+        let s = h.handle.shared.lock().load(chat_id).unwrap().unwrap();
+        if s.role_of(&me) == hive_core::WorkspaceRole::Viewer {
+            is_viewer = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(is_viewer, "the demotion never synced to the box");
+
+    let p = h.get(&format!("/v1/proposals/{pid}")).await;
+    assert_eq!(p["proposal"]["canVote"], false);
+    assert_eq!(p["proposal"]["myRole"], "viewer");
+    for (path, body) in [
+        (format!("/v1/proposals/{pid}/approve"), None),
+        (format!("/v1/proposals/{pid}/reject"), None),
+        (format!("/v1/proposals/{pid}/comments"), Some(json!({ "text": "hi" }))),
+        (format!("/v1/proposals/{pid}/request-changes"), Some(json!({ "note": "redo" }))),
+    ] {
+        let (code, v) = status_of(&h, reqwest::Method::POST, &path, body).await;
+        assert_eq!(code, 403, "{path}: {v}");
+    }
+    let s = h.handle.shared.lock().load(chat_id).unwrap().unwrap();
+    let p = s.proposals.iter().find(|p| p.id == pid).unwrap();
+    assert!(p.approvals.is_empty() && p.refinements.is_empty(), "a denied write left a trace");
+    assert_eq!(p.status, hive_core::ProposalStatus::Open);
+    drop(s);
+    h.handle.shutdown();
+}
+
 /// Approving from the phone must not apply a proposal a qualifying reviewer
 /// already rejected: quorum stays met after a reject, but the folded status is
 /// Rejected, and Applied would be terminal on every peer.

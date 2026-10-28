@@ -36,7 +36,8 @@ API plus a Server-Sent Events stream.
   - the HTTP API and the SSE stream (`api.rs`, axum);
   - an event hub (`hub.rs`). After every sync, write or turn step, a differ
     compares the projected chats with the last snapshot and emits
-    `message.created`, `message.done`, `proposal.created` and `chat.updated`.
+    `message.created`, `message.done`, `proposal.created`, `proposal.updated`
+    and `chat.updated`.
     A reply the desktop streamed and synced in therefore looks the same to the
     phone as one produced here. Deltas and turn status come straight from the
     worker.
@@ -80,6 +81,10 @@ and public addresses unless `HIVE_SERVE_ALLOW_ANY_BIND=1`.
 | GET | `/v1/proposals?status=open\|all` | `{proposals: [{id, chatId, title, body, kind, diff?, status, createdAt, author}]}` |
 | POST | `/v1/proposals/{id}/approve` | `{proposal}` |
 | POST | `/v1/proposals/{id}/reject` `{reason?}` | `{proposal}` |
+| GET | `/v1/proposals/{id}` | `{proposal}` |
+| GET | `/v1/proposals/{id}/comments` | `{comments: [Comment]}`, the refinement thread, oldest first |
+| POST | `/v1/proposals/{id}/comments` `{text, requestChanges?}` | `{comment, proposal}`. `requestChanges: true` marks it a change request |
+| POST | `/v1/proposals/{id}/request-changes` `{note?}` | `{proposal, message}`. The desktop's "Send to agent to revise"; `note` is added first as a change request |
 | GET | `/v1/dashboard` | `{title, source, refreshSeconds, sections: [{title, panels: [Panel]}], updatedAt, error?}`. Defined by the host's `dashboard.toml`; see [dashboard.md](dashboard.md) |
 | GET | `/v1/appearance` | `{palette, mode, source}`, the host's theme for a phone set to "Match host". `palette` is `pollen`, `studio`, `harbor`, `slate`, `meadow`, `obsidian` or `null`; `mode` is `auto`, `light`, `dark` or `null`; `source` is `config`, `desktop` or `none` |
 | GET | `/v1/lab/status` | **Deprecated** (`Deprecation: true`; use `/v1/dashboard`). `{workers: [{name, up}], powerWatts?, costPerHour?, ratePerKwh?, temps: [{name, celsius}], solar?, updatedAt}` |
@@ -91,6 +96,18 @@ and public addresses unless `HIVE_SERVE_ALLOW_ANY_BIND=1`.
 `decision`. `status` is `open`, `approved`, `rejected` or `applied`. `diff` is
 a unified diff.
 
+Every proposal also carries its collaboration state, as the desktop's Review
+card shows it: `requiredApprovals`, `qualifyingApprovals`, `quorumMet`,
+`approvalRoleFloor`, `votes: [{actorId, voter, role, approved, createdAt}]`
+(one per member, latest wins), `comments: [Comment]`, `commentCount`,
+`changeRequestCount`, `changedFiles`, `dismissed`, `parentId?` (the version it
+revises) and `supersededBy?` (its newer version). Proposals in API responses
+and events also say what this box's identity, the one the phone acts as, can
+do: `myRole`, `myVote: "approve"|"reject"|null`, `canVote` (its role meets the
+content floor the core applies to votes and notes) and `isMine`.
+`Comment = {id, actorId, author, role, text, requestChanges, createdAt}`.
+`role` everywhere is `owner`, `admin`, `contributor` or `viewer`.
+
 Field notes:
 
 - `unread` counts messages after the phone's read mark that this box didn't
@@ -99,6 +116,19 @@ Field notes:
 - `preview` is the newest non-empty, non-system message, up to 140 characters.
 - `/v1/proposals?status=open` lists open proposals that haven't been dismissed
   or superseded. `all` lists every proposal.
+- Votes and notes go through the same core calls as the desktop
+  (`ProposalVoteCast` and `ProposalRefined` deltas, signed by this box at its
+  real roster role), so they sync to every device and merge with concurrent
+  ones. A role below the content floor gets `403` and nothing is written.
+- `request-changes` bundles the thread's change requests (all notes if there
+  are none; `400` if the thread is empty), records "Sent to the agent to
+  revise." on the thread and posts the instruction as an `@agent` message to
+  the agent that produced the proposal, so whichever device hosts it answers.
+  When that agent files its next proposal in the chat, this box links it
+  (`parentId`) and marks the original `supersededBy`, and the original leaves
+  the open list. `409` if the proposal is already revised or applied, or if it
+  came from the chat's primary runtime and no `HIVE_SERVE_DEFAULT_AGENT` names
+  an agent to send it to.
 - An agent with no host runs on its owner's device. It has no `hostId`, and its
   `hostLabel` is "Owner's device". For an agent on this box, `hostLabel` is
   "<label> (this host)".
@@ -140,6 +170,7 @@ that falls further behind should refetch.
 | `message.done` | `{message}`, the final body with `streaming: false`. Replies synced in already finished get `created` followed by `done` |
 | `chat.updated` | `{chat}` (same shape as in `/v1/chats`) |
 | `proposal.created` | `{proposal}` |
+| `proposal.updated` | `{proposal}`, when a known proposal's status, votes, thread, revision link or dismissal changes (from this phone or any device) |
 | `turn.status` | `{chatId, agentId, state: "queued"\|"running"\|"done"\|"error", detail?}` |
 
 ### Pairing and links
@@ -283,6 +314,9 @@ hive remote disable | reset   # reset = new host keys: every phone re-pairs
   here explicitly. Once an agent is sent to a host, only that host answers its
   mentions; the desktop defers to it (and answers after 25 s only if the host
   is offline).
+- A pending "send to agent to revise" is remembered in memory: if the box
+  restarts before the revision arrives, the new version isn't linked to the
+  old one (both stay listed).
 - Approving doesn't apply a diff by default; the desktop's Implement does that.
   Set `HIVE_SERVE_APPLY_ON_APPROVE=1` to apply on the home host.
 

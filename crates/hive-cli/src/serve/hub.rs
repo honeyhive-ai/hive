@@ -78,8 +78,29 @@ struct ChatSnap {
     title: String,
     /// message id → still streaming
     messages: HashMap<Uuid, bool>,
-    /// proposal id → status
-    proposals: HashMap<Uuid, ProposalStatus>,
+    /// proposal id → what the phone shows of it
+    proposals: HashMap<Uuid, ProposalSnap>,
+}
+
+/// The parts of a proposal whose change is a `proposal.updated`: its status,
+/// votes, refinement thread, revision link and inbox visibility.
+#[derive(Debug, Clone, PartialEq)]
+struct ProposalSnap {
+    status: ProposalStatus,
+    votes: Vec<(String, bool)>,
+    comments: usize,
+    superseded: bool,
+    dismissed: bool,
+}
+
+fn proposal_snap(p: &ActionProposal) -> ProposalSnap {
+    ProposalSnap {
+        status: p.status,
+        votes: p.approvals.iter().map(|a| (a.actor_id.clone(), a.approved)).collect(),
+        comments: p.refinements.len(),
+        superseded: p.superseded_by.is_some(),
+        dismissed: p.dismissed,
+    }
 }
 
 /// Something the phone (or ntfy) should hear about.
@@ -88,6 +109,8 @@ pub enum Change {
     MessageCreated { chat: Uuid, message: Uuid },
     MessageDone { chat: Uuid, message: Uuid },
     ProposalCreated { chat: Uuid, proposal: Uuid },
+    /// A known proposal's votes, thread, status or revision link changed.
+    ProposalUpdated { chat: Uuid, proposal: Uuid },
     ChatUpdated { chat: Uuid },
 }
 
@@ -101,7 +124,7 @@ fn snap(s: &ChatSession) -> ChatSnap {
     ChatSnap {
         title: s.title.clone(),
         messages: s.messages.iter().map(|m| (m.id, m.is_streaming)).collect(),
-        proposals: s.proposals.iter().map(|p| (p.id, p.status)).collect(),
+        proposals: s.proposals.iter().map(|p| (p.id, proposal_snap(p))).collect(),
     }
 }
 
@@ -160,8 +183,15 @@ impl Differ {
                         out.push(Change::ProposalCreated { chat: s.id, proposal: p.id });
                     }
                     None => touched = true,
-                    Some(st) if *st != p.status => touched = true,
-                    _ => {}
+                    Some(before) => {
+                        let now = proposal_snap(p);
+                        if *before != now {
+                            // A status change still touches the chat (as before);
+                            // a vote or note alone is a proposal event only.
+                            touched |= before.status != now.status;
+                            out.push(Change::ProposalUpdated { chat: s.id, proposal: p.id });
+                        }
+                    }
                 }
             }
             if touched {
@@ -254,6 +284,36 @@ mod tests {
         s.proposals = vec![settled, hidden, open];
         let c = d.diff(std::slice::from_ref(&s));
         assert_eq!(c, vec![Change::ProposalCreated { chat: s.id, proposal: oid }, Change::ChatUpdated { chat: s.id }]);
+    }
+
+    #[test]
+    fn votes_and_notes_are_proposal_updates_status_also_touches_the_chat() {
+        let mut d = Differ::default();
+        let mut s = chat();
+        let p = ActionProposal::new("p", hive_core::ProposalKind::Decision, "");
+        let pid = p.id;
+        s.proposals.push(p);
+        d.seed(std::slice::from_ref(&s));
+        s.proposals[0].add_refinement(hive_core::proposals::ProposalRefinement {
+            id: Uuid::new_v4(),
+            actor_id: "a".into(),
+            role: hive_core::WorkspaceRole::Contributor,
+            text: "hm".into(),
+            request_changes: false,
+            created_at: hive_core::Timestamp::now(),
+        });
+        assert_eq!(d.diff(std::slice::from_ref(&s)), vec![Change::ProposalUpdated { chat: s.id, proposal: pid }]);
+        s.proposals[0].cast_vote(hive_core::proposals::ProposalApproval {
+            actor_id: "a".into(),
+            role: hive_core::WorkspaceRole::Contributor,
+            approved: true,
+            created_at: hive_core::Timestamp::now(),
+        });
+        assert_eq!(
+            d.diff(std::slice::from_ref(&s)),
+            vec![Change::ProposalUpdated { chat: s.id, proposal: pid }, Change::ChatUpdated { chat: s.id }]
+        );
+        assert!(d.diff(std::slice::from_ref(&s)).is_empty());
     }
 
     #[test]
