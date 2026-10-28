@@ -122,12 +122,17 @@ async fn tunnel_end_to_end_pair_get_sse_renew_revoke() {
         title: "coder replied".into(),
         sender: Some("coder".into()),
         preview: Some(format!("secret plan {}", "z".repeat(300))),
-        fixed_body: String::new(),
+        ..Default::default()
     };
+    // The SSE stream above was cancelled: the app is "in the background".
+    wait_background(&t, &pid).await;
     for (previews, want_preview) in [(false, false), (true, true)] {
         c.request("PUT", "/v1/tunnel/push", Some(json!({ "enabled": true, "previews": previews }))).await.unwrap();
         let seq = t.registry.get(&pid).unwrap().push_seq;
-        t.push_all(&content);
+        // A different chat each time: the same (kind, chat) within 10 s is
+        // coalesced by the host-side limiter.
+        let content = tun::PushContent { chat_id: Some(format!("c-{previews}")), ..content.clone() };
+        assert_eq!(t.push_all(&content), 1);
         let m = relay
             .wait_for(
                 "push",
@@ -198,6 +203,122 @@ async fn tunnel_end_to_end_pair_get_sse_renew_revoke() {
     let new_token = h.handle.shared.token();
     assert_ne!(new_token, old_token);
     assert_eq!(h.client.get(format!("{}/v1/chats", h.base)).bearer_auth(&new_token).send().await.unwrap().status(), 200);
+}
+
+/// Until the phone's cancelled `/v1/events` streams are gone.
+async fn wait_background(t: &tun::TunnelHost, pid: &str) {
+    for _ in 0..100 {
+        if t.foreground_streams(pid) == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the events stream still counts as foreground");
+}
+
+/// The four notification kinds, end to end: a real serve projection change
+/// (agent reply, mention, proposal, workflow gate) → push on the fake relay →
+/// decrypts with the phone's push key; and none while the app is open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pushes_reach_the_relay_encrypted_and_skip_a_foreground_phone() {
+    use hive_core::{workflow, ActionProposal, NodeRunStatus, ProposalKind};
+    let relay = FakeRelay::start().await;
+    let h = serve_with_relay(&relay.url).await;
+    relay.wait_connected(Duration::from_secs(10)).await.unwrap();
+    let t = h.handle.shared.tunnel.clone().unwrap();
+    let (_, _, _, ps) = parse_link(&pair_link(&h));
+    relay.wait_for("enroll", |m| m["eid"] == ps.eid, Duration::from_secs(5)).await.unwrap();
+    let info = host_info(&h, &relay.url);
+    let phone = PhoneKeys::generate();
+    let (_c, pid, credential) = testkit::phone_enroll(&info, &phone, &ps, "Push phone").await.unwrap();
+    drop(_c);
+    let mut c = testkit::phone_session(&info, &phone, &credential).await.unwrap();
+    assert_eq!(c.request("PUT", "/v1/tunnel/push", Some(json!({ "enabled": true }))).await.unwrap().status, 200);
+    t.push_available.store(true, std::sync::atomic::Ordering::SeqCst);
+    let key: [u8; 32] = tun::b64u_fixed(&t.registry.get(&pid).unwrap().push_key).unwrap();
+    let shared = h.handle.shared.clone();
+    let ws = shared.ws;
+    let chat = h.send(reqwest::Method::POST, "/v1/chats", None).await;
+    let chat_id = uuid::Uuid::parse_str(chat["chat"]["id"].as_str().unwrap()).unwrap();
+
+    // Foreground: an open events stream → a finished reply pushes nothing.
+    let sse = c.open("GET", "/v1/events", &[("accept", "text/event-stream")], None, true).await.unwrap();
+    let _ = c.recv_timeout(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(t.foreground_streams(&pid), 1);
+    let seq0 = t.registry.get(&pid).unwrap().push_seq;
+    let mid = shared.lock().begin_assistant_message(chat_id, ws, "coder".to_string(), "gw".to_string(), Some(h.agent_id), None).unwrap();
+    shared.lock().complete_assistant_message(chat_id, ws, mid, "all done").unwrap();
+    shared.refresh();
+    assert_eq!(t.registry.get(&pid).unwrap().push_seq, seq0, "no push while the app is open");
+
+    // Background: the app cancelled the stream.
+    c.send(Frame::reset(sse, frame::reset::CANCEL, "")).await.unwrap();
+    wait_background(&t, &pid).await;
+    let next = |seq: u64| {
+        let relay = &relay;
+        let pid = pid.clone();
+        let hid = t.host_id().to_string();
+        async move {
+            let m = relay
+                .wait_for(
+                    "push",
+                    |m| {
+                        let ct = tun::b64u_decode(m["ct"].as_str().unwrap_or_default()).unwrap_or_default();
+                        m["pid"] == json!(pid) && ct.len() > 28 && testkit::open_push(&key, &hid, &pid, &ct)["seq"] == json!(seq)
+                    },
+                    Duration::from_secs(5),
+                )
+                .await
+                .unwrap();
+            assert_eq!(m["prio"], "high");
+            assert!(m["collapse"].as_str().is_some_and(|c| !c.contains('-')), "collapse never reveals the chat id");
+            testkit::open_push(&key, &hid, &pid, &tun::b64u_decode(m["ct"].as_str().unwrap()).unwrap())
+        }
+    };
+
+    // An agent reply that mentions the user → one `mention` push, not two.
+    let me = shared.lock().author().display_name.clone();
+    let mid = shared.lock().begin_assistant_message(chat_id, ws, "coder".to_string(), "gw".to_string(), Some(h.agent_id), None).unwrap();
+    shared.lock().complete_assistant_message(chat_id, ws, mid, format!("@{me} the build is green")).unwrap();
+    shared.refresh();
+    let pt = next(seq0 + 1).await;
+    assert_eq!((pt["kind"].as_str(), pt["title"].as_str(), pt["sender"].as_str()), (Some("mention"), Some("coder mentioned you"), Some("coder")));
+    assert_eq!(pt["chatId"], json!(chat_id.to_string()));
+    assert_eq!(pt["body"], json!(format!("@{me} the build is green")));
+    assert_eq!(t.registry.get(&pid).unwrap().push_seq, seq0 + 1, "exactly one push for the mentioning reply");
+
+    // A proposal waiting for review.
+    let p = ActionProposal::new("coder proposed changes to 1 file", ProposalKind::FileDiff, "agent-x");
+    let proposal_id = p.id;
+    shared.lock().upsert_proposal(chat_id, ws, p).unwrap();
+    shared.refresh();
+    let pt = next(seq0 + 2).await;
+    assert_eq!((pt["kind"].as_str(), pt["title"].as_str()), (Some("proposal.created"), Some("Change ready for review")));
+    assert_eq!((pt["chatId"].clone(), pt["proposalId"].clone()), (json!(chat_id.to_string()), json!(proposal_id.to_string())));
+
+    // A workflow gate waiting for approval (the desktop's run engine writes
+    // the gate's proposal, then the run): one `workflow.approval` push.
+    let def = workflow::preset_review_gate();
+    let mut run = workflow::new_run(&def, "build it", "u1");
+    let gate = ActionProposal::new("Approve?", ProposalKind::Decision, "");
+    let st = run.node_state_mut("approval").unwrap();
+    st.status = NodeRunStatus::AwaitingApproval;
+    st.proposal_id = Some(gate.id);
+    let gate_id = gate.id;
+    shared.lock().upsert_proposal(chat_id, ws, gate).unwrap();
+    shared.refresh();
+    shared.lock().upsert_workflow_run(chat_id, ws, run.clone()).unwrap();
+    shared.refresh();
+    let pt = next(seq0 + 3).await;
+    assert_eq!(pt["kind"], "workflow.approval");
+    assert_eq!(pt["title"], json!(format!("{} needs approval", def.name)));
+    assert_eq!(pt["workflowRunId"], json!(run.id.to_string()));
+    assert_eq!(pt["workflowId"], json!(def.id.to_string()));
+    assert_eq!(pt["proposalId"], json!(gate_id.to_string()));
+    assert_eq!(pt["body"], "Approval");
+    assert_eq!(t.registry.get(&pid).unwrap().push_seq, seq0 + 3, "the gate's proposal didn't push on its own");
+    t.push_available.store(false, std::sync::atomic::Ordering::SeqCst);
+    h.handle.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

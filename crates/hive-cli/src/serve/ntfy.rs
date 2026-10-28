@@ -95,6 +95,29 @@ pub fn proposal_notice(title: &str, chat_title: &str, chat_id: Uuid) -> Notice {
     }
 }
 
+/// The notice for a message that `@mentions` the user.
+pub fn mention_notice(sender: &str, chat_title: &str, chat_id: Uuid) -> Notice {
+    let chat = short(if chat_title.trim().is_empty() { "Untitled" } else { chat_title }, 60);
+    Notice { title: format!("{} mentioned you", short(sender, 40)), body: format!("in “{chat}”"), chat_id, tags: "bell" }
+}
+
+/// The notice for a workflow run waiting on an approval gate.
+pub fn workflow_notice(workflow: &str, stage: &str, chat_title: &str, chat_id: Uuid) -> Notice {
+    let chat = short(if chat_title.trim().is_empty() { "Untitled" } else { chat_title }, 60);
+    Notice {
+        title: workflow_title(workflow),
+        body: format!("{} — in “{chat}”", short(stage, 80)),
+        chat_id,
+        tags: "raised_hand",
+    }
+}
+
+/// "<workflow> needs approval".
+pub fn workflow_title(workflow: &str) -> String {
+    let name = if workflow.trim().is_empty() { "Workflow" } else { workflow };
+    format!("{} needs approval", short(name, 40))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

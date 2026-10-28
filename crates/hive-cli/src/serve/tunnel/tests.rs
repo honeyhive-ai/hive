@@ -288,7 +288,7 @@ fn reply(text: &str) -> PushContent {
         title: "coder replied".into(),
         sender: Some("coder".into()),
         preview: Some(text.into()),
-        fixed_body: String::new(),
+        ..Default::default()
     }
 }
 

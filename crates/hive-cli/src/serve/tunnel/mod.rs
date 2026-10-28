@@ -38,6 +38,7 @@ pub mod frame;
 pub mod keys;
 pub mod noise;
 pub mod phones;
+pub mod push;
 pub mod session;
 
 #[cfg(test)]
@@ -376,7 +377,8 @@ pub struct TunnelPeer {
 enum Pending {
     Enroll(String),
     Revoke(String),
-    Push,
+    /// A push to this pid.
+    Push(String),
     Other,
 }
 
@@ -397,6 +399,8 @@ pub struct TunnelHost {
     pub sessions: AtomicUsize,
     pub max_sessions: AtomicUsize,
     pub push_available: AtomicBool,
+    /// Host-side push limits, foreground suppression and relay refusals.
+    push_gate: Mutex<push::PushGate>,
     status: Mutex<LiveStatus>,
 }
 
@@ -423,6 +427,7 @@ impl TunnelHost {
             sessions: AtomicUsize::new(0),
             max_sessions: AtomicUsize::new(8),
             push_available: AtomicBool::new(false),
+            push_gate: Mutex::new(push::PushGate::default()),
             status: Mutex::new(LiveStatus::default()),
         }))
     }
@@ -497,9 +502,17 @@ impl TunnelHost {
             Pending::Enroll(eid) if !ok => {
                 eprintln!("remote: relay refused enrollment window {eid} ({})", code.unwrap_or("?"));
             }
-            Pending::Push if !ok => {
-                if code == Some("push_unavailable") {
-                    self.push_available.store(false, Ordering::SeqCst);
+            Pending::Push(pid) if !ok => {
+                let code = code.unwrap_or("?");
+                if code == "push_unavailable" {
+                    // Off until the next `welcome` says otherwise; no retry.
+                    if self.push_available.swap(false, Ordering::SeqCst) {
+                        eprintln!("remote: the relay can't deliver pushes (push_unavailable); pushes are off until it reconnects");
+                        self.update_status(|s| s.push = false);
+                    }
+                } else {
+                    tracing::debug!(pid = %pid, code, "relay refused a push");
+                    Self::lock(&self.push_gate).refused(&pid, code, Instant::now());
                 }
             }
             _ => {}
@@ -680,19 +693,61 @@ impl TunnelHost {
 
     /// Encrypt and send a push to every active phone that wants pushes. Each
     /// phone gets the preview or not according to its `previews` preference.
-    pub fn push_all(&self, content: &PushContent) {
+    /// A phone with the app open (a live `/v1/events` stream through the
+    /// tunnel) is skipped, and the host-side limits apply ([`push`]).
+    /// Returns how many phones it was sent to.
+    pub fn push_all(&self, content: &PushContent) -> usize {
+        self.push_all_at(content, Instant::now())
+    }
+
+    pub fn push_all_at(&self, content: &PushContent, at: Instant) -> usize {
         if !self.push_available.load(Ordering::SeqCst) {
-            return;
+            return 0;
         }
+        let mut sent = 0;
         for rec in self.registry.list().into_iter().filter(|r| r.is_active() && r.push_enabled) {
+            let verdict = Self::lock(&self.push_gate).check(&rec.pid, &content.kind, content.chat_id.as_deref(), at);
+            if verdict != push::Verdict::Send {
+                tracing::debug!(pid = %rec.pid, kind = %content.kind, ?verdict, "push not sent");
+                continue;
+            }
             let Some((seq, key)) = self.registry.next_push_seq(&rec.pid) else { continue };
             let ct = seal_push(&key, self.host_id(), &rec.pid, content, rec.push_previews, seq, now());
             let mut msg = json!({ "t": "push", "pid": rec.pid, "ct": b64u(ct), "prio": "high" });
             if let Some(c) = &content.chat_id {
                 msg["collapse"] = json!(push_collapse(&key, c));
             }
-            self.send_request(msg, Pending::Push);
+            if self.send_request(msg, Pending::Push(rec.pid.clone())) {
+                sent += 1;
+            }
         }
+        sent
+    }
+
+    /// Count an open `/v1/events` stream from `pid` (the app is in the
+    /// foreground there) until the guard drops.
+    pub fn foreground(self: &Arc<Self>, pid: &str) -> ForegroundGuard {
+        Self::lock(&self.push_gate).foreground_open(pid);
+        ForegroundGuard { host: self.clone(), pid: pid.to_string() }
+    }
+
+    /// Open `/v1/events` streams from `pid` right now.
+    pub fn foreground_streams(&self, pid: &str) -> usize {
+        Self::lock(&self.push_gate).foreground_streams(pid)
+    }
+}
+
+/// Held by an events stream that came through the tunnel; see
+/// [`TunnelHost::foreground`]. Dropping it (stream finished, cancelled with
+/// RESET, or its session ended) uncounts the stream.
+pub struct ForegroundGuard {
+    host: Arc<TunnelHost>,
+    pid: String,
+}
+
+impl Drop for ForegroundGuard {
+    fn drop(&mut self) {
+        TunnelHost::lock(&self.host.push_gate).foreground_close(&self.pid);
     }
 }
 
@@ -703,6 +758,8 @@ pub const PREVIEW_CHARS: usize = 120;
 
 /// What a push is about (§14). `title` and `sender` never carry message
 /// text; `preview` is the content shown only to phones with previews on.
+/// Kinds: `message.done`, `mention`, `proposal.created`, `workflow.approval`,
+/// `phone.paired`, `test` (`docs/push-notifications.md`).
 #[derive(Debug, Clone, Default)]
 pub struct PushContent {
     pub kind: String,
@@ -711,6 +768,12 @@ pub struct PushContent {
     pub title: String,
     /// The agent or author name alone.
     pub sender: Option<String>,
+    /// The proposal to review (`proposal.created`, `workflow.approval`).
+    pub proposal_id: Option<String>,
+    /// The workflow run waiting on an approval (`workflow.approval`).
+    pub workflow_run_id: Option<String>,
+    /// That run's workflow definition (`workflow.approval`).
+    pub workflow_id: Option<String>,
     /// The raw content to preview (message text, proposal title). Shortened
     /// with [`preview_text`] when sealed.
     pub preview: Option<String>,
@@ -761,6 +824,11 @@ pub fn push_plaintext(content: &PushContent, previews: bool, seq: u64, ts: u64) 
     let mut pt = json!({ "v": 1, "seq": seq, "ts": ts, "kind": content.kind, "title": clip(&content.title, 64), "body": clip(&body, 512) });
     if let Some(c) = &content.chat_id {
         pt["chatId"] = json!(c);
+    }
+    for (key, value) in [("proposalId", &content.proposal_id), ("workflowRunId", &content.workflow_run_id), ("workflowId", &content.workflow_id)] {
+        if let Some(v) = value {
+            pt[key] = json!(clip(v, 64));
+        }
     }
     if let Some(s) = &content.sender {
         pt["sender"] = json!(clip(s, 64));
