@@ -20,6 +20,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
+/// Log a push decision at debug level: a `tracing` debug event, and a stderr
+/// line only when `HIVE_PUSH_DEBUG=1` (the CLI installs no tracing
+/// subscriber, and drops are routine, so they're silent by default).
+pub fn debug(msg: std::fmt::Arguments<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    tracing::debug!("{msg}");
+    if *ON.get_or_init(|| crate::reply::env_flag("HIVE_PUSH_DEBUG", false)) {
+        eprintln!("push: {msg}");
+    }
+}
+
 /// The limiter's knobs.
 #[derive(Debug, Clone, Copy)]
 pub struct PushLimits {

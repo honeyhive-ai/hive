@@ -271,7 +271,7 @@ async fn pushes_reach_the_relay_encrypted_and_skip_a_foreground_phone() {
                 .await
                 .unwrap();
             assert_eq!(m["prio"], "high");
-            assert!(m["collapse"].as_str().is_some_and(|c| !c.contains('-')), "collapse never reveals the chat id");
+            assert_eq!(m["collapse"], json!(tun::push_collapse(&key, &chat_id.to_string())), "collapse is the HMAC, never the chat id");
             testkit::open_push(&key, &hid, &pid, &tun::b64u_decode(m["ct"].as_str().unwrap()).unwrap())
         }
     };

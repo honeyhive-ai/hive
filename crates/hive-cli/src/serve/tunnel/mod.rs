@@ -511,7 +511,7 @@ impl TunnelHost {
                         self.update_status(|s| s.push = false);
                     }
                 } else {
-                    tracing::debug!(pid = %pid, code, "relay refused a push");
+                    push::debug(format_args!("relay refused a push to {pid}: {code}"));
                     Self::lock(&self.push_gate).refused(&pid, code, Instant::now());
                 }
             }
@@ -708,7 +708,7 @@ impl TunnelHost {
         for rec in self.registry.list().into_iter().filter(|r| r.is_active() && r.push_enabled) {
             let verdict = Self::lock(&self.push_gate).check(&rec.pid, &content.kind, content.chat_id.as_deref(), at);
             if verdict != push::Verdict::Send {
-                tracing::debug!(pid = %rec.pid, kind = %content.kind, ?verdict, "push not sent");
+                push::debug(format_args!("{} push to {} not sent: {verdict:?}", content.kind, rec.pid));
                 continue;
             }
             let Some((seq, key)) = self.registry.next_push_seq(&rec.pid) else { continue };
