@@ -15,6 +15,8 @@ Files here:
 | `hive-serve.env.example` | `~/.config/hive-serve/hive-serve.env` (mode 0600, then edit) |
 | `runtimes.toml.example` | `$HIVE_DATA_DIR/runtimes.toml` |
 | `mcp.toml.example` | `~/.config/hive-serve/mcp.toml` (optional) |
+| `dashboard.toml.example` | `$HIVE_DATA_DIR/dashboard.toml` (optional: the app's dashboard tab, [`docs/dashboard.md`](../../docs/dashboard.md)) |
+| `dashboard-solar.toml.example` | append to `dashboard.toml` (optional solar section) |
 
 ## 1. Build on the box
 

@@ -21,7 +21,7 @@ API plus a Server-Sent Events stream.
                                            │   └─ tool loop ── OpenAI wire ──▶ llama.cpp   desktop app
                                            │      (built-in file tools + MCP)   gateway    (same workspace)
                                            ├─ ntfy notifier ──▶ self-hosted ntfy
-                                           └─ /v1/lab/status ──▶ Prometheus (loopback)
+                                           └─ /v1/dashboard ──▶ Prometheus, JSON URLs (host side)
 ```
 
 ## Components
@@ -80,7 +80,8 @@ and public addresses unless `HIVE_SERVE_ALLOW_ANY_BIND=1`.
 | GET | `/v1/proposals?status=open\|all` | `{proposals: [{id, chatId, title, body, kind, diff?, status, createdAt, author}]}` |
 | POST | `/v1/proposals/{id}/approve` | `{proposal}` |
 | POST | `/v1/proposals/{id}/reject` `{reason?}` | `{proposal}` |
-| GET | `/v1/lab/status` | `{workers: [{name, up}], powerWatts?, costPerHour?, ratePerKwh?, temps: [{name, celsius}], updatedAt}` |
+| GET | `/v1/dashboard` | `{title, source, refreshSeconds, sections: [{title, panels: [Panel]}], updatedAt, error?}`. Defined by the host's `dashboard.toml`; see [dashboard.md](dashboard.md) |
+| GET | `/v1/lab/status` | **Deprecated** (`Deprecation: true`; use `/v1/dashboard`). `{workers: [{name, up}], powerWatts?, costPerHour?, ratePerKwh?, temps: [{name, celsius}], solar?, updatedAt}` |
 | GET | `/v1/events` | `text/event-stream` |
 
 `Message = {id, chatId, author, role: "user"|"agent"|"assistant"|"system", agentId?, body, createdAt, streaming: bool}`.
@@ -100,7 +101,18 @@ Field notes:
 - An agent with no host runs on its owner's device. It has no `hostId`, and its
   `hostLabel` is "Owner's device". For an agent on this box, `hostLabel` is
   "<label> (this host)".
-- `/v1/lab/status` is best-effort. Prometheus (`HIVE_PROMETHEUS_URL`, default
+- `/v1/dashboard` is what the host owner configures in `dashboard.toml` in
+  the data dir (format, panel kinds and examples in [dashboard.md](dashboard.md)).
+  `Panel = {id, title, kind: "stat"|"gauge"|"timeseries"|"bar"|"list"|"status"|"text", unit?, value?, text?, level?: "ok"|"warn"|"critical", sparkline?: [{t, v}], series?: [{name, points: [{t, v}]}], rows?: [{label, value?, text?, up?, level?}], min?, max?, thresholds?: [{value, level}], refreshSeconds, updatedAt, error?}`.
+  The host evaluates every panel (Prometheus or a JSON URL on its network,
+  never a command) with a per-panel timeout and cache; a failing panel carries
+  `error` and the rest still render. With no file, a host with
+  `HIVE_PROMETHEUS_URL` set serves a generated lab dashboard (the old
+  `/v1/lab/status` content), and any other host an empty one
+  (`sections: []`). The app hides its dashboard tab when the dashboard is
+  empty, and falls back to `/v1/lab/status` only when `/v1/dashboard` is 404
+  (an older host).
+- `/v1/lab/status` (deprecated) is best-effort. Prometheus (`HIVE_PROMETHEUS_URL`, default
   `http://127.0.0.1:9090`) gets each query with a 2 s timeout. A field whose
   query fails is left out. `workers` comes from `rdnagw_worker_up{worker}`,
   power and cost from `lab:power_watts:sum`, `lab:cost_usd_per_hour` and

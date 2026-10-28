@@ -995,7 +995,9 @@ fn usage() -> ! {
          hive pair [--listen ADDR] [--public-url URL] [--relay-only]   show the phone pairing QR code\n  \
          hive remote enable --relay URL [--reg-token T] | status | disable | reset\n                                       \
          phone remote access through a relay tunnel (off by default)\n  \
-         hive phones list | revoke <pid|name> [--keep-token]   phones paired over the relay\n\n\
+         hive phones list | revoke <pid|name> [--keep-token]   phones paired over the relay\n  \
+         hive dashboard check [--file PATH]   validate dashboard.toml and evaluate it once\n  \
+         hive dashboard default         print the generated default dashboard as TOML\n\n\
          Setup:\n  \
          hive enroll <hivews1:invite> [--token <hrt1>]   one-shot: save the workspace connection\n  \
          hive join <invite-code>        redeem a relay invite to self-enroll this box's identity\n  \
@@ -1058,6 +1060,7 @@ fn run() -> Result<()> {
         "--relay",
         "--reg-token",
         "--remote-relay",
+        "--file",
     ];
     let mut positional: Vec<&String> = Vec::new();
     let mut skip = false;
@@ -1240,6 +1243,14 @@ fn run() -> Result<()> {
                 Some(other) => bail!("unknown `hive phones {other}`: use list|revoke"),
             }
         }
+        "dashboard" => match positional.first().map(|s| s.as_str()) {
+            Some("check") => serve::dashboard::cmd_check(&cfg.data_dir, flag_val("--file")),
+            Some("default") => {
+                print!("{}", serve::dashboard::default_toml()?);
+                Ok(())
+            }
+            _ => bail!("usage: hive dashboard <check [--file PATH] | default>"),
+        },
         "bind-repo" => repos::cmd_bind_repo(
             &cfg.data_dir,
             positional.first().map(|s| s.as_str()),

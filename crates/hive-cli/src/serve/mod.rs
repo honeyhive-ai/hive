@@ -11,7 +11,8 @@
 //!    (`api.rs`; the contract is in `docs/ios-app.md`),
 //! 4. pushes notifications through a self-hosted ntfy (`ntfy.rs`),
 //! 5. optionally keeps a relay tunnel open so the phone reaches the API
-//!    without a VPN (`tunnel/`, spec `docs/relay-tunnel.md`; off by default).
+//!    without a VPN (`tunnel/`, spec `docs/relay-tunnel.md`; off by default),
+//! 6. serves the owner-defined dashboard (`dashboard.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -32,6 +33,7 @@ use crate::worker::{self, TurnSink, TurnState, WorkerCtx};
 use crate::{env_opt, open_service, sync_once, uuid_of_room, Config};
 
 pub mod api;
+pub mod dashboard;
 pub mod hub;
 pub mod lab;
 pub mod ntfy;
@@ -65,6 +67,11 @@ pub struct ServeOptions {
     pub name: Option<String>,
     pub pair: bool,
     pub prometheus_url: String,
+    /// Whether `HIVE_PROMETHEUS_URL` was set: with no `dashboard.toml`, only
+    /// then is the default (lab) dashboard generated.
+    pub prometheus_configured: bool,
+    /// `dashboard.toml` (`HIVE_DASHBOARD_FILE`, default in the data dir).
+    pub dashboard_file: PathBuf,
     /// `@mention` added to a phone message that names no agent.
     pub default_agent: Option<String>,
     /// Apply an approved file-diff proposal to this box's bound checkout.
@@ -119,6 +126,8 @@ impl ServeOptions {
             name: name.or_else(|| env_opt("HIVE_SERVE_NAME")),
             pair,
             prometheus_url: env_opt("HIVE_PROMETHEUS_URL").unwrap_or_else(|| "http://127.0.0.1:9090".into()),
+            prometheus_configured: env_opt("HIVE_PROMETHEUS_URL").is_some(),
+            dashboard_file: dashboard::config_path(&cfg.data_dir),
             default_agent: env_opt("HIVE_SERVE_DEFAULT_AGENT").map(|a| a.trim().trim_start_matches('@').to_string()),
             apply_on_approve: env_flag("HIVE_SERVE_APPLY_ON_APPROVE", false),
             sync_every: Duration::from_secs(3),
@@ -152,6 +161,8 @@ pub struct Shared {
     /// When this process started (see [`Shared::fresh`]).
     started_at: Timestamp,
     pub http: reqwest::Client,
+    /// Panel results, each kept for its `refresh`.
+    pub dashboard_cache: dashboard::Cache,
     rt: tokio::runtime::Handle,
 }
 
@@ -469,6 +480,7 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         stopping: AtomicBool::new(false),
         started_at: Timestamp::now(),
         http: reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).build()?,
+        dashboard_cache: dashboard::Cache::default(),
         rt: tokio::runtime::Handle::current(),
         cfg,
         opts,

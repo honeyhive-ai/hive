@@ -1,0 +1,119 @@
+# hive serve dashboard: copy to dashboard.toml in the serve data dir
+# (HIVE_DATA_DIR, or set HIVE_DASHBOARD_FILE), then run
+#   hive dashboard check
+# The phone shows these sections in its dashboard tab; the host runs every
+# query itself, so Prometheus and the URLs below never face the phone.
+# Format reference: docs/dashboard.md.
+#
+# Metric names below are the usual exporter names (node_exporter, llama.cpp
+# server --metrics, Prometheus' own `up`). Rename them to match your setup and
+# delete what you don't run: an `optional` section with no data is hidden.
+
+title = "Home lab"   # the tab title
+refresh = "15s"      # default: how long a panel's result is reused
+timeout = "3s"       # default per-panel timeout
+
+# ── This box ───────────────────────────────────────────────────────────────
+[[section]]
+title = "Server"
+
+[[section.panel]]
+title = "CPU"
+kind = "gauge"
+unit = "%"
+query = '100 * (1 - avg(rate(node_cpu_seconds_total{mode="idle"}[5m])))'
+round = 0
+min = 0
+max = 100
+thresholds = [
+  { value = 0, level = "ok" },
+  { value = 70, level = "warn" },
+  { value = 90, level = "critical" },
+]
+
+[[section.panel]]
+title = "Memory used"
+kind = "gauge"
+unit = "%"
+query = "100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)"
+round = 0
+thresholds = [{ value = 0, level = "ok" }, { value = 85, level = "warn" }, { value = 95, level = "critical" }]
+
+[[section.panel]]
+title = "Load (1 m)"
+query = "node_load1"
+round = 2
+sparkline = { range = "6h", step = "5m" }
+
+[[section.panel]]
+title = "Disk used"
+kind = "bar"
+unit = "%"
+query = '100 * (1 - node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"})'
+label = "mountpoint"
+round = 0
+max = 100
+thresholds = [{ value = 0, level = "ok" }, { value = 80, level = "warn" }, { value = 90, level = "critical" }]
+
+[[section.panel]]
+title = "Network"
+kind = "timeseries"
+unit = "Mbit/s"
+range = "6h"
+step = "5m"
+scale = 0.000008     # bytes/s → Mbit/s
+round = 2
+series = [
+  { name = "In", query = 'sum(rate(node_network_receive_bytes_total{device!="lo"}[5m]))' },
+  { name = "Out", query = 'sum(rate(node_network_transmit_bytes_total{device!="lo"}[5m]))' },
+]
+
+# ── GPU / LLM workers ──────────────────────────────────────────────────────
+[[section]]
+title = "Models"
+optional = true
+
+[[section.panel]]
+title = "Scrape targets"
+kind = "status"
+query = "up"
+label = "job"
+
+[[section.panel]]
+title = "GPU busy"
+kind = "bar"
+unit = "%"
+query = "node_drm_gpu_busy_percent"   # AMD via node_exporter; NVIDIA DCGM: DCGM_FI_DEV_GPU_UTIL
+label = "card"
+max = 100
+round = 0
+
+[[section.panel]]
+title = "GPU temperature"
+kind = "bar"
+unit = "°C"
+max = 100
+round = 0
+thresholds = [{ value = 0, level = "ok" }, { value = 75, level = "warn" }, { value = 85, level = "critical" }]
+rows = [
+  { label = "Hottest sensor", query = "max(node_hwmon_temp_celsius)" },
+]
+
+[[section.panel]]
+title = "Generation speed"
+unit = "tok/s"
+query = 'avg("llamacpp:predicted_tokens_seconds")'
+round = 1
+sparkline = true
+
+[[section.panel]]
+title = "Requests in flight"
+query = 'sum("llamacpp:requests_processing")'
+
+# An HTTP JSON health check on the host's network (GET only, no commands).
+[[section.panel]]
+title = "Model server"
+kind = "status"
+url = "http://127.0.0.1:8080/health"
+path = "/status"     # {"status": "ok"} → up
+timeout = "2s"
