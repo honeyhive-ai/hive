@@ -182,7 +182,52 @@ fn primary_runtime<'a>(chat: &ChatSession, known: &'a [WorkspaceRuntime]) -> Opt
     known.iter().find(|r| r.id == chat.runtime_id)
 }
 
-fn default_responder(s: &Shared, chat: &ChatSession, agents: &[Value], known: &[WorkspaceRuntime]) -> Value {
+/// Whether the chat's `@hive` can answer right now. Only a desktop runs the
+/// primary, and the one that does is its owner's: the chat's creator, or — when
+/// a linked box (this one, `HIVE_SERVE_OWNER`) created it — the person that box
+/// belongs to. Desktops heartbeat a `Device` host while open.
+///
+/// What [`primary_availability`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Availability {
+    /// Unknown: the owner's desktop is too old to heartbeat a Device host.
+    Unknown,
+    /// The owner's desktop is open (its label).
+    Online(String),
+    /// The owner's desktop is closed: the turn waits until it opens.
+    DesktopOffline,
+    /// The owner is this box itself (not linked to a person): no desktop
+    /// will ever run this chat's `@hive`.
+    NoDesktop,
+}
+
+pub(super) fn primary_availability(s: &Shared, chat: &ChatSession, hosts: &[WorkspaceHost]) -> Availability {
+    let links = s.lock().device_links(s.ws).unwrap_or_default();
+    let owner = links.person(&chat.creator_actor_id).to_string();
+    let me = s.my_actor_id();
+    if owner.is_empty() {
+        return Availability::Unknown;
+    }
+    let now = Timestamp::now();
+    let mut desktops: Vec<&WorkspaceHost> =
+        hosts.iter().filter(|h| h.kind == HostKind::Device && h.owner_actor_id == owner).collect();
+    if desktops.is_empty() {
+        return if owner == me { Availability::NoDesktop } else { Availability::Unknown };
+    }
+    desktops.sort_by_key(|h| std::cmp::Reverse(h.last_seen));
+    match desktops.iter().find(|h| h.is_online(&now, ONLINE_WINDOW_SECS)) {
+        Some(h) => Availability::Online(h.label.clone()),
+        None => Availability::DesktopOffline,
+    }
+}
+
+fn default_responder(
+    s: &Shared,
+    chat: &ChatSession,
+    agents: &[Value],
+    known: &[WorkspaceRuntime],
+    hosts: &[WorkspaceHost],
+) -> Value {
     // `hive serve --default-agent` routes an un-addressed phone message to that
     // agent; otherwise the chat's `@hive` answers it, as on the desktop.
     if let Some(name) = &s.opts.default_agent {
@@ -207,6 +252,21 @@ fn default_responder(s: &Shared, chat: &ChatSession, agents: &[Value], known: &[
     });
     if let Some(r) = rt.filter(|r| !r.model.trim().is_empty()) {
         v["model"] = json!(r.model);
+    }
+    match primary_availability(s, chat, hosts) {
+        Availability::Unknown => {}
+        Availability::Online(label) => {
+            v["available"] = json!(true);
+            v["availableVia"] = json!(label);
+        }
+        Availability::DesktopOffline => {
+            v["available"] = json!(false);
+            v["unavailableReason"] = json!("desktopOffline");
+        }
+        Availability::NoDesktop => {
+            v["available"] = json!(false);
+            v["unavailableReason"] = json!("noDesktop");
+        }
     }
     v
 }
@@ -290,7 +350,7 @@ pub async fn chat_details(State(s): S, Path(id): Path<String>) -> ApiResult<Json
 
     let mut known = config.workspace_runtimes.clone();
     known.extend(crate::worker::local_runtimes(&s.cfg.data_dir));
-    let responder = default_responder(&s, &chat, &agents, &known);
+    let responder = default_responder(&s, &chat, &agents, &known, &hosts);
     let model = responder["model"].as_str().map(str::to_string);
 
     let channel = s.lock().list_channels(s.ws)?.into_iter().find(|c| c.id == chat.channel_id);

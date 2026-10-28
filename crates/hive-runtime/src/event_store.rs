@@ -245,6 +245,41 @@ impl EventStore {
         )
     }
 
+    /// A workspace's account keys and device certificates (registrations,
+    /// rotations, certs), for checking a device belongs to an account without
+    /// folding the whole trust roster. Cheap: filtered by workspace and kind.
+    pub fn identity_envelopes(&self, workspace_id: Uuid) -> Result<Vec<SessionEventEnvelope>> {
+        self.query_envelopes(
+            "SELECT envelope_json FROM events WHERE workspace_id = ?1 \
+             AND kind IN ('accountKeyRegistered','accountKeyRotated','deviceCertificateAdded') \
+             ORDER BY row_id ASC",
+            [workspace_id.to_string()],
+        )
+    }
+
+    /// The highest row id stored (0 when empty): a cursor for "what arrived since".
+    pub fn max_row_id(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(row_id), 0) FROM events", [], |row| row.get(0))?)
+    }
+
+    /// Sessions that gained a message after row `after` (see [`Self::max_row_id`]),
+    /// for answering what a sync pull brought in.
+    pub fn sessions_with_messages_after(&self, after: i64) -> Result<Vec<Uuid>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT session_id FROM events WHERE row_id > ?1 AND kind = 'messageAppended'",
+        )?;
+        let rows = stmt.query_map([after], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for id in rows {
+            if let Ok(id) = Uuid::parse_str(&id?) {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether this workspace already carries a device certificate binding
     /// `device_id` to `account_id` — so identity publication stays idempotent
     /// (and re-publishes once when the account id changes, e.g. GitHub sign-in).

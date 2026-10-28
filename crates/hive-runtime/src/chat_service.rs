@@ -1044,6 +1044,44 @@ impl ChatService {
             .unwrap_or_default())
     }
 
+    /// Which members are another member's own device (a `hive serve` box its
+    /// owner runs), so dispatch counts them as one person and maps a chat the
+    /// box created to its owner. See [`hive_core::DeviceLinks`] for the rules.
+    /// A device counts as an account's only if its certificate verifies against
+    /// a key that account registered in this workspace.
+    pub fn device_links(&self, workspace_id: Uuid) -> Result<hive_core::DeviceLinks> {
+        let Some(config) = self.load(workspace_config_session_id(workspace_id))? else {
+            return Ok(hive_core::DeviceLinks::default());
+        };
+        if config.workspace_hosts.iter().all(|h| h.owner_actor_id.is_empty()) {
+            return Ok(hive_core::DeviceLinks::default());
+        }
+        let mut keys: std::collections::HashMap<Uuid, Vec<Vec<u8>>> = Default::default();
+        let mut certs = Vec::new();
+        for env in self.store.identity_envelopes(workspace_id)? {
+            match env.payload {
+                SessionEvent::AccountKeyRegistered { account_id, signing_public_key } => {
+                    keys.entry(account_id).or_default().push(signing_public_key);
+                }
+                SessionEvent::AccountKeyRotated { account_id, new_signing_public_key, .. } => {
+                    keys.entry(account_id).or_default().push(new_signing_public_key);
+                }
+                SessionEvent::DeviceCertificateAdded { certificate } => certs.push(certificate),
+                _ => {}
+            }
+        }
+        let certified = |device: Uuid, account: Uuid| {
+            certs.iter().any(|c| {
+                c.device_id == device
+                    && c.account_id == account
+                    && keys
+                        .get(&account)
+                        .is_some_and(|ks| ks.iter().any(|k| c.verify(k).is_ok()))
+            })
+        };
+        Ok(hive_core::DeviceLinks::from_config(&config, certified))
+    }
+
     /// Register (or replace by id) a host. The id is a machine's device id.
     pub fn register_host(&mut self, workspace_id: Uuid, mut host: WorkspaceHost) -> Result<()> {
         if host.owner_actor_id.is_empty() {
@@ -2369,6 +2407,56 @@ mod tests {
             .filter(|m| m.actor.kind == hive_core::ActorKind::Human)
             .count();
         assert_eq!(humans, 1, "still exactly one self");
+    }
+
+    /// A `hive serve` box registered as its owner's device (host owned by the
+    /// owner, cert under the box's own account) links only once it's an Admin.
+    #[test]
+    fn serve_box_host_owned_by_owner_links_as_their_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let wid = Uuid::new_v4();
+        let cfg = workspace_config_session_id(wid);
+        let owner_id = Uuid::new_v4().to_string();
+        let box_id = Uuid::new_v4().to_string();
+
+        let mut owner = svc_on(&path, "x", "Alex");
+        owner.set_author_account(owner_id.clone(), "Alex", None);
+        owner.create_chat("general", wid, "rt").unwrap();
+        owner.ensure_workspace_config(wid).unwrap();
+        let mut boxed = svc_on(&path, "y", "Phone");
+        boxed.set_author_account(box_id.clone(), "Phone", None);
+        boxed.ensure_self_member(cfg, wid).unwrap();
+        boxed.publish_identity(cfg, wid).unwrap();
+        let mut host = hive_core::WorkspaceHost::new(
+            boxed.device_id().to_string(),
+            hive_core::HostKind::Worker,
+            "sff",
+        );
+        host.owner_actor_id = owner_id.clone();
+        boxed.register_host(wid, host).unwrap();
+
+        // A contributor's claim is not honored.
+        assert!(owner.device_links(wid).unwrap().is_empty());
+
+        owner.set_member_role(cfg, wid, &box_id, WorkspaceRole::Admin).unwrap();
+        let links = owner.device_links(wid).unwrap();
+        assert_eq!(links.owner_of(&box_id), Some(owner_id.as_str()));
+        let chat = boxed.create_chat("phone chat", wid, "rt").unwrap();
+        let chat = owner.load(chat.id).unwrap().unwrap();
+        assert_eq!(links.person(&chat.creator_actor_id), owner_id);
+        assert_eq!(links.human_count(&chat), 1, "owner + their box are one person");
+
+        // A host naming the owner whose device has no cert for the box's account
+        // (someone else's device id) links nothing.
+        let mut forged = hive_core::WorkspaceHost::new(
+            Uuid::new_v4().to_string(),
+            hive_core::HostKind::Worker,
+            "not-mine",
+        );
+        forged.owner_actor_id = owner_id.clone();
+        boxed.register_host(wid, forged).unwrap();
+        assert_eq!(owner.device_links(wid).unwrap(), links);
     }
 
     #[test]

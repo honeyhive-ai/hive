@@ -435,14 +435,14 @@ async fn prepare_stage(
     // SessionBusyGuard for the whole run (blocking local `maybe_respond`), and the
     // stage hangs `REMOTE_STAGE_TIMEOUT` then fails with no local fallback.
     let local_only = state.is_local_only();
-    let solo = crate::human_member_count(&before) <= 1;
+    let links = crate::device_links_of(&state.service.lock().unwrap(), before.workspace_id);
 
     // Remote-owned stage: dispatch it over the existing cross-device path by
     // posting a prompt that @mentions its agent, then wait for the reply.
     // An agent sent to another host runs there: a Remote stage, answered by
     // that host's worker like any other mention.
     let binding = crate::host_binding(&responder.host_id, &state.local_host_id());
-    if !crate::turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id, binding) {
+    if !crate::runs_here_linked(local_only, &links, &before, &local_actor_id, &responder.owner_actor_id, binding) {
         let prompt = format!(
             "{} **[Workflow · {} → {}]**\n\n{rendered}",
             stage_mention_token(agent.as_ref()),

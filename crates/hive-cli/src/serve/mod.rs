@@ -77,6 +77,12 @@ pub struct ServeOptions {
     pub dashboard_file: PathBuf,
     /// `@mention` added to a phone message that names no agent.
     pub default_agent: Option<String>,
+    /// The member this box belongs to (`HIVE_SERVE_OWNER`: an actor id or a
+    /// display name). Set, the box registers its host as theirs, so desktops
+    /// treat it as one of that person's own devices: it doesn't count as a
+    /// second human, and the owner's desktop answers `@hive` in chats the phone
+    /// creates. Honored once the box is an Admin (`hive_core::DeviceLinks`).
+    pub owner: Option<String>,
     /// Apply an approved file-diff proposal to this box's bound checkout.
     pub apply_on_approve: bool,
     /// Relay sync cadence.
@@ -134,6 +140,7 @@ impl ServeOptions {
             prometheus_configured: env_opt("HIVE_PROMETHEUS_URL").is_some(),
             dashboard_file: dashboard::config_path(&cfg.data_dir),
             default_agent: env_opt("HIVE_SERVE_DEFAULT_AGENT").map(|a| a.trim().trim_start_matches('@').to_string()),
+            owner: env_opt("HIVE_SERVE_OWNER").map(|o| o.trim().trim_start_matches('@').to_string()),
             apply_on_approve: env_flag("HIVE_SERVE_APPLY_ON_APPROVE", false),
             sync_every: Duration::from_secs(3),
             remote: None,
@@ -145,6 +152,38 @@ impl ServeOptions {
     pub fn server_url(&self) -> String {
         self.public_url.clone().unwrap_or_else(|| pair::default_server_url(self.listen))
     }
+}
+
+/// Resolve `HIVE_SERVE_OWNER` against the workspace roster: a human member other
+/// than this box, by actor id or (unique, case-insensitive) display name.
+/// Returns their actor id and whether this box is already an Admin or Owner.
+fn resolve_owner(svc: &ChatService, ws: Uuid, wanted: &str) -> Result<(String, bool)> {
+    let config = svc
+        .load(workspace_config_session_id(ws))?
+        .ok_or_else(|| anyhow::anyhow!("the workspace roster hasn't synced yet"))?;
+    let me = svc.author().id.clone();
+    let humans: Vec<_> = config
+        .members
+        .iter()
+        .filter(|m| m.actor.kind == hive_core::ActorKind::Human && m.actor.id != me)
+        .collect();
+    let by_id: Vec<_> = humans.iter().filter(|m| m.actor.id == wanted).collect();
+    let found: Vec<_> = if by_id.is_empty() {
+        humans.iter().filter(|m| m.actor.display_name.eq_ignore_ascii_case(wanted)).collect()
+    } else {
+        by_id
+    };
+    let owner = match found.as_slice() {
+        [one] => one.actor.id.clone(),
+        [] => bail!("no member named '{wanted}'"),
+        _ => bail!("more than one member is named '{wanted}' (use their actor id)"),
+    };
+    let admin = config
+        .members
+        .iter()
+        .find(|m| m.actor.id == me)
+        .is_some_and(|m| m.role.rank() >= hive_core::WorkspaceRole::Admin.rank());
+    Ok((owner, admin))
 }
 
 /// State shared by the API handlers, the sync loop and the worker thread.
@@ -475,8 +514,22 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
     if let Err(e) = svc.ensure_self_member(workspace_config_session_id(ws), ws) {
         eprintln!("serve: joining the workspace roster failed: {e}");
     }
-    svc.register_host(ws, WorkspaceHost::new(host_id.clone(), HostKind::Worker, opts.label.clone()))
-        .context("registering this box as a workspace host")?;
+    let mut host = WorkspaceHost::new(host_id.clone(), HostKind::Worker, opts.label.clone());
+    if let Some(wanted) = &opts.owner {
+        match resolve_owner(&svc, ws, wanted) {
+            Ok((owner, admin)) => {
+                if !admin {
+                    eprintln!(
+                        "serve: HIVE_SERVE_OWNER: desktops treat this box as {wanted}'s device only once it is an Admin \
+                         (make it one in the desktop's People panel)"
+                    );
+                }
+                host.owner_actor_id = owner;
+            }
+            Err(e) => eprintln!("serve: HIVE_SERVE_OWNER ignored: {e}"),
+        }
+    }
+    svc.register_host(ws, host).context("registering this box as a workspace host")?;
 
     let tunnel = match &opts.remote {
         Some(settings) => Some(tunnel::TunnelHost::open(&cfg.data_dir, settings.clone()).context("opening the relay tunnel state")?),

@@ -193,6 +193,7 @@ async fn harness_with(
         prometheus_configured: false,
         dashboard_file: dir_for_dashboard.join("dashboard.toml"),
         default_agent: None,
+        owner: None,
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
         remote: None,
@@ -310,6 +311,7 @@ async fn empty_workspace_lists_are_empty_not_404() {
         prometheus_configured: false,
         dashboard_file: dir_for_dashboard.join("dashboard.toml"),
         default_agent: None,
+        owner: None,
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
         remote: None,
@@ -1314,3 +1316,75 @@ async fn live_gateway_turn_reads_a_file() {
 
 #[path = "tunnel/e2e_tests.rs"]
 mod tunnel_e2e;
+
+/// `HIVE_SERVE_OWNER` makes this box its owner's device: a chat the phone
+/// creates is answered by the owner's desktop, and details say whether that
+/// desktop is online (`available` / `availableVia`) from its Device heartbeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phone_chat_primary_availability_follows_the_owners_desktop() {
+    let (endpoint, _model) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    // The desktop's identity is named "hive-cli" (the CLI test identity).
+    let h = harness_with(&endpoint, "gpt-4o", &[("README.md", "# demo\n")], |o| o.owner = Some("hive-cli".into())).await;
+    let ws = crate::uuid_of_room(&h.handle.shared.cfg.room);
+    let cfg_id = workspace_config_session_id(ws);
+    let (desktop_actor, box_actor, box_host) = {
+        let svc = open_service(&h.desktop).unwrap();
+        let hosts = h.handle.shared.lock().list_hosts(ws).unwrap();
+        let mine = hosts.iter().find(|x| x.id == h.handle.shared.host_id).unwrap().clone();
+        (svc.author().id.clone(), h.handle.shared.my_actor_id(), mine)
+    };
+    // The box registered its host as the owner's.
+    assert_eq!(box_host.owner_actor_id, desktop_actor);
+
+    let chat = h.send(reqwest::Method::POST, "/v1/chats", Some(json!({ "title": "phone @hive test" }))).await;
+    let chat_id = chat["chat"]["id"].as_str().unwrap().to_string();
+    let details = || async { h.get(&format!("/v1/chats/{chat_id}/details")).await["defaultResponder"].clone() };
+
+    // Still a Contributor: the claim isn't honored, so the phone's chat is the
+    // box's own, which can't run @hive — and nothing pretends otherwise.
+    let r = details().await;
+    assert_eq!(r["kind"], "primary");
+    assert_eq!(r["available"], json!(false));
+    assert_eq!(r["unavailableReason"], "noDesktop");
+    assert!(r.get("availableVia").is_none());
+
+    // The owner makes the box an Admin and opens the desktop (Device heartbeat).
+    {
+        let mut svc = open_service(&h.desktop).unwrap();
+        svc.set_member_role(cfg_id, ws, &box_actor, hive_core::WorkspaceRole::Admin).unwrap();
+        svc.register_host(ws, hive_core::WorkspaceHost::new(svc.device_id().to_string(), hive_core::HostKind::Device, "Studio Mac"))
+            .unwrap();
+    }
+    sync_once(&h.desktop).await.unwrap();
+    let mut r = Value::Null;
+    for _ in 0..50 {
+        r = details().await;
+        if r["available"] == json!(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(r["available"], json!(true), "{r}");
+    assert_eq!(r["availableVia"], "Studio Mac");
+    assert_eq!(h.handle.shared.lock().device_links(ws).unwrap().person(&box_actor), desktop_actor);
+
+    // The desktop closes: its last heartbeat ages out.
+    {
+        let mut svc = open_service(&h.desktop).unwrap();
+        let mut stale = hive_core::WorkspaceHost::new(svc.device_id().to_string(), hive_core::HostKind::Device, "Studio Mac");
+        stale.last_seen = hive_core::Timestamp::from_unix_seconds(0);
+        svc.register_host(ws, stale).unwrap();
+    }
+    sync_once(&h.desktop).await.unwrap();
+    for _ in 0..50 {
+        r = details().await;
+        if r["available"] == json!(false) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(r["available"], json!(false), "{r}");
+    assert_eq!(r["unavailableReason"], "desktopOffline");
+    assert!(r.get("availableVia").is_none());
+    h.handle.shutdown();
+}

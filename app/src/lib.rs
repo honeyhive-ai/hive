@@ -6071,12 +6071,34 @@ enum DispatchTarget {
     Agent(Uuid),
 }
 
-fn human_member_count(session: &ChatSession) -> usize {
-    session
-        .members
-        .iter()
-        .filter(|m| m.actor.kind == ActorKind::Human)
-        .count()
+/// Distinct *people* among the chat's human members. A member's own devices (a
+/// `hive serve` box linked to its owner, see [`hive_core::DeviceLinks`]) count
+/// once with them, so you plus your phone's home box is still a solo room.
+fn human_member_count(session: &ChatSession, links: &hive_core::DeviceLinks) -> usize {
+    links.human_count(session)
+}
+
+/// The workspace's device links, best effort: on a read error nothing is
+/// linked, which is today's behavior.
+fn device_links_of(svc: &ChatService, workspace_id: Uuid) -> hive_core::DeviceLinks {
+    svc.device_links(workspace_id).unwrap_or_default()
+}
+
+/// [`turn_runs_here`] with device links applied: solo counts people, not
+/// member records, and a responder owned by a linked device (the chat a phone
+/// created through its owner's `hive serve` box) is owned by that device's
+/// account — so the owner's desktop answers it. The single-answer claim still
+/// arbitrates between the owner's devices.
+fn runs_here_linked(
+    local_only: bool,
+    links: &hive_core::DeviceLinks,
+    session: &ChatSession,
+    local: &str,
+    owner: &str,
+    binding: HostBinding,
+) -> bool {
+    let solo = human_member_count(session, links) <= 1;
+    turn_runs_here(local_only, solo, local, links.person(owner), binding)
 }
 
 /// Decide whether a message triggers a runtime, and which one. An `@agent` or
@@ -6091,7 +6113,12 @@ fn human_member_count(session: &ChatSession) -> usize {
 /// under a stale account id) inflates the human count and an unaddressed "hi"
 /// stops auto-triggering Hive — you'd have to `@hive` every message. A
 /// relay-backed room still uses the real human count.
-fn dispatch_target(body: &str, session: &ChatSession, local_only: bool) -> Option<DispatchTarget> {
+fn dispatch_target(
+    body: &str,
+    session: &ChatSession,
+    local_only: bool,
+    links: &hive_core::DeviceLinks,
+) -> Option<DispatchTarget> {
     let mentions = parse_mentions(body, session);
     if let Some(id) = mentions.agents.first().copied() {
         return Some(DispatchTarget::Agent(id));
@@ -6099,7 +6126,7 @@ fn dispatch_target(body: &str, session: &ChatSession, local_only: bool) -> Optio
     if mentions.primary {
         return Some(DispatchTarget::Primary);
     }
-    (local_only || human_member_count(session) <= 1).then_some(DispatchTarget::Primary)
+    (local_only || human_member_count(session, links) <= 1).then_some(DispatchTarget::Primary)
 }
 
 // `cascade_depth` now lives on `hive_core::ChatSession` (shared with the worker
@@ -7861,7 +7888,8 @@ async fn run_deferred_claim_fallback(
         let Some(trigger) = session.messages.iter().find(|m| m.id == trigger_id) else {
             return Ok(());
         };
-        match dispatch_target(&trigger.body, &session, local_only) {
+        let links = device_links_of(&svc, session.workspace_id);
+        match dispatch_target(&trigger.body, &session, local_only, &links) {
             Some(DispatchTarget::Agent(id)) => session
                 .workspace_agents
                 .iter()
@@ -7932,7 +7960,8 @@ async fn send_message(
         // never `.unwrap()` under the `service` lock, or a None poisons the
         // global mutex and bricks every future `service.lock()` this process.
         let Some(session) = svc.load(sid).map_err(map_err)? else { return Ok(()) };
-        (workspace_id, posted.id, dispatch_target(&body, &session, local_only))
+        let links = device_links_of(&svc, workspace_id);
+        (workspace_id, posted.id, dispatch_target(&body, &session, local_only, &links))
     };
 
     // Turn loop: a reply that mentions another (distinct) agent cascades a
@@ -7967,9 +7996,9 @@ async fn send_message(
         // stale self-identity no live device owns → "thinking…" forever, no
         // dispatch. Mirrors `maybe_respond`; both gates must use `turn_runs_here`.
         let local_only = state.is_local_only_ws(workspace_id);
-        let solo = human_member_count(&session) <= 1;
+        let links = device_links_of(&state.service.lock().unwrap(), workspace_id);
         let binding = host_binding(&responder.host_id, &state.local_host_id());
-        if !turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id, binding) {
+        if !runs_here_linked(local_only, &links, &session, &local_actor_id, &responder.owner_actor_id, binding) {
             tracing::info!(
                 target: "dispatch",
                 responder = %responder.author,
@@ -8160,13 +8189,13 @@ async fn maybe_respond(
         // primary silently never answers ("thinking…" forever, nothing logged).
         // The cross-device ownership split only matters in a real multi-human room.
         let local_only = state.is_local_only_ws(session.workspace_id);
-        let solo = human_member_count(&session) <= 1;
+        let links = device_links_of(&svc, session.workspace_id);
         let runs_here = |responder: &Responder| {
             let binding = host_binding(&responder.host_id, &local_host_id);
-            turn_runs_here(local_only, solo, &local_actor_id, &responder.owner_actor_id, binding)
+            runs_here_linked(local_only, &links, &session, &local_actor_id, &responder.owner_actor_id, binding)
         };
         match last {
-            Some(m) if m.role == MessageRole::User => match dispatch_target(&m.body, &session, local_only) {
+            Some(m) if m.role == MessageRole::User => match dispatch_target(&m.body, &session, local_only, &links) {
                 Some(target) => {
                     let agent = match target {
                         DispatchTarget::Agent(id) => {
@@ -8238,6 +8267,33 @@ async fn maybe_respond(
     }
     let result = run_turn(&app, &state, sid, workspace_id, &responder).await;
     result.map(|_| ())
+}
+
+/// Run [`maybe_respond`] for each chat a sync pull added messages to, in the
+/// active workspace. Each runs on its own task; the per-chat busy guard and the
+/// turn claim keep a chat the UI is also dispatching from answering twice.
+fn dispatch_synced_sessions(app: &AppHandle, sessions: Vec<Uuid>) {
+    if sessions.is_empty() {
+        return;
+    }
+    let active = app.state::<AppState>().active_workspace_id();
+    for sid in sessions {
+        let in_active = {
+            let state = app.state::<AppState>();
+            let svc = state.service.lock().unwrap();
+            matches!(svc.load(sid), Ok(Some(s)) if s.workspace_id == active)
+        };
+        if !in_active {
+            continue;
+        }
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = app.state::<AppState>();
+            if let Err(e) = maybe_respond(app.clone(), state, sid.to_string()).await {
+                tracing::warn!(target: "dispatch", session = %sid, "synced dispatch failed: {e}");
+            }
+        });
+    }
 }
 
 /// Add the local user to a chat's roster when they open it, so the People tab
@@ -10278,6 +10334,76 @@ fn set_schedule_enabled(state: State<AppState>, id: String, enabled: bool) -> Re
     Ok(())
 }
 
+/// How often the desktop checks its Device-host heartbeat, and the minimum gap
+/// between two heartbeats it writes. Peers (and `hive serve`) count a host online
+/// for 90 s, and the sync heartbeat pushes within 20 s, so a heartbeat at most
+/// ~60 s old keeps the desktop "online" while the app runs.
+const DEVICE_HOST_TICK: std::time::Duration = std::time::Duration::from_secs(15);
+const DEVICE_HOST_THROTTLE_SECS: i64 = 45;
+
+/// The name this computer shows other members (macOS "Computer Name", else the
+/// host name), for the Device host label: "@hive · on <name>" on the phone.
+fn computer_name() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output().ok()?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() && !name.is_empty() {
+            return Some(name);
+        }
+    }
+    hostname_label()
+}
+
+/// Keep this desktop registered and heartbeating as a `Device` host in the
+/// synced room's workspace (spec §12.4: a member's machine, online while its
+/// app runs). The phone's `hive serve` reads it to say whether `@hive` — which
+/// only a desktop can run — will answer now or once the desktop is open.
+///
+/// Registers only once the room's config log has synced in (never seeds a
+/// competing one) and heartbeats through the throttled `touch_host`, the same
+/// event a worker writes.
+async fn run_device_host_loop(app: AppHandle) {
+    let label = tauri::async_runtime::spawn_blocking(computer_name)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "Desktop".to_string());
+    let mut tick = tokio::time::interval(DEVICE_HOST_TICK);
+    loop {
+        tick.tick().await;
+        let state = app.state::<AppState>();
+        let ws = {
+            let s = state.settings.lock().unwrap();
+            s.relay_url
+                .as_ref()
+                .filter(|u| !u.is_empty())
+                .map(|_| room_workspace_id(&s.sync_room))
+        };
+        let Some(ws) = ws else { continue };
+        let host_id = state.local_host_id();
+        let mut svc = state.service.lock().unwrap();
+        if !matches!(svc.load(hive_core::workspace_config_session_id(ws)), Ok(Some(_))) {
+            continue;
+        }
+        let me = svc.author().id.clone();
+        let current = svc.list_hosts(ws).unwrap_or_default().into_iter().find(|h| h.id == host_id);
+        let result = match current {
+            // (Re-)register when missing, renamed, or recorded under an old self.
+            Some(h) if h.kind == hive_core::HostKind::Device && h.label == label && h.owner_actor_id == me => {
+                svc.touch_host(ws, &host_id, DEVICE_HOST_THROTTLE_SECS).map(|_| ())
+            }
+            _ => svc.register_host(
+                ws,
+                hive_core::WorkspaceHost::new(host_id.clone(), hive_core::HostKind::Device, label.clone()),
+            ),
+        };
+        if let Err(e) = result {
+            tracing::debug!(target: "hosts", "device host heartbeat failed: {e}");
+        }
+    }
+}
+
 /// Background scheduler: every 30s, fire any due scheduled agents. Each fire
 /// opens a fresh chat in the target workspace, posts the prompt, and runs one
 /// turn through the normal dispatch path. `last_run` is stamped + persisted so
@@ -10378,6 +10504,7 @@ async fn sync_pull_once(
     last_sync_err: &mut Option<String>,
 ) -> bool {
     // Split steps keep the store's borrow out of any `.await`.
+    let before_row = store.max_row_id().unwrap_or(i64::MAX);
     let outcome: Result<usize, hive_runtime::SyncError> = async {
         let to_push = eng.take_unpushed(store)?;
         eng.push_envelopes(&to_push).await?;
@@ -10395,6 +10522,13 @@ async fn sync_pull_once(
                 ConnHealth { state: "live".to_string(), last_error: None };
             if pulled > 0 {
                 let _ = app.emit("workspace://synced", pulled);
+                // Answer what just arrived in ANY chat, not only the open one:
+                // the frontend asks `maybe_respond` for the selected chat only,
+                // so an @hive in a chat the phone just created (never opened
+                // here) went unanswered. `maybe_respond` keeps every gate —
+                // ownership, host binding, busy guard, the cross-device claim.
+                let touched = store.sessions_with_messages_after(before_row).unwrap_or_default();
+                dispatch_synced_sessions(app, touched);
                 // Wake every live workflow driver so a stage suspended on a
                 // remote reply (or a remote gate vote) reacts within sync
                 // latency instead of on its safety-net poll.
@@ -13530,6 +13664,10 @@ pub fn run() {
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(run_sync_loop(handle, settings.clone(), db_path));
 
+            // List this desktop as an online Device host in the synced room, so
+            // the phone (via `hive serve`) can tell whether @hive can answer now.
+            tauri::async_runtime::spawn(run_device_host_loop(app.handle().clone()));
+
             // Scheduled/triggered agents: fires due schedules on a 30s tick.
             // Idle until the user adds a schedule (Settings → Schedules).
             {
@@ -14120,7 +14258,7 @@ mod dispatch_ownership_tests {
 
 #[cfg(test)]
 mod dispatch_target_tests {
-    use super::{dispatch_target, DispatchTarget};
+    use super::{dispatch_target, DispatchTarget, HostBinding};
     use hive_core::{session::ChatSession, ActorIdentity, ActorKind, WorkspaceMember, WorkspaceRole};
     use hive_core::Timestamp;
     use uuid::Uuid;
@@ -14150,7 +14288,7 @@ mod dispatch_target_tests {
         // auto-triggers the primary even though the roster shows two humans.
         let s = two_human_session();
         assert!(matches!(
-            dispatch_target("hi", &s, true),
+            dispatch_target("hi", &s, true, &Default::default()),
             Some(DispatchTarget::Primary)
         ));
     }
@@ -14159,12 +14297,66 @@ mod dispatch_target_tests {
     fn synced_room_stays_human_to_human_until_addressed() {
         // Relay-backed, two real humans: an unaddressed message is human-to-human.
         let s = two_human_session();
-        assert!(dispatch_target("hi", &s, false).is_none());
+        assert!(dispatch_target("hi", &s, false, &Default::default()).is_none());
         // …but an explicit @primary/@hive always dispatches.
         assert!(matches!(
-            dispatch_target("@hive hi", &s, false),
+            dispatch_target("@hive hi", &s, false, &Default::default()),
             Some(DispatchTarget::Primary)
         ));
+    }
+
+    /// The owner (desktop) plus their phone's `hive serve` box, which created
+    /// the chat. The box's host names the owner, and its device carries a cert
+    /// for the box's account; `admin` sets the box's role.
+    fn phone_box_world(admin: bool) -> (ChatSession, hive_core::DeviceLinks) {
+        let box_account = Uuid::new_v4();
+        let box_device = Uuid::new_v4();
+        let mut owner = human("owner", "Alex");
+        owner.actor.account_id = Some(Uuid::new_v4());
+        let mut phone = human(&box_account.to_string(), "Phone");
+        phone.actor.account_id = Some(box_account);
+        phone.role = if admin { WorkspaceRole::Admin } else { WorkspaceRole::Contributor };
+        let mut config = ChatSession::new("", Uuid::nil(), "");
+        config.members = vec![owner, phone];
+        let mut host = hive_core::WorkspaceHost::new(box_device.to_string(), hive_core::HostKind::Worker, "sff");
+        host.owner_actor_id = "owner".into();
+        config.workspace_hosts = vec![host];
+        let links = hive_core::DeviceLinks::from_config(&config, |d, a| d == box_device && a == box_account);
+        let mut chat = ChatSession::new("phone @hive test", Uuid::nil(), "rt");
+        chat.creator_actor_id = box_account.to_string();
+        chat.members = config.members.clone();
+        (chat, links)
+    }
+
+    #[test]
+    fn owner_desktop_answers_hive_in_a_chat_its_phone_box_created() {
+        let (chat, links) = phone_box_world(true);
+        // Owner + their box are one person: solo, so un-addressed messages
+        // reach the primary as they did before the box joined.
+        assert_eq!(super::human_member_count(&chat, &links), 1);
+        assert!(matches!(dispatch_target("hi", &chat, false, &links), Some(DispatchTarget::Primary)));
+        // The chat's primary is owned by the box's account → mapped to the
+        // owner, so the owner's desktop runs it…
+        assert!(super::runs_here_linked(false, &links, &chat, "owner", &chat.creator_actor_id, HostBinding::Unbound));
+        // …while a teammate's desktop still defers (a third person makes the
+        // room multi-human, and the owner isn't them).
+        let mut team = chat.clone();
+        team.members.push(human("teammate", "Ana"));
+        assert!(!super::runs_here_linked(false, &links, &team, "teammate", &team.creator_actor_id, HostBinding::Unbound));
+        assert!(super::runs_here_linked(false, &links, &team, "owner", &team.creator_actor_id, HostBinding::Unbound));
+        // An agent sent to a host still runs only there.
+        assert!(!super::runs_here_linked(false, &links, &chat, "owner", &chat.creator_actor_id, HostBinding::Elsewhere));
+    }
+
+    #[test]
+    fn unlinked_phone_box_keeps_todays_behavior() {
+        // Older box (host owned by itself) or a non-admin box: no link, so the
+        // room is two people and the box-created chat isn't the owner's.
+        let (chat, links) = phone_box_world(false);
+        assert!(links.is_empty());
+        assert_eq!(super::human_member_count(&chat, &links), 2);
+        assert!(dispatch_target("hi", &chat, false, &links).is_none());
+        assert!(!super::runs_here_linked(false, &links, &chat, "owner", &chat.creator_actor_id, HostBinding::Unbound));
     }
 }
 

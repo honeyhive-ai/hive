@@ -9,6 +9,7 @@ pub mod chat;
 pub mod config;
 pub mod context_budget;
 pub mod crypto;
+pub mod device_link;
 pub mod e2ee;
 pub mod endpoint;
 pub mod events;
@@ -32,6 +33,7 @@ pub mod workspace_runtime;
 pub use agent::WorkspaceAgent;
 pub use authorization::{evaluate as authorize, AuthzDecision, AuthzReason};
 pub use channel::{workspace_config_session_id, Channel};
+pub use device_link::DeviceLinks;
 pub use workspace_host::{HostKind, WorkspaceHost};
 pub use workspace_runtime::{WorkspaceCredential, WorkspaceRuntime};
 pub use chat::{

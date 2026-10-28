@@ -160,6 +160,15 @@ Field notes:
   `defaultResponder = {kind: "primary"|"agent", name, via: "untagged"|"serveDefault", runtimeLabel?, model?, agentId?, hostLabel?, hostKind?}`
   is who answers an untagged message: the chat's `@hive` on its runtime, or the
   agent named by `hive serve --default-agent`.
+  For the primary it also carries `available?: bool`, `availableVia?: string`
+  and `unavailableReason?: "desktopOffline"|"noDesktop"`.
+  Only a desktop runs `@hive`: its owner's (the chat's creator, or the person
+  this box belongs to when the phone created it, see `HIVE_SERVE_OWNER`).
+  `available: true` with `availableVia` = that desktop's name while it
+  heartbeats its Device host; `false` with `desktopOffline` when it's closed
+  (the turn waits and is answered once it opens), or `noDesktop` when the chat
+  is this box's own and no desktop will run it (set `HIVE_SERVE_OWNER`);
+  absent when unknown (a desktop too old to heartbeat).
   `context = {estimated: true, windowTokens, usedTokens, historyTokens, skillTokens, messageCount, compacting, model?}`
   is a coarse estimate from the transcript, the loaded skills and the model's
   window (the desktop's Context pane plans the real prompt).
@@ -330,7 +339,12 @@ hive remote disable | reset   # reset = new host keys: every phone re-pairs
   token (the token isn't per-device). Phones paired over the relay are
   per-device and can be revoked one by one.
 - The box is a separate member identity, not the phone owner's account. The
-  desktop shows the phone's messages under `HIVE_SERVE_NAME`.
+  desktop shows the phone's messages under `HIVE_SERVE_NAME`. With
+  `HIVE_SERVE_OWNER` set (and the box an Admin) desktops count it as one of the
+  owner's devices: a room with the owner and the box is solo, and a chat the
+  phone creates is the owner's, so their desktop answers `@hive` there. The
+  link is the box's host record naming the owner (no new event or field, so
+  older desktops keep their behavior); a Contributor's claim is ignored.
 - Agents run one at a time on the worker thread. A long turn delays the next
   one, but the API and sync keep running.
 - Deltas are pushed only for turns that run on this box. A reply streamed on
