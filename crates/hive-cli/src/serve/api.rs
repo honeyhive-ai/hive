@@ -38,7 +38,7 @@ type S = State<Arc<Shared>>;
 pub struct ApiError(StatusCode, String);
 
 impl ApiError {
-    fn not_found(what: &str) -> Self {
+    pub(super) fn not_found(what: &str) -> Self {
         Self(StatusCode::NOT_FOUND, format!("{what} not found"))
     }
     fn bad_request(msg: impl Into<String>) -> Self {
@@ -69,7 +69,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
+pub(super) type ApiResult<T> = Result<T, ApiError>;
 
 // ── DTOs ───────────────────────────────────────────────────────────────────
 
@@ -103,6 +103,11 @@ pub fn message_dto(chat: Uuid, m: &ChatMessage) -> Value {
     if let Some(a) = m.responder_id {
         v["agentId"] = json!(a);
     }
+    // Who wrote a person's message (matches `GET /v1/people` `actorId`), so the
+    // phone can draw their avatar.
+    if let Some(actor) = m.actor_identity.as_ref().filter(|_| m.role == MessageRole::User) {
+        v["actorId"] = json!(actor.id);
+    }
     v
 }
 
@@ -134,6 +139,9 @@ pub fn chat_dto(s: &ChatSession, unread: usize) -> Value {
         "updatedAt": iso(updated_at(s)),
         "preview": preview,
         "unread": unread,
+        // Channels (`GET /v1/channels`): "" = unfiled.
+        "channelId": s.channel_id,
+        "participants": super::people::participants(s, 5),
     })
 }
 
@@ -224,6 +232,9 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/agents", get(list_agents))
         .route("/v1/agents/:id/host", put(set_agent_host))
         .route("/v1/hosts", get(list_hosts))
+        .route("/v1/people", get(super::people::list_people))
+        .route("/v1/channels", get(super::people::list_channels))
+        .route("/v1/chats/:id/details", get(super::people::chat_details))
         .route("/v1/proposals", get(list_proposals))
         .route("/v1/proposals/:id/approve", post(approve_proposal))
         .route("/v1/proposals/:id/reject", post(reject_proposal))
@@ -291,7 +302,7 @@ async fn create_chat(State(s): S, body: Bytes) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "chat": chat_dto(&chat, 0) })))
 }
 
-fn load_chat(s: &Shared, raw: &str) -> ApiResult<ChatSession> {
+pub(super) fn load_chat(s: &Shared, raw: &str) -> ApiResult<ChatSession> {
     let id = parse_id(raw, "chat")?;
     s.workspace_chats()?.into_iter().find(|c| c.id == id).ok_or_else(|| ApiError::not_found("chat"))
 }
@@ -368,7 +379,7 @@ impl Shared {
 /// log hasn't synced in yet has no agents: an empty log stands in, so
 /// `GET /v1/agents` answers `[]` rather than 404 (the phone's pairing check
 /// calls it).
-fn hosts_and_agents(s: &Shared) -> ApiResult<(Vec<hive_core::WorkspaceHost>, ChatSession)> {
+pub(super) fn hosts_and_agents(s: &Shared) -> ApiResult<(Vec<hive_core::WorkspaceHost>, ChatSession)> {
     let svc = s.lock();
     let hosts = svc.list_hosts(s.ws)?;
     let config_id = hive_core::workspace_config_session_id(s.ws);
@@ -380,7 +391,7 @@ fn hosts_and_agents(s: &Shared) -> ApiResult<(Vec<hive_core::WorkspaceHost>, Cha
     Ok((hosts, config))
 }
 
-fn agent_dto(s: &Shared, a: &hive_core::WorkspaceAgent, config: &ChatSession, hosts: &[hive_core::WorkspaceHost]) -> Value {
+pub(super) fn agent_dto(s: &Shared, a: &hive_core::WorkspaceAgent, config: &ChatSession, hosts: &[hive_core::WorkspaceHost]) -> Value {
     // What the agent runs on: a workspace runtime, or — when hosted here —
     // this box's own runtime for it (see `worker::local_runtimes`).
     let mut known = config.workspace_runtimes.clone();
@@ -414,6 +425,7 @@ fn agent_dto(s: &Shared, a: &hive_core::WorkspaceAgent, config: &ChatSession, ho
         // Empty host = the agent owner's own device (the desktop's default).
         v["hostLabel"] = json!("Owner's device");
     }
+    super::people::decorate_agent(&mut v, s, a, hosts);
     v
 }
 
@@ -424,7 +436,7 @@ async fn list_agents(State(s): S) -> ApiResult<Json<Value>> {
 }
 
 /// Presence window, as `hive queue` uses.
-const ONLINE_WINDOW_SECS: i64 = 90;
+pub(super) const ONLINE_WINDOW_SECS: i64 = 90;
 
 async fn list_hosts(State(s): S) -> ApiResult<Json<Value>> {
     let (hosts, _) = hosts_and_agents(&s)?;
