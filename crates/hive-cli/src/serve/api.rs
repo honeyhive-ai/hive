@@ -983,18 +983,23 @@ fn to_event(ev: super::hub::SseEvent) -> Event {
     Event::default().id(ev.id.to_string()).event(ev.name).data(ev.data.to_string())
 }
 
-async fn events(State(s): S, headers: HeaderMap) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn events(State(s): S, peer: Option<Extension<TunnelPeer>>, headers: HeaderMap) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let last = headers.get("last-event-id").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse::<u64>().ok());
     let (backlog, rx) = s.hub.subscribe(last);
+    // Through the tunnel, an open events stream means the app is in the
+    // foreground on that phone (it cancels the stream when backgrounded): no
+    // pushes to it while the stream lives. The guard rides in the stream
+    // state, so it drops with the response body however the stream ends.
+    let foreground = peer.and_then(|Extension(p)| s.tunnel.as_ref().map(|t| t.foreground(&p.pid)));
     // Open with a comment so the client sees body bytes at once: URLSession
     // (the phone) doesn't hand back the response until the first body byte, so
     // without this a quiet stream looked "connecting" until the 15 s heartbeat.
     let hello = stream::once(async { Ok(Event::default().comment("connected")) });
     let backlog = hello.chain(stream::iter(backlog.into_iter().map(|e| Ok(to_event(e)))));
-    let live = stream::unfold(rx, |mut rx| async move {
+    let live = stream::unfold((rx, foreground), |(mut rx, foreground)| async move {
         loop {
             match rx.recv().await {
-                Ok(ev) => return Some((Ok(to_event(ev)), rx)),
+                Ok(ev) => return Some((Ok(to_event(ev)), (rx, foreground))),
                 // A slow client skipped some events; it keeps the stream and
                 // can refetch (best effort, like Last-Event-ID).
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

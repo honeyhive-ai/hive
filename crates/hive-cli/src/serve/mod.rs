@@ -37,6 +37,7 @@ pub mod appearance;
 pub mod dashboard;
 pub mod hub;
 pub mod lab;
+pub mod notify;
 pub mod ntfy;
 pub mod pair;
 pub mod people;
@@ -259,7 +260,7 @@ impl Shared {
     }
 
     /// Diff the projection against the last look and publish the difference
-    /// (SSE events, plus ntfy for finished agent replies and new proposals).
+    /// (SSE events, plus ntfy and relay pushes for what [`notify`] picks).
     ///
     /// The sync loop, the worker thread and API handlers all call this. The
     /// projection is loaded while holding the differ lock, so each diff runs on
@@ -267,7 +268,8 @@ impl Shared {
     /// slow caller diff a stale snapshot after a newer one, rolling the differ
     /// back and re-emitting `message.done` (and its ntfy push).
     pub fn refresh(&self) {
-        let me = self.my_actor_id();
+        let author = self.lock().author().clone();
+        let me = author.id.clone();
         let mut notices = Vec::new();
         let mut created = Vec::new();
         {
@@ -288,17 +290,11 @@ impl Shared {
                         let Some(m) = s.messages.iter().find(|m| m.id == message) else { continue };
                         let name = if done { "message.done" } else { "message.created" };
                         self.hub.emit(name, hub::wrap("message", api::message_dto(chat, m)));
-                        if done && matches!(m.role, MessageRole::Assistant | MessageRole::Agent) && self.fresh(m.created_at) {
-                            let notice = ntfy::reply_notice(&m.author, &s.title, chat, m.body.starts_with("[error]"));
-                            let push = tunnel::PushContent {
-                                kind: "message.done".into(),
-                                chat_id: Some(chat.to_string()),
-                                title: notice.title.clone(),
-                                sender: Some(m.author.clone()),
-                                preview: Some(m.body.clone()),
-                                fixed_body: String::new(),
-                            };
-                            notices.push((notice, push));
+                        // Agent replies notify when done; other members'
+                        // messages when they appear (only if they mention you).
+                        if self.fresh(m.created_at) {
+                            let me = notify::Me::in_chat(&author, s);
+                            notices.extend(notify::for_message(s, m, done, &me));
                         }
                     }
                     Change::ProposalCreated { chat, proposal } => {
@@ -307,16 +303,14 @@ impl Shared {
                         created.push((chat, proposal));
                         self.hub.emit("proposal.created", hub::wrap("proposal", api::proposal_dto_as(s, p, &me)));
                         if self.fresh(p.created_at) {
-                            let notice = ntfy::proposal_notice(&p.title, &s.title, chat);
-                            let push = tunnel::PushContent {
-                                kind: "proposal.created".into(),
-                                chat_id: Some(chat.to_string()),
-                                title: notice.title.clone(),
-                                sender: None,
-                                preview: Some(p.title.clone()),
-                                fixed_body: String::new(),
-                            };
-                            notices.push((notice, push));
+                            notices.extend(notify::for_proposal(s, p));
+                        }
+                    }
+                    Change::WorkflowApproval { chat, run, node } => {
+                        let Some(s) = sessions.iter().find(|s| s.id == chat) else { continue };
+                        let Some(r) = s.workflow_runs.iter().find(|r| r.id == run) else { continue };
+                        if self.fresh(r.updated_at) {
+                            notices.extend(notify::for_workflow_gate(s, r, &node));
                         }
                     }
                     Change::ProposalUpdated { chat, proposal } => {

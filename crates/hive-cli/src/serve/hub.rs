@@ -11,10 +11,10 @@
 //! synced in looks the same to the phone as one this box produced. Only
 //! `message.delta` and `turn.status` come straight from the worker.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 
-use hive_core::{ActionProposal, ChatSession, MessageRole, ProposalStatus};
+use hive_core::{ActionProposal, ChatSession, MessageRole, NodeRunStatus, ProposalStatus};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -80,6 +80,8 @@ struct ChatSnap {
     messages: HashMap<Uuid, bool>,
     /// proposal id → what the phone shows of it
     proposals: HashMap<Uuid, ProposalSnap>,
+    /// Workflow gates awaiting approval: (run id, node id, attempt).
+    gates: HashSet<(Uuid, String, u32)>,
 }
 
 /// The parts of a proposal whose change is a `proposal.updated`: its status,
@@ -111,6 +113,9 @@ pub enum Change {
     ProposalCreated { chat: Uuid, proposal: Uuid },
     /// A known proposal's votes, thread, status or revision link changed.
     ProposalUpdated { chat: Uuid, proposal: Uuid },
+    /// A workflow run's gate started waiting for approval (each attempt of a
+    /// rerouted gate counts again).
+    WorkflowApproval { chat: Uuid, run: Uuid, node: String },
     ChatUpdated { chat: Uuid },
 }
 
@@ -125,7 +130,17 @@ fn snap(s: &ChatSession) -> ChatSnap {
         title: s.title.clone(),
         messages: s.messages.iter().map(|m| (m.id, m.is_streaming)).collect(),
         proposals: s.proposals.iter().map(|p| (p.id, proposal_snap(p))).collect(),
+        gates: awaiting_gates(s).collect(),
     }
+}
+
+fn awaiting_gates(s: &ChatSession) -> impl Iterator<Item = (Uuid, String, u32)> + '_ {
+    s.workflow_runs.iter().flat_map(|r| {
+        r.nodes
+            .iter()
+            .filter(|n| n.status == NodeRunStatus::AwaitingApproval)
+            .map(move |n| (r.id, n.node_id.clone(), n.attempts))
+    })
 }
 
 /// A proposal still waiting for review.
@@ -192,6 +207,11 @@ impl Differ {
                             out.push(Change::ProposalUpdated { chat: s.id, proposal: p.id });
                         }
                     }
+                }
+            }
+            for (run, node, attempt) in awaiting_gates(s) {
+                if !before.gates.contains(&(run, node.clone(), attempt)) {
+                    out.push(Change::WorkflowApproval { chat: s.id, run, node });
                 }
             }
             if touched {
@@ -314,6 +334,33 @@ mod tests {
             vec![Change::ProposalUpdated { chat: s.id, proposal: pid }, Change::ChatUpdated { chat: s.id }]
         );
         assert!(d.diff(std::slice::from_ref(&s)).is_empty());
+    }
+
+    #[test]
+    fn workflow_gate_awaiting_approval_is_reported_once_per_attempt() {
+        use hive_core::workflow;
+        let mut d = Differ::default();
+        let mut s = chat();
+        let def = workflow::preset_review_gate();
+        let mut run = workflow::new_run(&def, "build it", "u1");
+        s.workflow_runs.push(run.clone());
+        d.seed(std::slice::from_ref(&s));
+        let gate = run.node_state_mut("approval").unwrap();
+        gate.status = NodeRunStatus::AwaitingApproval;
+        s.workflow_runs[0] = run.clone();
+        let c = d.diff(std::slice::from_ref(&s));
+        assert_eq!(c, vec![Change::WorkflowApproval { chat: s.id, run: run.id, node: "approval".into() }]);
+        assert!(d.diff(std::slice::from_ref(&s)).is_empty(), "still waiting: not reported again");
+        // Rejected and rerouted: the next attempt waits again → reported again.
+        let gate = run.node_state_mut("approval").unwrap();
+        gate.attempts = 1;
+        s.workflow_runs[0] = run.clone();
+        let c = d.diff(std::slice::from_ref(&s));
+        assert_eq!(c, vec![Change::WorkflowApproval { chat: s.id, run: run.id, node: "approval".into() }]);
+        // Seeding an already-waiting gate reports nothing (restart).
+        let mut fresh = Differ::default();
+        fresh.seed(std::slice::from_ref(&s));
+        assert!(fresh.diff(std::slice::from_ref(&s)).is_empty());
     }
 
     #[test]

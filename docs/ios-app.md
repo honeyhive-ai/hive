@@ -252,6 +252,9 @@ hive remote disable | reset   # reset = new host keys: every phone re-pairs
   `POST /v1/tunnel/credential`. That route and `PUT /v1/tunnel/push
   {"enabled": bool}` exist only through the tunnel and return 404 with a
   bearer token.
+- End-to-end encrypted push notifications (replies, mentions, reviews,
+  workflow approvals) and how to enable them with your own APNs key:
+  [`push-notifications.md`](push-notifications.md).
 - `hive phones revoke` takes effect at once: the server ends the phone's live
   sessions (GOAWAY), refuses its requests and handshakes, and tells the relay
   (retried until acked). It also rotates `serve.token` unless `--keep-token`,
