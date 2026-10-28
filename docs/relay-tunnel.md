@@ -695,15 +695,19 @@ must re-pair. Use it if the host key may have leaked.
 
 ## 14. End-to-end encrypted push
 
+(When `hive serve` sends which kind, its host-side limits, and how to set up
+push with your own APNs key: [`push-notifications.md`](push-notifications.md).)
+
 The host encrypts and the relay forwards ciphertext to APNs. Only the hosted
 relay can push to the App Store app, because it holds the APNs key. An open
 relay without a `PushSender` acks `push` with `ok:false, code:"push_unavailable"`,
 and the host falls back to ntfy if that's configured.
 
 ```
-plaintext = {"v":1,"seq":<u64>,"ts":<s>,"kind":"message.done"|"proposal.created"|"phone.paired"|"test",
-             "chatId"?:"…","proposalId"?:"…","title":"<≤64 bytes>","body":"<≤512 bytes>",
-             "sender"?:"<≤64 bytes>","preview"?:true}
+plaintext = {"v":1,"seq":<u64>,"ts":<s>,
+             "kind":"message.done"|"mention"|"proposal.created"|"workflow.approval"|"phone.paired"|"test",
+             "chatId"?:"…","proposalId"?:"…","workflowRunId"?:"…","workflowId"?:"…",
+             "title":"<≤64 bytes>","body":"<≤512 bytes>","sender"?:"<≤64 bytes>","preview"?:true}
 nonce     = 12 random bytes
 ad        = ctx("push", host_id, pid)
 ct        = b64u(nonce ‖ ChaCha20-Poly1305(push_key, nonce, plaintext, ad))     (raw ≤ 2 048 bytes)
@@ -718,12 +722,13 @@ they are; the host decides what goes in them:
   scalar values; whitespace runs collapsed to one space, control characters
   dropped, cut on a character boundary, `…` appended when cut, so at most
   121 characters); for `proposal.created`, the proposal title, cut the same
-  way. `"preview":true` is set.
+  way. `mention` previews the message like `message.done`;
+  `workflow.approval` previews the gate's stage name. `"preview":true` is set.
 - `previews` off (sender only): `body` is empty and `preview` is absent.
   `title` still names the sender ("coder replied").
 
 `title` names the sender and the event ("coder replied", "coder hit an error",
-"Change ready for review") and `sender` is the agent or author name alone,
+"Ana mentioned you", "Change ready for review", "Review gate needs approval") and `sender` is the agent or author name alone,
 both cut on a character boundary to 64 bytes. Neither ever contains message
 text. The preview is end-to-end encrypted like everything else: Apple and the
 relay see only `ct`. If the encrypted push would exceed 2 048 bytes, the host
@@ -754,6 +759,11 @@ ntfy. A possible later addition (not part of v1): an optional push gateway on
 the hosted service that accepts the same `{hid, pid, token, env, ct, prio,
 collapse}` from a registered self-hosted relay and forwards it to APNs. It
 would see only ciphertext, as the hosted relay does today.
+
+An open relay configured with an APNs key of its own (`HIVE_RELAY_APNS_*`)
+does push, but only to builds of the app signed by the same Apple team as
+that key: someone self-hosting builds and signs the app themselves
+([`push-notifications.md`](push-notifications.md#turning-push-on-for-yourself)).
 
 ## 15. Relay seams and configuration
 
