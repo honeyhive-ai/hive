@@ -23,7 +23,8 @@ hive serve ──(control WebSocket)──▶ relay ──(HTTP/2, APNs key)─�
 
 1. When a phone pairs, both ends derive a 32-byte **push key** from the
    enrollment handshake. The host keeps it in `tunnel/phones.json`; the app
-   keeps it in its App Group.
+   keeps it in a Keychain access group shared only with its Notification
+   Service Extension.
 2. On an event, `hive serve` builds the plaintext below and seals it for each
    phone that wants pushes: `ChaCha20-Poly1305(push_key, nonce, plaintext,
    ctx("push", host_id, pid))`. It sends `{"t":"push","pid","ct","prio","collapse"}`
@@ -137,9 +138,13 @@ the same team.
    secret, like a password. Note the **Key ID** and your **Team ID** (top
    right of the portal, or Membership details).
 2. On the app's identifier(s) (your development bundle id, and the release
-   bundle id if you ship one), enable the **Push Notifications** and **App
-   Groups** capabilities. With automatic signing in Xcode this happens for
-   development builds when you build with push turned on (step 4).
+   bundle id if you ship one), enable the **Push Notifications** capability
+   (and register the extension's id, `<bundle id>.notifications`). With
+   automatic signing in Xcode, signed in with an Apple ID of that team
+   (Xcode → Settings → Accounts), this happens for development builds when
+   you build with push turned on (step 4). Without an account, Xcode falls
+   back to a wildcard profile, which can't carry Push, and the push build
+   fails to sign.
 
 ### 2. Run the relay with the key
 

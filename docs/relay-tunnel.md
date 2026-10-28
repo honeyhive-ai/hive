@@ -742,7 +742,8 @@ sends it without the preview instead.
 - The Notification Service Extension:
   1. decrypts with the push key for `(hid, pid)`;
   2. accepts the notification only if `|ts − now| ≤ 3600` and `seq` is greater
-     than the last seen `seq` (kept in the App Group);
+     than the last seen `seq` (kept where only the app and its extension can
+     read it: the iOS app uses the shared Keychain access group);
   3. then replaces the title and body and sets the deep link
      `hive://chat/<chatId>`.
 
