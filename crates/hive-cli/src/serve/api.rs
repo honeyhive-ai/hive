@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
 
-use super::{lab, pair, Shared};
+use super::{dashboard, lab, pair, Shared};
 
 type S = State<Arc<Shared>>;
 
@@ -217,6 +217,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/proposals", get(list_proposals))
         .route("/v1/proposals/:id/approve", post(approve_proposal))
         .route("/v1/proposals/:id/reject", post(reject_proposal))
+        .route("/v1/dashboard", get(dashboard_view))
         .route("/v1/lab/status", get(lab_status))
         .route("/v1/events", get(events))
         .layer(middleware::from_fn_with_state(shared.clone(), auth))
@@ -621,8 +622,16 @@ fn git_commit(dir: &std::path::Path, message: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn lab_status(State(s): S) -> Json<Value> {
-    Json(lab::status(&s.http, &s.opts.prometheus_url).await)
+/// Deprecated: kept for app builds older than `/v1/dashboard`.
+async fn lab_status(State(s): S) -> Response {
+    let body = Json(lab::status(&s.http, &s.opts.prometheus_url).await);
+    ([("deprecation", "true"), ("link", "</v1/dashboard>; rel=\"successor-version\"")], body).into_response()
+}
+
+async fn dashboard_view(State(s): S) -> Json<Value> {
+    let loaded = dashboard::load(&s.opts.dashboard_file, s.opts.prometheus_configured);
+    let src = dashboard::Sources { http: &s.http, prometheus_url: &s.opts.prometheus_url };
+    Json(dashboard::render(&loaded, &src, Some(&s.dashboard_cache)).await)
 }
 
 fn to_event(ev: super::hub::SseEvent) -> Event {

@@ -1,0 +1,88 @@
+# Optional solar section for the hive serve dashboard: append it to your
+# dashboard.toml. It mirrors what the old /v1/lab/status solar pane showed.
+#
+# It assumes:
+# - an Enphase Envoy exporter publishing envoy_production_watts,
+#   envoy_consumption_watts and envoy_grid_watts (grid: + importing,
+#   - exporting), and
+# - two recording rules of your own:
+#     site:power_watts   what the equipment you care about draws
+#     site:solar_watts   the part of that the panels cover
+#                        (e.g. min(site:power_watts, clamp_min(envoy_production_watts - other load, 0)))
+#   plus site:electric_rate_usd_per_kwh, your retail rate.
+# Rename to whatever your exporters and rules are called.
+
+[[section]]
+title = "Solar"
+optional = true
+show_when = "envoy_up"   # hidden while the exporter isn't reporting
+
+[[section.panel]]
+title = "Solar now"
+unit = "W"
+query = "clamp_min(envoy_production_watts, 0)"
+round = 0
+sparkline = { range = "12h", step = "15m" }
+
+[[section.panel]]
+title = "House now"
+unit = "W"
+query = "envoy_consumption_watts"
+round = 0
+
+[[section.panel]]
+title = "Grid now"
+unit = "W"
+query = "envoy_grid_watts"
+round = 0
+thresholds = [{ value = -100000, level = "ok" }, { value = 0, level = "warn" }]
+
+[[section.panel]]
+title = "Covered by solar, 24 h"
+kind = "gauge"
+unit = "%"
+query = "clamp_max(sum_over_time(site:solar_watts[24h:1m]) / sum_over_time(site:power_watts[24h:1m]), 1)"
+scale = 100
+round = 0
+min = 0
+max = 100
+thresholds = [{ value = 0, level = "critical" }, { value = 25, level = "warn" }, { value = 60, level = "ok" }]
+refresh = "60s"
+
+[[section.panel]]
+title = "Solar vs load, 24 h"
+kind = "timeseries"
+unit = "W"
+range = "24h"
+step = "1h"
+round = 0
+refresh = "60s"
+series = [
+  { name = "Solar", query = "avg_over_time(clamp_min(envoy_production_watts, 0)[1h:1m])" },
+  { name = "Load", query = "avg_over_time(site:power_watts[1h:1m])" },
+]
+
+[[section.panel]]
+title = "Energy, 24 h"
+kind = "list"
+unit = "kWh"
+round = 1
+refresh = "60s"
+rows = [
+  { label = "Produced", query = "sum_over_time(clamp_min(envoy_production_watts, 0)[24h:1m]) / 60 / 1000" },
+  { label = "House used", query = "sum_over_time(envoy_consumption_watts[24h:1m]) / 60 / 1000" },
+  { label = "Grid import", query = "sum_over_time(clamp_min(envoy_grid_watts, 0)[24h:1m]) / 60 / 1000" },
+  { label = "Grid export", query = "sum_over_time(clamp_min(-envoy_grid_watts, 0)[24h:1m]) / 60 / 1000" },
+]
+
+[[section.panel]]
+title = "Solar value, 24 h"
+unit = "$"
+query = "sum_over_time(site:solar_watts[24h:1m]) / 60 / 1000 * scalar(site:electric_rate_usd_per_kwh)"
+round = 2
+refresh = "60s"
+
+[[section.panel]]
+title = "Exporter"
+kind = "status"
+query = "envoy_up"

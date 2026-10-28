@@ -991,7 +991,9 @@ fn usage() -> ! {
          run the home host for the iOS app (sync + worker + HTTP/SSE API)\n  \
          hive bind-repo <name|path> [--chat <id>] | --clear   bind a checkout for agent file tools\n  \
          hive repos                     show the repos dir and bindings\n  \
-         hive pair [--listen ADDR] [--public-url URL]   show the phone pairing QR code\n\n\
+         hive pair [--listen ADDR] [--public-url URL]   show the phone pairing QR code\n  \
+         hive dashboard check [--file PATH]   validate dashboard.toml and evaluate it once\n  \
+         hive dashboard default         print the generated default dashboard as TOML\n\n\
          Setup:\n  \
          hive enroll <hivews1:invite> [--token <hrt1>]   one-shot: save the workspace connection\n  \
          hive join <invite-code>        redeem a relay invite to self-enroll this box's identity\n  \
@@ -1051,6 +1053,7 @@ fn run() -> Result<()> {
         "--public-url",
         "--name",
         "--role",
+        "--file",
     ];
     let mut positional: Vec<&String> = Vec::new();
     let mut skip = false;
@@ -1195,6 +1198,14 @@ fn run() -> Result<()> {
             )?;
             serve::cmd_pair(&opts)
         }
+        "dashboard" => match positional.first().map(|s| s.as_str()) {
+            Some("check") => serve::dashboard::cmd_check(&cfg.data_dir, flag_val("--file")),
+            Some("default") => {
+                print!("{}", serve::dashboard::default_toml()?);
+                Ok(())
+            }
+            _ => bail!("usage: hive dashboard <check [--file PATH] | default>"),
+        },
         "bind-repo" => repos::cmd_bind_repo(
             &cfg.data_dir,
             positional.first().map(|s| s.as_str()),

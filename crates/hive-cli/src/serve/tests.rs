@@ -180,6 +180,7 @@ async fn harness_with(
     RepoBindings { workspace: Some(repo.to_string_lossy().into_owned()), ..Default::default() }.save(&serve_dir).unwrap();
 
     let (ntfy_url, ntfy) = spawn_ntfy().await;
+    let dir_for_dashboard = serve_dir.clone();
     let opts = ServeOptions {
         listen: "127.0.0.1:0".parse().unwrap(),
         token_file: serve_dir.join("serve.token"),
@@ -189,6 +190,8 @@ async fn harness_with(
         name: Some("Phone".into()),
         pair: false,
         prometheus_url: "http://127.0.0.1:9".into(),
+        prometheus_configured: false,
+        dashboard_file: dir_for_dashboard.join("dashboard.toml"),
         default_agent: None,
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
@@ -292,6 +295,7 @@ async fn empty_workspace_lists_are_empty_not_404() {
     let relay = spawn(test_relay::router()).await;
     let room = format!("serve-empty-{}", Uuid::new_v4());
     let dir = tmp.path().join("serve");
+    let dir_for_dashboard = dir.clone();
     let opts = ServeOptions {
         listen: "127.0.0.1:0".parse().unwrap(),
         token_file: dir.join("serve.token"),
@@ -301,6 +305,8 @@ async fn empty_workspace_lists_are_empty_not_404() {
         name: Some("Phone".into()),
         pair: false,
         prometheus_url: "http://127.0.0.1:9".into(),
+        prometheus_configured: false,
+        dashboard_file: dir_for_dashboard.join("dashboard.toml"),
         default_agent: None,
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
@@ -362,7 +368,7 @@ async fn auth_is_required_except_for_bare_health() {
     assert!(authed["workspace"].as_str().unwrap().starts_with("serve-test-"));
     assert_eq!(authed["deviceLabel"], "sff");
 
-    for path in ["/v1/chats", "/v1/agents", "/v1/hosts", "/v1/proposals", "/v1/lab/status", "/v1/events"] {
+    for path in ["/v1/chats", "/v1/agents", "/v1/hosts", "/v1/proposals", "/v1/lab/status", "/v1/dashboard", "/v1/events"] {
         let none = h.client.get(format!("{}{path}", h.base)).send().await.unwrap();
         assert_eq!(none.status(), 401, "{path} without a token");
         let wrong = h.client.get(format!("{}{path}", h.base)).bearer_auth("nope").send().await.unwrap();
@@ -375,6 +381,63 @@ async fn auth_is_required_except_for_bare_health() {
     let lab = h.get("/v1/lab/status").await;
     assert_eq!(lab["workers"], json!([]));
     assert!(lab["updatedAt"].is_string());
+    let r = h.client.get(format!("{}/v1/lab/status", h.base)).bearer_auth(&h.token).send().await.unwrap();
+    assert_eq!(r.headers()["deprecation"], "true", "lab status is deprecated");
+
+    // No dashboard.toml and no HIVE_PROMETHEUS_URL: an empty dashboard (the
+    // app hides its tab).
+    let d = h.get("/v1/dashboard").await;
+    assert_eq!(d["sections"], json!([]), "{d}");
+    assert_eq!(d["title"], "Dashboard");
+    assert_eq!(d["source"], "none");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dashboard_serves_the_hosts_config_with_per_panel_errors() {
+    use axum::routing::get;
+    let json_src = spawn(Router::new().route("/status", get(|| async { axum::Json(json!({"gpu": {"temp": 61.5}, "state": "ok"})) }))).await;
+    let (endpoint, _model) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let dashboard_toml = format!(
+        r#"
+title = "Home"
+[[section]]
+title = "Box"
+[[section.panel]]
+id = "gpu-temp"
+title = "GPU temp"
+kind = "gauge"
+unit = "°C"
+url = "{json_src}/status"
+path = "/gpu/temp"
+max = 110
+thresholds = [{{ value = 0, level = "ok" }}, {{ value = 80, level = "critical" }}]
+[[section.panel]]
+title = "Gateway"
+kind = "status"
+url = "{json_src}/status"
+path = "/state"
+[[section.panel]]
+title = "Power"
+query = "sum(power_watts)"
+"#
+    );
+    let h = harness_with(&endpoint, "gemma4:12b", &[("README.md", "# demo\n")], |o| {
+        std::fs::create_dir_all(o.dashboard_file.parent().unwrap()).unwrap();
+        std::fs::write(&o.dashboard_file, &dashboard_toml).unwrap();
+    })
+    .await;
+    let d = h.get("/v1/dashboard").await;
+    assert_eq!(d["title"], "Home");
+    assert_eq!(d["source"], "config");
+    let panels = d["sections"][0]["panels"].as_array().unwrap();
+    assert_eq!(panels[0]["id"], "gpu-temp");
+    assert_eq!(panels[0]["value"], json!(61.5));
+    assert_eq!(panels[0]["max"], json!(110.0));
+    assert!(panels[0].get("error").is_none(), "{}", panels[0]);
+    assert_eq!(panels[1]["rows"], json!([{"label": "Gateway", "up": true, "text": "ok"}]));
+    // Prometheus at 127.0.0.1:9 is unreachable: that panel errors, the rest stand.
+    assert!(panels[2]["error"].as_str().unwrap().contains("Prometheus"), "{}", panels[2]);
+    assert!(panels[2].get("value").is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

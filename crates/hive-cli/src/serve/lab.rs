@@ -1,5 +1,5 @@
-//! `GET /v1/lab/status` — a best-effort snapshot of the home lab from
-//! Prometheus (`HIVE_PROMETHEUS_URL`, default `http://127.0.0.1:9090`).
+//! `GET /v1/lab/status` (deprecated: use `/v1/dashboard`, `dashboard.rs`) — a
+//! best-effort snapshot of the home lab from Prometheus (`HIVE_PROMETHEUS_URL`, default `http://127.0.0.1:9090`).
 //!
 //! Every query runs concurrently with a short timeout; a query that fails or
 //! comes back empty just leaves its field out. The `solar` object (Enphase
