@@ -339,6 +339,143 @@ async fn empty_workspace_lists_are_empty_not_404() {
     handle.shutdown();
 }
 
+/// People, channels and chat details: avatars and host kinds ride the roster,
+/// chats carry their channel and recent speakers, and details mirror the
+/// desktop's right-hand panel (agents, people, default responder, context,
+/// workflow runs, skills, vaults).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn people_channels_and_chat_details() {
+    let (endpoint, _model) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let h = harness(&endpoint, "gpt-4o", &[("README.md", "# demo\n")]).await;
+    let ws = crate::uuid_of_room(&h.handle.shared.cfg.room);
+
+    // The desktop files a channel, gives @coder a picture, loads a skill and
+    // runs a workflow in the channel's chat.
+    let avatar = "data:image/png;base64,iVBORw0KGgo=";
+    let (channel_id, chat_id) = {
+        let mut svc = open_service(&h.desktop).unwrap();
+        let (ch, chat) = svc.create_channel(ws, "design", Some("UI and UX".into()), "gw").unwrap();
+        svc.set_agent_avatar(chat.id, ws, h.agent_id, Some(avatar.into()), Some("#336699".into())).unwrap();
+        let mut skill = hive_core::SkillProfile::new("Reviewer", "# Review code\nLook for bugs.");
+        skill.source_url = Some("https://example.com/skill.md".into());
+        svc.add_skill(chat.id, ws, skill).unwrap();
+        let def = hive_core::WorkflowDefinition {
+            id: Uuid::new_v4(),
+            name: "Ship it".into(),
+            description: String::new(),
+            input_label: None,
+            nodes: vec![hive_core::workflow::WorkflowNode {
+                id: "draft".into(),
+                name: "Draft".into(),
+                depends_on: vec![],
+                kind: hive_core::WorkflowNodeKind::Agent { agent_id: None, prompt_template: "go".into() },
+                x: None,
+                y: None,
+            }],
+            created_at: hive_core::Timestamp::now(),
+        };
+        let me = svc.author().id.clone();
+        svc.upsert_workflow_run(chat.id, ws, hive_core::workflow::new_run(&def, "now", me)).unwrap();
+        svc.post_user_message(chat.id, ws, "kicking off the design pass").unwrap();
+        (ch.id, chat.id)
+    };
+    sync_once(&h.desktop).await.unwrap();
+
+    // The serve box syncs on its own loop; wait for the channel to arrive.
+    let mut channels = Value::Null;
+    for _ in 0..50 {
+        channels = h.get("/v1/channels").await;
+        if channels["channels"].as_array().is_some_and(|c| c.iter().any(|c| c["id"] == json!(channel_id))) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let design = channels["channels"].as_array().unwrap().iter().find(|c| c["id"] == json!(channel_id)).expect("channel synced");
+    assert_eq!(design["name"], "design");
+    assert_eq!(design["purpose"], "UI and UX");
+    assert_eq!(design["archived"], json!(false));
+    assert_eq!(design["defaultChatId"], json!(chat_id.to_string()));
+
+    // Wait for the avatar edit and the message too.
+    let mut chat = Value::Null;
+    for _ in 0..50 {
+        let chats = h.get("/v1/chats").await;
+        chat = chats["chats"].as_array().unwrap().iter().find(|c| c["id"] == json!(chat_id)).cloned().unwrap_or(Value::Null);
+        if chat["participants"].as_array().is_some_and(|p| !p.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(chat["channelId"], json!(channel_id));
+    let speaker = &chat["participants"][0];
+    assert_eq!(speaker["kind"], "person");
+    assert!(speaker.get("avatarUrl").is_none(), "chat rows never carry avatars");
+    let desktop_actor = speaker["id"].as_str().unwrap().to_string();
+
+    // Messages name a person's actor.
+    let msgs = h.get(&format!("/v1/chats/{chat_id}/messages")).await;
+    let m = msgs["messages"].as_array().unwrap().iter().find(|m| m["role"] == "user").unwrap();
+    assert_eq!(m["actorId"], json!(desktop_actor));
+
+    // Agents carry the avatar, color and where they run.
+    let agents = h.get("/v1/agents").await;
+    let coder = agents["agents"].as_array().unwrap().iter().find(|a| a["name"] == "coder").unwrap().clone();
+    assert_eq!(coder["avatarUrl"], avatar);
+    assert_eq!(coder["avatarColorHex"], "#336699");
+    assert_eq!(coder["hostKind"], "ownerDevice");
+    let host = this_host(&h).await;
+    let moved = h
+        .send(reqwest::Method::PUT, &format!("/v1/agents/{}/host", h.agent_id), Some(json!({ "hostId": host })))
+        .await;
+    assert_eq!(moved["agent"]["hostKind"], "thisHost");
+    assert_eq!(moved["agent"]["hostOnline"], json!(true));
+
+    // People: the desktop founder (with role) and this box.
+    let people = h.get("/v1/people").await;
+    let list = people["people"].as_array().unwrap();
+    let founder = list.iter().find(|p| p["actorId"] == json!(desktop_actor)).expect("founder listed");
+    assert_eq!(founder["role"], "owner");
+    assert_eq!(founder["isSelf"], json!(false));
+
+    // Details.
+    let d = h.get(&format!("/v1/chats/{chat_id}/details")).await;
+    assert_eq!(d["chat"]["id"], json!(chat_id));
+    assert_eq!(d["channel"]["name"], "design");
+    let coder = d["agents"].as_array().unwrap().iter().find(|a| a["name"] == "coder").unwrap();
+    assert_eq!(coder["inChat"], json!(false));
+    assert_eq!(coder["avatarUrl"], avatar);
+    let founder = d["people"].as_array().unwrap().iter().find(|p| p["actorId"] == json!(desktop_actor)).unwrap();
+    assert_eq!(founder["inChat"], json!(true));
+    assert_eq!(d["defaultResponder"]["kind"], "primary");
+    assert_eq!(d["defaultResponder"]["name"], "hive");
+    assert_eq!(d["defaultResponder"]["runtimeLabel"], "Lab gateway");
+    assert_eq!(d["defaultResponder"]["model"], "gpt-4o");
+    assert_eq!(d["context"]["estimated"], json!(true));
+    assert_eq!(d["context"]["model"], "gpt-4o");
+    assert!(d["context"]["windowTokens"].as_u64().unwrap() >= 8192);
+    assert!(d["context"]["usedTokens"].as_u64().unwrap() > 0);
+    assert!(d["context"]["skillTokens"].as_u64().unwrap() > 0);
+    let run = &d["workflowRuns"][0];
+    assert_eq!(run["name"], "Ship it");
+    assert_eq!(run["status"], "running");
+    assert_eq!(run["stepsDone"], json!(0));
+    assert_eq!(run["stepsTotal"], json!(1));
+    let skill = &d["skills"][0];
+    assert_eq!(skill["name"], "Reviewer");
+    assert_eq!(skill["summary"], "Review code");
+    assert_eq!(skill["sourceUrl"], "https://example.com/skill.md");
+    assert_eq!(d["vaults"], json!([]));
+
+    // An unknown chat is a 404.
+    let r = h.client.get(format!("{}/v1/chats/{}/details", h.base, Uuid::new_v4())).bearer_auth(&h.token).send().await.unwrap();
+    assert_eq!(r.status(), 404);
+
+    // A phone-made chat lands in the first channel (sidebar order).
+    let made = h.send(reqwest::Method::POST, "/v1/chats", Some(json!({ "title": "From the phone" }))).await;
+    assert_eq!(made["chat"]["channelId"], json!(channel_id));
+    h.handle.shutdown();
+}
+
 /// The phone's URLSession only returns the response once body bytes arrive, so
 /// a quiet event stream must send something at once — not wait for the 15 s
 /// heartbeat (the app showed "Connecting" that long after every connect).

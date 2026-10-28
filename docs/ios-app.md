@@ -70,11 +70,14 @@ and public addresses unless `HIVE_SERVE_ALLOW_ANY_BIND=1`.
 | Method | Path | Response |
 |---|---|---|
 | GET | `/v1/health` | `{ok: true, version, workspace?, deviceLabel?}`. `workspace` (room name) and `deviceLabel` appear only when authorized |
-| GET | `/v1/chats` | `{chats: [{id, title, updatedAt, preview, unread: int}]}`, newest first |
+| GET | `/v1/chats` | `{chats: [{id, title, updatedAt, preview, unread: int, channelId, participants: [Participant]}]}`, newest first |
 | POST | `/v1/chats` `{title?}` | `{chat}` |
 | GET | `/v1/chats/{id}/messages?after=<messageId>&limit=<n>` | `{messages: [Message]}`, oldest first. Without `after`, the latest page (default limit 100, max 1000) |
 | POST | `/v1/chats/{id}/messages` `{body}` | `{message}`. `@Name` mentions route to agents exactly as on the desktop/CLI |
-| GET | `/v1/agents` | `{agents: [{id, name, runtimeLabel, model?, hostId?, hostLabel?}]}` |
+| GET | `/v1/chats/{id}/details` | The chat's details (the desktop's right-hand panel, read-only); see below |
+| GET | `/v1/agents` | `{agents: [{id, name, runtimeLabel, model?, hostId?, hostLabel?, hostKind, hostOnline?, role?, avatarUrl?, avatarColorHex?}]}` |
+| GET | `/v1/people` | `{people: [Person]}`, the workspace's human members |
+| GET | `/v1/channels` | `{channels: [{id, name, purpose?, position, archived, defaultChatId}]}`, in sidebar order |
 | GET | `/v1/hosts` | `{hosts: [{id, label, isThis: bool, online: bool}]}` |
 | PUT | `/v1/agents/{id}/host` `{hostId}` | `{agent}`. `hostId` must be a registered host. `""` hands the agent back to its owner's device |
 | GET | `/v1/proposals?status=open\|all` | `{proposals: [{id, chatId, title, body, kind, diff?, status, createdAt, author}]}` |
@@ -85,7 +88,8 @@ and public addresses unless `HIVE_SERVE_ALLOW_ANY_BIND=1`.
 | GET | `/v1/lab/status` | **Deprecated** (`Deprecation: true`; use `/v1/dashboard`). `{workers: [{name, up}], powerWatts?, costPerHour?, ratePerKwh?, temps: [{name, celsius}], solar?, updatedAt}` |
 | GET | `/v1/events` | `text/event-stream` |
 
-`Message = {id, chatId, author, role: "user"|"agent"|"assistant"|"system", agentId?, body, createdAt, streaming: bool}`.
+`Message = {id, chatId, author, role: "user"|"agent"|"assistant"|"system", agentId?, actorId?, body, createdAt, streaming: bool}`.
+`actorId` (on a person's message) matches `Person.actorId`.
 `role` is `agent` for a named agent's reply, which also carries `agentId`, and
 `assistant` for the chat's primary runtime. `kind` is `fileDiff`, `command` or
 `decision`. `status` is `open`, `approved`, `rejected` or `applied`. `diff` is
@@ -102,6 +106,36 @@ Field notes:
 - An agent with no host runs on its owner's device. It has no `hostId`, and its
   `hostLabel` is "Owner's device". For an agent on this box, `hostLabel` is
   "<label> (this host)".
+- Avatars: `avatarUrl` is the picture a member or agent uploaded on the
+  desktop, a bounded `data:image/…` URL (about 96 KB at most) that rides the
+  synced roster. Without one, draw initials on `avatarColorHex` (agents) or a
+  color derived from the name. Avatars are sent only by `/v1/people`,
+  `/v1/agents` and chat details, never on chat rows, so a client caches them
+  by id.
+- `hostKind` says where an agent runs, as the desktop's host badge does:
+  `ownerDevice` (no host: its owner's machine), `thisHost` (this box),
+  `worker` or `device` (another registered host). `hostOnline` is present
+  for an agent with a host.
+- `Person = {actorId, displayName, kind, role: "owner"|"admin"|"contributor"|"viewer", title?, avatarUrl?, isSelf: bool}`.
+  `isSelf` marks this box's own identity (the one the phone writes as).
+- `channelId` files a chat under a channel (`""` = unfiled). A channel's
+  `defaultChatId` is its drop-in chat. `POST /v1/chats` files the new chat
+  under the first channel, as the desktop does.
+- `Participant = {kind: "person"|"agent"|"primary", id, name}`: who spoke in the
+  chat, newest first, at most 5. `id` is an actor id (`person`), an agent id
+  (`agent`) or `hive` (`primary`, the chat's own `@hive`).
+- `GET /v1/chats/{id}/details` answers
+  `{chat, channel?, people: [Person + inChat], agents: [Agent + inChat], defaultResponder, context, workflowRuns, skills, vaults}`.
+  `inChat` is true for whoever spoke there (or an agent added to the chat).
+  `defaultResponder = {kind: "primary"|"agent", name, via: "untagged"|"serveDefault", runtimeLabel?, model?, agentId?, hostLabel?, hostKind?}`
+  is who answers an untagged message: the chat's `@hive` on its runtime, or the
+  agent named by `hive serve --default-agent`.
+  `context = {estimated: true, windowTokens, usedTokens, historyTokens, skillTokens, messageCount, compacting, model?}`
+  is a coarse estimate from the transcript, the loaded skills and the model's
+  window (the desktop's Context pane plans the real prompt).
+  `workflowRuns = [{id, name, status: "running"|"awaitingGate"|"completed"|"failed"|"halted"|"canceled", startedAt, updatedAt, stepsDone, stepsTotal, initiator?}]`,
+  newest first, at most 10. `skills = [{id, name, summary, sourceUrl?, agentIds?}]`
+  and `vaults = [{label, url, agentIds?}]` (`agentIds` absent = every agent).
 - `/v1/dashboard` is what the host owner configures in `dashboard.toml` in
   the data dir (format, panel kinds and examples in [dashboard.md](dashboard.md)).
   `Panel = {id, title, kind: "stat"|"gauge"|"timeseries"|"bar"|"list"|"status"|"text", unit?, value?, text?, level?: "ok"|"warn"|"critical", sparkline?: [{t, v}], series?: [{name, points: [{t, v}]}], rows?: [{label, value?, text?, up?, level?}], min?, max?, thresholds?: [{value, level}], refreshSeconds, updatedAt, error?}`.

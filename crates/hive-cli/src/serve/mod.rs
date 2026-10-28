@@ -39,6 +39,7 @@ pub mod hub;
 pub mod lab;
 pub mod ntfy;
 pub mod pair;
+pub mod people;
 pub mod tunnel;
 
 #[cfg(test)]
