@@ -169,6 +169,10 @@ pub struct Shared {
     /// Panel results, each kept for its `refresh`.
     pub dashboard_cache: dashboard::Cache,
     rt: tokio::runtime::Handle,
+    /// "Send to agent to revise" requests awaiting the agent's new version,
+    /// by the proposal they revise (`api::request_changes`). In memory: a
+    /// restart before the revision lands leaves it unlinked.
+    pub revisions: Mutex<HashMap<Uuid, api::PendingRevision>>,
 }
 
 /// The device-local serve state file (read marks).
@@ -265,6 +269,7 @@ impl Shared {
     pub fn refresh(&self) {
         let me = self.my_actor_id();
         let mut notices = Vec::new();
+        let mut created = Vec::new();
         {
             let mut differ = self.differ.lock().unwrap_or_else(|e| e.into_inner());
             let sessions = match self.workspace_chats() {
@@ -299,7 +304,8 @@ impl Shared {
                     Change::ProposalCreated { chat, proposal } => {
                         let Some(s) = sessions.iter().find(|s| s.id == chat) else { continue };
                         let Some(p) = s.proposals.iter().find(|p| p.id == proposal) else { continue };
-                        self.hub.emit("proposal.created", hub::wrap("proposal", api::proposal_dto(s, p)));
+                        created.push((chat, proposal));
+                        self.hub.emit("proposal.created", hub::wrap("proposal", api::proposal_dto_as(s, p, &me)));
                         if self.fresh(p.created_at) {
                             let notice = ntfy::proposal_notice(&p.title, &s.title, chat);
                             let push = tunnel::PushContent {
@@ -313,6 +319,11 @@ impl Shared {
                             notices.push((notice, push));
                         }
                     }
+                    Change::ProposalUpdated { chat, proposal } => {
+                        let Some(s) = sessions.iter().find(|s| s.id == chat) else { continue };
+                        let Some(p) = s.proposals.iter().find(|p| p.id == proposal) else { continue };
+                        self.hub.emit("proposal.updated", hub::wrap("proposal", api::proposal_dto_as(s, p, &me)));
+                    }
                     Change::ChatUpdated { chat } => {
                         let Some(s) = sessions.iter().find(|s| s.id == chat) else { continue };
                         let unread = self.unread(s, &me);
@@ -320,6 +331,12 @@ impl Shared {
                     }
                 }
             }
+        }
+        // A revision the agent just filed: link it to the version it revises
+        // (a write of its own), then publish that change too.
+        if self.link_revisions(&created) {
+            self.sync_kick.notify_one();
+            self.refresh();
         }
         if let Some(t) = &self.tunnel {
             for (_, push) in &notices {
@@ -487,6 +504,7 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         http: reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).build()?,
         dashboard_cache: dashboard::Cache::default(),
         rt: tokio::runtime::Handle::current(),
+        revisions: Mutex::new(HashMap::new()),
         cfg,
         opts,
     });
