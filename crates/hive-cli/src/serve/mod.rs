@@ -30,6 +30,7 @@ use crate::worker::{self, TurnSink, TurnState, WorkerCtx};
 use crate::{env_opt, open_service, sync_once, uuid_of_room, Config};
 
 pub mod api;
+pub mod appearance;
 pub mod hub;
 pub mod lab;
 pub mod ntfy;
@@ -68,6 +69,8 @@ pub struct ServeOptions {
     pub apply_on_approve: bool,
     /// Relay sync cadence.
     pub sync_every: Duration,
+    /// Where `GET /v1/appearance` finds the host's theme (`appearance.rs`).
+    pub appearance: appearance::AppearanceConfig,
 }
 
 impl ServeOptions {
@@ -117,6 +120,7 @@ impl ServeOptions {
             default_agent: env_opt("HIVE_SERVE_DEFAULT_AGENT").map(|a| a.trim().trim_start_matches('@').to_string()),
             apply_on_approve: env_flag("HIVE_SERVE_APPLY_ON_APPROVE", false),
             sync_every: Duration::from_secs(3),
+            appearance: appearance::AppearanceConfig::from_env(),
         })
     }
 

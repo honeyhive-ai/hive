@@ -192,6 +192,7 @@ async fn harness_with(
         default_agent: None,
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
+        appearance: Default::default(),
     };
     let mut opts = opts;
     tweak(&mut opts);
@@ -304,6 +305,7 @@ async fn empty_workspace_lists_are_empty_not_404() {
         default_agent: None,
         apply_on_approve: false,
         sync_every: Duration::from_millis(300),
+        appearance: Default::default(),
     };
     let handle = start(config(&dir, &relay, &room), opts).await.unwrap();
     let base = format!("http://{}", handle.addr);
@@ -362,7 +364,7 @@ async fn auth_is_required_except_for_bare_health() {
     assert!(authed["workspace"].as_str().unwrap().starts_with("serve-test-"));
     assert_eq!(authed["deviceLabel"], "sff");
 
-    for path in ["/v1/chats", "/v1/agents", "/v1/hosts", "/v1/proposals", "/v1/lab/status", "/v1/events"] {
+    for path in ["/v1/chats", "/v1/agents", "/v1/hosts", "/v1/proposals", "/v1/lab/status", "/v1/appearance", "/v1/events"] {
         let none = h.client.get(format!("{}{path}", h.base)).send().await.unwrap();
         assert_eq!(none.status(), 401, "{path} without a token");
         let wrong = h.client.get(format!("{}{path}", h.base)).bearer_auth("nope").send().await.unwrap();
@@ -375,6 +377,31 @@ async fn auth_is_required_except_for_bare_health() {
     let lab = h.get("/v1/lab/status").await;
     assert_eq!(lab["workers"], json!([]));
     assert!(lab["updatedAt"].is_string());
+}
+
+/// "Match host" on the phone: `/v1/appearance` reports the desktop app's saved
+/// theme on this machine, live (no restart), and serve config pins a field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn appearance_follows_the_desktop_file_and_config() {
+    let (endpoint, _) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    let desk = tempfile::tempdir().unwrap();
+    let dir = desk.path().to_path_buf();
+    let h = harness_with(&endpoint, "m", &[("README.md", "x\n")], |o| {
+        o.appearance = appearance::AppearanceConfig { desktop_dir: Some(dir), ..Default::default() };
+    })
+    .await;
+    assert_eq!(h.get("/v1/appearance").await, json!({"palette": null, "mode": null, "source": "none"}));
+
+    std::fs::write(desk.path().join(appearance::FILE_NAME), r#"{"palette":"harbor","mode":"dark"}"#).unwrap();
+    assert_eq!(h.get("/v1/appearance").await, json!({"palette": "harbor", "mode": "dark", "source": "desktop"}));
+    h.handle.shutdown();
+
+    let pinned = harness_with(&endpoint, "m", &[("README.md", "x\n")], |o| {
+        o.appearance = appearance::AppearanceConfig { palette: Some("obsidian".into()), mode: None, desktop_dir: None };
+    })
+    .await;
+    assert_eq!(pinned.get("/v1/appearance").await, json!({"palette": "obsidian", "mode": null, "source": "config"}));
+    pinned.handle.shutdown();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

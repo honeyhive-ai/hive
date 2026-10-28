@@ -1082,6 +1082,11 @@ export const onTrayNavigate = (cb: (route: string) => void): Promise<UnlistenFn>
 export const setTitlebarColor = (r: number, g: number, b: number, dark: boolean) =>
   invoke<void>("set_titlebar_color", { r, g, b, dark });
 
+/// Mirror the theme to the app data dir so `hive serve` on this machine can
+/// tell a paired phone which theme to follow ("Match host").
+export const saveAppearance = (palette: string, mode: string) =>
+  invoke<void>("save_appearance", { palette, mode });
+
 /// Factory reset: wipe all local data (chats, identity, keys, settings,
 /// workspaces) and relaunch the app. The backend defers the actual deletion to
 /// the next launch (the DB file is open/locked) and restarts immediately.

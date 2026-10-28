@@ -218,6 +218,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/v1/proposals/:id/approve", post(approve_proposal))
         .route("/v1/proposals/:id/reject", post(reject_proposal))
         .route("/v1/lab/status", get(lab_status))
+        .route("/v1/appearance", get(appearance))
         .route("/v1/events", get(events))
         .layer(middleware::from_fn_with_state(shared.clone(), auth))
         .with_state(shared)
@@ -619,6 +620,11 @@ fn git_commit(dir: &std::path::Path, message: &str) -> Result<(), String> {
         return Err(format!("git commit: {}", text.trim()));
     }
     Ok(())
+}
+
+/// The host's theme for a phone set to "Match host" (`appearance.rs`).
+async fn appearance(State(s): S) -> Json<Value> {
+    Json(super::appearance::resolve(&s.opts.appearance))
 }
 
 async fn lab_status(State(s): S) -> Json<Value> {
