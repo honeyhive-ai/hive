@@ -3931,9 +3931,24 @@ fn list_members(state: State<AppState>, session_id: String) -> Result<Vec<Worksp
         return Ok(Vec::new());
     };
     let local = !known_rooms.contains(&s.workspace_id);
-    let mut out: Vec<WorkspaceMemberDto> = s.members.iter().map(|m| member_dto(m, &me)).collect();
+    // A retired alias — the separate member a `hive serve` box used before it
+    // was enrolled as its owner's device — lingers as the creator seed of the
+    // chats it made. It's the owner now: don't list it as another person.
+    let links = device_links_of(&svc, s.workspace_id);
+    let roster: std::collections::HashSet<String> = svc
+        .load(hive_core::workspace_config_session_id(s.workspace_id))
+        .ok()
+        .flatten()
+        .map(|c| c.members.into_iter().map(|m| m.id).collect())
+        .unwrap_or_default();
+    let members: Vec<&WorkspaceMember> = s
+        .members
+        .iter()
+        .filter(|m| roster.contains(&m.id) || links.owner_of(&m.actor.id).is_none())
+        .collect();
+    let mut out: Vec<WorkspaceMemberDto> = members.iter().map(|m| member_dto(m, &me)).collect();
     if local {
-        for (dto, m) in out.iter_mut().zip(s.members.iter()) {
+        for (dto, m) in out.iter_mut().zip(members.iter()) {
             if m.actor.kind == ActorKind::Human {
                 dto.is_self = true;
             }
