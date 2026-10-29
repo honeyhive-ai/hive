@@ -93,8 +93,11 @@ and public addresses unless `HIVE_SERVE_ALLOW_ANY_BIND=1`.
 | GET | `/v1/lab/status` | **Deprecated** (`Deprecation: true`; use `/v1/dashboard`). `{workers: [{name, up}], powerWatts?, costPerHour?, ratePerKwh?, temps: [{name, celsius}], solar?, updatedAt}` |
 | GET | `/v1/events` | `text/event-stream` |
 
-`Message = {id, chatId, author, role: "user"|"agent"|"assistant"|"system", agentId?, actorId?, body, createdAt, streaming: bool}`.
-`actorId` (on a person's message) matches `Person.actorId`.
+`Message = {id, chatId, author, role: "user"|"agent"|"assistant"|"system", agentId?, actorId?, via?, body, createdAt, streaming: bool}`.
+`actorId` (on a person's message) matches `Person.actorId`. A message the box
+wrote as its own member before it was enrolled as the owner's device reads as
+the owner's in the message list: `author` "Alex via Phone", `actorId` the
+owner's, `via` the old name.
 `role` is `agent` for a named agent's reply, which also carries `agentId`, and
 `assistant` for the chat's primary runtime. `kind` is `fileDiff`, `command` or
 `decision`. `status` is `open`, `approved`, `rejected` or `applied`. `diff` is

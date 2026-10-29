@@ -1564,3 +1564,31 @@ async fn phone_chat_primary_availability_follows_the_owners_desktop() {
     assert!(r.get("availableVia").is_none());
     h.handle.shutdown();
 }
+
+/// A message the box wrote as its own (since retired) member reads on the
+/// phone as the owner's, via the box.
+#[test]
+fn retired_box_messages_read_as_the_owner_via_the_box() {
+    use hive_core::{ActorIdentity, ActorKind, ChatMessage, ChatSession, MessageRole, WorkspaceMember, WorkspaceRole};
+    let owner = ActorIdentity::new("owner-1", "Alex", ActorKind::Human);
+    let mut chat = ChatSession::new("c", Uuid::new_v4(), "rt");
+    chat.members = vec![WorkspaceMember {
+        id: owner.id.clone(),
+        actor: owner.clone(),
+        role: WorkspaceRole::Owner,
+        title: String::new(),
+        index: 1,
+        joined_at: Default::default(),
+    }];
+    let mut links = hive_core::DeviceLinks::default();
+    assert!(links.link_retired(&chat, "box-1", "owner-1"));
+    let mut old = ChatMessage::new(MessageRole::User, "Phone", "from the box");
+    old.actor_identity = Some(ActorIdentity::new("box-1", "Phone", ActorKind::Human));
+    let v = api::linked_message_dto(&chat, &old, &links);
+    assert_eq!((v["author"].as_str(), v["via"].as_str(), v["actorId"].as_str()), (Some("Alex via Phone"), Some("Phone"), Some("owner-1")));
+    let mut mine = ChatMessage::new(MessageRole::User, "Alex", "from the desktop");
+    mine.actor_identity = Some(owner);
+    let v = api::linked_message_dto(&chat, &mine, &links);
+    assert_eq!(v["author"], "Alex");
+    assert!(v.get("via").is_none());
+}

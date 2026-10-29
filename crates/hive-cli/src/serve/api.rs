@@ -112,6 +112,25 @@ pub fn message_dto(chat: Uuid, m: &ChatMessage) -> Value {
     v
 }
 
+/// [`message_dto`], with a message by a person's other identity — the separate
+/// member this box used before it was enrolled as its owner's device — shown as
+/// theirs: `author` "Alex via Phone", `actorId` the owner's (for the avatar),
+/// `via` the old name.
+pub fn linked_message_dto(chat: &ChatSession, m: &ChatMessage, links: &hive_core::DeviceLinks) -> Value {
+    let mut v = message_dto(chat.id, m);
+    if m.role != MessageRole::User {
+        return v;
+    }
+    let Some(owner) = m.actor_identity.as_ref().and_then(|a| links.owner_of(&a.id)) else { return v };
+    let Some(name) = chat.members.iter().find(|x| x.actor.id == owner).map(|x| x.actor.display_name.clone()) else {
+        return v;
+    };
+    v["author"] = json!(format!("{name} via {}", m.author));
+    v["via"] = json!(m.author);
+    v["actorId"] = json!(owner);
+    v
+}
+
 fn truncate(s: &str, n: usize) -> String {
     let s = s.trim();
     if s.chars().count() <= n {
@@ -429,7 +448,8 @@ async fn list_messages(State(s): S, Path(id): Path<String>, Query(page): Query<P
     if let Some(last) = slice.last() {
         s.mark_read(&chat, last.id);
     }
-    let list: Vec<Value> = slice.iter().map(|m| message_dto(chat.id, m)).collect();
+    let links = s.lock().device_links(s.ws).unwrap_or_default();
+    let list: Vec<Value> = slice.iter().map(|m| linked_message_dto(&chat, m, &links)).collect();
     Ok(Json(json!({ "messages": list })))
 }
 
