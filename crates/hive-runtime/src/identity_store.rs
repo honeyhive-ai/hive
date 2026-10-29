@@ -197,6 +197,40 @@ impl<V: KeyVault> IdentityStore<V> {
         Ok(stored)
     }
 
+    /// Replace this install's **device** with a fresh one (new id + signing key,
+    /// certified by the same account key) and persist. For a device that was
+    /// revoked: a revoked device id stays revoked, so re-enrolling needs a new
+    /// one. The old device's seed is left in the vault (never used again).
+    pub fn rotate_device(&self) -> Result<StoredIdentity, IdentityError> {
+        let mut stored = self
+            .load()?
+            .ok_or_else(|| IdentityError::Vault("no identity to rotate".into()))?;
+        let account_kp = self.account_keypair(stored.account.id)?;
+        let now = Timestamp::now();
+        let device_kp = SigningKeypair::generate()?;
+        let device_id = Uuid::new_v4();
+        self.vault.store_seed(&device_key_id(device_id), &device_kp.seed_bytes())?;
+        let certificate = DeviceCertificate::issue(
+            &account_kp,
+            stored.account.id,
+            device_id,
+            &device_kp.public_key_bytes(),
+            now,
+        );
+        stored.device = DeviceIdentity {
+            id: device_id,
+            account_id: stored.account.id,
+            platform: stored.device.platform,
+            device_name: stored.device.device_name.clone(),
+            signing_public_key: device_kp.public_key_bytes().to_vec(),
+            certificate,
+            created_at: now,
+            revoked_at: None,
+        };
+        self.save(&stored)?;
+        Ok(stored)
+    }
+
     fn save(&self, stored: &StoredIdentity) -> Result<(), IdentityError> {
         if let Some(parent) = self.records_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -249,6 +283,22 @@ mod tests {
             .certificate
             .verify(&first.account.signing_public_key)
             .is_ok());
+    }
+
+    #[test]
+    fn rotate_device_keeps_the_account_and_issues_a_fresh_certified_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = store(dir.path());
+        let first = s.bootstrap("Alex", "alex", "box").unwrap();
+        let rotated = s.rotate_device().unwrap();
+        assert_eq!(rotated.account, first.account);
+        assert_ne!(rotated.device.id, first.device.id);
+        assert_ne!(rotated.device.signing_public_key, first.device.signing_public_key);
+        assert!(rotated.device.certificate.verify(&first.account.signing_public_key).is_ok());
+        assert_eq!(s.load().unwrap().unwrap(), rotated);
+        // The new device's key is in the vault.
+        let kp = s.device_keypair(rotated.device.id).unwrap();
+        assert_eq!(kp.public_key_bytes().to_vec(), rotated.device.signing_public_key);
     }
 
     #[test]

@@ -990,6 +990,8 @@ fn usage() -> ! {
          hive serve [--listen ADDR] [--pair] [--token-file PATH] [--label NAME]\n                                       \
          run the home host for the iOS app (sync + worker + HTTP/SSE API);\n                                       \
          --remote-relay URL / HIVE_REMOTE_RELAY also serves it through a relay\n  \
+         hive serve enroll [--new-device]   print the code that makes this box your own device\n                                       \
+         (approve it on your desktop; --new-device after a revocation)\n  \
          hive bind-repo <name|path> [--chat <id>] | --clear   bind a checkout for agent file tools\n  \
          hive repos                     show the repos dir and bindings\n  \
          hive pair [--listen ADDR] [--public-url URL] [--relay-only]   show the phone pairing QR code\n  \
@@ -1177,6 +1179,20 @@ fn run() -> Result<()> {
         }
         "worker" => rt()?.block_on(cmd_worker(&cfg, flag_val("--label"))),
         "queue" => cmd_queue(&cfg),
+        "serve" if positional.first().map(|s| s.as_str()) == Some("enroll") => {
+            let opts = serve::ServeOptions::from_flags(
+                &cfg,
+                flag_val("--listen"),
+                None,
+                None,
+                None,
+                None,
+                flag_val("--label"),
+                None,
+                false,
+            )?;
+            serve::cmd_enroll(&cfg, &opts, has("--new-device"))
+        }
         "serve" => {
             let opts = serve::ServeOptions::from_flags(
                 &cfg,

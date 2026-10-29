@@ -232,16 +232,33 @@ impl EventStore {
         Ok(env)
     }
 
-    /// The envelopes that feed the trust roster (membership + account-key /
-    /// device-cert events + snapshots), across all sessions. Cheap — filtered by
-    /// `kind`. Consumed by `envelope_verifier::build_roster` to verify signatures
-    /// on ingest without any network.
+    /// The envelopes that feed the trust roster (membership, account keys and
+    /// their rotations, device certificates and revocations, snapshots), across
+    /// all sessions. Cheap — filtered by `kind`. Consumed by
+    /// `envelope_verifier::build_roster` to verify signatures on ingest without
+    /// any network. Revocations and rotations must be here: a `DeviceRevoked`
+    /// pulled in an earlier batch is what keeps a revoked device's later events
+    /// out.
     pub fn roster_envelopes(&self) -> Result<Vec<SessionEventEnvelope>> {
         self.query_envelopes(
             "SELECT envelope_json FROM events \
-             WHERE kind IN ('accountKeyRegistered','deviceCertificateAdded','memberAdded','memberRemoved','sessionSnapshot') \
+             WHERE kind IN ('accountKeyRegistered','accountKeyRotated','deviceCertificateAdded','deviceRevoked',\
+             'memberAdded','memberRemoved','sessionSnapshot') \
              ORDER BY row_id ASC",
             [],
+        )
+    }
+
+    /// A workspace's whole trust history — account keys (registered/rotated),
+    /// device certificates and revocations, and membership — for folding its
+    /// [`crate::envelope_verifier::WorkspaceRoster`] without the rest of the log.
+    pub fn trust_envelopes(&self, workspace_id: Uuid) -> Result<Vec<SessionEventEnvelope>> {
+        self.query_envelopes(
+            "SELECT envelope_json FROM events WHERE workspace_id = ?1 \
+             AND kind IN ('accountKeyRegistered','accountKeyRotated','deviceCertificateAdded','deviceRevoked',\
+             'memberAdded','memberRemoved','sessionSnapshot') \
+             ORDER BY row_id ASC",
+            [workspace_id.to_string()],
         )
     }
 

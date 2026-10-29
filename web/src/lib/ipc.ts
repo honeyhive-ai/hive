@@ -893,6 +893,47 @@ export interface RevokeResultDto {
 export const removeAndRevoke = (sessionId: string, memberId: string) =>
   invoke<RevokeResultDto>("remove_and_revoke", { sessionId, memberId });
 
+// ── My devices (a `hive serve` box enrolled as one of your devices) ─────────
+
+export interface DeviceCodeDto {
+  deviceId: string;
+  label: string;
+  /** Compare with the box's terminal (`hive serve enroll` prints it). */
+  fingerprint: string;
+  knownWorkspace: boolean;
+  alreadyMine: boolean;
+  revoked: boolean;
+  /** The box's own pre-enrollment member, retired on approval if asked. */
+  replacesMember: { memberId: string; displayName: string } | null;
+}
+export interface MyDeviceDto {
+  deviceId: string;
+  label: string;
+  fingerprint: string;
+  thisDevice: boolean;
+  revoked: boolean;
+  lastSeen: string | null;
+}
+export interface DeviceRequestDto {
+  hostId: string;
+  label: string;
+}
+export interface ApproveDeviceDto {
+  retired: string | null;
+  retireError: string | null;
+}
+/// Parse an enrollment code (`hivedev1:…`) to show before approving it.
+export const inspectDeviceCode = (code: string) => invoke<DeviceCodeDto>("inspect_device_code", { code });
+/// Approve a box as one of your devices (signs its certificate with your
+/// account key); `retireMember` also removes its separate member.
+export const approveDevice = (code: string, retireMember: boolean) =>
+  invoke<ApproveDeviceDto>("approve_device", { code, retireMember });
+export const listMyDevices = () => invoke<MyDeviceDto[]>("list_my_devices");
+/// Hosts naming you as their owner that you haven't approved yet.
+export const listDeviceRequests = () => invoke<DeviceRequestDto[]>("list_device_requests");
+/// Revoke one of your devices: every member stops accepting its events.
+export const revokeMyDevice = (deviceId: string) => invoke<void>("revoke_my_device", { deviceId });
+
 export const setMemberRole = (sessionId: string, memberId: string, role: string) =>
   invoke<void>("set_member_role", { sessionId, memberId, role });
 

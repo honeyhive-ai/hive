@@ -11,7 +11,18 @@
 //! `owner_actor_id` set to the account it belongs to (`HIVE_SERVE_OWNER`).
 //! Older clients see an ordinary host record and keep today's behavior.
 //!
-//! **Trust.** A member `M` is a device of `X` only when all hold:
+//! **Enrolled devices (the real fix).** Once the owner approves the box on a
+//! desktop that holds their account key, the box's device carries a
+//! certificate signed by the owner's account and the box authors events *as the
+//! owner* (see `hive_runtime::device_enroll`). The box's old member is then
+//! retired, and it becomes a **retired alias**: an actor that is no longer a
+//! member, whose own device (one that signed events as it) the owner has since
+//! certified. Aliases map to the owner too, so chats the box created before
+//! enrollment keep being answered by the owner's desktop and its history reads
+//! as theirs. See [`DeviceLinks::link_retired`].
+//!
+//! **Trust (host claim, pre-enrollment).** A member `M` is a device of `X` only
+//! when all hold:
 //!   * a host's id is a device certified (cert signed by `M`'s own account key)
 //!     to `M`, and that host names `X` as its owner;
 //!   * `M` and `X` are both human members, `M != X`;
@@ -59,6 +70,32 @@ impl DeviceLinks {
         }
         // One hop only: a device of a device is not followed (no chains).
         Self(out)
+    }
+
+    /// Link a **retired alias**: `alias` (an actor id that is no longer a member
+    /// of `config`) acts for `owner` (a current human member's actor id). The
+    /// caller has established the cryptographic facts: a device that signed
+    /// events as `alias` is certified by `owner`'s account key, which only the
+    /// owner can produce. Ignored when `alias` is still a member (a live member is
+    /// never silently merged into another), when `owner` isn't a human member, or
+    /// when they're the same actor. Returns whether it linked.
+    pub fn link_retired(&mut self, config: &ChatSession, alias: &str, owner: &str) -> bool {
+        if alias == owner || config.members.iter().any(|m| m.actor.id == alias || m.id == alias) {
+            return false;
+        }
+        let owner_is_human =
+            config.members.iter().any(|m| m.actor.id == owner && m.actor.kind == ActorKind::Human);
+        if !owner_is_human {
+            return false;
+        }
+        self.0.entry(alias.to_string()).or_insert_with(|| owner.to_string());
+        true
+    }
+
+    /// Every actor id that is `person` or acts for them (their linked devices
+    /// and retired aliases).
+    pub fn ids_of<'a>(&'a self, person: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        std::iter::once(person).chain(self.0.iter().filter(move |(_, p)| p.as_str() == person).map(|(a, _)| a.as_str()))
     }
 
     /// The person `actor_id` acts for: its owner if it's a linked device, else itself.
@@ -178,6 +215,28 @@ mod tests {
         // A host naming a non-member as owner.
         w.config.workspace_hosts = vec![host(w.box_device, Uuid::new_v4())];
         assert!(DeviceLinks::from_config(&w.config, certs(&w)).is_empty());
+    }
+
+    #[test]
+    fn retired_alias_maps_to_its_owner_but_a_live_member_never_merges() {
+        let w = world(WorkspaceRole::Contributor);
+        let mut links = DeviceLinks::default();
+        // The box is still a member: never merged by the alias rule.
+        assert!(!links.link_retired(&w.config, &w.boxed.to_string(), &w.owner.to_string()));
+        assert!(links.is_empty());
+        // Retired (removed from the roster): its history and chats are the owner's.
+        let mut config = w.config.clone();
+        config.members.retain(|m| m.actor.id != w.boxed.to_string());
+        assert!(links.link_retired(&config, &w.boxed.to_string(), &w.owner.to_string()));
+        assert_eq!(links.person(&w.boxed.to_string()), w.owner.to_string());
+        let owner = w.owner.to_string();
+        let ids: Vec<&str> = links.ids_of(&owner).collect();
+        assert!(ids.contains(&w.boxed.to_string().as_str()) && ids.contains(&w.owner.to_string().as_str()));
+        // An owner that isn't a human member links nothing.
+        let mut other = DeviceLinks::default();
+        assert!(!other.link_retired(&config, &w.boxed.to_string(), &Uuid::new_v4().to_string()));
+        // Self-alias is meaningless.
+        assert!(!other.link_retired(&config, &w.owner.to_string(), &w.owner.to_string()));
     }
 
     #[test]

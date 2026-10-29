@@ -10,14 +10,17 @@
 //!   gate's proposal, which is announced as `workflow.approval` instead;
 //! - a workflow run's gate waiting for approval → `workflow.approval`.
 //!
-//! "The user" is this box's identity — the one the phone posts as — plus any
-//! member sharing its account or its display name (the owner's desktop). Their
-//! own messages never notify.
+//! "The user" is the identity the phone posts as — the owner, once this box is
+//! enrolled as their device — plus every actor that is the same person: a
+//! member sharing the account, the box's retired pre-enrollment member, or a
+//! linked device ([`hive_core::DeviceLinks`]). Identity is by account / actor
+//! id, never by display name (two people can share a name). Their own messages
+//! never notify.
 
 use std::collections::HashSet;
 
 use hive_core::{
-    ActionProposal, ActorIdentity, ChatMessage, ChatSession, MessageRole, ProposalKind, TranscriptEventKind, WorkflowRun,
+    ActionProposal, ActorIdentity, ChatMessage, ChatSession, DeviceLinks, MessageRole, ProposalKind, TranscriptEventKind, WorkflowRun,
     WorkspaceRole,
 };
 
@@ -34,14 +37,15 @@ pub struct Me {
 }
 
 impl Me {
-    pub fn in_chat(author: &ActorIdentity, s: &ChatSession) -> Self {
+    pub fn in_chat(author: &ActorIdentity, s: &ChatSession, links: &DeviceLinks) -> Self {
         let mut me = Me { display_name: author.display_name.clone(), ..Default::default() };
+        let person = links.person(&author.id).to_string();
         me.ids.insert(author.id.clone());
-        let name = author.display_name.trim();
+        me.ids.extend(links.ids_of(&person).map(str::to_string));
         for m in &s.members {
-            let same = m.actor.id == author.id
-                || (author.account_id.is_some() && m.actor.account_id == author.account_id)
-                || (!name.is_empty() && m.actor.display_name.trim().eq_ignore_ascii_case(name));
+            let same = me.ids.contains(&m.actor.id)
+                || me.ids.contains(&m.id)
+                || (author.account_id.is_some() && m.actor.account_id == author.account_id);
             if same {
                 me.ids.insert(m.id.clone());
                 me.ids.insert(m.actor.id.clone());
@@ -167,8 +171,11 @@ mod tests {
         s: ChatSession,
         me_actor: ActorIdentity,
         other: ActorIdentity,
+        links: DeviceLinks,
     }
 
+    /// Zoe's box posts as its own (pre-enrollment) member "box-1", linked to
+    /// her desktop identity "desk-1" (a retired alias or a host claim).
     fn fixture() -> Fixture {
         let me_actor = actor("box-1", "Zoe");
         let desktop = actor("desk-1", "zoe");
@@ -176,11 +183,19 @@ mod tests {
         let mut s = ChatSession::new("Fix the build", Uuid::new_v4(), "rt");
         s.members = vec![
             member(&desktop, WorkspaceRole::Owner, 1),
-            member(&me_actor, WorkspaceRole::Contributor, 2),
             member(&other, WorkspaceRole::Admin, 3),
         ];
         s.workspace_agents = vec![WorkspaceAgent::new("coder", "rt")];
-        Fixture { s, me_actor, other }
+        let mut links = DeviceLinks::default();
+        assert!(links.link_retired(&s, "box-1", "desk-1"));
+        s.members.push(member(&me_actor, WorkspaceRole::Contributor, 2));
+        Fixture { s, me_actor, other, links }
+    }
+
+    impl Fixture {
+        fn me(&self) -> Me {
+            Me::in_chat(&self.me_actor, &self.s, &self.links)
+        }
     }
 
     fn reply(body: &str) -> ChatMessage {
@@ -196,7 +211,7 @@ mod tests {
     #[test]
     fn finished_agent_reply_is_message_done_with_preview_only_when_on() {
         let f = fixture();
-        let me = Me::in_chat(&f.me_actor, &f.s);
+        let me = f.me();
         let (notice, p) = for_message(&f.s, &reply("Done: the build is green."), true, &me).unwrap();
         assert_eq!((p.kind.as_str(), p.title.as_str(), p.sender.as_deref()), ("message.done", "coder replied", Some("coder")));
         assert_eq!(p.chat_id, Some(f.s.id.to_string()));
@@ -222,7 +237,7 @@ mod tests {
     #[test]
     fn a_reply_that_mentions_you_is_one_mention_push() {
         let f = fixture();
-        let me = Me::in_chat(&f.me_actor, &f.s);
+        let me = f.me();
         let (notice, p) = for_message(&f.s, &reply("@Zoe can you check the token?"), true, &me).unwrap();
         assert_eq!((p.kind.as_str(), p.title.as_str(), p.sender.as_deref()), ("mention", "coder mentioned you", Some("coder")));
         assert_eq!(notice.title, "coder mentioned you");
@@ -234,28 +249,51 @@ mod tests {
     #[test]
     fn mentions_from_other_members_by_name_broadcast_or_role() {
         let f = fixture();
-        let me = Me::in_chat(&f.me_actor, &f.s);
+        let me = f.me();
         let (_, p) = for_message(&f.s, &from(&f.other, "@zoe take a look"), false, &me).unwrap();
         assert_eq!((p.kind.as_str(), p.title.as_str(), p.sender.as_deref()), ("mention", "Ana mentioned you", Some("Ana")));
         assert!(for_message(&f.s, &from(&f.other, "heads up @all"), false, &me).is_some());
-        // The owner's desktop shares the display name: @owners includes "you".
+        // The owner's desktop is the same person (linked): @owners includes "you".
         assert!(for_message(&f.s, &from(&f.other, "@owners please approve"), false, &me).is_some());
         assert!(for_message(&f.s, &from(&f.other, "@viewers fyi"), false, &me).is_none());
         // No mention of you → nothing for a user message.
         assert!(for_message(&f.s, &from(&f.other, "@coder fix it"), false, &me).is_none());
         assert!(for_message(&f.s, &from(&f.other, "mail zoe@example.com"), false, &me).is_none());
         // Mentioning someone else.
-        assert!(for_message(&f.s, &from(&f.me_actor, "@Ana ping"), false, &Me::in_chat(&f.other, &f.s)).is_some());
+        assert!(for_message(&f.s, &from(&f.me_actor, "@Ana ping"), false, &Me::in_chat(&f.other, &f.s, &f.links)).is_some());
     }
 
     #[test]
     fn your_own_messages_never_notify() {
         let f = fixture();
-        let me = Me::in_chat(&f.me_actor, &f.s);
+        let me = f.me();
         assert!(for_message(&f.s, &from(&f.me_actor, "@all @Zoe note to self"), false, &me).is_none());
-        // …nor from the owner's desktop identity (same display name).
+        // …nor from the owner's desktop identity (the same person).
         let desktop = f.s.members[0].actor.clone();
         assert!(for_message(&f.s, &from(&desktop, "@all hi"), false, &me).is_none());
+    }
+
+    #[test]
+    fn a_namesake_is_not_you() {
+        // Another person who happens to be called "Zoe", with no link to you:
+        // their messages notify, and their role isn't yours.
+        let mut f = fixture();
+        f.links = DeviceLinks::default();
+        let me = f.me();
+        let namesake = f.s.members[0].actor.clone();
+        assert!(for_message(&f.s, &from(&namesake, "@all hi"), false, &me).is_some());
+        assert!(for_message(&f.s, &from(&f.other, "@owners please approve"), false, &me).is_none());
+    }
+
+    #[test]
+    fn enrolled_box_is_the_owner() {
+        // After enrollment the box posts as the owner's own actor: mentions of
+        // the owner are mentions of you, with no link needed.
+        let f = fixture();
+        let desktop = f.s.members[0].actor.clone();
+        let me = Me::in_chat(&desktop, &f.s, &DeviceLinks::default());
+        assert!(for_message(&f.s, &from(&f.other, "@zoe take a look"), false, &me).is_some());
+        assert!(for_message(&f.s, &from(&desktop, "@all from my desktop"), false, &me).is_none());
     }
 
     #[test]

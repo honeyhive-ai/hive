@@ -1317,14 +1317,189 @@ async fn live_gateway_turn_reads_a_file() {
 #[path = "tunnel/e2e_tests.rs"]
 mod tunnel_e2e;
 
-/// `HIVE_SERVE_OWNER` makes this box its owner's device: a chat the phone
-/// creates is answered by the owner's desktop, and details say whether that
-/// desktop is online (`available` / `availableVia`) from its Device heartbeat.
+/// Poll `GET /v1/health` until `identity.mode` is `mode`.
+async fn wait_identity(h: &Harness, mode: &str) -> Value {
+    let mut v = Value::Null;
+    for _ in 0..100 {
+        v = h.get("/v1/health").await["identity"].clone();
+        if v["mode"] == mode {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("identity never became {mode}: {v}");
+}
+
+/// The owner approves a box's enrollment code on their desktop (here the
+/// headless client standing in for it: the same `certify_device`).
+async fn approve_on_desktop(desktop: &Config, code: &str) {
+    let request = hive_runtime::device_enroll::DeviceEnrollment::decode(code).unwrap();
+    open_service(desktop).unwrap().certify_device(&request).unwrap();
+    sync_once(desktop).await.unwrap();
+}
+
+/// `HIVE_SERVE_OWNER` + the owner's approval make this box one of the owner's
+/// own devices: everything the phone does is authored as the owner and accepted
+/// by the owner's desktop; one person, one vote; `@hive` in a chat the phone
+/// creates belongs to the owner's desktop; revoking the box stops it, and a new
+/// device key re-enrolls it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn phone_chat_primary_availability_follows_the_owners_desktop() {
+async fn phone_box_enrolled_as_the_owners_device() {
     let (endpoint, _model) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
     // The desktop's identity is named "hive-cli" (the CLI test identity).
     let h = harness_with(&endpoint, "gpt-4o", &[("README.md", "# demo\n")], |o| o.owner = Some("hive-cli".into())).await;
+    let ws = crate::uuid_of_room(&h.handle.shared.cfg.room);
+    let cfg_id = workspace_config_session_id(ws);
+    let desktop_actor = open_service(&h.desktop).unwrap().author().id.clone();
+
+    // Before approval: the box waits — it neither joined the roster nor writes.
+    let id = wait_identity(&h, "pending").await;
+    assert_ne!(id["actorId"], json!(desktop_actor));
+    let r = h.client.post(format!("{}/v1/chats", h.base)).bearer_auth(&h.token).json(&json!({"title": "x"})).send().await.unwrap();
+    assert_eq!(r.status(), 403);
+    let box_actor = h.handle.shared.my_actor_id();
+    let roster = open_service(&h.desktop).unwrap().load(cfg_id).unwrap().unwrap().members;
+    assert!(!roster.iter().any(|m| m.actor.id == box_actor), "a pending box doesn't join as its own member");
+
+    // The owner approves the code `hive serve` printed; the box switches live.
+    let code = h.handle.shared.lock().enrollment_request(ws, "sff").encode();
+    approve_on_desktop(&h.desktop, &code).await;
+    let id = wait_identity(&h, "owner").await;
+    assert_eq!(id["actorId"], json!(desktop_actor));
+    assert_eq!(id["displayName"], "hive-cli");
+
+    // The phone's chat, message, vote and comment are the owner's.
+    let chat = h.send(reqwest::Method::POST, "/v1/chats", Some(json!({ "title": "from the phone" }))).await;
+    let chat_id = chat["chat"]["id"].as_str().unwrap().to_string();
+    let cid = Uuid::parse_str(&chat_id).unwrap();
+    h.send(reqwest::Method::POST, &format!("/v1/chats/{chat_id}/messages"), Some(json!({ "body": "@hive what changed?" }))).await;
+    let proposal = hive_core::ActionProposal::new("ship it", hive_core::ProposalKind::Decision, desktop_actor.clone());
+    let pid = proposal.id;
+    // Wait for the phone's chat to reach the desktop, then file a proposal in it.
+    for _ in 0..50 {
+        sync_once(&h.desktop).await.unwrap();
+        if open_service(&h.desktop).unwrap().load(cid).unwrap().is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    open_service(&h.desktop).unwrap().upsert_proposal(cid, ws, proposal).unwrap();
+    sync_once(&h.desktop).await.unwrap();
+    let mut found = false;
+    for _ in 0..50 {
+        if h.get("/v1/proposals").await["proposals"].as_array().unwrap().iter().any(|p| p["id"] == json!(pid)) {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(found, "the desktop's proposal reaches the phone");
+    h.send(reqwest::Method::POST, &format!("/v1/proposals/{pid}/approve"), None).await;
+    h.send(reqwest::Method::POST, &format!("/v1/proposals/{pid}/comments"), Some(json!({ "text": "looks right" }))).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    sync_once(&h.desktop).await.unwrap();
+    let svc = open_service(&h.desktop).unwrap();
+    let s = svc.load(cid).unwrap().expect("the phone's chat reached the desktop");
+    assert_eq!(s.creator_actor_id, desktop_actor, "the chat is the owner's: their desktop runs its @hive");
+    let m = s.messages.iter().find(|m| m.body == "@hive what changed?").expect("message accepted");
+    assert_eq!(m.actor_identity.as_ref().unwrap().id, desktop_actor);
+    let p = s.proposals.iter().find(|p| p.id == pid).unwrap();
+    assert_eq!(p.approvals.len(), 1);
+    assert_eq!(p.approvals[0].actor_id, desktop_actor);
+    assert_eq!(p.refinements.last().unwrap().actor_id, desktop_actor);
+    drop(svc);
+    // One person, one vote: the desktop's vote replaces the phone's.
+    open_service(&h.desktop).unwrap().vote_on_proposal(cid, ws, pid, desktop_actor.clone(), hive_core::WorkspaceRole::Owner, false).unwrap();
+    sync_once(&h.desktop).await.unwrap();
+    let mut votes = Value::Null;
+    for _ in 0..50 {
+        votes = h.get(&format!("/v1/proposals/{pid}")).await["proposal"].clone();
+        if votes["myVote"] == "reject" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(votes["myVote"], "reject", "{votes}");
+    let s = open_service(&h.desktop).unwrap().load(cid).unwrap().unwrap();
+    assert_eq!(s.proposals.iter().find(|p| p.id == pid).unwrap().approvals.len(), 1);
+
+    // People: the phone's "you" is the owner.
+    let people = h.get("/v1/people").await;
+    let me: Vec<&Value> = people["people"].as_array().unwrap().iter().filter(|p| p["isSelf"] == json!(true)).collect();
+    assert_eq!(me.len(), 1);
+    assert_eq!(me[0]["actorId"], json!(desktop_actor));
+
+    // @hive availability follows the owner's desktop heartbeat.
+    {
+        let mut svc = open_service(&h.desktop).unwrap();
+        svc.register_host(ws, hive_core::WorkspaceHost::new(svc.device_id().to_string(), hive_core::HostKind::Device, "Studio Mac"))
+            .unwrap();
+    }
+    sync_once(&h.desktop).await.unwrap();
+    let mut r = Value::Null;
+    for _ in 0..50 {
+        r = h.get(&format!("/v1/chats/{chat_id}/details")).await["defaultResponder"].clone();
+        if r["available"] == json!(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(r["availableVia"], "Studio Mac", "{r}");
+
+    // Revoke: the box goes read-only, and what it already sent stays.
+    let old_device = Uuid::parse_str(&h.handle.shared.host_id).unwrap();
+    open_service(&h.desktop).unwrap().revoke_device(cfg_id, ws, old_device).unwrap();
+    sync_once(&h.desktop).await.unwrap();
+    wait_identity(&h, "revoked").await;
+    let r = h
+        .client
+        .post(format!("{}/v1/chats/{chat_id}/messages", h.base))
+        .bearer_auth(&h.token)
+        .json(&json!({ "body": "after revocation" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 403);
+
+    // Re-enroll: a new device key, approved again.
+    let serve_cfg = h.handle.shared.cfg.clone();
+    let opts = h.handle.shared.opts.clone();
+    assert!(h.handle.stop(Duration::from_secs(5)).await);
+    assert!(cmd_enroll(&serve_cfg, &opts, false).is_err(), "a revoked box needs --new-device");
+    cmd_enroll(&serve_cfg, &opts, true).unwrap();
+    let handle = start(serve_cfg.clone(), opts.clone()).await.unwrap();
+    assert_ne!(handle.shared.host_id, old_device.to_string());
+    let code = handle.shared.lock().enrollment_request(ws, "sff").encode();
+    approve_on_desktop(&h.desktop, &code).await;
+    let h2 = Harness { base: format!("http://{}", handle.addr), token: handle.shared.token(), handle, ..h };
+    wait_identity(&h2, "owner").await;
+    h2.send(reqwest::Method::POST, &format!("/v1/chats/{chat_id}/messages"), Some(json!({ "body": "back again" }))).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    sync_once(&h2.desktop).await.unwrap();
+    let s = open_service(&h2.desktop).unwrap().load(cid).unwrap().unwrap();
+    let bodies: Vec<(&str, &str)> =
+        s.messages.iter().map(|m| (m.body.as_str(), m.actor_identity.as_ref().map(|a| a.id.as_str()).unwrap_or(""))).collect();
+    assert!(bodies.contains(&("back again", desktop_actor.as_str())), "{bodies:?}");
+    assert!(!bodies.iter().any(|(b, _)| *b == "after revocation"));
+    h2.handle.shutdown();
+}
+
+/// A box that was its own member before `HIVE_SERVE_OWNER` keeps the dispatch
+/// stopgap until its owner approves it: the owner's desktop answers `@hive` in
+/// chats the phone creates once the box is an Admin, and details say whether
+/// that desktop is online (`available` / `availableVia`) from its heartbeat.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn phone_chat_primary_availability_follows_the_owners_desktop() {
+    let (endpoint, _model) = spawn_model(vec![vec![delta(json!({"content": "hi"}))]]).await;
+    // An existing box: joined as its own member before the owner was set.
+    let h0 = harness(&endpoint, "gpt-4o", &[("README.md", "# demo\n")]).await;
+    let serve_cfg = h0.handle.shared.cfg.clone();
+    let mut opts = h0.handle.shared.opts.clone();
+    assert!(h0.handle.stop(Duration::from_secs(5)).await);
+    opts.owner = Some("hive-cli".into());
+    let handle = start(serve_cfg, opts).await.unwrap();
+    let h = Harness { base: format!("http://{}", handle.addr), token: handle.shared.token(), handle, ..h0 };
+    assert_eq!(h.get("/v1/health").await["identity"]["mode"], "pending");
     let ws = crate::uuid_of_room(&h.handle.shared.cfg.room);
     let cfg_id = workspace_config_session_id(ws);
     let (desktop_actor, box_actor, box_host) = {
@@ -1349,6 +1524,7 @@ async fn phone_chat_primary_availability_follows_the_owners_desktop() {
     assert!(r.get("availableVia").is_none());
 
     // The owner makes the box an Admin and opens the desktop (Device heartbeat).
+    sync_once(&h.desktop).await.unwrap();
     {
         let mut svc = open_service(&h.desktop).unwrap();
         svc.set_member_role(cfg_id, ws, &box_actor, hive_core::WorkspaceRole::Admin).unwrap();

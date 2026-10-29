@@ -367,6 +367,7 @@ async fn health(State(s): S, Extension(Authorized(ok)): Extension<Authorized>) -
     if ok {
         v["workspace"] = json!(s.cfg.room);
         v["deviceLabel"] = json!(s.opts.label);
+        v["identity"] = s.identity_json();
     }
     Json(v)
 }

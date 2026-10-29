@@ -64,6 +64,14 @@ pub struct ChatService {
     /// workspace bypass the roster-role check (see [`append_signed`]). `None` until
     /// the app sets it via [`set_local_workspace`].
     local_workspace_id: Option<Uuid>,
+    /// Set when this device acts for an account whose key it doesn't hold — a
+    /// `hive serve` box enrolled as its owner's device (`device_enroll`). The
+    /// author is then the owner; `account_keypair` is still the box's own, so
+    /// anything that would publish or sign with it under the author's account
+    /// (identity publication, key rotation, certifying devices) is refused.
+    delegated: bool,
+    /// When set, every append is refused with this reason (a revoked device).
+    write_block: Option<String>,
 }
 
 impl ChatService {
@@ -82,7 +90,123 @@ impl ChatService {
             author,
             trusted_founder: None,
             local_workspace_id: None,
+            delegated: false,
+            write_block: None,
         }
+    }
+
+    /// Act as `owner` — this device is enrolled as one of their devices (a
+    /// certificate from their account key is in the workspace). New events are
+    /// stamped as the owner and signed by this device's key; the verifier
+    /// accepts them on every desktop through that certificate. This device has
+    /// no key-agreement key of the owner's, so none is stamped.
+    pub fn act_as_owner_device(&mut self, owner: ActorIdentity) {
+        let mut actor = owner;
+        actor.key_agreement_public = None;
+        self.author = actor;
+        self.delegated = true;
+    }
+
+    /// Whether this device acts for an account whose key it doesn't hold.
+    pub fn is_delegated(&self) -> bool {
+        self.delegated
+    }
+
+    /// Refuse every write with `reason` (or allow writes again with `None`).
+    pub fn set_write_block(&mut self, reason: Option<String>) {
+        self.write_block = reason;
+    }
+
+    /// The reason writes are refused, if they are.
+    pub fn write_block(&self) -> Option<&str> {
+        self.write_block.as_deref()
+    }
+
+    /// This device's id and its signing keypair's public key.
+    pub fn device_public_key(&self) -> [u8; 32] {
+        self.keypair.public_key_bytes()
+    }
+
+    /// An enrollment request for this device in `workspace_id` (the code the
+    /// owner pastes into their desktop), signed by this device's key.
+    pub fn enrollment_request(&self, workspace_id: Uuid, label: &str) -> crate::device_enroll::DeviceEnrollment {
+        crate::device_enroll::DeviceEnrollment::new(workspace_id, self.device_id, &self.keypair, label)
+    }
+
+    /// Where this device stands in `workspace_id`: its own identity, enrolled as
+    /// an owner's device, or revoked. See [`crate::device_enroll::standing`].
+    pub fn device_standing(&self, workspace_id: Uuid, prefer: Option<&str>) -> Result<crate::device_enroll::Standing> {
+        let trust = self.store.trust_envelopes(workspace_id)?;
+        let config = self.load(workspace_config_session_id(workspace_id))?;
+        Ok(crate::device_enroll::standing(
+            &trust,
+            config.as_ref(),
+            self.device_id,
+            &self.account_keypair.public_key_bytes(),
+            prefer,
+        ))
+    }
+
+    /// Approve `request` as one of **your** devices: issue a certificate for its
+    /// device key under your account key and publish it in the workspace. From
+    /// then on, events it stamps as you are accepted by every member. Only a
+    /// device holding the account key can do this (never a delegated box).
+    pub fn certify_device(
+        &mut self,
+        request: &crate::device_enroll::DeviceEnrollment,
+    ) -> Result<DeviceCertificate> {
+        request.verify().map_err(|e| ChatError::Unauthorized(e.to_string()))?;
+        if self.delegated {
+            return Err(ChatError::Unauthorized(
+                "only a device holding your account key can approve a device".into(),
+            ));
+        }
+        let Some(account_id) = self.author.account_id else {
+            return Err(ChatError::Unauthorized("this device has no account identity".into()));
+        };
+        if request.device_id == self.device_id {
+            return Err(ChatError::Unauthorized("that is this device".into()));
+        }
+        let ws = request.workspace_id;
+        let config_id = self.ensure_workspace_config(ws)?;
+        self.publish_identity(config_id, ws)?;
+        // The cert must chain to the key the workspace pinned for this account,
+        // or no one would accept it.
+        let pinned = crate::envelope_verifier::build_roster(&self.store.trust_envelopes(ws)?)
+            .account_signing_key(account_id)
+            .map(<[u8]>::to_vec);
+        if pinned.as_deref() != Some(&self.account_keypair.public_key_bytes()[..]) {
+            return Err(ChatError::Unauthorized(
+                "this desktop's account key isn't the one the workspace trusts for you".into(),
+            ));
+        }
+        let certificate = DeviceCertificate::issue(
+            &self.account_keypair,
+            account_id,
+            request.device_id,
+            &request.device_public_key,
+            Timestamp::now(),
+        );
+        self.append_signed(
+            config_id,
+            ws,
+            SessionEvent::DeviceCertificateAdded { certificate: certificate.clone() },
+        )?;
+        Ok(certificate)
+    }
+
+    /// The devices the local account has certified in `workspace_id` (this one
+    /// included), revoked ones too.
+    pub fn own_devices(&self, workspace_id: Uuid) -> Result<Vec<crate::device_enroll::OwnDevice>> {
+        let Some(account) = self.author.account_id else { return Ok(Vec::new()) };
+        Ok(crate::device_enroll::devices_of(&self.store.trust_envelopes(workspace_id)?, account))
+    }
+
+    /// Other accounts holding a valid certificate for `device` in the workspace
+    /// (a box's own bootstrap account, before it was enrolled as yours).
+    pub fn accounts_certifying(&self, workspace_id: Uuid, device: Uuid) -> Result<Vec<Uuid>> {
+        let me = self.author.account_id.unwrap_or_else(Uuid::nil);
+        Ok(crate::device_enroll::accounts_certifying(&self.store.trust_envelopes(workspace_id)?, device, me))
     }
 
     /// Mark which workspace id is this device's private local workspace, so writes
@@ -280,6 +404,9 @@ impl ChatService {
         workspace_id: Uuid,
         payload: SessionEvent,
     ) -> Result<SessionEventEnvelope> {
+        if let Some(reason) = &self.write_block {
+            return Err(ChatError::Unauthorized(reason.clone()));
+        }
         // Skip governance authz entirely for the device-local workspace: it's solo
         // and never syncs, so the check protects nothing there — and an identity
         // churn would otherwise deny the sole user routine actions in their own
@@ -358,6 +485,12 @@ impl ChatService {
     /// (a local-only session with no verifiable identity). Returns whether it
     /// published.
     pub fn publish_identity(&mut self, session_id: Uuid, workspace_id: Uuid) -> Result<bool> {
+        // A delegated device's identity is the owner's certificate for it; its own
+        // account key must never be registered under the owner's account id (that
+        // would contest the owner's key and quarantine all of their events).
+        if self.delegated {
+            return Ok(false);
+        }
         let Some(account_id) = self.author.account_id else {
             return Ok(false);
         };
@@ -402,6 +535,9 @@ impl ChatService {
         session_id: Uuid,
         workspace_id: Uuid,
     ) -> Result<bool> {
+        if self.delegated {
+            return Err(ChatError::Unauthorized("a delegated device can't rotate its owner's key".into()));
+        }
         let Some(account_id) = self.author.account_id else {
             return Ok(false);
         };
@@ -1044,29 +1180,32 @@ impl ChatService {
             .unwrap_or_default())
     }
 
-    /// Which members are another member's own device (a `hive serve` box its
-    /// owner runs), so dispatch counts them as one person and maps a chat the
-    /// box created to its owner. See [`hive_core::DeviceLinks`] for the rules.
-    /// A device counts as an account's only if its certificate verifies against
-    /// a key that account registered in this workspace.
+    /// Which actors are another member's own device, so dispatch counts them as
+    /// one person and maps a chat they created to the owner. Two sources:
+    ///
+    /// * **retired aliases** — a former member whose device (one that signed
+    ///   as it) the owner's account has since certified: a `hive serve` box
+    ///   enrolled as its owner's device (`device_enroll`), its old member removed;
+    /// * **host claims** (pre-enrollment stopgap) — an Admin member's host naming
+    ///   another member as owner, see [`hive_core::DeviceLinks`]. A device counts
+    ///   as an account's only if its certificate verifies against a key that
+    ///   account registered in this workspace.
     pub fn device_links(&self, workspace_id: Uuid) -> Result<hive_core::DeviceLinks> {
         let Some(config) = self.load(workspace_config_session_id(workspace_id))? else {
             return Ok(hive_core::DeviceLinks::default());
         };
-        if config.workspace_hosts.iter().all(|h| h.owner_actor_id.is_empty()) {
-            return Ok(hive_core::DeviceLinks::default());
-        }
+        let trust = self.store.trust_envelopes(workspace_id)?;
         let mut keys: std::collections::HashMap<Uuid, Vec<Vec<u8>>> = Default::default();
         let mut certs = Vec::new();
-        for env in self.store.identity_envelopes(workspace_id)? {
-            match env.payload {
+        for env in &trust {
+            match &env.payload {
                 SessionEvent::AccountKeyRegistered { account_id, signing_public_key } => {
-                    keys.entry(account_id).or_default().push(signing_public_key);
+                    keys.entry(*account_id).or_default().push(signing_public_key.clone());
                 }
                 SessionEvent::AccountKeyRotated { account_id, new_signing_public_key, .. } => {
-                    keys.entry(account_id).or_default().push(new_signing_public_key);
+                    keys.entry(*account_id).or_default().push(new_signing_public_key.clone());
                 }
-                SessionEvent::DeviceCertificateAdded { certificate } => certs.push(certificate),
+                SessionEvent::DeviceCertificateAdded { certificate } => certs.push(certificate.clone()),
                 _ => {}
             }
         }
@@ -1079,7 +1218,15 @@ impl ChatService {
                         .is_some_and(|ks| ks.iter().any(|k| c.verify(k).is_ok()))
             })
         };
-        Ok(hive_core::DeviceLinks::from_config(&config, certified))
+        let mut links = if config.workspace_hosts.iter().all(|h| h.owner_actor_id.is_empty()) {
+            hive_core::DeviceLinks::default()
+        } else {
+            hive_core::DeviceLinks::from_config(&config, certified)
+        };
+        for (alias, owner) in crate::device_enroll::retired_aliases(&trust, &config) {
+            links.link_retired(&config, &alias, &owner);
+        }
+        Ok(links)
     }
 
     /// Register (or replace by id) a host. The id is a machine's device id.

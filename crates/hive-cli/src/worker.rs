@@ -198,6 +198,11 @@ pub async fn drain_tick(
     }
     let (work, runtimes) = {
         let mut svc = lock(svc);
+        // A box that can't write (revoked, or awaiting its owner's approval)
+        // can't claim or answer anything either.
+        if svc.write_block().is_some() {
+            return Ok(());
+        }
         // Heartbeat presence (throttled), so peers see this worker as online.
         let _ = svc.touch_host(ctx.ws, ctx.my_host, 60);
         let hosted: HashSet<Uuid> = svc

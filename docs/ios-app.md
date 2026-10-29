@@ -70,7 +70,7 @@ and public addresses unless `HIVE_SERVE_ALLOW_ANY_BIND=1`.
 
 | Method | Path | Response |
 |---|---|---|
-| GET | `/v1/health` | `{ok: true, version, workspace?, deviceLabel?}`. `workspace` (room name) and `deviceLabel` appear only when authorized |
+| GET | `/v1/health` | `{ok: true, version, workspace?, deviceLabel?, identity?}`. `workspace` (room name), `deviceLabel` and `identity` appear only when authorized. `identity = {mode: "owner"\|"member"\|"pending"\|"revoked", actorId, displayName, deviceFingerprint}`: who the phone acts as (see "Your own device" below) |
 | GET | `/v1/chats` | `{chats: [{id, title, updatedAt, preview, unread: int, channelId, participants: [Participant]}]}`, newest first |
 | POST | `/v1/chats` `{title?}` | `{chat}` |
 | GET | `/v1/chats/{id}/messages?after=<messageId>&limit=<n>` | `{messages: [Message]}`, oldest first. Without `after`, the latest page (default limit 100, max 1000) |
@@ -162,12 +162,12 @@ Field notes:
   agent named by `hive serve --default-agent`.
   For the primary it also carries `available?: bool`, `availableVia?: string`
   and `unavailableReason?: "desktopOffline"|"noDesktop"`.
-  Only a desktop runs `@hive`: its owner's (the chat's creator, or the person
-  this box belongs to when the phone created it, see `HIVE_SERVE_OWNER`).
+  Only a desktop runs `@hive`: its owner's (the chat's creator; once this box
+  is enrolled as the owner's device, chats the phone creates are the owner's).
   `available: true` with `availableVia` = that desktop's name while it
   heartbeats its Device host; `false` with `desktopOffline` when it's closed
   (the turn waits and is answered once it opens), or `noDesktop` when the chat
-  is this box's own and no desktop will run it (set `HIVE_SERVE_OWNER`);
+  is this box's own and no desktop will run it (enroll the box as your device);
   absent when unknown (a desktop too old to heartbeat).
   `context = {estimated: true, windowTokens, usedTokens, historyTokens, skillTokens, messageCount, compacting, model?}`
   is a coarse estimate from the transcript, the loaded skills and the model's
@@ -338,13 +338,29 @@ hive remote disable | reset   # reset = new host keys: every phone re-pairs
 - Single user, single workspace per `hive serve` process, and one phone per
   token (the token isn't per-device). Phones paired over the relay are
   per-device and can be revoked one by one.
-- The box is a separate member identity, not the phone owner's account. The
-  desktop shows the phone's messages under `HIVE_SERVE_NAME`. With
-  `HIVE_SERVE_OWNER` set (and the box an Admin) desktops count it as one of the
-  owner's devices: a room with the owner and the box is solo, and a chat the
-  phone creates is the owner's, so their desktop answers `@hive` there. The
-  link is the box's host record naming the owner (no new event or field, so
-  older desktops keep their behavior); a Contributor's claim is ignored.
+- **Your own device.** With `HIVE_SERVE_OWNER` set, the box asks to become one
+  of the owner's devices: it prints an enrollment code (`hivedev1:…`, also
+  `hive serve enroll`), and the owner approves it on their desktop (Settings >
+  Account > My devices > Add a device), checking the fingerprint. The desktop
+  signs a certificate for the box's device key with the owner's account key,
+  which never leaves the desktop. From then on the box authors everything as the
+  owner (`identity.mode = "owner"`): messages, votes, comments and chats the
+  phone creates are the owner's, so one person has one vote and the owner's
+  desktop answers `@hive`. A box can't make itself the owner's device: an event
+  it stamps as the owner without that certificate is quarantined everywhere as
+  impersonation. Approving also removes the box's separate member (if it had
+  one); its past messages show on the desktop as "<owner> via <box>".
+  Revoking it (My devices > Revoke) stops every updated desktop accepting its
+  events and makes the box read-only (`revoked`); `hive serve enroll
+  --new-device` makes a new device key to approve again. No new event type:
+  older desktops accept the enrolled box's events as the owner's too, but only
+  updated desktops keep honoring a revocation after the sync batch it arrived in.
+- Before enrollment (no `HIVE_SERVE_OWNER`, or not approved yet) the box is a
+  separate member identity: the desktop shows the phone's messages under
+  `HIVE_SERVE_NAME`. A box that is already a member with `HIVE_SERVE_OWNER` set
+  (and an Admin) keeps the earlier stopgap meanwhile: desktops count it as one
+  of the owner's devices for dispatch only. A box that isn't a member waits
+  read-only (`pending`) instead of joining as one.
 - Agents run one at a time on the worker thread. A long turn delays the next
   one, but the API and sync keep running.
 - Deltas are pushed only for turns that run on this box. A reply streamed on

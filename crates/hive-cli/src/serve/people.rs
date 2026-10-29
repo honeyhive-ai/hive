@@ -184,8 +184,9 @@ fn primary_runtime<'a>(chat: &ChatSession, known: &'a [WorkspaceRuntime]) -> Opt
 
 /// Whether the chat's `@hive` can answer right now. Only a desktop runs the
 /// primary, and the one that does is its owner's: the chat's creator, or — when
-/// a linked box (this one, `HIVE_SERVE_OWNER`) created it — the person that box
-/// belongs to. Desktops heartbeat a `Device` host while open.
+/// a linked box (this one, before it was enrolled as its owner's device) created
+/// it — the person that box belongs to. Desktops heartbeat a `Device` host while
+/// open.
 ///
 /// What [`primary_availability`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,7 +213,11 @@ pub(super) fn primary_availability(s: &Shared, chat: &ChatSession, hosts: &[Work
     let mut desktops: Vec<&WorkspaceHost> =
         hosts.iter().filter(|h| h.kind == HostKind::Device && h.owner_actor_id == owner).collect();
     if desktops.is_empty() {
-        return if owner == me { Availability::NoDesktop } else { Availability::Unknown };
+        // This box's own identity never has a desktop; but once it's enrolled as
+        // its owner's device, "me" is the owner, whose desktop may just predate
+        // Device heartbeats.
+        let box_only = owner == me && !matches!(s.standing(), hive_runtime::device_enroll::Standing::OwnerDevice(_));
+        return if box_only { Availability::NoDesktop } else { Availability::Unknown };
     }
     desktops.sort_by_key(|h| std::cmp::Reverse(h.last_seen));
     match desktops.iter().find(|h| h.is_online(&now, ONLINE_WINDOW_SECS)) {

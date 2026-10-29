@@ -3503,7 +3503,42 @@ fn move_chat(state: State<AppState>, chat_id: String, channel_id: String) -> Res
 fn get_chat(state: State<AppState>, session_id: String) -> Result<Option<ChatSessionDto>, String> {
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let svc = state.service.lock().unwrap();
-    Ok(svc.load(id).map_err(map_err)?.as_ref().map(session_dto))
+    let Some(mut session) = svc.load(id).map_err(map_err)? else { return Ok(None) };
+    let links = device_links_of(&svc, session.workspace_id);
+    attribute_linked_devices(&mut session, &links);
+    Ok(Some(session_dto(&session)))
+}
+
+/// Show messages a person's other identity wrote — the separate member their
+/// `hive serve` box used before it was enrolled as their device — as theirs:
+/// "Alex via sff". Display only; the log is unchanged.
+fn attribute_linked_devices(session: &mut ChatSession, links: &hive_core::DeviceLinks) {
+    if links.is_empty() {
+        return;
+    }
+    let name_of = |id: &str| {
+        session
+            .members
+            .iter()
+            .find(|m| m.actor.id == id)
+            .map(|m| m.actor.display_name.clone())
+            .filter(|n| !n.trim().is_empty())
+    };
+    let renames: Vec<(usize, String)> = session
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == MessageRole::User)
+        .filter_map(|(i, m)| {
+            let actor = m.actor_identity.as_ref()?;
+            let owner = name_of(links.owner_of(&actor.id)?)?;
+            let via = if m.author.trim().is_empty() { actor.display_name.clone() } else { m.author.clone() };
+            Some((i, format!("{owner} via {via}")))
+        })
+        .collect();
+    for (i, author) in renames {
+        session.messages[i].author = author;
+    }
 }
 
 #[tauri::command]
@@ -4046,6 +4081,208 @@ fn remove_member(state: State<AppState>, session_id: String, member_id: String) 
     let id = Uuid::parse_str(&session_id).map_err(map_err)?;
     let mut svc = state.service.lock().unwrap();
     svc.remove_member(id, state.active_workspace_id(), member_id).map_err(map_err)
+}
+
+// ── My devices: enroll a `hive serve` box as one of your own devices ─────────
+// The box prints an enrollment code (`hive serve enroll`); approving it here
+// signs a certificate for its device key with this desktop's account key, so
+// everything the box (and the phone behind it) does is authored as you. See
+// `hive_runtime::device_enroll`.
+
+/// What an enrollment code asks for, shown before the owner approves it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceCodeDto {
+    device_id: String,
+    label: String,
+    /// Check against the box's terminal (`hive serve enroll` prints it).
+    fingerprint: String,
+    /// The workspace the code is for is one this desktop has.
+    known_workspace: bool,
+    /// Already certified as yours (and not revoked).
+    already_mine: bool,
+    /// Revoked in this workspace: the box needs `--new-device`.
+    revoked: bool,
+    /// The box's own pre-enrollment member, removed on approval if asked.
+    replaces_member: Option<DeviceMemberDto>,
+}
+
+#[derive(serde::Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DeviceMemberDto {
+    member_id: String,
+    display_name: String,
+}
+
+/// One of your devices in the active workspace.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MyDeviceDto {
+    device_id: String,
+    label: String,
+    fingerprint: String,
+    this_device: bool,
+    revoked: bool,
+    /// When its host last checked in (RFC 3339), if it registers one.
+    last_seen: Option<String>,
+}
+
+/// A host that names you as its owner but isn't certified as your device
+/// (a `hive serve` box with `HIVE_SERVE_OWNER` set, waiting for approval).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceRequestDto {
+    host_id: String,
+    label: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApproveDeviceDto {
+    /// Display name of the box's old member, when it was retired.
+    retired: Option<String>,
+    /// Why the old member stayed (e.g. you aren't an admin here).
+    retire_error: Option<String>,
+}
+
+fn decode_device_code(code: &str) -> Result<hive_runtime::device_enroll::DeviceEnrollment, String> {
+    hive_runtime::device_enroll::DeviceEnrollment::decode(code).map_err(|e| e.to_string())
+}
+
+/// Human members (not you) whose account certified `device`: the box's own
+/// pre-enrollment identity.
+fn device_own_members(svc: &ChatService, ws: Uuid, device: Uuid) -> Vec<WorkspaceMember> {
+    let accounts = svc.accounts_certifying(ws, device).unwrap_or_default();
+    let me = svc.author().id.clone();
+    svc.load(hive_core::workspace_config_session_id(ws))
+        .ok()
+        .flatten()
+        .map(|c| c.members)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| m.actor.kind == ActorKind::Human && m.actor.id != me)
+        .filter(|m| m.actor.account_id.is_some_and(|a| accounts.contains(&a)))
+        .collect()
+}
+
+#[tauri::command]
+fn inspect_device_code(state: State<AppState>, code: String) -> Result<DeviceCodeDto, String> {
+    let req = decode_device_code(&code)?;
+    let svc = state.service.lock().unwrap();
+    let ws = req.workspace_id;
+    let known_workspace = matches!(svc.load(hive_core::workspace_config_session_id(ws)), Ok(Some(_)));
+    let mine = svc.own_devices(ws).unwrap_or_default();
+    let entry = mine.iter().find(|d| d.device_id == req.device_id);
+    let revoked = entry.is_some_and(|d| d.revoked);
+    Ok(DeviceCodeDto {
+        device_id: req.device_id.to_string(),
+        label: req.label.clone(),
+        fingerprint: req.fingerprint(),
+        known_workspace,
+        already_mine: entry.is_some_and(|d| !d.revoked),
+        revoked,
+        replaces_member: device_own_members(&svc, ws, req.device_id)
+            .first()
+            .map(|m| DeviceMemberDto { member_id: m.id.clone(), display_name: m.actor.display_name.clone() }),
+    })
+}
+
+/// Approve a box as one of your devices: certify its device key under your
+/// account key (only a device holding that key can), then — when asked —
+/// retire the box's own member so it stops counting as a separate person.
+#[tauri::command]
+fn approve_device(state: State<AppState>, code: String, retire_member: bool) -> Result<ApproveDeviceDto, String> {
+    let req = decode_device_code(&code)?;
+    let ws = req.workspace_id;
+    let mut svc = state.service.lock().unwrap();
+    if !matches!(svc.load(hive_core::workspace_config_session_id(ws)), Ok(Some(_))) {
+        return Err("This code is for a workspace this desktop doesn't have.".into());
+    }
+    if svc.own_devices(ws).unwrap_or_default().iter().any(|d| d.device_id == req.device_id && d.revoked) {
+        return Err("This device was revoked. On the box, run `hive serve enroll --new-device` and use its new code.".into());
+    }
+    svc.certify_device(&req).map_err(map_err)?;
+    tracing::info!(target: "identity", device = %req.device_id, label = %req.label, "approved a device as this account's");
+    let mut out = ApproveDeviceDto { retired: None, retire_error: None };
+    if retire_member {
+        let cfg = hive_core::workspace_config_session_id(ws);
+        for m in device_own_members(&svc, ws, req.device_id) {
+            match svc.remove_member(cfg, ws, m.id.clone()) {
+                Ok(()) => out.retired = Some(m.actor.display_name.clone()),
+                Err(e) => out.retire_error = Some(e.to_string()),
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+fn list_my_devices(state: State<AppState>) -> Result<Vec<MyDeviceDto>, String> {
+    let ws = state.active_workspace_id();
+    let svc = state.service.lock().unwrap();
+    let here = svc.device_id();
+    let hosts = svc.list_hosts(ws).unwrap_or_default();
+    Ok(svc
+        .own_devices(ws)
+        .map_err(map_err)?
+        .into_iter()
+        .map(|d| {
+            let host = hosts.iter().find(|h| h.id == d.device_id.to_string());
+            let short = d.device_id.to_string()[..8].to_string();
+            MyDeviceDto {
+                device_id: d.device_id.to_string(),
+                label: host.map(|h| h.label.clone()).filter(|l| !l.trim().is_empty()).unwrap_or(if d.device_id == here {
+                    "This device".into()
+                } else {
+                    format!("Device {short}")
+                }),
+                fingerprint: d.fingerprint,
+                this_device: d.device_id == here,
+                revoked: d.revoked,
+                last_seen: host.map(|h| rfc3339(h.last_seen)),
+            }
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn list_device_requests(state: State<AppState>) -> Result<Vec<DeviceRequestDto>, String> {
+    let ws = state.active_workspace_id();
+    let svc = state.service.lock().unwrap();
+    let me = svc.author().id.clone();
+    let here = svc.device_id().to_string();
+    let mine = svc.own_devices(ws).unwrap_or_default();
+    Ok(svc
+        .list_hosts(ws)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|h| h.owner_actor_id == me && h.id != here)
+        .filter(|h| Uuid::parse_str(&h.id).is_ok_and(|id| !mine.iter().any(|d| d.device_id == id)))
+        // A box already acting as you re-registers its host as yours too, but
+        // then it IS in `mine`; a stale Device host of this account's other
+        // desktop shows here only if it was never certified.
+        .filter(|h| h.kind == hive_core::HostKind::Worker)
+        .map(|h| DeviceRequestDto { host_id: h.id, label: h.label })
+        .collect())
+}
+
+/// Revoke one of your devices (lost box, re-enrollment): every member stops
+/// accepting its events. Admin+ in the workspace (the same gate as any device
+/// revocation). Never this desktop itself.
+#[tauri::command]
+fn revoke_my_device(state: State<AppState>, device_id: String) -> Result<(), String> {
+    let device = Uuid::parse_str(&device_id).map_err(map_err)?;
+    let ws = state.active_workspace_id();
+    let mut svc = state.service.lock().unwrap();
+    if device == svc.device_id() {
+        return Err("You can't revoke the device you're using.".into());
+    }
+    if !svc.own_devices(ws).map_err(map_err)?.iter().any(|d| d.device_id == device) {
+        return Err("That isn't one of your devices in this workspace.".into());
+    }
+    svc.revoke_device(hive_core::workspace_config_session_id(ws), ws, device).map_err(map_err)?;
+    tracing::info!(target: "identity", device = %device, "revoked one of this account's devices");
+    Ok(())
 }
 
 // ── Relay access user management (Settings → Team) ──────────────────────────
@@ -13744,6 +13981,11 @@ pub fn run() {
             import_github_teams,
             remove_member,
             remove_and_revoke,
+            inspect_device_code,
+            approve_device,
+            list_my_devices,
+            list_device_requests,
+            revoke_my_device,
             set_member_role,
             list_vaults,
             add_vault,
@@ -14346,6 +14588,59 @@ mod dispatch_target_tests {
         assert!(super::runs_here_linked(false, &links, &team, "owner", &team.creator_actor_id, HostBinding::Unbound));
         // An agent sent to a host still runs only there.
         assert!(!super::runs_here_linked(false, &links, &chat, "owner", &chat.creator_actor_id, HostBinding::Elsewhere));
+    }
+
+    #[test]
+    fn enrolled_phone_box_is_the_owner_so_their_desktop_answers() {
+        // Enrolled as the owner's device, the box creates chats and posts as the
+        // owner itself: one human, the owner's chat — no link needed.
+        let mut owner = human("owner", "Alex");
+        owner.actor.account_id = Some(Uuid::new_v4());
+        let mut chat = ChatSession::new("from the phone", Uuid::nil(), "rt");
+        chat.creator_actor_id = "owner".into();
+        chat.members = vec![owner];
+        let links = hive_core::DeviceLinks::default();
+        assert_eq!(super::human_member_count(&chat, &links), 1);
+        assert!(matches!(dispatch_target("@hive hi", &chat, false, &links), Some(DispatchTarget::Primary)));
+        assert!(super::runs_here_linked(false, &links, &chat, "owner", &chat.creator_actor_id, HostBinding::Unbound));
+    }
+
+    #[test]
+    fn retired_box_member_keeps_its_old_chats_answered_by_the_owner() {
+        // A chat the box created as its own member, before enrollment. Its member
+        // was retired; as the owner's alias, its chats are still the owner's.
+        let mut owner = human("owner", "Alex");
+        owner.actor.account_id = Some(Uuid::new_v4());
+        let box_actor = Uuid::new_v4().to_string();
+        let mut config = ChatSession::new("", Uuid::nil(), "");
+        config.members = vec![owner];
+        let mut links = hive_core::DeviceLinks::default();
+        assert!(links.link_retired(&config, &box_actor, "owner"));
+        let mut chat = ChatSession::new("old phone chat", Uuid::nil(), "rt");
+        chat.creator_actor_id = box_actor.clone();
+        chat.members = config.members.clone();
+        assert!(super::runs_here_linked(false, &links, &chat, "owner", &chat.creator_actor_id, HostBinding::Unbound));
+        let mut team = chat.clone();
+        team.members.push(human("teammate", "Ana"));
+        assert!(!super::runs_here_linked(false, &links, &team, "teammate", &team.creator_actor_id, HostBinding::Unbound));
+    }
+
+    #[test]
+    fn a_retired_box_members_messages_read_as_the_owner_via_the_box() {
+        let owner = human("owner", "Alex");
+        let box_actor = Uuid::new_v4().to_string();
+        let mut chat = ChatSession::new("c", Uuid::nil(), "rt");
+        chat.members = vec![owner.clone()];
+        let mut links = hive_core::DeviceLinks::default();
+        assert!(links.link_retired(&chat, &box_actor, "owner"));
+        let mut from_box = hive_core::ChatMessage::new(hive_core::MessageRole::User, "Phone", "hi");
+        from_box.actor_identity = Some(ActorIdentity::new(box_actor.clone(), "Phone", ActorKind::Human));
+        let mut from_owner = hive_core::ChatMessage::new(hive_core::MessageRole::User, "Alex", "hey");
+        from_owner.actor_identity = Some(owner.actor.clone());
+        chat.messages = vec![from_box, from_owner];
+        super::attribute_linked_devices(&mut chat, &links);
+        assert_eq!(chat.messages[0].author, "Alex via Phone");
+        assert_eq!(chat.messages[1].author, "Alex");
     }
 
     #[test]

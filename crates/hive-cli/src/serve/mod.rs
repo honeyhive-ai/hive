@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use hive_core::{workspace_config_session_id, ChatSession, HostKind, MessageRole, Timestamp, WorkspaceHost};
+use hive_runtime::device_enroll::Standing;
 use hive_runtime::ChatService;
 use serde_json::json;
 use tokio::sync::{watch, Notify};
@@ -186,6 +187,95 @@ fn resolve_owner(svc: &ChatService, ws: Uuid, wanted: &str) -> Result<(String, b
     Ok((owner, admin))
 }
 
+/// Pre-enrollment start: this box acts as its own identity. Without
+/// `HIVE_SERVE_OWNER`, it joins the roster as its own member (the original
+/// model). With it, it asks to be enrolled as the owner's device (the code the
+/// owner approves on their desktop) and keeps today's behavior meanwhile: an
+/// existing member registers its host as the owner's (the dispatch stopgap); a
+/// box that isn't a member doesn't join, it waits for approval.
+fn register_own(svc: &mut ChatService, ws: Uuid, host_id: &str, opts: &ServeOptions) -> Result<()> {
+    let config = svc.load(workspace_config_session_id(ws))?;
+    let me = svc.author().clone();
+    let is_member = config.as_ref().is_some_and(|c| c.members.iter().any(|m| m.actor.id == me.id));
+    let Some(wanted) = &opts.owner else {
+        // Announce this box in the workspace roster and publish its identity so
+        // peers verify its events, then register it as an always-on host.
+        if let Err(e) = svc.ensure_self_member(workspace_config_session_id(ws), ws) {
+            eprintln!("serve: joining the workspace roster failed: {e}");
+        }
+        let host = WorkspaceHost::new(host_id.to_string(), HostKind::Worker, opts.label.clone());
+        return svc.register_host(ws, host).context("registering this box as a workspace host");
+    };
+    print_enrollment(svc, ws, &opts.label, Some(wanted));
+    if !is_member {
+        println!("hive serve: waiting for approval; the phone can read the workspace but not write until then.");
+        svc.set_write_block(Some(PENDING.into()));
+        return Ok(());
+    }
+    if let Err(e) = svc.ensure_self_member(workspace_config_session_id(ws), ws) {
+        eprintln!("serve: refreshing this box's identity failed: {e}");
+    }
+    let mut host = WorkspaceHost::new(host_id.to_string(), HostKind::Worker, opts.label.clone());
+    match resolve_owner(svc, ws, wanted) {
+        Ok((owner, admin)) => {
+            if !admin {
+                eprintln!(
+                    "serve: HIVE_SERVE_OWNER: until you approve this box as your device, desktops treat it as {wanted}'s \
+                     only once it is an Admin"
+                );
+            }
+            host.owner_actor_id = owner;
+        }
+        Err(e) => eprintln!("serve: HIVE_SERVE_OWNER ignored: {e}"),
+    }
+    svc.register_host(ws, host).context("registering this box as a workspace host")
+}
+
+/// Print the enrollment code the owner approves on their desktop.
+pub fn print_enrollment(svc: &ChatService, ws: Uuid, label: &str, owner: Option<&str>) {
+    let request = svc.enrollment_request(ws, label);
+    let whose = owner.map(|o| format!("{o}'s")).unwrap_or_else(|| "your".into());
+    println!(
+        "\nTo make this box {whose} own device (everything the phone does is then authored as its owner),\n\
+         approve it on {whose} desktop: Settings > Account > My devices > Add a device, and paste:\n\n  {}\n\n\
+         Check the desktop shows this fingerprint: {}  (label \"{}\")\n",
+        request.encode(),
+        request.fingerprint(),
+        request.label
+    );
+}
+
+/// `hive serve enroll [--new-device]`: print this box's enrollment code. With
+/// `--new-device` (needed after a revocation: a revoked device id stays
+/// revoked), first replace the box's device key with a fresh one.
+pub fn cmd_enroll(cfg: &Config, opts: &ServeOptions, new_device: bool) -> Result<()> {
+    let ws = uuid_of_room(&cfg.room);
+    let svc = open_service(cfg)?;
+    let standing = svc.device_standing(ws, opts.owner.as_deref())?;
+    let svc = match (&standing, new_device) {
+        (Standing::Revoked, false) => bail!(
+            "this box's device was revoked; run `hive serve enroll --new-device` to make a new device key, then approve its code"
+        ),
+        (_, true) => {
+            drop(svc);
+            let ids = hive_runtime::IdentityStore::new(&cfg.data_dir, hive_runtime::FileKeyVault::new(&cfg.data_dir));
+            let rotated = ids.rotate_device()?;
+            println!(
+                "This box has a new device key ({}). Restart hive serve so it uses it (e.g. systemctl --user restart hive-serve).",
+                rotated.device.id
+            );
+            open_service(cfg)?
+        }
+        (Standing::OwnerDevice(o), false) => {
+            println!("This box is already enrolled as {}'s device.", o.display_name);
+            return Ok(());
+        }
+        (Standing::Own, false) => svc,
+    };
+    print_enrollment(&svc, ws, &opts.label, opts.owner.as_deref());
+    Ok(())
+}
+
 /// State shared by the API handlers, the sync loop and the worker thread.
 pub struct Shared {
     pub cfg: Config,
@@ -213,7 +303,16 @@ pub struct Shared {
     /// by the proposal they revise (`api::request_changes`). In memory: a
     /// restart before the revision lands leaves it unlinked.
     pub revisions: Mutex<HashMap<Uuid, api::PendingRevision>>,
+    /// Whose device this box is (see [`Standing`]): its own identity, its
+    /// owner's enrolled device, or revoked. Re-read after every pull.
+    standing: Mutex<Standing>,
 }
+
+/// Why a revoked box refuses writes.
+const REVOKED: &str = "this box's device was revoked by its owner; run `hive serve enroll --new-device` on it and approve the new code on your desktop";
+
+/// Why a box waiting for enrollment (and not a member) refuses writes.
+const PENDING: &str = "this box is waiting for its owner to approve it as their device (the code is in hive serve's log, or run `hive serve enroll`)";
 
 /// The device-local serve state file (read marks).
 fn state_path(cfg: &Config) -> PathBuf {
@@ -262,6 +361,77 @@ impl Shared {
         Ok(out)
     }
 
+    /// Whose device this box currently is.
+    pub fn standing(&self) -> Standing {
+        self.standing.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// `identity` for `GET /v1/health`: who the phone posts as.
+    ///
+    /// `mode`: `owner` (enrolled as the owner's device: the phone acts as the
+    /// owner), `member` (its own workspace member, the pre-enrollment model),
+    /// `pending` (`HIVE_SERVE_OWNER` set, waiting for the owner's approval) or
+    /// `revoked` (read-only until re-enrolled).
+    pub fn identity_json(&self) -> serde_json::Value {
+        let (actor, fingerprint) = {
+            let svc = self.lock();
+            (svc.author().clone(), hive_runtime::device_enroll::fingerprint(&svc.device_public_key()))
+        };
+        let mode = match self.standing() {
+            Standing::OwnerDevice(_) => "owner",
+            Standing::Revoked => "revoked",
+            Standing::Own if self.opts.owner.is_some() => "pending",
+            Standing::Own => "member",
+        };
+        json!({ "mode": mode, "actorId": actor.id, "displayName": actor.display_name, "deviceFingerprint": fingerprint })
+    }
+
+    /// Re-read this box's standing after a pull, switching identity when the
+    /// owner approves it (or revokes it) while it runs. Returns whether it changed.
+    pub fn refresh_standing(&self) -> bool {
+        let next = match self.lock().device_standing(self.ws, self.opts.owner.as_deref()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("serve: reading this box's device standing failed: {e}");
+                return false;
+            }
+        };
+        let prev = self.standing();
+        if next == prev {
+            return false;
+        }
+        {
+            let mut svc = self.lock();
+            match (&prev, &next) {
+                (_, Standing::Revoked) => {
+                    svc.set_write_block(Some(REVOKED.into()));
+                    eprintln!("hive serve: {REVOKED}.");
+                }
+                (_, Standing::OwnerDevice(owner)) => {
+                    let first = !matches!(prev, Standing::OwnerDevice(_));
+                    svc.act_as_owner_device(owner.clone());
+                    svc.set_write_block(None);
+                    if first {
+                        println!("hive serve: approved as {}'s device; the phone now acts as {0}.", owner.display_name);
+                        let host = WorkspaceHost::new(self.host_id.clone(), HostKind::Worker, self.opts.label.clone());
+                        if let Err(e) = svc.register_host(self.ws, host) {
+                            eprintln!("serve: re-registering this host as the owner's failed: {e}");
+                        }
+                    }
+                }
+                (Standing::OwnerDevice(_), Standing::Own) => {
+                    // The owner's certificate no longer counts (the owner left the
+                    // workspace): don't keep writing as them.
+                    svc.set_write_block(Some("this box is no longer enrolled as its owner's device; restart hive serve".into()));
+                    eprintln!("hive serve: no longer enrolled as the owner's device; writes are paused until a restart.");
+                }
+                _ => {}
+            }
+        }
+        *self.standing.lock().unwrap_or_else(|e| e.into_inner()) = next;
+        true
+    }
+
     /// The actor id this box writes as.
     pub fn my_actor_id(&self) -> String {
         self.lock().author().id.clone()
@@ -307,7 +477,10 @@ impl Shared {
     /// slow caller diff a stale snapshot after a newer one, rolling the differ
     /// back and re-emitting `message.done` (and its ntfy push).
     pub fn refresh(&self) {
-        let author = self.lock().author().clone();
+        let (author, links) = {
+            let svc = self.lock();
+            (svc.author().clone(), svc.device_links(self.ws).unwrap_or_default())
+        };
         let me = author.id.clone();
         let mut notices = Vec::new();
         let mut created = Vec::new();
@@ -332,7 +505,7 @@ impl Shared {
                         // Agent replies notify when done; other members'
                         // messages when they appear (only if they mention you).
                         if self.fresh(m.created_at) {
-                            let me = notify::Me::in_chat(&author, s);
+                            let me = notify::Me::in_chat(&author, s, &links);
                             notices.extend(notify::for_message(s, m, done, &me));
                         }
                     }
@@ -498,39 +671,43 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         }
     }
     let mut svc = open_service(&cfg)?;
-    if let Some(name) = &opts.name {
-        svc.set_author_display_name(name.clone());
-    }
     let host_id = svc.device_id().to_string();
-    // A turn cut off by the last stop would otherwise stay "streaming" forever
-    // and never be answered (its placeholder counts as the reply).
-    match worker::recover_interrupted_turns(&mut svc) {
-        Ok(done) if !done.is_empty() => eprintln!("serve: finished {} reply(s) interrupted by the last stop", done.len()),
-        Ok(_) => {}
-        Err(e) => eprintln!("serve: interrupted-turn recovery failed: {e}"),
-    }
-    // Announce this box in the workspace roster and publish its identity so
-    // peers verify its events, then register it as an always-on host.
-    if let Err(e) = svc.ensure_self_member(workspace_config_session_id(ws), ws) {
-        eprintln!("serve: joining the workspace roster failed: {e}");
-    }
-    let mut host = WorkspaceHost::new(host_id.clone(), HostKind::Worker, opts.label.clone());
-    if let Some(wanted) = &opts.owner {
-        match resolve_owner(&svc, ws, wanted) {
-            Ok((owner, admin)) => {
-                if !admin {
-                    eprintln!(
-                        "serve: HIVE_SERVE_OWNER: desktops treat this box as {wanted}'s device only once it is an Admin \
-                         (make it one in the desktop's People panel)"
-                    );
-                }
-                host.owner_actor_id = owner;
+    // Whose device is this box? Enrolled as its owner's (a certificate from the
+    // owner's account key is in the workspace), its own member, or revoked.
+    let standing = svc.device_standing(ws, opts.owner.as_deref()).unwrap_or(Standing::Own);
+    match &standing {
+        Standing::OwnerDevice(owner) => {
+            svc.act_as_owner_device(owner.clone());
+            println!("hive serve: enrolled as {}'s device; the phone acts as {0}.", owner.display_name);
+        }
+        Standing::Revoked => {
+            svc.set_write_block(Some(REVOKED.into()));
+            eprintln!("hive serve: {REVOKED}.");
+        }
+        Standing::Own => {
+            if let Some(name) = &opts.name {
+                svc.set_author_display_name(name.clone());
             }
-            Err(e) => eprintln!("serve: HIVE_SERVE_OWNER ignored: {e}"),
         }
     }
-    svc.register_host(ws, host).context("registering this box as a workspace host")?;
-
+    // A turn cut off by the last stop would otherwise stay "streaming" forever
+    // and never be answered (its placeholder counts as the reply).
+    if standing != Standing::Revoked {
+        match worker::recover_interrupted_turns(&mut svc) {
+            Ok(done) if !done.is_empty() => eprintln!("serve: finished {} reply(s) interrupted by the last stop", done.len()),
+            Ok(_) => {}
+            Err(e) => eprintln!("serve: interrupted-turn recovery failed: {e}"),
+        }
+    }
+    match &standing {
+        Standing::OwnerDevice(_) => {
+            // The owner is already a member; this box only (re)registers its host.
+            let host = WorkspaceHost::new(host_id.clone(), HostKind::Worker, opts.label.clone());
+            svc.register_host(ws, host).context("registering this box as a workspace host")?;
+        }
+        Standing::Revoked => {}
+        Standing::Own => register_own(&mut svc, ws, &host_id, &opts)?,
+    }
     let tunnel = match &opts.remote {
         Some(settings) => Some(tunnel::TunnelHost::open(&cfg.data_dir, settings.clone()).context("opening the relay tunnel state")?),
         None => None,
@@ -552,6 +729,7 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         dashboard_cache: dashboard::Cache::default(),
         rt: tokio::runtime::Handle::current(),
         revisions: Mutex::new(HashMap::new()),
+        standing: Mutex::new(standing),
         cfg,
         opts,
     });
@@ -614,6 +792,7 @@ async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
             Ok((_, pulled)) => {
                 fails = 0;
                 if pulled > 0 {
+                    shared.refresh_standing();
                     shared.refresh();
                     shared.worker_kick.notify_one();
                 }
