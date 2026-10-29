@@ -231,10 +231,19 @@ fn register_own(svc: &mut ChatService, ws: Uuid, host_id: &str, opts: &ServeOpti
     svc.register_host(ws, host).context("registering this box as a workspace host")
 }
 
-/// Print the enrollment code the owner approves on their desktop.
+/// Print the enrollment code the owner approves on their desktop. `owner` is
+/// `HIVE_SERVE_OWNER` (an actor id or display name), shown by name.
 pub fn print_enrollment(svc: &ChatService, ws: Uuid, label: &str, owner: Option<&str>) {
     let request = svc.enrollment_request(ws, label);
-    let whose = owner.map(|o| format!("{o}'s")).unwrap_or_else(|| "your".into());
+    let name = owner.map(|o| {
+        svc.load(workspace_config_session_id(ws))
+            .ok()
+            .flatten()
+            .and_then(|c| c.members.into_iter().find(|m| m.actor.id == o).map(|m| m.actor.display_name))
+            .filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| o.to_string())
+    });
+    let whose = name.map(|o| format!("{o}'s")).unwrap_or_else(|| "your".into());
     println!(
         "\nTo make this box {whose} own device (everything the phone does is then authored as its owner),\n\
          approve it on {whose} desktop: Settings > Account > My devices > Add a device, and paste:\n\n  {}\n\n\
