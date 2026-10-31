@@ -8418,6 +8418,7 @@ async fn maybe_respond(
     session_id: String,
 ) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let started = std::time::Instant::now();
     let local_actor_id = state.local_actor_id();
     let local_host_id = state.local_host_id();
 
@@ -8517,6 +8518,7 @@ async fn maybe_respond(
             return Ok(());
         }
     }
+    tracing::info!(target: "dispatch", session = %sid, ms = started.elapsed().as_millis() as u64, "claimed turn");
     let result = run_turn(&app, &state, sid, workspace_id, &responder).await;
     result.map(|_| ())
 }
@@ -10856,6 +10858,11 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
     // A stream that stayed up at least this long counts as "healthy", so its drop
     // resets the reconnect backoff; a faster flap keeps escalating it.
     const STABLE_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+    // While the stream is live, how often to look for local writes (a reply,
+    // its streaming checkpoints, a turn claim) to push. Nothing else wakes the
+    // loop for them, so a phone waiting on this desktop's answer used to wait
+    // for the 20s heartbeat. A max(row_id) read; no network unless it grew.
+    const LOCAL_WRITES: std::time::Duration = std::time::Duration::from_millis(250);
 
     let mut store = match EventStore::open(&db_path) {
         Ok(s) => s,
@@ -11010,6 +11017,7 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                 // sweeps up any nudge missed while the stream was down, so an SSE
                 // gap never loses events. `sync_pull_once` owns the health /
                 // recovery / `workspace://synced` bookkeeping.
+                let mut pushed_through = store.max_row_id().unwrap_or(0);
                 if let Some((eng, _)) = engine.as_mut() {
                     let _ = sync_pull_once(&app, eng, &mut store, &mut last_sync_err).await;
                 }
@@ -11031,11 +11039,14 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                         heartbeat.tick().await; // drop the immediate first tick
                         let mut cfg = tokio::time::interval(CONFIG_WATCH);
                         cfg.tick().await;
+                        let mut local = tokio::time::interval(LOCAL_WRITES);
+                        local.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                         loop {
                             tokio::select! {
                                 nudge = stream.recv() => match nudge {
                                     // A nudge ("wake up and pull") → pull now.
                                     Some(_seq) => {
+                                        pushed_through = store.max_row_id().unwrap_or(pushed_through);
                                         let _ = sync_pull_once(
                                             &app, eng, &mut store, &mut last_sync_err,
                                         )
@@ -11047,6 +11058,19 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                                         break;
                                     }
                                 },
+                                // Something was stored since the last round (marked
+                                // before it, so a write during a round still counts):
+                                // push it now. A pull's own rows cost one empty round.
+                                _ = local.tick() => {
+                                    let now = store.max_row_id().unwrap_or(pushed_through);
+                                    if now > pushed_through {
+                                        pushed_through = now;
+                                        let _ = sync_pull_once(
+                                            &app, eng, &mut store, &mut last_sync_err,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 // Safety-net heartbeat: refresh at the outer top.
                                 _ = heartbeat.tick() => break,
                                 // Cheap local-config watch: rebuild on a change.
