@@ -1981,28 +1981,51 @@ pub fn pending_mentions(session: &ChatSession) -> Vec<PendingMention> {
     // which — unlike the desktop's inline loop — otherwise never sees it. Bound by
     // cascade depth so an A↔B chain across devices/workers can't loop forever.
     if let Some(last) = session.messages.iter().rev().find(|m| m.role != MessageRole::System) {
-        if matches!(last.role, MessageRole::Assistant | MessageRole::Agent)
-            && session.cascade_depth() < hive_core::MAX_CASCADE_DEPTH
-        {
-            let targets = crate::mentions::parse_mentions(&last.body, session);
-            for aid in &targets.agents {
-                let Some(agent) = session.workspace_agents.iter().find(|a| &a.id == aid) else {
-                    continue;
-                };
-                if agent.name == last.author {
-                    continue; // an agent mentioning itself never re-triggers
-                }
-                out.retain(|p| p.agent_id != *aid);
-                out.push(PendingMention {
-                    session_id: session.id,
-                    message_id: last.id,
-                    agent_id: *aid,
-                    agent_name: agent.name.clone(),
-                });
-            }
+        if let Some(agent) = cascade_target(session, last) {
+            out.retain(|p| p.agent_id != agent.id);
+            out.push(PendingMention {
+                session_id: session.id,
+                message_id: last.id,
+                agent_id: agent.id,
+                agent_name: agent.name.clone(),
+            });
         }
     }
     out
+}
+
+/// What a turn whose model produced no text posts instead of an empty
+/// message (an empty bubble reads as a broken chat, and says nothing about
+/// why). Both the desktop and a headless host use it.
+pub fn empty_reply_notice(runtime_label: &str) -> String {
+    let who = runtime_label.trim();
+    let who = if who.is_empty() { "The model" } else { who };
+    format!(
+        "[error] {who} returned an empty reply. Ask again; if it keeps happening, check that runtime (Settings, Models, Test)."
+    )
+}
+
+/// The one agent an agent's reply hands the conversation to: the first
+/// roster agent it `@mentions` other than itself, within the cascade depth.
+/// One, not every agent named — a reply that lists agents ("I can do it, or
+/// hand it to @coder or @chat") used to wake each of them on its host, so a
+/// greeting drew a reply from every agent. The desktop's inline cascade and
+/// every host's queue use this same rule, so exactly one responder runs.
+pub fn cascade_target<'a>(session: &'a ChatSession, reply: &ChatMessage) -> Option<&'a hive_core::WorkspaceAgent> {
+    if !matches!(reply.role, MessageRole::Assistant | MessageRole::Agent)
+        || session.cascade_depth() >= hive_core::MAX_CASCADE_DEPTH
+    {
+        return None;
+    }
+    let lower = reply.body.to_lowercase();
+    crate::mentions::parse_mentions(&reply.body, session)
+        .agents
+        .iter()
+        .filter_map(|aid| session.workspace_agents.iter().find(|a| &a.id == aid))
+        .filter(|a| a.name != reply.author)
+        // The one named first in the reply (ties: roster order, which every
+        // device shares).
+        .min_by_key(|a| lower.find(&format!("@{}", a.name.to_lowercase())).unwrap_or(usize::MAX))
 }
 
 /// Resolve a workspace runtime's credential to a usable secret — where a
@@ -2071,10 +2094,23 @@ pub fn turns_with_summary(
 }
 
 /// The per-message mapping behind [`turns_from`], before alternation repair.
+///
+/// The turn being answered is always a `user` turn: when the conversation ends
+/// on another participant's reply (an agent handing off with an `@mention`),
+/// that reply is the responder's input, not its own unfinished output. Left as
+/// a trailing `assistant` turn, an OpenAI-style server treats it as a prefill
+/// to continue, and a local model typically ends it at once: an empty reply.
 fn attributed_turns(messages: &[ChatMessage], own_id: Option<Uuid>, own_author: &str) -> Vec<ChatTurn> {
-    messages
+    // "Own" turns stay unprefixed. Key on the responder's stable id when
+    // responding as an agent (robust to rename/duplicate name); for the primary
+    // (no agent id) fall back to a primary-authored turn matched by name.
+    let is_own = |m: &ChatMessage| match own_id {
+        Some(oid) => m.responder_id == Some(oid),
+        None => m.responder_id.is_none() && !own_author.is_empty() && m.author == own_author,
+    };
+    let kept: Vec<&ChatMessage> = messages.iter().filter(|m| !m.body.is_empty() && !m.is_streaming).collect();
+    let mut turns: Vec<ChatTurn> = kept
         .iter()
-        .filter(|m| !m.body.is_empty() && !m.is_streaming)
         .filter_map(|m| {
             let attributed = || {
                 let who = m.author.trim();
@@ -2087,19 +2123,7 @@ fn attributed_turns(messages: &[ChatMessage], own_id: Option<Uuid>, own_author: 
             match m.role {
                 MessageRole::User => Some(ChatTurn::user(attributed())),
                 MessageRole::Assistant | MessageRole::Agent => {
-                    // "Own" turns stay unprefixed. Key on the responder's stable
-                    // id when responding as an agent (robust to rename/duplicate
-                    // name); for the primary (no agent id) fall back to a
-                    // primary-authored turn matched by name.
-                    let is_own = match own_id {
-                        Some(oid) => m.responder_id == Some(oid),
-                        None => {
-                            m.responder_id.is_none()
-                                && !own_author.is_empty()
-                                && m.author == own_author
-                        }
-                    };
-                    if is_own {
+                    if is_own(m) {
                         Some(ChatTurn::assistant(m.body.clone()))
                     } else {
                         Some(ChatTurn::assistant(attributed()))
@@ -2108,7 +2132,14 @@ fn attributed_turns(messages: &[ChatMessage], own_id: Option<Uuid>, own_author: 
                 MessageRole::System => None,
             }
         })
-        .collect()
+        .collect();
+    let last = kept.iter().rev().find(|m| m.role != MessageRole::System);
+    if let (Some(m), Some(t)) = (last, turns.last_mut()) {
+        if matches!(m.role, MessageRole::Assistant | MessageRole::Agent) && !is_own(m) {
+            t.role = "user".into();
+        }
+    }
+    turns
 }
 
 /// Make a turn list provider-safe: coalesce consecutive same-role turns and
@@ -2232,6 +2263,45 @@ mod tests {
             !pend.iter().any(|p| p.agent_name == "Scout"),
             "an agent's self-mention never re-triggers itself"
         );
+    }
+
+    /// Regression (an untagged "Hello"): the primary's greeting listed the
+    /// agents by handle, and every listed agent's host answered it — with an
+    /// empty reply, since each saw the greeting as an assistant turn to
+    /// continue. Exactly one agent is woken, and it sees the greeting as input.
+    #[test]
+    fn a_reply_listing_agents_wakes_one_and_reads_as_its_input() {
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let sid = svc.create_chat("general", wid, "anthropic").unwrap().id;
+        let coder = WorkspaceAgent::new("coder", "r");
+        let chat = WorkspaceAgent::new("chat", "r");
+        let coder_id = coder.id;
+        svc.add_agent(sid, wid, coder).unwrap();
+        svc.add_agent(sid, wid, chat).unwrap();
+        svc.post_user_message(sid, wid, "Hello").unwrap();
+        let m = svc.begin_assistant_message(sid, wid, "Hive", "r", None, None).unwrap();
+        svc.complete_assistant_message(sid, wid, m, "Hi Alex! I can take something myself, or hand it to @chat or @coder.")
+            .unwrap();
+        let s = svc.load(sid).unwrap().unwrap();
+
+        let pend = pending_mentions(&s);
+        assert_eq!(pend.len(), 1, "{pend:?}");
+        assert_eq!(pend[0].agent_name, "chat", "the agent named first");
+        assert_eq!(cascade_target(&s, s.messages.last().unwrap()).map(|a| a.name.as_str()), Some("chat"));
+
+        // The responder's transcript ends on a user turn carrying the greeting.
+        let turns = turns_for(&s, Some(coder_id), "coder");
+        let last = turns.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert!(last.content.contains("Hive: Hi Alex!"), "{}", last.content);
+        assert_eq!(turns.len(), 1, "the user's Hello and the greeting merge into one input turn");
+
+        // The responder's own last reply stays an assistant turn.
+        let own = svc.begin_assistant_message(sid, wid, "coder", "r", Some(coder_id), None).unwrap();
+        svc.complete_assistant_message(sid, wid, own, "On it.").unwrap();
+        let s = svc.load(sid).unwrap().unwrap();
+        assert_eq!(turns_for(&s, Some(coder_id), "coder").last().unwrap().role, "assistant");
     }
 
     #[test]
@@ -3012,14 +3082,22 @@ mod tests {
         svc.complete_assistant_message(sid, wid, m2, "drafting the fix").unwrap();
 
         // From Scout's perspective: its own turn is clean; Nova + the human are
-        // attributed so Scout can tell the contributions apart. Scout's and Nova's
-        // consecutive assistant turns coalesce (alternation repair), preserving
-        // the attribution prefixes.
+        // attributed so Scout can tell the contributions apart. Nova's reply is
+        // the latest message, the one Scout answers, so it is Scout's input (a
+        // user turn), not a continuation of Scout's own output.
         let session = svc.load(sid).unwrap().unwrap();
         let turns = turns_for(&session, None, "Scout");
-        assert_eq!(turns.len(), 2);
+        assert_eq!(turns.len(), 3);
         assert_eq!(turns[0].content, "Mara: kick off");
         assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "found the bug");
+        assert_eq!(turns[2].role, "user");
+        assert_eq!(turns[2].content, "Nova: drafting the fix");
+
+        // Mid-transcript, consecutive agent turns still coalesce, prefixes kept.
+        svc.post_user_message(sid, wid, "thanks").unwrap();
+        let session = svc.load(sid).unwrap().unwrap();
+        let turns = turns_for(&session, None, "Scout");
         assert_eq!(turns[1].content, "found the bug\n\nNova: drafting the fix");
     }
 
@@ -3041,9 +3119,11 @@ mod tests {
 
         let session = svc.load(sid).unwrap().unwrap();
         let turns = turns_for(&session, Some(nova_a), "Nova");
-        // A's turn (id-matched) unprefixed; B's (same name, different id) named.
-        // The two consecutive assistant turns coalesce.
-        assert_eq!(turns.last().unwrap().content, "A analysis\n\nNova: B take");
+        // A's turn (id-matched) unprefixed; B's (same name, different id) named,
+        // and, as the latest message, A's input.
+        assert_eq!(turns[turns.len() - 2].content, "A analysis");
+        assert_eq!(turns.last().unwrap().role, "user");
+        assert_eq!(turns.last().unwrap().content, "Nova: B take");
     }
 
     #[test]

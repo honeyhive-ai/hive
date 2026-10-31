@@ -1178,6 +1178,81 @@ async fn restart_finishes_a_reply_cut_off_mid_stream() {
     again.shutdown();
 }
 
+/// Regression (an untagged "Hello" in a chat): the desktop's @hive greeting
+/// listed the box's agents by handle, and each of them answered it with an
+/// empty reply. Exactly one agent is woken, the greeting reaches its model as
+/// the user's turn, and a model that returns nothing posts a notice instead
+/// of an empty message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_greeting_listing_agents_wakes_one_and_an_empty_model_posts_a_notice() {
+    let (endpoint, model) = spawn_model(vec![vec![]]).await;
+    let h = harness(&endpoint, "m", &[("README.md", "x\n")]).await;
+    let ws = h.handle.shared.ws;
+    let host = this_host(&h).await;
+    let chat_agent = {
+        let mut svc = open_service(&h.desktop).unwrap();
+        let mut agent = WorkspaceAgent::new("chat", "gw");
+        agent.owner_actor_id = svc.author().id.clone();
+        let id = agent.id;
+        svc.add_agent(ws, ws, agent).unwrap();
+        id
+    };
+    sync_once(&h.desktop).await.unwrap();
+    for _ in 0..50 {
+        if h.get("/v1/agents").await["agents"].as_array().unwrap().len() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    for id in [h.agent_id, chat_agent] {
+        h.send(reqwest::Method::PUT, &format!("/v1/agents/{id}/host"), Some(json!({ "hostId": host }))).await;
+    }
+    h.handle.shared.sync_kick.notify_one();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    sync_once(&h.desktop).await.unwrap();
+
+    // On the desktop: Alex says hello; @hive greets and lists the agents.
+    let chat_id = {
+        let mut svc = open_service(&h.desktop).unwrap();
+        let chat = svc.create_chat("general", ws, "gw").unwrap();
+        svc.post_user_message(chat.id, ws, "Hello").unwrap();
+        let m = svc.begin_assistant_message(chat.id, ws, "Hive", "gw", None, None).unwrap();
+        svc.complete_assistant_message(chat.id, ws, m, "Hi Alex! I can take something myself, or hand it to @chat or @coder.")
+            .unwrap();
+        chat.id
+    };
+    sync_once(&h.desktop).await.unwrap();
+
+    let replies = || {
+        let svc = h.handle.shared.lock();
+        svc.load(chat_id)
+            .unwrap()
+            .map(|s| s.messages.into_iter().filter(|m| m.responder_id.is_some()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    for _ in 0..100 {
+        if replies().iter().any(|m| !m.is_streaming) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // Give a second (wrong) responder time to show up, then check.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let got = replies();
+    assert_eq!(got.len(), 1, "exactly one agent answers: {got:?}");
+    assert_eq!(got[0].author, "chat", "the agent named first");
+    assert!(!got[0].is_streaming);
+    assert!(got[0].body.starts_with("[error]") && got[0].body.contains("empty reply"), "{}", got[0].body);
+
+    // The model saw the greeting as the user's turn, not an assistant turn to continue.
+    let bodies = model.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 1, "one model call");
+    let last = bodies[0]["messages"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["role"], "user", "{last}");
+    assert!(last["content"].as_str().unwrap().contains("Hive: Hi Alex!"), "{last}");
+    h.handle.shutdown();
+}
+
 /// refresh() runs at once from the sync loop, the worker and API handlers. A
 /// refresh that loaded its projection before a newer one was diffed must not
 /// roll the differ back, or the next refresh re-emits message.done (and a

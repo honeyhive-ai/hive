@@ -7443,7 +7443,14 @@ fn finalize_reply(
     edits_in_review: bool,
 ) -> Result<String, String> {
     let parsed = hive_runtime::directives::parse_reply_directives(full);
-    let cleaned = redact_workspace_path(&parsed.cleaned, workspace_root);
+    let mut cleaned = redact_workspace_path(&parsed.cleaned, workspace_root);
+    // A turn that produced nothing at all — no text, no directive, no edits —
+    // never posts an empty message: the chat says the model came back empty.
+    let did_nothing = parsed.emojis.is_empty() && parsed.workflows.is_empty() && parsed.proposals.is_empty() && !edits_in_review;
+    if cleaned.trim().is_empty() && did_nothing {
+        tracing::warn!(target: "dispatch", %author, "the model returned an empty reply");
+        cleaned = hive_runtime::empty_reply_notice(author);
+    }
     svc.complete_assistant_message(session_id, workspace_id, message_id, &cleaned)
         .map_err(map_err)?;
     if !parsed.emojis.is_empty() {
@@ -8306,7 +8313,6 @@ async fn send_message(
             let Some(reloaded) = svc.load(sid).map_err(map_err)? else { return Ok(()) };
             reloaded
         };
-        let reply_mentions = parse_mentions(&reply, &reloaded);
         // Only notify when THIS device's user is actually the mentioned human —
         // not any human (which pinged the wrong user), and don't double up with
         // the sync-side `notify_mentions` that fires on other devices.
@@ -8324,12 +8330,17 @@ async fn send_message(
                 .show();
         }
 
-        // Cascade to the next mentioned agent if it's new (agent→agent only;
-        // a reply never re-summons the primary).
-        next_target = reply_mentions
-            .agents
-            .into_iter()
-            .find(|id| !visited.contains(id))
+        // Cascade to the one agent the reply hands off to, if it's new
+        // (agent→agent only; a reply never re-summons the primary). Same rule
+        // as every host's queue (`cascade_target`), so one responder runs.
+        next_target = reloaded
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role != MessageRole::System)
+            .and_then(|m| hive_runtime::cascade_target(&reloaded, m))
+            .map(|a| a.id)
+            .filter(|id| !visited.contains(id))
             .map(DispatchTarget::Agent);
     }
 
@@ -8478,21 +8489,13 @@ async fn maybe_respond(
             // the replying device couldn't run). Bound the chain depth so an
             // A↔B cascade across devices can't loop forever, and never re-answer
             // as the replier itself.
+            // Exactly one agent is handed the turn (`cascade_target`, the rule
+            // every host's queue uses); it runs here only if it's ours.
             Some(m) if matches!(m.role, MessageRole::Assistant | MessageRole::Agent) => {
-                if session.cascade_depth() >= MAX_CASCADE_DEPTH {
-                    None
-                } else {
-                    parse_mentions(&m.body, &session)
-                        .agents
-                        .iter()
-                        .filter_map(|aid| session.workspace_agents.iter().find(|a| &a.id == aid))
-                        .filter(|a| a.name != m.author)
-                        .find_map(|a| {
-                            let responder = responder_for(&state, &session, Some(a));
-                            runs_here(&responder)
-                                .then_some((session.workspace_id, responder, m.id))
-                        })
-                }
+                hive_runtime::cascade_target(&session, m).and_then(|a| {
+                    let responder = responder_for(&state, &session, Some(a));
+                    runs_here(&responder).then_some((session.workspace_id, responder, m.id))
+                })
             }
             _ => None,
         }

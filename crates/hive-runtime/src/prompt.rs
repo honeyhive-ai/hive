@@ -219,7 +219,10 @@ fn mention_guidance() -> &'static str {
     "You can address other participants with @mentions: @primary for the \
 coordinator, @<agent name> for a specific agent, @<name> for a specific human, \
 @owners/@admins for a role group, and @you to notify the humans present. Only \
-mention someone when you need their input."
+mention someone when you need their input. Writing @<agent name> hands the \
+conversation to that agent at once: it replies next. So @mention one agent, and \
+only when you are handing it work now; when you only refer to agents (listing \
+who is here, offering options), write their names without the @."
 }
 
 fn workflow_guidance() -> &'static str {

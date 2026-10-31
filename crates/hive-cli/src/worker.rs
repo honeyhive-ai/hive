@@ -453,9 +453,13 @@ async fn run_turn(
         Ok(reply) => {
             let worktree = eager.or(reply.worktree);
             let captured = worktree.as_ref().and_then(|wt| wt.diff().ok()).filter(|d| !d.trim().is_empty());
+            // A model that produced nothing (and changed no files) never posts
+            // an empty reply: the chat gets a notice saying so, as on the desktop.
+            let empty = reply.text.trim().is_empty() && captured.is_none();
+            let body = if empty { hive_runtime::empty_reply_notice(&format!("@{}", agent.name)) } else { reply.text };
             {
                 let mut svc = lock(svc);
-                svc.complete_assistant_message(s.id, s.workspace_id, mid, reply.text)?;
+                svc.complete_assistant_message(s.id, s.workspace_id, mid, body)?;
                 if let (Some(wt), Some(diff)) = (worktree.as_ref(), captured) {
                     let files = wt.changed_files().unwrap_or_default();
                     let n = files.len();
@@ -474,8 +478,13 @@ async fn run_turn(
                 let _ = wt.remove();
             }
             sink.changed();
-            sink.status(s.id, agent.id, TurnState::Done, None);
-            println!("   @{} done", agent.name);
+            if empty {
+                sink.status(s.id, agent.id, TurnState::Error, Some("the model returned an empty reply"));
+                println!("   @{} returned an empty reply", agent.name);
+            } else {
+                sink.status(s.id, agent.id, TurnState::Done, None);
+                println!("   @{} done", agent.name);
+            }
             Ok(())
         }
         Err(e) => {
