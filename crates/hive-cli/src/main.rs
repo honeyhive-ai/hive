@@ -193,23 +193,39 @@ fn open_service(cfg: &Config) -> Result<ChatService> {
 /// ingest. Uses its own EventStore connection (shares the WAL file), as the app
 /// does. Returns (pushed, pulled) counts.
 async fn sync_once(cfg: &Config) -> Result<(usize, usize)> {
+    let mut engine = sync_engine(cfg)?;
+    let mut store = EventStore::open(cfg.data_dir.join("hive.db"))?;
+    sync_round(&mut engine, &mut store).await
+}
+
+/// The relay client this config syncs through.
+fn relay_client(cfg: &Config) -> Result<RelayClient> {
     let relay_url = cfg
         .relay_url
         .clone()
         .ok_or_else(|| anyhow!("set HIVE_RELAY_URL to sync"))?;
-    let relay = RelayClient::new(&relay_url)
+    Ok(RelayClient::new(&relay_url)
         .with_auth(cfg.token.clone())
-        .with_github_token(cfg.github_token.clone());
-    let mut engine = SyncEngine::new(relay, cfg.room.clone());
+        .with_github_token(cfg.github_token.clone()))
+}
+
+/// A sync engine for this config. Kept across rounds (as `hive serve` does),
+/// it scans only rows stored since its last push instead of the whole store.
+fn sync_engine(cfg: &Config) -> Result<SyncEngine> {
+    let mut engine = SyncEngine::new(relay_client(cfg)?, cfg.room.clone());
     if let Some(pass) = &cfg.key {
         engine = engine.with_key(derive_workspace_key(pass));
     }
-    let mut store = EventStore::open(cfg.data_dir.join("hive.db"))?;
-    let to_push = engine.take_unpushed(&store)?;
+    Ok(engine)
+}
+
+/// One push + pull round: (pushed, pulled).
+async fn sync_round(engine: &mut SyncEngine, store: &mut EventStore) -> Result<(usize, usize)> {
+    let to_push = engine.take_unpushed(store)?;
     let pushed = to_push.len();
     engine.push_envelopes(&to_push).await?;
     let fetched = engine.fetch_new().await?;
-    let pulled = engine.apply_fetched(&mut store, &fetched)?;
+    let pulled = engine.apply_fetched(store, &fetched)?;
     Ok((pushed, pulled))
 }
 

@@ -8,8 +8,10 @@
 //! [`Differ`] compares the projected chats with what it saw last time and
 //! emits `message.created` / `message.done` / `proposal.created` /
 //! `chat.updated` for the difference. So a reply streamed on the desktop and
-//! synced in looks the same to the phone as one this box produced. Only
-//! `message.delta` and `turn.status` come straight from the worker.
+//! synced in looks the same to the phone as one this box produced. The
+//! worker's own `message.delta` and `turn.status` come straight from it; a
+//! reply streaming elsewhere (the desktop) becomes `message.delta` as its
+//! checkpointed text syncs in ([`Change::MessageDelta`]).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -76,8 +78,8 @@ impl Hub {
 #[derive(Debug, Default, Clone)]
 struct ChatSnap {
     title: String,
-    /// message id → still streaming
-    messages: HashMap<Uuid, bool>,
+    /// message id → (still streaming, body length in bytes)
+    messages: HashMap<Uuid, (bool, usize)>,
     /// proposal id → what the phone shows of it
     proposals: HashMap<Uuid, ProposalSnap>,
     /// Workflow gates awaiting approval: (run id, node id, attempt).
@@ -110,6 +112,9 @@ fn proposal_snap(p: &ActionProposal) -> ProposalSnap {
 pub enum Change {
     MessageCreated { chat: Uuid, message: Uuid },
     MessageDone { chat: Uuid, message: Uuid },
+    /// A still-streaming reply's body grew past byte `from` (its text so far
+    /// synced in from the device writing it).
+    MessageDelta { chat: Uuid, message: Uuid, from: usize },
     ProposalCreated { chat: Uuid, proposal: Uuid },
     /// A known proposal's votes, thread, status or revision link changed.
     ProposalUpdated { chat: Uuid, proposal: Uuid },
@@ -128,7 +133,7 @@ pub struct Differ {
 fn snap(s: &ChatSession) -> ChatSnap {
     ChatSnap {
         title: s.title.clone(),
-        messages: s.messages.iter().map(|m| (m.id, m.is_streaming)).collect(),
+        messages: s.messages.iter().map(|m| (m.id, (m.is_streaming, m.body.len()))).collect(),
         proposals: s.proposals.iter().map(|p| (p.id, proposal_snap(p))).collect(),
         gates: awaiting_gates(s).collect(),
     }
@@ -178,9 +183,12 @@ impl Differ {
                             out.push(Change::MessageDone { chat: s.id, message: m.id });
                         }
                     }
-                    Some(true) if !m.is_streaming => {
+                    Some((true, _)) if !m.is_streaming => {
                         touched = true;
                         out.push(Change::MessageDone { chat: s.id, message: m.id });
+                    }
+                    Some(&(true, from)) if m.body.len() > from => {
+                        out.push(Change::MessageDelta { chat: s.id, message: m.id, from });
                     }
                     _ => {}
                 }
@@ -265,6 +273,30 @@ mod tests {
         s.messages[0].body = "hi".into();
         let c = d.diff(std::slice::from_ref(&s));
         assert_eq!(c, vec![Change::MessageDone { chat: s.id, message: mid }, Change::ChatUpdated { chat: s.id }]);
+    }
+
+    /// A reply streaming on another device: each checkpoint that syncs in is
+    /// a delta from where the last one ended; completion is a done, not a delta.
+    #[test]
+    fn differ_reports_synced_streaming_text_as_deltas() {
+        let mut d = Differ::default();
+        let mut s = chat();
+        let mut m = ChatMessage::new(MessageRole::Assistant, "Hive", "");
+        m.is_streaming = true;
+        let mid = m.id;
+        s.messages.push(m);
+        d.seed(std::slice::from_ref(&s));
+        s.messages[0].body = "Hel".into();
+        assert_eq!(d.diff(std::slice::from_ref(&s)), vec![Change::MessageDelta { chat: s.id, message: mid, from: 0 }]);
+        s.messages[0].body = "Hello".into();
+        assert_eq!(d.diff(std::slice::from_ref(&s)), vec![Change::MessageDelta { chat: s.id, message: mid, from: 3 }]);
+        assert!(d.diff(std::slice::from_ref(&s)).is_empty());
+        s.messages[0].body = "Hello there".into();
+        s.messages[0].is_streaming = false;
+        assert_eq!(
+            d.diff(std::slice::from_ref(&s)),
+            vec![Change::MessageDone { chat: s.id, message: mid }, Change::ChatUpdated { chat: s.id }]
+        );
     }
 
     #[test]

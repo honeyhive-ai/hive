@@ -24,7 +24,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use hive_core::{workspace_config_session_id, ChatSession, HostKind, MessageRole, Timestamp, WorkspaceHost};
 use hive_runtime::device_enroll::Standing;
-use hive_runtime::ChatService;
+use hive_runtime::{ChatService, EventStore};
 use serde_json::json;
 use tokio::sync::{watch, Notify};
 use uuid::Uuid;
@@ -297,6 +297,9 @@ pub struct Shared {
     pub svc: Mutex<ChatService>,
     pub hub: hub::Hub,
     differ: Mutex<hub::Differ>,
+    /// Replies this box's worker is streaming: their tokens already went out
+    /// as `message.delta`, so the differ doesn't repeat their checkpoints.
+    local_streams: Mutex<HashSet<Uuid>>,
     /// chat id → id of the last message the phone has seen.
     read_marks: Mutex<HashMap<Uuid, Uuid>>,
     pub sync_kick: Notify,
@@ -505,8 +508,21 @@ impl Shared {
             for change in differ.diff(&sessions) {
                 use hub::Change;
                 match change {
+                    Change::MessageDelta { chat, message, from } => {
+                        if self.local_streams.lock().unwrap_or_else(|e| e.into_inner()).contains(&message) {
+                            continue;
+                        }
+                        let Some(s) = sessions.iter().find(|s| s.id == chat) else { continue };
+                        let Some(m) = s.messages.iter().find(|m| m.id == message) else { continue };
+                        if let Some(text) = m.body.get(from..) {
+                            self.hub.emit("message.delta", json!({ "chatId": chat, "messageId": message, "text": text }));
+                        }
+                    }
                     Change::MessageCreated { chat, message } | Change::MessageDone { chat, message } => {
                         let done = matches!(change, Change::MessageDone { .. });
+                        if done {
+                            self.local_streams.lock().unwrap_or_else(|e| e.into_inner()).remove(&message);
+                        }
                         let Some(s) = sessions.iter().find(|s| s.id == chat) else { continue };
                         let Some(m) = s.messages.iter().find(|m| m.id == message) else { continue };
                         let name = if done { "message.done" } else { "message.created" };
@@ -595,6 +611,7 @@ impl TurnSink for ServeSink {
     }
 
     fn delta(&self, chat: Uuid, message: Uuid, text: &str) {
+        self.0.local_streams.lock().unwrap_or_else(|e| e.into_inner()).insert(message);
         self.0.hub.emit("message.delta", json!({ "chatId": chat, "messageId": message, "text": text }));
     }
 
@@ -729,6 +746,7 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         svc: Mutex::new(svc),
         hub: hub::Hub::new(),
         differ: Mutex::new(hub::Differ::default()),
+        local_streams: Mutex::new(HashSet::new()),
         read_marks: Mutex::new(load_read_marks(&cfg)),
         sync_kick: Notify::new(),
         worker_kick: Notify::new(),
@@ -793,11 +811,57 @@ async fn token_watch(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
     }
 }
 
-/// Relay sync: every few seconds, and immediately after a local write.
+/// While the relay's push stream is open, a full round this often anyway
+/// catches a nudge the stream dropped (the desktop's heartbeat, too).
+const SYNC_SAFETY_POLL: Duration = Duration::from_secs(20);
+
+/// A push stream up at least this long was healthy: its drop resets the
+/// reconnect backoff.
+const STREAM_STABLE_AFTER: Duration = Duration::from_secs(30);
+
+/// Relay sync: immediately after a local write, when the relay's push stream
+/// says something new arrived, and every few seconds while that stream is down.
+///
+/// The engine and store live as long as the loop, so a round only scans what
+/// was stored since the last one.
 async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    let (mut engine, mut store) = match crate::sync_engine(&shared.cfg)
+        .and_then(|e| Ok((e, EventStore::open(shared.cfg.data_dir.join("hive.db"))?)))
+    {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("sync: cannot start: {e}");
+            return;
+        }
+    };
     let mut fails: u32 = 0;
+    // The relay's push stream ("pull now" nudges), with its reconnect backoff.
+    let mut stream: Option<hive_runtime::SseStream> = None;
+    let mut stream_since = tokio::time::Instant::now();
+    let mut stream_attempt: u32 = 0;
+    let mut next_stream_try = tokio::time::Instant::now();
+    let mut stream_unsupported = false;
     while !shared.stopping() {
-        let wait = match sync_once(&shared.cfg).await {
+        // Subscribe before pulling: whatever lands from here on queues a nudge.
+        if stream.is_none() && !stream_unsupported && tokio::time::Instant::now() >= next_stream_try {
+            match crate::relay_client(&shared.cfg) {
+                Ok(c) => match c.open_event_stream(&shared.cfg.room).await {
+                    Ok(s) => {
+                        stream_since = tokio::time::Instant::now();
+                        stream = Some(s);
+                    }
+                    Err(hive_runtime::SseConnectError::Unsupported) => stream_unsupported = true,
+                    Err(e) => {
+                        let delay = hive_runtime::next_backoff(stream_attempt);
+                        stream_attempt = stream_attempt.saturating_add(1);
+                        next_stream_try = tokio::time::Instant::now() + delay;
+                        eprintln!("sync: no relay push stream ({e}); polling, retry in {}s", delay.as_secs());
+                    }
+                },
+                Err(_) => stream_unsupported = true,
+            }
+        }
+        let wait = match crate::sync_round(&mut engine, &mut store).await {
             Ok((_, pulled)) => {
                 fails = 0;
                 if pulled > 0 {
@@ -805,7 +869,11 @@ async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
                     shared.refresh();
                     shared.worker_kick.notify_one();
                 }
-                shared.opts.sync_every
+                if stream.is_some() {
+                    SYNC_SAFETY_POLL
+                } else {
+                    shared.opts.sync_every
+                }
             }
             Err(_) if shared.stopping() => return,
             Err(e) => {
@@ -818,6 +886,21 @@ async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
         tokio::select! {
             _ = tokio::time::sleep(wait) => {}
             _ = shared.sync_kick.notified(), if fails == 0 => {}
+            nudge = async { stream.as_mut().expect("guarded").recv().await }, if stream.is_some() => {
+                if nudge.is_none() {
+                    // Dropped. One that stayed up a while reconnects at once; a
+                    // flapping one backs off further each time (polling meanwhile).
+                    stream = None;
+                    if stream_since.elapsed() >= STREAM_STABLE_AFTER {
+                        stream_attempt = 0;
+                        next_stream_try = tokio::time::Instant::now();
+                    } else {
+                        let delay = hive_runtime::next_backoff(stream_attempt);
+                        stream_attempt = stream_attempt.saturating_add(1);
+                        next_stream_try = tokio::time::Instant::now() + delay;
+                    }
+                }
+            }
             _ = stop.wait_for(|s| *s) => return,
         }
     }
