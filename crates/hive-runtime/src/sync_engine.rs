@@ -50,6 +50,9 @@ pub struct SyncEngine {
     /// store is the source of truth; this set is bounded by the number of events
     /// in the workspace (same order as the durable set).
     seen: HashSet<Uuid>,
+    /// Highest store row the push scan has looked at; 0 = scan everything.
+    /// Reset on a failed push so the rolled-back envelopes are found again.
+    scanned_row: i64,
     /// highest relay server sequence fetched so far. Loaded from the durable
     /// `sync_cursor` on first use and persisted whenever it advances, so a
     /// restart resumes from the durable cursor instead of 0.
@@ -99,6 +102,7 @@ impl SyncEngine {
             relay,
             workspace: workspace.into(),
             seen: HashSet::new(),
+            scanned_row: 0,
             last_fetched_seq: 0,
             loaded: false,
             pending: Vec::new(),
@@ -264,6 +268,19 @@ impl SyncEngine {
         self.ensure_loaded(store)?;
         self.persist_pending(store)?;
         let mut out = Vec::new();
+        if self.scanned_row > 0 {
+            // Incremental: only rows stored since the last scan. Everything at
+            // or below `scanned_row` was already collected (or seen), and a
+            // failed push resets the mark, so nothing is skipped.
+            let (last, envs) = store.envelopes_after_row(self.scanned_row)?;
+            self.scanned_row = last;
+            out.extend(envs.into_iter().filter(|env| self.seen.insert(env.event_id)));
+            return Ok(out);
+        }
+        // Full scan (first round, or after a failed push). Read the high-water
+        // mark first: a row committed during the scan has a larger id, so the
+        // next incremental round finds it (and `seen` dedups any overlap).
+        let mark = store.max_row_id()?;
         for session_id in store.list_session_ids()? {
             for env in store.list(session_id)? {
                 // `seen` is seeded from the durable `pushed` table, so this skips
@@ -275,6 +292,7 @@ impl SyncEngine {
                 }
             }
         }
+        self.scanned_row = mark;
         Ok(out)
     }
 
@@ -294,6 +312,7 @@ impl SyncEngine {
                     for unsent in &envelopes[i..] {
                         self.seen.remove(&unsent.event_id);
                     }
+                    self.scanned_row = 0;
                     return Err(e);
                 }
             };
@@ -301,6 +320,7 @@ impl SyncEngine {
                 for unsent in &envelopes[i..] {
                     self.seen.remove(&unsent.event_id);
                 }
+                self.scanned_row = 0;
                 return Err(e.into());
             }
             // Delivered: queue it for the durable `pushed` table so a restart
@@ -618,6 +638,34 @@ mod tests {
         assert!(eng.push_envelopes(&batch).await.is_err());
         let retry = eng.take_unpushed(&store).unwrap();
         assert_eq!(retry.len(), 1, "unsent events must be retryable after a failed push");
+    }
+
+    /// After the first full scan, rounds scan only new rows — and still find
+    /// every new event, while a failed push makes the next round rescan.
+    #[tokio::test]
+    async fn push_scan_is_incremental_and_rescans_after_a_failure() {
+        let base = spawn_relay().await;
+        let mut store = EventStore::open_in_memory().unwrap();
+        let (sid, wid) = seed_chat(&mut store);
+        let mut eng = SyncEngine::new(RelayClient::new(&base), Uuid::new_v4().to_string())
+            .with_key(hive_core::derive_workspace_key("incremental room"));
+        let first = eng.take_unpushed(&store).unwrap();
+        assert_eq!(first.len(), 1);
+        eng.push_envelopes(&first).await.unwrap();
+        assert!(eng.take_unpushed(&store).unwrap().is_empty());
+
+        let msg = |body: &str| SessionEvent::MessageAppended { message: ChatMessage::new(MessageRole::User, "Mara", body) };
+        let e = store.append(sid, wid, msg("hi")).unwrap();
+        let batch = eng.take_unpushed(&store).unwrap();
+        assert_eq!(batch.iter().map(|e| e.event_id).collect::<Vec<_>>(), [e.event_id]);
+
+        // That push fails (relay gone): the next round finds it again.
+        let mut offline = SyncEngine::new(RelayClient::new("http://127.0.0.1:9"), Uuid::new_v4().to_string())
+            .with_key(hive_core::derive_workspace_key("incremental room"));
+        std::mem::swap(&mut eng.relay, &mut offline.relay);
+        assert!(eng.push_envelopes(&batch).await.is_err());
+        let retry = eng.take_unpushed(&store).unwrap();
+        assert_eq!(retry.iter().map(|e| e.event_id).collect::<Vec<_>>(), [e.event_id]);
     }
 
     #[tokio::test]

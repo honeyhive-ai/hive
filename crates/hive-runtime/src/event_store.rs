@@ -12,7 +12,9 @@
 //! indexed columns (`session_id`, `sequence`, `kind`, `scope`, `timestamp`)
 //! exist for efficient ordering/filtering and are derived from the envelope.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use hive_core::{project_with_options, ChatSession, SessionEvent, SessionEventEnvelope};
 use rusqlite::{Connection, OptionalExtension};
@@ -45,7 +47,24 @@ pub struct StoredCompaction {
 /// An append-only, per-session-sequenced event log over SQLite.
 pub struct EventStore {
     conn: Connection,
+    /// Projections reused while their session's rows are unchanged. A busy
+    /// workspace-config log (host heartbeats) runs to tens of thousands of
+    /// events, and every chat load projects it again, so without this one
+    /// dispatch or UI refresh spent seconds re-folding the same log.
+    projections: Mutex<HashMap<ProjectionKey, (RowsSig, Option<ChatSession>)>>,
 }
+
+/// (session, trusted founder, trusted workspace): what a projection depends on
+/// besides the session's rows.
+type ProjectionKey = (Uuid, Option<String>, Option<Uuid>);
+
+/// (row count, max row id) of a session. Any append raises the max row id and
+/// any delete lowers the count, so an equal signature means the same rows
+/// (envelope rows are never updated in place).
+type RowsSig = (i64, i64);
+
+/// Cached projections kept at most; past this the cache starts over.
+const PROJECTION_CACHE_MAX: usize = 256;
 
 impl EventStore {
     /// Open (creating if needed) the event store at `path`.
@@ -122,7 +141,7 @@ impl EventStore {
             );
             "#,
         )?;
-        Ok(Self { conn })
+        Ok(Self { conn, projections: Mutex::new(HashMap::new()) })
     }
 
     /// Highest sequence recorded for a session, if any.
@@ -381,6 +400,28 @@ impl EventStore {
         )
     }
 
+    /// Every envelope stored after row `after`, in row order, with the highest
+    /// row id seen (`after` when there are none) — the incremental push scan.
+    /// Row ids only grow (AUTOINCREMENT, one writer at a time), so a later call
+    /// from the returned row id never misses a row committed since.
+    pub fn envelopes_after_row(&self, after: i64) -> Result<(i64, Vec<SessionEventEnvelope>)> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT row_id, envelope_json FROM events WHERE row_id > ?1 ORDER BY row_id ASC")?;
+        let rows = stmt.query_map([after], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let mut last = after;
+        let mut out = Vec::new();
+        for row in rows {
+            let (row_id, json) = row?;
+            last = last.max(row_id);
+            match serde_json::from_str::<SessionEventEnvelope>(&json) {
+                Ok(env) => out.push(env),
+                Err(e) => tracing::warn!(error = %e, "skipping unparseable event row during push scan"),
+            }
+        }
+        Ok((last, out))
+    }
+
     /// Envelopes for a session with `sequence > after`, in order — the sync
     /// fetch path.
     pub fn list_after(&self, session_id: Uuid, after: i64) -> Result<Vec<SessionEventEnvelope>> {
@@ -592,11 +633,28 @@ impl EventStore {
         // feed a different subset when a snapshot is ingested after its own deltas
         // — reintroducing cross-device divergence. Bounded-cost compaction
         // (canonical lamport-ordered slicing) is a follow-up; correctness first.
+        let sig: RowsSig = self.conn.query_row(
+            "SELECT COUNT(*), COALESCE(MAX(row_id), 0) FROM events WHERE session_id = ?1",
+            [session_id.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let key: ProjectionKey = (session_id, trusted_founder.map(str::to_string), trusted_workspace);
+        if let Some((cached, session)) = self.projections.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            if *cached == sig {
+                return Ok(session.clone());
+            }
+        }
         let envelopes = self.query_envelopes(
             "SELECT envelope_json FROM events WHERE session_id = ?1 ORDER BY row_id ASC",
             [session_id.to_string()],
         )?;
-        Ok(project_with_options(&envelopes, trusted_founder, trusted_workspace))
+        let session = project_with_options(&envelopes, trusted_founder, trusted_workspace);
+        let mut cache = self.projections.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= PROJECTION_CACHE_MAX && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, (sig, session.clone()));
+        Ok(session)
     }
 
     /// Row id of the latest `sessionSnapshot` for a session, if any.
@@ -789,6 +847,43 @@ mod tests {
         assert_eq!(sa, sb, "stores diverged under different ingest order");
         assert_eq!(sa.title, "Second", "canonical-latest title wins");
         assert!(sa.members.is_empty(), "m1 added then removed");
+    }
+
+    /// The projection cache never serves a stale session: an append (also one
+    /// made through another connection to the same file) or a delete re-folds.
+    #[test]
+    fn cached_projection_follows_appends_and_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hive.db");
+        let mut store = EventStore::open(&path).unwrap();
+        let session = ChatSession::new("Demo", Uuid::nil(), "anthropic");
+        let (sid, wid) = (session.id, session.workspace_id);
+        store.append(sid, wid, SessionEvent::SessionSnapshot { session: Box::new(session) }).unwrap();
+        let msg = |body: &str| SessionEvent::MessageAppended { message: ChatMessage::new(MessageRole::User, "Mara", body) };
+        store.append(sid, wid, msg("one")).unwrap();
+        assert_eq!(store.load_session(sid).unwrap().unwrap().messages.len(), 1);
+        assert_eq!(store.load_session(sid).unwrap().unwrap().messages.len(), 1, "cache hit");
+
+        let mut other = EventStore::open(&path).unwrap();
+        other.append(sid, wid, msg("two")).unwrap();
+        let bodies: Vec<_> = store.load_session(sid).unwrap().unwrap().messages.into_iter().map(|m| m.body).collect();
+        assert_eq!(bodies, ["one", "two"], "a write through another connection is seen");
+
+        store.delete_session(sid).unwrap();
+        assert!(store.load_session(sid).unwrap().is_none(), "a delete is seen");
+    }
+
+    #[test]
+    fn envelopes_after_row_returns_only_newer_rows() {
+        let (mut store, sid, wid) = seeded_store();
+        let mark = store.max_row_id().unwrap();
+        assert_eq!(store.envelopes_after_row(mark).unwrap(), (mark, vec![]));
+        let e = store
+            .append(sid, wid, SessionEvent::SessionTitleChanged { title: "t".into() })
+            .unwrap();
+        let (last, envs) = store.envelopes_after_row(mark).unwrap();
+        assert_eq!(last, mark + 1);
+        assert_eq!(envs.iter().map(|e| e.event_id).collect::<Vec<_>>(), [e.event_id]);
     }
 
     #[test]
