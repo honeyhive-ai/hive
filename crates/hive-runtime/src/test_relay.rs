@@ -27,6 +27,8 @@ struct MockState {
     envelopes: HashMap<String, Vec<Value>>,
     /// workspace → published key rotations (opaque).
     keyrings: HashMap<String, Vec<Value>>,
+    /// workspace → device slot → presence blob (overwritten in place).
+    presence: HashMap<String, HashMap<String, Value>>,
     /// pairing code → opaque payload.
     pairings: HashMap<String, String>,
     pair_seq: u64,
@@ -47,8 +49,7 @@ pub fn router() -> Router {
             "/v1/workspaces/:ws/keyring",
             post(push_keyring).get(list_keyring),
         )
-        // Presence is transient metadata; tests don't assert on it, so accept + drop.
-        .route("/v1/workspaces/:ws/presence", post(|| async { Json(json!({"ok": true})) }))
+        .route("/v1/workspaces/:ws/presence", post(put_presence).get(list_presence))
         .route("/v1/pair", post(create_pair))
         .route("/v1/pair/:code", get(resolve_pair))
         .with_state(state)
@@ -90,6 +91,22 @@ async fn list_envelopes(
         })
         .unwrap_or_default();
     Json(Value::Array(rows))
+}
+
+#[derive(serde::Deserialize)]
+struct PresenceReq {
+    device_id: String,
+    data: Value,
+}
+
+async fn put_presence(State(st): State<Shared>, Path(ws): Path<String>, Json(req): Json<PresenceReq>) -> Json<Value> {
+    st.lock().unwrap().presence.entry(ws).or_default().insert(req.device_id, req.data);
+    Json(json!({ "ok": true }))
+}
+
+async fn list_presence(State(st): State<Shared>, Path(ws): Path<String>) -> Json<Value> {
+    let map = st.lock().unwrap().presence.get(&ws).cloned().unwrap_or_default();
+    Json(json!(map))
 }
 
 async fn push_keyring(

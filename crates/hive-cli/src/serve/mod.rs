@@ -204,7 +204,7 @@ fn register_own(svc: &mut ChatService, ws: Uuid, host_id: &str, opts: &ServeOpti
             eprintln!("serve: joining the workspace roster failed: {e}");
         }
         let host = WorkspaceHost::new(host_id.to_string(), HostKind::Worker, opts.label.clone());
-        return svc.register_host(ws, host).context("registering this box as a workspace host");
+        return svc.ensure_host(ws, host).map(|_| ()).context("registering this box as a workspace host");
     };
     print_enrollment(svc, ws, &opts.label, Some(wanted));
     if !is_member {
@@ -228,7 +228,7 @@ fn register_own(svc: &mut ChatService, ws: Uuid, host_id: &str, opts: &ServeOpti
         }
         Err(e) => eprintln!("serve: HIVE_SERVE_OWNER ignored: {e}"),
     }
-    svc.register_host(ws, host).context("registering this box as a workspace host")
+    svc.ensure_host(ws, host).map(|_| ()).context("registering this box as a workspace host")
 }
 
 /// Print the enrollment code the owner approves on their desktop. `owner` is
@@ -318,6 +318,9 @@ pub struct Shared {
     /// Whose device this box is (see [`Standing`]): its own identity, its
     /// owner's enrolled device, or revoked. Re-read after every pull.
     standing: Mutex<Standing>,
+    /// Host liveness from the relay's presence channel (see
+    /// [`hive_runtime::host_presence`]), refreshed by `presence_loop`.
+    pub presence: hive_runtime::HostPresence,
 }
 
 /// Why a revoked box refuses writes.
@@ -426,7 +429,7 @@ impl Shared {
                     if first {
                         println!("hive serve: approved as {}'s device; the phone now acts as {0}.", owner.display_name);
                         let host = WorkspaceHost::new(self.host_id.clone(), HostKind::Worker, self.opts.label.clone());
-                        if let Err(e) = svc.register_host(self.ws, host) {
+                        if let Err(e) = svc.ensure_host(self.ws, host) {
                             eprintln!("serve: re-registering this host as the owner's failed: {e}");
                         }
                     }
@@ -732,7 +735,7 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         Standing::OwnerDevice(_) => {
             // The owner is already a member; this box only (re)registers its host.
             let host = WorkspaceHost::new(host_id.clone(), HostKind::Worker, opts.label.clone());
-            svc.register_host(ws, host).context("registering this box as a workspace host")?;
+            svc.ensure_host(ws, host).context("registering this box as a workspace host")?;
         }
         Standing::Revoked => {}
         Standing::Own => register_own(&mut svc, ws, &host_id, &opts)?,
@@ -760,6 +763,7 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         rt: tokio::runtime::Handle::current(),
         revisions: Mutex::new(HashMap::new()),
         standing: Mutex::new(standing),
+        presence: hive_runtime::HostPresence::new(),
         cfg,
         opts,
     });
@@ -793,6 +797,7 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
     });
     if shared.cfg.relay_url.is_some() {
         tokio::spawn(sync_loop(shared.clone(), rx.clone()));
+        tokio::spawn(presence_loop(shared.clone(), rx.clone()));
     }
     tokio::spawn(token_watch(shared.clone(), rx.clone()));
     if let Some(t) = shared.tunnel.clone() {
@@ -904,6 +909,35 @@ async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
                     }
                 }
             }
+            _ = stop.wait_for(|s| *s) => return,
+        }
+    }
+}
+
+/// Host liveness: publish this box's beat to the relay's presence channel and
+/// read everyone else's, every [`HOST_BEAT_EVERY_SECS`](hive_runtime::host_presence::HOST_BEAT_EVERY_SECS).
+/// Replaces the durable heartbeat (a signed host upsert a minute, forever).
+async fn presence_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    use hive_runtime::host_presence::{fetch_host_beats, publish_host_beat, HOST_BEAT_EVERY_SECS};
+    let (Ok(relay), Some(pass)) = (crate::relay_client(&shared.cfg), shared.cfg.key.clone()) else {
+        return;
+    };
+    let key = hive_core::derive_workspace_key(&pass);
+    let room = shared.cfg.room.clone();
+    loop {
+        shared.presence.record(&shared.host_id, Timestamp::now().inner().unix_timestamp());
+        // A box that can't write (revoked, awaiting approval) isn't serving work.
+        let writable = shared.lock().write_block().is_none();
+        if writable {
+            if let Err(e) = publish_host_beat(&relay, &room, &key, &shared.host_id).await {
+                eprintln!("presence: publishing this host's beat failed: {e}");
+            }
+        }
+        if let Ok(beats) = fetch_host_beats(&relay, &room, &key).await {
+            shared.presence.merge(beats);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(HOST_BEAT_EVERY_SECS as u64)) => {}
             _ = stop.wait_for(|s| *s) => return,
         }
     }

@@ -17,6 +17,7 @@ pub mod event_store;
 pub mod git_attribution;
 pub mod git_worktree;
 pub mod github;
+pub mod host_presence;
 pub mod identity_store;
 pub mod identity_verifier;
 pub mod mcp;
@@ -55,6 +56,7 @@ pub use relay_client::{
 };
 pub use remote_manifest::resolve_manifest_url;
 pub use sse::{next_backoff, parse_seq, SseConnectError, SseDecoder, SseStream};
+pub use host_presence::HostPresence;
 pub use sync_engine::{SyncEngine, SyncError};
 pub use provider::dispatch::{self, ResolvedRuntime};
 pub use provider::{AnthropicClient, ChatTurn, OpenAiClient, ProviderError};

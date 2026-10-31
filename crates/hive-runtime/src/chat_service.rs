@@ -1255,6 +1255,25 @@ impl ChatService {
         Ok(())
     }
 
+    /// Register `host` only when the durable record would change: missing, or a
+    /// different kind, label, or owner. Liveness is not a change — it rides the
+    /// relay's presence channel ([`crate::host_presence`]), so a restart or a
+    /// heartbeat never appends to the log. Returns whether it wrote.
+    pub fn ensure_host(&mut self, workspace_id: Uuid, mut host: WorkspaceHost) -> Result<bool> {
+        if host.owner_actor_id.is_empty() {
+            host.owner_actor_id = self.author.id.clone();
+        }
+        let current = self.list_hosts(workspace_id)?.into_iter().find(|h| h.id == host.id);
+        if let Some(h) = current {
+            if h.kind == host.kind && h.label == host.label && h.owner_actor_id == host.owner_actor_id {
+                return Ok(false);
+            }
+            host.created_at = h.created_at;
+        }
+        self.register_host(workspace_id, host)?;
+        Ok(true)
+    }
+
     /// Remove a host by id.
     pub fn remove_host(&mut self, workspace_id: Uuid, id: &str) -> Result<()> {
         let config_id = self.ensure_workspace_config(workspace_id)?;
@@ -2232,6 +2251,25 @@ mod tests {
         // A host last seen at the epoch is offline.
         let stale = WorkspaceHost { last_seen: Timestamp::from_unix_seconds(0), ..hosts[0].clone() };
         assert!(!stale.is_online(&now, 90), "stale host is offline");
+    }
+
+    /// Restarts and liveness never append host events; only a real change does.
+    #[test]
+    fn ensure_host_writes_only_real_changes() {
+        use hive_core::{HostKind, WorkspaceHost};
+        let (mut svc, _pk) = service();
+        let wid = Uuid::new_v4();
+        let hid = svc.device_id().to_string();
+        let config = workspace_config_session_id(wid);
+        assert!(svc.ensure_host(wid, WorkspaceHost::new(hid.clone(), HostKind::Worker, "box")).unwrap());
+        let rows = svc.store().list(config).unwrap().len();
+        // Same host again (a restart): nothing written.
+        assert!(!svc.ensure_host(wid, WorkspaceHost::new(hid.clone(), HostKind::Worker, "box")).unwrap());
+        assert_eq!(svc.store().list(config).unwrap().len(), rows);
+        // Renamed: one upsert.
+        assert!(svc.ensure_host(wid, WorkspaceHost::new(hid.clone(), HostKind::Worker, "Alex's box")).unwrap());
+        assert_eq!(svc.store().list(config).unwrap().len(), rows + 1);
+        assert_eq!(svc.list_hosts(wid).unwrap()[0].label, "Alex's box");
     }
 
     #[test]

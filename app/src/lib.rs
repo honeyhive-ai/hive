@@ -90,6 +90,9 @@ impl BoundedIdSet {
 
 struct AppState {
     service: Mutex<ChatService>,
+    /// Host liveness from the connected room's relay presence channel (see
+    /// `hive_runtime::host_presence`), refreshed by `run_device_host_loop`.
+    host_presence: hive_runtime::HostPresence,
     identity: IdentityStore<FileKeyVault>,
     data_dir: PathBuf,
     base_runtimes: Mutex<Vec<RuntimeTarget>>,
@@ -3732,7 +3735,7 @@ fn list_queued_work(state: State<AppState>) -> Result<Vec<QueuedWorkDto>, String
             let (host_label, host_status) = if host_id.is_empty() {
                 (String::new(), "device")
             } else if let Some(h) = hosts.iter().find(|h| h.id == host_id) {
-                (h.label.clone(), if h.is_online(&now, 90) { "online" } else { "offline" })
+                (h.label.clone(), if state.host_presence.is_online(h, &now) { "online" } else { "offline" })
             } else {
                 (String::new(), "unknown")
             };
@@ -3768,8 +3771,8 @@ fn list_workspace_hosts(state: State<AppState>) -> Result<Vec<WorkspaceHostDto>,
             }
             .to_string(),
             label: h.label.clone(),
-            online: h.is_online(&now, 90),
-            last_seen: rfc3339(h.last_seen.clone()),
+            online: state.host_presence.is_online(h, &now),
+            last_seen: rfc3339(state.host_presence.last_seen(h)),
         })
         .collect())
 }
@@ -4252,7 +4255,7 @@ fn list_my_devices(state: State<AppState>) -> Result<Vec<MyDeviceDto>, String> {
                 fingerprint: d.fingerprint,
                 this_device: d.device_id == here,
                 revoked: d.revoked,
-                last_seen: host.map(|h| rfc3339(h.last_seen)),
+                last_seen: host.map(|h| rfc3339(state.host_presence.last_seen(h))),
             }
         })
         .collect())
@@ -6206,13 +6209,14 @@ fn host_binding(host_id: &str, this_device: &str) -> HostBinding {
     }
 }
 
-/// Whether the host `host_id` has heartbeated recently (as the Hosts list
-/// shows it). Unknown hosts count as offline.
+/// Whether the host `host_id` beat recently on the relay's presence channel
+/// (or, on an older build, heartbeated durably) — as the Hosts list shows it.
+/// Unknown hosts count as offline.
 fn host_online(state: &AppState, workspace_id: Uuid, host_id: &str) -> bool {
     let svc = state.service.lock().unwrap();
     let now = hive_core::Timestamp::now();
     svc.list_hosts(workspace_id)
-        .map(|hosts| hosts.iter().any(|h| h.id == host_id && h.is_online(&now, 90)))
+        .map(|hosts| hosts.iter().any(|h| h.id == host_id && state.host_presence.is_online(h, &now)))
         .unwrap_or(false)
 }
 
@@ -10429,6 +10433,7 @@ fn build_state_in(app: &AppHandle, data_dir: PathBuf) -> Result<AppState, String
 
     Ok(AppState {
         service: Mutex::new(service),
+        host_presence: hive_runtime::HostPresence::new(),
         identity,
         data_dir,
         base_runtimes: Mutex::new(base_runtimes),
@@ -10586,12 +10591,10 @@ fn set_schedule_enabled(state: State<AppState>, id: String, enabled: bool) -> Re
     Ok(())
 }
 
-/// How often the desktop checks its Device-host heartbeat, and the minimum gap
-/// between two heartbeats it writes. Peers (and `hive serve`) count a host online
-/// for 90 s, and the sync heartbeat pushes within 20 s, so a heartbeat at most
-/// ~60 s old keeps the desktop "online" while the app runs.
+/// How often the desktop checks its Device-host registration and refreshes
+/// host presence. Its own beat goes out every `HOST_BEAT_EVERY_SECS` (30 s);
+/// peers (and `hive serve`) count a host online for 90 s.
 const DEVICE_HOST_TICK: std::time::Duration = std::time::Duration::from_secs(15);
-const DEVICE_HOST_THROTTLE_SECS: i64 = 45;
 
 /// The name this computer shows other members (macOS "Computer Name", else the
 /// host name), for the Device host label: "@hive · on <name>" on the phone.
@@ -10607,51 +10610,64 @@ fn computer_name() -> Option<String> {
     hostname_label()
 }
 
-/// Keep this desktop registered and heartbeating as a `Device` host in the
-/// synced room's workspace (spec §12.4: a member's machine, online while its
-/// app runs). The phone's `hive serve` reads it to say whether `@hive` — which
-/// only a desktop can run — will answer now or once the desktop is open.
+/// Keep this desktop registered as a `Device` host in the synced room's
+/// workspace (spec §12.4: a member's machine, online while its app runs) and
+/// beating on the room's relay presence channel. The phone's `hive serve`
+/// reads the beat to say whether `@hive` — which only a desktop can run — will
+/// answer now or once the desktop is open.
 ///
 /// Registers only once the room's config log has synced in (never seeds a
-/// competing one) and heartbeats through the throttled `touch_host`, the same
-/// event a worker writes.
+/// competing one), and only writes the durable host record when it changes
+/// (label, kind, owner). Liveness is the presence beat, never the event log:
+/// the old durable heartbeat appended a signed host upsert a minute, forever.
+/// Each tick also refreshes everyone else's beats into `host_presence`.
 async fn run_device_host_loop(app: AppHandle) {
     let label = tauri::async_runtime::spawn_blocking(computer_name)
         .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "Desktop".to_string());
+    let beat_every = std::time::Duration::from_secs(hive_runtime::host_presence::HOST_BEAT_EVERY_SECS as u64);
+    let mut last_beat: Option<(String, std::time::Instant)> = None;
     let mut tick = tokio::time::interval(DEVICE_HOST_TICK);
     loop {
         tick.tick().await;
         let state = app.state::<AppState>();
-        let ws = {
+        let conn = {
             let s = state.settings.lock().unwrap();
             s.relay_url
-                .as_ref()
-                .filter(|u| !u.is_empty())
-                .map(|_| room_workspace_id(&s.sync_room))
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .map(|u| (u, s.sync_room.clone(), s.workspace_key()))
         };
-        let Some(ws) = ws else { continue };
+        let Some((url, room, key)) = conn else { continue };
+        let ws = room_workspace_id(&room);
         let host_id = state.local_host_id();
-        let mut svc = state.service.lock().unwrap();
-        if !matches!(svc.load(hive_core::workspace_config_session_id(ws)), Ok(Some(_))) {
-            continue;
-        }
-        let me = svc.author().id.clone();
-        let current = svc.list_hosts(ws).unwrap_or_default().into_iter().find(|h| h.id == host_id);
-        let result = match current {
-            // (Re-)register when missing, renamed, or recorded under an old self.
-            Some(h) if h.kind == hive_core::HostKind::Device && h.label == label && h.owner_actor_id == me => {
-                svc.touch_host(ws, &host_id, DEVICE_HOST_THROTTLE_SECS).map(|_| ())
+        {
+            let mut svc = state.service.lock().unwrap();
+            if !matches!(svc.load(hive_core::workspace_config_session_id(ws)), Ok(Some(_))) {
+                continue;
             }
-            _ => svc.register_host(
-                ws,
-                hive_core::WorkspaceHost::new(host_id.clone(), hive_core::HostKind::Device, label.clone()),
-            ),
+            let host = hive_core::WorkspaceHost::new(host_id.clone(), hive_core::HostKind::Device, label.clone());
+            if let Err(e) = svc.ensure_host(ws, host) {
+                tracing::debug!(target: "hosts", "device host registration failed: {e}");
+            }
+        }
+        state.host_presence.record(&host_id, hive_core::Timestamp::now().inner().unix_timestamp());
+        let Some(key) = key else { continue };
+        let relay = state.relay_client(&url);
+        let due = match &last_beat {
+            Some((r, at)) => r != &room || at.elapsed() >= beat_every,
+            None => true,
         };
-        if let Err(e) = result {
-            tracing::debug!(target: "hosts", "device host heartbeat failed: {e}");
+        if due {
+            match hive_runtime::host_presence::publish_host_beat(&relay, &room, &key, &host_id).await {
+                Ok(()) => last_beat = Some((room.clone(), std::time::Instant::now())),
+                Err(e) => tracing::debug!(target: "hosts", "presence beat failed: {e}"),
+            }
+        }
+        if let Ok(beats) = hive_runtime::host_presence::fetch_host_beats(&relay, &room, &key).await {
+            state.host_presence.merge(beats);
         }
     }
 }

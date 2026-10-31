@@ -836,7 +836,7 @@ fn cmd_register_worker(cfg: &Config, label: Option<String>) -> Result<String> {
     let mut svc = open_service(cfg)?;
     let id = svc.device_id().to_string();
     let label = label.or_else(|| env_opt("HOSTNAME")).unwrap_or_else(|| "worker".into());
-    svc.register_host(uuid_of_room(&cfg.room), WorkspaceHost::new(id.clone(), HostKind::Worker, label))?;
+    svc.ensure_host(uuid_of_room(&cfg.room), WorkspaceHost::new(id.clone(), HostKind::Worker, label))?;
     Ok(id)
 }
 
@@ -901,7 +901,14 @@ async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
     // Exponential backoff on repeated relay-sync failures, so a relay outage
     // isn't hammered every 3s. Resets to the base cadence on the first success.
     let mut sync_fails: u32 = 0;
+    // Liveness beat on the relay's presence channel (not the event log).
+    let mut last_beat: Option<std::time::Instant> = None;
+    let beat_every = Duration::from_secs(hive_runtime::host_presence::HOST_BEAT_EVERY_SECS as u64);
     loop {
+        if last_beat.is_none_or(|t| t.elapsed() >= beat_every) {
+            publish_beat(cfg, &my_host).await;
+            last_beat = Some(std::time::Instant::now());
+        }
         if cfg.relay_url.is_some() {
             match sync_once(cfg).await {
                 Ok(_) => sync_fails = 0,
@@ -971,6 +978,7 @@ fn cmd_queue(cfg: &Config) -> Result<()> {
     let svc = open_service(cfg)?;
     let ws = uuid_of_room(&cfg.room);
     let hosts = svc.list_hosts(ws)?;
+    let presence = fetch_presence(cfg);
     let now = Timestamp::now();
     let mut any = false;
     for id in svc.store().list_session_ids()? {
@@ -990,7 +998,7 @@ fn cmd_queue(cfg: &Config) -> Result<()> {
                 "owner-device".to_string()
             } else {
                 match hosts.iter().find(|h| h.id == host_id) {
-                    Some(h) if h.is_online(&now, 90) => format!("{} · online", h.label),
+                    Some(h) if presence.is_online(h, &now) => format!("{} · online", h.label),
                     Some(h) => format!("{} · OFFLINE → queued", h.label),
                     None => format!("{host_id} · unknown"),
                 }
@@ -1004,11 +1012,37 @@ fn cmd_queue(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Host liveness from the relay's presence channel, best effort (an empty
+/// view without a relay, a key, or a reachable relay: the durable record then
+/// decides, see [`hive_runtime::HostPresence::is_online`]).
+fn fetch_presence(cfg: &Config) -> hive_runtime::HostPresence {
+    let presence = hive_runtime::HostPresence::new();
+    if let (Ok(relay), Some(pass)) = (relay_client(cfg), cfg.key.as_deref()) {
+        let key = derive_workspace_key(pass);
+        if let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let fetch = hive_runtime::host_presence::fetch_host_beats(&relay, &cfg.room, &key);
+            if let Ok(Ok(beats)) = rt.block_on(async { tokio::time::timeout(Duration::from_secs(5), fetch).await }) {
+                presence.merge(beats);
+            }
+        }
+    }
+    presence
+}
+
+/// Publish this host's liveness beat (best effort; no relay or key = no-op).
+async fn publish_beat(cfg: &Config, host_id: &str) {
+    if let (Ok(relay), Some(pass)) = (relay_client(cfg), cfg.key.as_deref()) {
+        let key = derive_workspace_key(pass);
+        if let Err(e) = hive_runtime::host_presence::publish_host_beat(&relay, &cfg.room, &key, host_id).await {
+            eprintln!("presence: publishing this host's beat failed: {e}");
+        }
+    }
+}
+
 /// Deterministic workspace id for a relay room (mirrors the app's
 /// `room_workspace_id`), so config-log filtering matches the app.
 fn uuid_of_room(room: &str) -> Uuid {
-    const NS: Uuid = Uuid::from_u128(0x6869_7665_726f_6f6d_776f_726b_7370_6163);
-    Uuid::new_v5(&NS, room.trim().as_bytes())
+    hive_core::room_workspace_id(room)
 }
 
 fn truncate(s: &str, n: usize) -> String {

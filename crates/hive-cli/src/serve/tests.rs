@@ -1562,6 +1562,17 @@ async fn phone_chat_primary_availability_follows_the_owners_desktop() {
     assert_eq!(r["available"], json!(false), "{r}");
     assert_eq!(r["unavailableReason"], "desktopOffline");
     assert!(r.get("availableVia").is_none());
+
+    // The desktop opens again, now beating on the relay's presence channel
+    // instead of re-writing its durable host record: available, with no new
+    // host event in the log.
+    let desktop_host = open_service(&h.desktop).unwrap().device_id().to_string();
+    let rows_before = h.handle.shared.lock().store().list(cfg_id).unwrap().len();
+    h.handle.shared.presence.record(&desktop_host, hive_core::Timestamp::now().inner().unix_timestamp());
+    let r = details().await;
+    assert_eq!(r["available"], json!(true), "{r}");
+    assert_eq!(r["availableVia"], "Studio Mac");
+    assert_eq!(h.handle.shared.lock().store().list(cfg_id).unwrap().len(), rows_before);
     h.handle.shutdown();
 }
 

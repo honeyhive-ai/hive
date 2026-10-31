@@ -556,9 +556,6 @@ async fn list_agents(State(s): S) -> ApiResult<Json<Value>> {
     Ok(Json(json!({ "agents": list })))
 }
 
-/// Presence window, as `hive queue` uses.
-pub(super) const ONLINE_WINDOW_SECS: i64 = 90;
-
 async fn list_hosts(State(s): S) -> ApiResult<Json<Value>> {
     let (hosts, _) = hosts_and_agents(&s)?;
     let now = Timestamp::now();
@@ -570,7 +567,7 @@ async fn list_hosts(State(s): S) -> ApiResult<Json<Value>> {
                 "id": h.id,
                 "label": h.label,
                 "isThis": is_this,
-                "online": is_this || h.is_online(&now, ONLINE_WINDOW_SECS),
+                "online": is_this || s.presence.is_online(h, &now),
             })
         })
         .collect();

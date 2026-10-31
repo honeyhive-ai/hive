@@ -20,7 +20,7 @@ use hive_core::{
 };
 use serde_json::{json, Value};
 
-use super::api::{agent_dto, hosts_and_agents, load_chat, ApiResult, ONLINE_WINDOW_SECS};
+use super::api::{agent_dto, hosts_and_agents, load_chat, ApiResult};
 use super::Shared;
 
 type S = State<Arc<Shared>>;
@@ -61,7 +61,7 @@ fn host_kind(s: &Shared, a: &WorkspaceAgent, hosts: &[WorkspaceHost]) -> (&'stat
     match hosts.iter().find(|h| h.id == a.host_id) {
         Some(h) => (
             if h.kind == HostKind::Worker { "worker" } else { "device" },
-            Some(h.is_online(&now, ONLINE_WINDOW_SECS)),
+            Some(s.presence.is_online(h, &now)),
         ),
         None => ("worker", Some(false)),
     }
@@ -219,8 +219,10 @@ pub(super) fn primary_availability(s: &Shared, chat: &ChatSession, hosts: &[Work
         let box_only = owner == me && !matches!(s.standing(), hive_runtime::device_enroll::Standing::OwnerDevice(_));
         return if box_only { Availability::NoDesktop } else { Availability::Unknown };
     }
-    desktops.sort_by_key(|h| std::cmp::Reverse(h.last_seen));
-    match desktops.iter().find(|h| h.is_online(&now, ONLINE_WINDOW_SECS)) {
+    // Liveness comes from the relay's presence channel (a desktop's beat), or
+    // the durable record of a desktop still on an older build.
+    desktops.sort_by_key(|h| std::cmp::Reverse(s.presence.last_seen(h)));
+    match desktops.iter().find(|h| s.presence.is_online(h, &now)) {
         Some(h) => Availability::Online(h.label.clone()),
         None => Availability::DesktopOffline,
     }

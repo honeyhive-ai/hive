@@ -203,8 +203,8 @@ pub async fn drain_tick(
         if svc.write_block().is_some() {
             return Ok(());
         }
-        // Heartbeat presence (throttled), so peers see this worker as online.
-        let _ = svc.touch_host(ctx.ws, ctx.my_host, 60);
+        // Liveness is published to the relay's presence channel by the caller
+        // (`hive serve`'s presence loop, `hive worker`'s loop), not the log.
         let hosted: HashSet<Uuid> = svc
             .load(workspace_config_session_id(ctx.ws))?
             .map(|s| s.workspace_agents)
