@@ -32,7 +32,7 @@ pub mod workspace_runtime;
 // Flat re-exports of the core domain types for ergonomic downstream use.
 pub use agent::WorkspaceAgent;
 pub use authorization::{evaluate as authorize, AuthzDecision, AuthzReason};
-pub use channel::{workspace_config_session_id, Channel};
+pub use channel::{room_workspace_id, workspace_config_session_id, Channel};
 pub use device_link::DeviceLinks;
 pub use workspace_host::{HostKind, WorkspaceHost};
 pub use workspace_runtime::{WorkspaceCredential, WorkspaceRuntime};

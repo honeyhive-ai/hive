@@ -189,6 +189,38 @@ fn open_service(cfg: &Config) -> Result<ChatService> {
     ))
 }
 
+/// One-time cleanup: drop events of any workspace other than this config's
+/// room that this box never wrote in — events older clients pushed into the
+/// room regardless of their workspace (the sync engine now refuses both ways).
+/// The database is backed up next to itself first; nothing is deleted unless
+/// that backup succeeds. A no-op (no backup) once clean.
+fn purge_foreign_workspaces(cfg: &Config) -> Result<()> {
+    let db = cfg.data_dir.join("hive.db");
+    if !db.exists() {
+        return Ok(());
+    }
+    let identity = IdentityStore::new(&cfg.data_dir, FileKeyVault::new(&cfg.data_dir));
+    let own_device = identity.bootstrap("hive-cli", "hive-cli", "hive-cli")?.device.id;
+    let keep = HashSet::from([uuid_of_room(&cfg.room)]);
+    let mut store = EventStore::open(&db)?;
+    if store.foreign_workspaces(&keep, own_device)?.is_empty() {
+        return Ok(());
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = cfg.data_dir.join(format!("hive.db.bak-foreign-purge-{stamp}"));
+    let dropped = store.purge_foreign_workspaces(&keep, own_device, Some(&backup))?;
+    let events: usize = dropped.iter().map(|(_, n)| n).sum();
+    println!(
+        "hive: removed {events} event(s) of {} other workspace(s) that don't belong to this room (backup: {}).",
+        dropped.len(),
+        backup.display()
+    );
+    Ok(())
+}
+
 /// One sync round against the relay: push everything unpushed, then fetch +
 /// ingest. Uses its own EventStore connection (shares the WAL file), as the app
 /// does. Returns (pushed, pulled) counts.
@@ -834,6 +866,9 @@ fn cmd_set_agent_host(cfg: &Config, agent_name: &str, host_id: &str) -> Result<(
 /// `worker.rs` for the turn itself (tool loop, worktrees, proposals).
 async fn cmd_worker(cfg: &Config, label: Option<String>) -> Result<()> {
     let ws = uuid_of_room(&cfg.room);
+    if let Err(e) = purge_foreign_workspaces(cfg) {
+        eprintln!("worker: foreign-workspace cleanup skipped: {e}");
+    }
     // Same label `cmd_register_worker` publishes, reused for the identity block
     // so an agent can say which worker it runs on.
     let host_label = label

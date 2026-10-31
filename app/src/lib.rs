@@ -559,9 +559,7 @@ impl Default for LiveSettings {
 /// human-name rooms in older settings keep resolving to the exact same id
 /// (back-compat: we never rewrite an existing `room`).
 fn room_workspace_id(room: &str) -> Uuid {
-    // A fixed namespace so the mapping is stable across builds/devices.
-    const NS: Uuid = Uuid::from_u128(0x6869_7665_726f_6f6d_776f_726b_7370_6163);
-    Uuid::new_v5(&NS, room.trim().as_bytes())
+    hive_core::room_workspace_id(room)
 }
 
 /// A joined/created team workspace: a relay room plus the (optional) E2EE key
@@ -13659,6 +13657,18 @@ async fn run_peer_sync_supervisor(
     }
 }
 
+/// The workspaces direct P2P carries: the connected relay room's, if any.
+#[cfg(feature = "p2p")]
+fn peer_sync_workspaces(app: &AppHandle) -> Vec<Uuid> {
+    let state = app.state::<AppState>();
+    let s = state.settings.lock().unwrap();
+    match s.relay_url.as_deref() {
+        Some(u) if !u.trim().is_empty() && !s.sync_room.trim().is_empty() => vec![room_workspace_id(&s.sync_room)],
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(feature = "p2p")]
 async fn run_peer_sync_session(app: AppHandle, data_dir: PathBuf, db_path: PathBuf, secret: [u8; 32]) {
     use hive_runtime::peer::{PeerLink, PeerSync};
     use hive_runtime::peer_iroh::{secret_from_bytes, IrohNode};
@@ -13679,7 +13689,10 @@ async fn run_peer_sync_session(app: AppHandle, data_dir: PathBuf, db_path: PathB
             return;
         }
     };
-    let mut sync = PeerSync::new();
+    // The link carries the connected room's workspace only — never this
+    // device's local workspace or another room (re-read every tick, since the
+    // connected room can change).
+    let mut sync = PeerSync::new(peer_sync_workspaces(&app));
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(3));
 
     loop {
@@ -13689,6 +13702,7 @@ async fn run_peer_sync_session(app: AppHandle, data_dir: PathBuf, db_path: PathB
                 // All contacts removed → tear the session down so iroh stops its
                 // background networking; the supervisor goes back to dormant.
                 if contacts.is_empty() { return; }
+                sync.set_workspaces(peer_sync_workspaces(&app));
                 let batch = match sync.take_unpushed(&store) {
                     Ok(b) => b,
                     Err(e) => { eprintln!("p2p: take_unpushed: {e}"); continue; }
@@ -13898,6 +13912,30 @@ pub fn run() {
                                 if removed > 0 {
                                     eprintln!("pruned {removed} superseded chunk rows");
                                 }
+                            }
+                        }
+                        // One-time cleanup after the room-scoping fix: events of a
+                        // workspace this device isn't in (and never wrote in) that
+                        // an older client pushed into a shared room. Backed up first.
+                        let mut keep = state.known_room_ids();
+                        keep.insert(state.local_workspace_id);
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        let backup = state.data_dir.join(format!("hive.db.bak-foreign-purge-{stamp}"));
+                        if let Ok(mut svc) = state.service.lock() {
+                            match svc.purge_foreign_workspaces(&keep, &backup) {
+                                Ok(dropped) if !dropped.is_empty() => {
+                                    let n: usize = dropped.iter().map(|(_, n)| n).sum();
+                                    eprintln!(
+                                        "removed {n} event(s) of {} workspace(s) this device isn't in (backup: {})",
+                                        dropped.len(),
+                                        backup.display()
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => eprintln!("foreign-workspace cleanup skipped: {e}"),
                             }
                         }
                         // Give every workspace a default #general channel so the

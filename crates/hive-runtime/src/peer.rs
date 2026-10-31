@@ -163,25 +163,32 @@ impl PeerLink for LoopbackLink {
 /// already seen, so the same instance can broadcast and ingest without loops.
 pub struct PeerSync {
     seen: HashSet<Uuid>,
+    /// The workspaces this link carries. Only their events are sent, and an
+    /// inbound event of any other workspace is dropped: a store holds every
+    /// workspace on the device (its local one included), and a peer link must
+    /// never become a way to read, or inject into, a workspace it isn't for.
+    workspaces: HashSet<Uuid>,
     /// Same identity policy as the relay path, so P2P isn't a weaker door: under
     /// Option C a not-yet-GitHub-verified event is held, not silently accepted.
     identity_mode: IdentityMode,
     identity_cache: IdentityCache,
 }
 
-impl Default for PeerSync {
-    fn default() -> Self {
+impl PeerSync {
+    /// A sync that carries exactly `workspaces` (empty = carries nothing).
+    pub fn new(workspaces: impl IntoIterator<Item = Uuid>) -> Self {
         Self {
             seen: HashSet::new(),
+            workspaces: workspaces.into_iter().collect(),
             identity_mode: IdentityMode::from_env(),
             identity_cache: IdentityCache::new(),
         }
     }
-}
 
-impl PeerSync {
-    pub fn new() -> Self {
-        Self::default()
+    /// Re-point the link at `workspaces` (the connected room changed). Events
+    /// already sent stay sent; newly in-scope ones go out on the next push.
+    pub fn set_workspaces(&mut self, workspaces: impl IntoIterator<Item = Uuid>) {
+        self.workspaces = workspaces.into_iter().collect();
     }
 
     /// Override the identity-verification mode (mirrors `SyncEngine`).
@@ -197,7 +204,7 @@ impl PeerSync {
         for session_id in ids {
             let envs = store.list(session_id).map_err(|e| PeerError::Store(e.to_string()))?;
             for env in envs {
-                if self.seen.insert(env.event_id) {
+                if self.workspaces.contains(&env.workspace_id) && self.seen.insert(env.event_id) {
                     out.push(serde_json::to_vec(&env)?);
                 }
             }
@@ -233,6 +240,10 @@ impl PeerSync {
     /// at least as strict as the relay path.
     pub fn apply(&mut self, store: &mut EventStore, data: &[u8]) -> Result<bool, PeerError> {
         let env: SessionEventEnvelope = serde_json::from_slice(data)?;
+        if !self.workspaces.contains(&env.workspace_id) {
+            tracing::warn!(event_id = %env.event_id, "dropped a peer event of a workspace this link doesn't carry");
+            return Ok(false);
+        }
         self.seen.insert(env.event_id);
 
         let mut roster_src = store
@@ -324,8 +335,8 @@ mod tests {
         let env = sample_envelope(1);
         store_a.append_envelope(&env).unwrap();
 
-        let mut sync_a = PeerSync::new();
-        let mut sync_b = PeerSync::new();
+        let mut sync_a = PeerSync::new([Uuid::nil()]);
+        let mut sync_b = PeerSync::new([Uuid::nil()]);
 
         // A pushes its unpushed envelopes to B.
         let pushed = sync_a.push_to(&la, &b, &store_a).await.unwrap();
@@ -341,6 +352,43 @@ mod tests {
         assert!(!sync_b.apply(&mut store_b, &data).unwrap());
         // A doesn't re-push the same envelope.
         assert_eq!(sync_a.push_to(&la, &b, &store_a).await.unwrap(), 0);
+    }
+
+    /// Regression: the link sends only its workspaces' events and drops an
+    /// inbound event of any other workspace.
+    #[tokio::test]
+    async fn peer_link_carries_only_its_workspaces() {
+        let a = PeerId("alice".into());
+        let b = PeerId("bob".into());
+        let (la, lb) = LoopbackLink::pair(a.clone(), b.clone());
+        let room = Uuid::new_v4();
+        let local = Uuid::new_v4();
+        let msg = |ws: Uuid, body: &str| {
+            SessionEventEnvelope::new(
+                Uuid::new_v4(),
+                ws,
+                1,
+                SessionEvent::MessageAppended { message: ChatMessage::new(MessageRole::User, "Alex", body) },
+            )
+        };
+        let store_a = EventStore::open_in_memory().unwrap();
+        let shared = msg(room, "team");
+        let private = msg(local, "PRIVATE");
+        store_a.append_envelope(&shared).unwrap();
+        store_a.append_envelope(&private).unwrap();
+
+        let mut sync_a = PeerSync::new([room]);
+        assert_eq!(sync_a.push_to(&la, &b, &store_a).await.unwrap(), 1, "only the room's event goes out");
+        let (_, data) = lb.recv().await.unwrap();
+        assert!(!String::from_utf8_lossy(&data).contains("PRIVATE"));
+
+        let mut store_b = EventStore::open_in_memory().unwrap();
+        let mut sync_b = PeerSync::new([room]);
+        assert!(sync_b.apply(&mut store_b, &data).unwrap());
+        // An older peer that still sends everything: the foreign event is dropped.
+        let leaked = serde_json::to_vec(&private).unwrap();
+        assert!(!sync_b.apply(&mut store_b, &leaked).unwrap());
+        assert!(!store_b.has_event(private.event_id).unwrap());
     }
 
     #[test]
@@ -427,7 +475,7 @@ mod tests {
         tampered.sequence = 9999; // breaks the signature
         let spoof = content(102, Uuid::new_v4()); // stamps a different account
 
-        let mut sync = PeerSync::new();
+        let mut sync = PeerSync::new([Uuid::nil()]);
         let bytes = |e: &SessionEventEnvelope| serde_json::to_vec(e).unwrap();
 
         // A validly-signed envelope from a known-roster device is ingested.

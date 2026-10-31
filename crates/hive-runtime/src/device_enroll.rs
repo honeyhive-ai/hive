@@ -416,7 +416,7 @@ mod flow_tests {
                 me.account.actor(),
             );
             let key = hive_core::derive_workspace_key("enroll flow passphrase");
-            let engine = SyncEngine::new(RelayClient::new(relay), ws.to_string()).with_key(key);
+            let engine = SyncEngine::new(RelayClient::new(relay), ws.to_string()).with_room_workspace(ws).with_key(key);
             Self { svc, dir: dir.to_path_buf(), engine }
         }
 
@@ -596,7 +596,7 @@ mod flow_tests {
         let rotated = ids.rotate_device().unwrap();
         assert_ne!(rotated.device.id, old_device);
         let mut sff2 = Dev::open(&tmp.path().join("sff"), "hive-cli", &relay, ws);
-        sff2.engine = SyncEngine::new(RelayClient::new(&relay), ws.to_string())
+        sff2.engine = SyncEngine::new(RelayClient::new(&relay), ws.to_string()).with_room_workspace(ws)
             .with_key(hive_core::derive_workspace_key("enroll flow passphrase"));
         sff2.sync().await;
         assert_eq!(sff2.svc.device_standing(ws, None).unwrap(), Standing::Own);

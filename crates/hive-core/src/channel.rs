@@ -19,6 +19,16 @@ pub fn workspace_config_session_id(workspace_id: Uuid) -> Uuid {
     Uuid::new_v5(&NS, workspace_id.as_bytes())
 }
 
+/// The workspace id a relay **room** carries: UUID v5 over the trimmed room
+/// string, so every member of the room computes the same id. A room holds the
+/// events of exactly this one workspace; sync never pushes, and never accepts,
+/// an event stamped with any other workspace id.
+pub fn room_workspace_id(room: &str) -> Uuid {
+    // Fixed namespace ("hiveroomworkspac") so the mapping is stable across builds.
+    const NS: Uuid = Uuid::from_u128(0x6869_7665_726f_6f6d_776f_726b_7370_6163);
+    Uuid::new_v5(&NS, room.trim().as_bytes())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Channel {

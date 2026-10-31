@@ -682,6 +682,9 @@ fn load_read_marks(cfg: &Config) -> HashMap<Uuid, Uuid> {
 pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
     let token = pair::load_or_create_token(&opts.token_file)?;
     let ws = uuid_of_room(&cfg.room);
+    if let Err(e) = crate::purge_foreign_workspaces(&cfg) {
+        eprintln!("serve: foreign-workspace cleanup skipped: {e}");
+    }
     // Pull the workspace first, so registering below extends the real config
     // log instead of seeding a competing one.
     if cfg.relay_url.is_some() {

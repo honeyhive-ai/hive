@@ -43,6 +43,15 @@ pub enum SyncError {
 pub struct SyncEngine {
     relay: RelayClient,
     workspace: String,
+    /// The workspace ids whose events belong in this room — by default just
+    /// [`hive_core::room_workspace_id`] of the room. The store is shared by every
+    /// workspace on the device (its local workspace, each joined room), so the
+    /// push scan only sends events stamped with one of these ids, and a fetched
+    /// event stamped with any other id is dropped rather than ingested.
+    scope: HashSet<Uuid>,
+    /// Test-only: admit every workspace (fixtures that predate room scoping).
+    #[cfg(test)]
+    any_workspace: bool,
     /// event_ids already pushed (or ingested from the relay) — never re-push.
     /// This is a **fast-path cache** layered over the durable `pushed` table in
     /// the event store: on first use it is seeded from that table (so a restart
@@ -98,9 +107,14 @@ enum Decoded {
 
 impl SyncEngine {
     pub fn new(relay: RelayClient, workspace: impl Into<String>) -> Self {
+        let workspace = workspace.into();
+        let scope = HashSet::from([hive_core::room_workspace_id(&workspace)]);
         Self {
             relay,
-            workspace: workspace.into(),
+            workspace,
+            scope,
+            #[cfg(test)]
+            any_workspace: false,
             seen: HashSet::new(),
             scanned_row: 0,
             last_fetched_seq: 0,
@@ -110,6 +124,33 @@ impl SyncEngine {
             identity_mode: IdentityMode::from_env(),
             identity_cache: shared_cache(),
         }
+    }
+
+    /// Scope this room to `workspace_id` instead of the id derived from the room
+    /// string. For a room whose events carry an id that isn't
+    /// `room_workspace_id(room)` (tests, older fixtures). Exactly one workspace:
+    /// a room never mixes workspaces.
+    pub fn with_room_workspace(mut self, workspace_id: Uuid) -> Self {
+        self.scope = HashSet::from([workspace_id]);
+        self
+    }
+
+    /// Whether an event stamped `workspace_id` belongs in this room.
+    pub fn in_scope(&self, workspace_id: Uuid) -> bool {
+        #[cfg(test)]
+        if self.any_workspace {
+            return true;
+        }
+        self.scope.contains(&workspace_id)
+    }
+
+    /// Test-only: an engine that admits every workspace, for fixtures that
+    /// stamp events with arbitrary workspace ids.
+    #[cfg(test)]
+    pub(crate) fn unscoped(relay: RelayClient, workspace: impl Into<String>) -> Self {
+        let mut e = Self::new(relay, workspace);
+        e.any_workspace = true;
+        e
     }
 
     /// Override the identity-verification mode (default: [`IdentityMode::from_env`]).
@@ -274,7 +315,11 @@ impl SyncEngine {
             // failed push resets the mark, so nothing is skipped.
             let (last, envs) = store.envelopes_after_row(self.scanned_row)?;
             self.scanned_row = last;
-            out.extend(envs.into_iter().filter(|env| self.seen.insert(env.event_id)));
+            for env in envs {
+                if self.in_scope(env.workspace_id) && self.seen.insert(env.event_id) {
+                    out.push(env);
+                }
+            }
             return Ok(out);
         }
         // Full scan (first round, or after a failed push). Read the high-water
@@ -283,6 +328,11 @@ impl SyncEngine {
         let mark = store.max_row_id()?;
         for session_id in store.list_session_ids()? {
             for env in store.list(session_id)? {
+                // Another workspace's event (the device-local workspace, a
+                // different room) never leaves for this room.
+                if !self.in_scope(env.workspace_id) {
+                    continue;
+                }
                 // `seen` is seeded from the durable `pushed` table, so this skips
                 // events already on the relay even across a restart. Newly
                 // collected events are marked seen optimistically; a failed push
@@ -381,8 +431,17 @@ impl SyncEngine {
         let mut decoded: Vec<(u64, SessionEventEnvelope)> = Vec::new();
         let mut resolved: Vec<u64> = Vec::new();
         let mut retry_at: Option<u64> = None;
+        let mut foreign = 0usize;
         for (seq, body) in fetched {
             match self.decode(body) {
+                // An event of another workspace has no business in this room
+                // (an older client pushed everything in its store). Never
+                // ingest it, and move past it: it is stable, so re-fetching
+                // can't change the verdict.
+                Decoded::Ready(env) if !self.in_scope(env.workspace_id) => {
+                    foreign += 1;
+                    resolved.push(*seq);
+                }
                 Decoded::Ready(env) => decoded.push((*seq, *env)),
                 Decoded::Malformed(reason) => {
                     tracing::warn!(seq = *seq, reason, "skipping a malformed relay body; advancing the cursor past it");
@@ -395,6 +454,10 @@ impl SyncEngine {
                     retry_at = Some(retry_at.map_or(*seq, |r| r.min(*seq)));
                 }
             }
+        }
+
+        if foreign > 0 {
+            tracing::warn!(room = %self.workspace, foreign, "dropped fetched events stamped with another workspace");
         }
 
         // Verify-on-ingest (S1): build the trust roster from what we already hold
@@ -535,6 +598,82 @@ mod tests {
         (sid, wid)
     }
 
+    /// A chat (snapshot + one message from Alex) stamped with `wid`.
+    fn seed_chat_in(store: &mut EventStore, wid: Uuid, body: &str) -> Uuid {
+        let session = ChatSession::new("Chat", wid, "anthropic");
+        let sid = session.id;
+        store
+            .ingest(&SessionEventEnvelope::new(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(session) }))
+            .unwrap();
+        store
+            .ingest(&SessionEventEnvelope::new(
+                sid,
+                wid,
+                2,
+                SessionEvent::MessageAppended { message: ChatMessage::new(MessageRole::User, "Alex", body) },
+            ))
+            .unwrap();
+        sid
+    }
+
+    /// Regression: a device's store holds every workspace it has (its local
+    /// workspace, each room it joined), but a room's sync only ever sends that
+    /// room's events. The old push scan sent the whole store to whichever room
+    /// was connected.
+    #[tokio::test]
+    async fn push_sends_only_the_rooms_own_workspace() {
+        let base = spawn_relay().await;
+        let room = "room-alpha";
+        let room_ws = hive_core::room_workspace_id(room);
+        let key = hive_core::derive_workspace_key("alpha secret");
+
+        let mut store = EventStore::open_in_memory().unwrap();
+        seed_chat_in(&mut store, room_ws, "team message");
+        seed_chat_in(&mut store, Uuid::new_v4(), "PRIVATE local-only note");
+        seed_chat_in(&mut store, hive_core::room_workspace_id("room-beta"), "PRIVATE other-room message");
+
+        let mut eng = SyncEngine::new(RelayClient::new(&base), room).with_key(key);
+        assert_eq!(eng.push_new(&store).await.unwrap(), 2, "only the room's snapshot + message");
+        // A later round, incremental or full, still never picks the others up.
+        assert_eq!(eng.push_new(&store).await.unwrap(), 0);
+        let mut fresh = SyncEngine::new(RelayClient::new(&base), room).with_key(key);
+        assert_eq!(fresh.push_new(&store).await.unwrap(), 0);
+
+        let raw = RelayClient::new(&base).fetch_values(room, 0).await.unwrap();
+        assert_eq!(raw.len(), 2);
+        for (_, body) in &raw {
+            let sealed: SealedEnvelope = serde_json::from_value(body.clone()).unwrap();
+            let env: SessionEventEnvelope = serde_json::from_slice(&open_symmetric(&key, &sealed).unwrap()).unwrap();
+            assert_eq!(env.workspace_id, room_ws);
+            assert!(!serde_json::to_string(&env).unwrap().contains("PRIVATE"));
+        }
+    }
+
+    /// Defense in depth: events of another workspace that an older client
+    /// pushed into the room are never ingested, and don't wedge the cursor.
+    #[tokio::test]
+    async fn pull_drops_events_of_another_workspace() {
+        let base = spawn_relay().await;
+        let room = "room-alpha";
+        let room_ws = hive_core::room_workspace_id(room);
+        let key = hive_core::derive_workspace_key("alpha secret");
+
+        // The pre-fix behavior: an unscoped engine pushes its whole store.
+        let mut leaky_store = EventStore::open_in_memory().unwrap();
+        let foreign = seed_chat_in(&mut leaky_store, Uuid::new_v4(), "PRIVATE local-only note");
+        let ours = seed_chat_in(&mut leaky_store, room_ws, "team message");
+        let mut leaky = SyncEngine::unscoped(RelayClient::new(&base), room).with_key(key);
+        assert_eq!(leaky.push_new(&leaky_store).await.unwrap(), 4);
+
+        let mut store = EventStore::open_in_memory().unwrap();
+        let mut eng = SyncEngine::new(RelayClient::new(&base), room).with_key(key);
+        assert_eq!(eng.pull(&mut store).await.unwrap(), 2);
+        assert!(store.load_session(foreign).unwrap().is_none(), "foreign chat never ingested");
+        assert!(store.load_session(ours).unwrap().is_some());
+        assert_eq!(eng.cursor(), 4, "cursor moves past the dropped events");
+        assert_eq!(store.list_session_ids().unwrap(), vec![ours]);
+    }
+
     #[tokio::test]
     async fn two_devices_converge_through_the_relay() {
         let base = spawn_relay().await;
@@ -556,11 +695,11 @@ mod tests {
         // A pushes; B pulls into an empty store. E2EE is mandatory for relay
         // sync, so both carry the shared workspace key.
         let key = hive_core::derive_workspace_key("converge room secret");
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         assert_eq!(sync_a.push_new(&store_a).await.unwrap(), 2);
 
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_b = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         let applied = sync_b.pull(&mut store_b).await.unwrap();
         assert_eq!(applied, 2);
 
@@ -593,7 +732,7 @@ mod tests {
             ))
             .unwrap();
 
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         sync_a.push_new(&store_a).await.unwrap();
 
         // The relay's stored bodies must be ciphertext — no plaintext leak.
@@ -611,14 +750,14 @@ mod tests {
 
         // B with the same key converges; the message is readable again.
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_b = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         assert_eq!(sync_b.pull(&mut store_b).await.unwrap(), 2);
         let session_b = store_b.load_session(sid).unwrap().unwrap();
         assert_eq!(session_b.messages[0].body, "TOP SECRET PLAN");
 
         // B with the WRONG key can't open anything.
         let mut store_c = EventStore::open_in_memory().unwrap();
-        let mut sync_c = SyncEngine::new(RelayClient::new(&base), &workspace)
+        let mut sync_c = SyncEngine::unscoped(RelayClient::new(&base), &workspace)
             .with_key(hive_core::derive_workspace_key("wrong"));
         assert_eq!(sync_c.pull(&mut store_c).await.unwrap(), 0);
     }
@@ -628,7 +767,7 @@ mod tests {
         // Relay pointed at a closed port → every push errors mid-batch.
         let mut store = EventStore::open_in_memory().unwrap();
         seed_chat(&mut store); // one event (the snapshot)
-        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:9"), Uuid::new_v4().to_string())
+        let mut eng = SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:9"), Uuid::new_v4().to_string())
             .with_key(hive_core::derive_workspace_key("rollback room"));
 
         let batch = eng.take_unpushed(&store).unwrap();
@@ -647,7 +786,7 @@ mod tests {
         let base = spawn_relay().await;
         let mut store = EventStore::open_in_memory().unwrap();
         let (sid, wid) = seed_chat(&mut store);
-        let mut eng = SyncEngine::new(RelayClient::new(&base), Uuid::new_v4().to_string())
+        let mut eng = SyncEngine::unscoped(RelayClient::new(&base), Uuid::new_v4().to_string())
             .with_key(hive_core::derive_workspace_key("incremental room"));
         let first = eng.take_unpushed(&store).unwrap();
         assert_eq!(first.len(), 1);
@@ -660,7 +799,7 @@ mod tests {
         assert_eq!(batch.iter().map(|e| e.event_id).collect::<Vec<_>>(), [e.event_id]);
 
         // That push fails (relay gone): the next round finds it again.
-        let mut offline = SyncEngine::new(RelayClient::new("http://127.0.0.1:9"), Uuid::new_v4().to_string())
+        let mut offline = SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:9"), Uuid::new_v4().to_string())
             .with_key(hive_core::derive_workspace_key("incremental room"));
         std::mem::swap(&mut eng.relay, &mut offline.relay);
         assert!(eng.push_envelopes(&batch).await.is_err());
@@ -681,7 +820,7 @@ mod tests {
         let mut store = EventStore::open_in_memory().unwrap();
         seed_chat(&mut store); // one event (the snapshot)
 
-        let mut eng = SyncEngine::new(RelayClient::new(&base), &workspace);
+        let mut eng = SyncEngine::unscoped(RelayClient::new(&base), &workspace);
         assert!(!eng.is_encrypted(), "no key configured");
 
         let batch = eng.take_unpushed(&store).unwrap();
@@ -737,7 +876,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace);
+        let mut sync_a = SyncEngine::unscoped(RelayClient::new(&base), &workspace);
         sync_a.add_key(1, k1);
         sync_a.push_new(&store_a).await.unwrap();
 
@@ -745,7 +884,7 @@ mod tests {
         // openable, so it applies nothing AND does NOT advance its cursor past
         // them (they must be retried once the key arrives).
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace);
+        let mut sync_b = SyncEngine::unscoped(RelayClient::new(&base), &workspace);
         assert_eq!(sync_b.pull(&mut store_b).await.unwrap(), 0);
         assert_eq!(sync_b.cursor(), 0, "not-yet-openable events must not be skipped");
 
@@ -786,7 +925,7 @@ mod tests {
 
         let mut store = EventStore::open_in_memory().unwrap();
         let mut eng =
-            SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string());
+            SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string());
         assert_eq!(eng.apply_fetched(&mut store, &batch).unwrap(), 2);
         assert!(store.has_event(snap.event_id).unwrap());
         assert!(store.has_event(msg.event_id).unwrap(), "event after the bad body applies");
@@ -804,7 +943,7 @@ mod tests {
         // the behavior must be deterministic across repeated passes.
         let held = hive_core::derive_workspace_key("held epoch 0");
         let missing = hive_core::e2ee::generate_workspace_key().unwrap(); // epoch 7, unheld
-        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
+        let mut eng = SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
             .with_key(held);
 
         let session = ChatSession::new("Shared", Uuid::new_v4(), "anthropic");
@@ -937,7 +1076,7 @@ mod tests {
             .collect();
 
         let mut store = EventStore::open_in_memory().unwrap();
-        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string());
+        let mut eng = SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string());
         eng.apply_fetched(&mut store, &batch).unwrap();
 
         assert!(store.has_event(good.event_id).unwrap(), "valid signed event ingested");
@@ -955,7 +1094,7 @@ mod tests {
         // A seals a snapshot under epoch 0, rotates to epoch 1, seals a message.
         let mut store_a = EventStore::open_in_memory().unwrap();
         let (sid, wid) = seed_chat(&mut store_a);
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(k0);
+        let mut sync_a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(k0);
         assert_eq!(sync_a.push_new(&store_a).await.unwrap(), 1); // snapshot @ epoch 0
 
         store_a
@@ -974,7 +1113,7 @@ mod tests {
         // B holds only epoch 0: reads the epoch-0 snapshot; the epoch-1 message is
         // undecodable and retained (not permanently skipped — phase 7).
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(k0);
+        let mut sync_b = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(k0);
         sync_b.pull(&mut store_b).await.unwrap();
         let sb = store_b.load_session(sid).unwrap().expect("snapshot synced");
         assert_eq!(sb.title, "Shared", "epoch-0 content is readable");
@@ -1011,12 +1150,12 @@ mod tests {
                 },
             ))
             .unwrap();
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         assert_eq!(sync_a.push_new(&store_a).await.unwrap(), 2);
 
         // First engine on B pulls both, persisting the cursor into store_b.
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b1 = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_b1 = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         assert_eq!(sync_b1.pull(&mut store_b).await.unwrap(), 2);
         let cursor = sync_b1.cursor();
         assert!(cursor > 0, "cursor advanced");
@@ -1025,7 +1164,7 @@ mod tests {
 
         // A brand-new engine (simulating a restart) resumes from the durable
         // cursor: it fetches nothing new and starts at the persisted cursor.
-        let mut sync_b2 = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_b2 = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         assert_eq!(sync_b2.pull(&mut store_b).await.unwrap(), 0, "resumes; nothing re-fetched");
         assert_eq!(sync_b2.cursor(), cursor, "cursor restored from the durable store");
     }
@@ -1051,7 +1190,7 @@ mod tests {
             ))
             .unwrap();
 
-        let mut sync1 = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync1 = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         assert_eq!(sync1.push_new(&store).await.unwrap(), 2);
         drop(sync1);
         assert_eq!(store.pushed_ids(&workspace).unwrap().len(), 2, "pushes are durable");
@@ -1059,7 +1198,7 @@ mod tests {
         // Fresh engine, same store: the durable `pushed` set makes take_unpushed
         // collect nothing, so a restart re-push is a no-op and the relay keeps
         // exactly two bodies (no duplicates).
-        let mut sync2 = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync2 = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         assert!(sync2.take_unpushed(&store).unwrap().is_empty(), "already-pushed not re-collected");
         assert_eq!(sync2.push_new(&store).await.unwrap(), 0, "restart re-push is a no-op");
         let raw = RelayClient::new(&base).fetch_values(&workspace, 0).await.unwrap();
@@ -1105,7 +1244,7 @@ mod tests {
         ];
 
         let mut store = EventStore::open_in_memory().unwrap();
-        let mut eng1 = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), &workspace)
+        let mut eng1 = SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:0"), &workspace)
             .with_key(held);
         assert_eq!(eng1.apply_fetched(&mut store, &batch).unwrap(), 1);
         assert_eq!(eng1.cursor(), 0, "cursor held before the not-yet-openable seq");
@@ -1115,7 +1254,7 @@ mod tests {
         // Fresh engine (restart), STILL without epoch 7: resumes cursor 0, the
         // openable event is already ingested so nothing new applies, and the
         // cursor stays before the missing body.
-        let mut eng2 = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), &workspace)
+        let mut eng2 = SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:0"), &workspace)
             .with_key(held);
         assert_eq!(eng2.apply_fetched(&mut store, &batch).unwrap(), 0, "openable already applied");
         assert_eq!(eng2.cursor(), 0, "resumed cursor still before the retry point");
@@ -1137,12 +1276,12 @@ mod tests {
         let key = hive_core::derive_workspace_key("round trip room");
         let mut store_a = EventStore::open_in_memory().unwrap();
         let (sid, wid) = seed_chat(&mut store_a);
-        let mut sync_a = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         sync_a.sync_once(&mut store_a).await.unwrap();
 
         // B joins, syncs, then replies.
         let mut store_b = EventStore::open_in_memory().unwrap();
-        let mut sync_b = SyncEngine::new(RelayClient::new(&base), &workspace).with_key(key);
+        let mut sync_b = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
         sync_b.sync_once(&mut store_b).await.unwrap();
         let reply = SessionEventEnvelope::new(
             sid,
@@ -1262,7 +1401,7 @@ mod tests {
     }
 
     fn oc_engine(cache: SharedIdentityCache) -> SyncEngine {
-        SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
+        SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
             .with_identity_mode(IdentityMode::GithubSigningKeys)
             .with_identity_cache(cache)
     }
@@ -1346,7 +1485,7 @@ mod tests {
             IdentityVerdict::NotListed,
             std::time::Duration::from_secs(600),
         );
-        let mut eng = SyncEngine::new(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
+        let mut eng = SyncEngine::unscoped(RelayClient::new("http://127.0.0.1:0"), Uuid::new_v4().to_string())
             .with_identity_mode(IdentityMode::Relay)
             .with_identity_cache(cache);
         let mut store = EventStore::open_in_memory().unwrap();

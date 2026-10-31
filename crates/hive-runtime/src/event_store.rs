@@ -12,7 +12,7 @@
 //! indexed columns (`session_id`, `sequence`, `kind`, `scope`, `timestamp`)
 //! exist for efficient ordering/filtering and are derived from the envelope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -688,6 +688,87 @@ impl EventStore {
         Ok(n)
     }
 
+    /// Workspaces that hold events but aren't `keep` and that `own_device`
+    /// never signed an event in, with their event counts — what
+    /// [`purge_foreign_workspaces`](Self::purge_foreign_workspaces) would drop.
+    /// The nil workspace (legacy local events) is never foreign.
+    pub fn foreign_workspaces(&self, keep: &HashSet<Uuid>, own_device: Uuid) -> Result<Vec<(Uuid, usize)>> {
+        let counts: Vec<(String, i64)> = {
+            let mut stmt = self.conn.prepare("SELECT workspace_id, COUNT(*) FROM events GROUP BY workspace_id")?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        // The device id as the envelope JSON spells it (`"signerDeviceId":"…"`).
+        let signed_here = format!("\"signerDeviceId\":\"{own_device}\"");
+        let mut out = Vec::new();
+        for (raw, n) in counts {
+            let Ok(ws) = Uuid::parse_str(&raw) else { continue };
+            if ws.is_nil() || keep.contains(&ws) {
+                continue;
+            }
+            let own: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE workspace_id = ?1 AND instr(envelope_json, ?2) > 0",
+                rusqlite::params![raw, signed_here],
+                |r| r.get(0),
+            )?;
+            if own == 0 {
+                out.push((ws, n as usize));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One-time cleanup after the room-scoping fix: delete every event of a
+    /// workspace this device doesn't belong to (not in `keep`) and never
+    /// authored anything in — events an older client pushed into a shared room
+    /// regardless of their workspace. A workspace with any event signed by
+    /// `own_device` is kept, so nothing this device wrote is ever dropped.
+    ///
+    /// With `backup`, the whole database is first copied there (`VACUUM INTO`)
+    /// and nothing is deleted unless that copy succeeds. The sync bookkeeping
+    /// (cursor, pushed set) of a room whose workspace is dropped goes too, so
+    /// re-joining that room later pulls it from the start. Returns the dropped
+    /// workspaces with their event counts (empty = nothing to do, no backup).
+    pub fn purge_foreign_workspaces(
+        &mut self,
+        keep: &HashSet<Uuid>,
+        own_device: Uuid,
+        backup: Option<&Path>,
+    ) -> Result<Vec<(Uuid, usize)>> {
+        let doomed = self.foreign_workspaces(keep, own_device)?;
+        if doomed.is_empty() {
+            return Ok(doomed);
+        }
+        if let Some(path) = backup {
+            self.conn.execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
+        }
+        let rooms: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT workspace FROM sync_cursor UNION SELECT DISTINCT workspace FROM pushed")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let tx = self.conn.transaction()?;
+        for (ws, _) in &doomed {
+            let ws_s = ws.to_string();
+            tx.execute(
+                "DELETE FROM compaction_state WHERE session_id IN (SELECT DISTINCT session_id FROM events WHERE workspace_id = ?1)",
+                [&ws_s],
+            )?;
+            tx.execute(
+                "DELETE FROM pushed WHERE event_id IN (SELECT event_id FROM events WHERE workspace_id = ?1)",
+                [&ws_s],
+            )?;
+            tx.execute("DELETE FROM events WHERE workspace_id = ?1", [&ws_s])?;
+            for room in rooms.iter().filter(|r| hive_core::room_workspace_id(r) == *ws) {
+                tx.execute("DELETE FROM sync_cursor WHERE workspace = ?1", [room])?;
+                tx.execute("DELETE FROM pushed WHERE workspace = ?1", [room])?;
+            }
+        }
+        tx.commit()?;
+        self.projections.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        Ok(doomed)
+    }
+
     /// One-time maintenance: delete `messageChunkReceived` rows whose message
     /// already has a `messageCompleted` (the completed body supersedes them).
     /// Shrinks DBs written before per-token persistence was removed; projection
@@ -1113,5 +1194,67 @@ mod tests {
         assert_eq!(s.messages.iter().find(|m| m.id == mid).unwrap().body, "Hello");
         // idempotent
         assert_eq!(store.prune_superseded_chunks().unwrap(), 0);
+    }
+
+    /// The cleanup for events an older client pushed into a room regardless of
+    /// their workspace: another workspace's events go (after a backup), this
+    /// device's own work never does.
+    #[test]
+    fn purge_drops_only_foreign_workspaces_after_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = EventStore::open(dir.path().join("hive.db")).unwrap();
+        let me = Uuid::new_v4();
+        let room = "room-alpha";
+        let room_ws = hive_core::room_workspace_id(room);
+        let leaked_room = "room-beta";
+        let leaked_ws = hive_core::room_workspace_id(leaked_room);
+        let other_local = Uuid::new_v4();
+        let mine_elsewhere = Uuid::new_v4();
+        let msg = |ws: Uuid, signer: Option<Uuid>| {
+            let mut e = SessionEventEnvelope::new(
+                Uuid::new_v4(),
+                ws,
+                1,
+                SessionEvent::MessageAppended { message: ChatMessage::new(MessageRole::User, "Alex", "hi") },
+            );
+            e.signer_device_id = signer;
+            e
+        };
+        for e in [
+            msg(room_ws, Some(Uuid::new_v4())),
+            msg(Uuid::nil(), None),
+            msg(leaked_ws, Some(Uuid::new_v4())),
+            msg(leaked_ws, None),
+            msg(other_local, Some(Uuid::new_v4())),
+            msg(mine_elsewhere, Some(me)),
+        ] {
+            store.ingest(&e).unwrap();
+        }
+        store.set_sync_cursor(leaked_room, 7).unwrap();
+        store.set_sync_cursor(room, 9).unwrap();
+
+        let keep = HashSet::from([room_ws]);
+        let mut found = store.foreign_workspaces(&keep, me).unwrap();
+        found.sort();
+        let mut want = vec![(leaked_ws, 2), (other_local, 1)];
+        want.sort();
+        assert_eq!(found, want);
+
+        let backup = dir.path().join("hive.db.bak");
+        let mut dropped = store.purge_foreign_workspaces(&keep, me, Some(&backup)).unwrap();
+        dropped.sort();
+        assert_eq!(dropped, want);
+        assert_eq!(store.max_row_id().unwrap(), 6);
+        let left: i64 = store.conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, 3, "the room's event, the legacy nil one, and this device's own");
+        assert_eq!(store.sync_cursor(leaked_room).unwrap(), 0, "a dropped room re-pulls from the start");
+        assert_eq!(store.sync_cursor(room).unwrap(), 9);
+
+        // The backup holds everything, and a second run is a no-op.
+        let copy = EventStore::open(&backup).unwrap();
+        let all: i64 = copy.conn.query_row("SELECT COUNT(*) FROM events", [], |r| r.get(0)).unwrap();
+        assert_eq!(all, 6);
+        assert!(store.purge_foreign_workspaces(&keep, me, Some(&dir.path().join("again"))).unwrap().is_empty());
+        assert!(!dir.path().join("again").exists());
     }
 }

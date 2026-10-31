@@ -242,6 +242,18 @@ impl ChatService {
         self.store.prune_superseded_chunks()
     }
 
+    /// Drop the events of every workspace outside `keep` that this device never
+    /// wrote in, after copying the database to `backup` (see
+    /// [`EventStore::purge_foreign_workspaces`]). Returns what was dropped.
+    pub fn purge_foreign_workspaces(
+        &mut self,
+        keep: &std::collections::HashSet<Uuid>,
+        backup: &std::path::Path,
+    ) -> std::result::Result<Vec<(Uuid, usize)>, EventStoreError> {
+        let me = self.device_id;
+        self.store.purge_foreign_workspaces(keep, me, Some(backup))
+    }
+
     /// The local actor used to author + sign new messages. Stable account id;
     /// the display name can change at runtime (see [`set_author_display_name`]).
     pub fn author(&self) -> &ActorIdentity {

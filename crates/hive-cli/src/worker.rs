@@ -226,7 +226,9 @@ pub async fn drain_tick(
                     continue;
                 }
             };
-            if id == workspace_config_session_id(s.workspace_id) {
+            // Only this workspace's chats: the store may still hold another
+            // workspace's events (an older client pushed them into the room).
+            if s.workspace_id != ctx.ws || id == workspace_config_session_id(s.workspace_id) {
                 continue;
             }
             candidates.extend(
