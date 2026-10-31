@@ -43,6 +43,21 @@ async fn json_ok<T: serde::de::DeserializeOwned>(resp: reqwest::Response) -> Res
     }
 }
 
+/// Envelopes per page a client asks the relay for. The relay also caps a page
+/// by size (4 MiB), so a room of large bodies returns fewer.
+pub const ENVELOPE_PAGE_LIMIT: u32 = 500;
+
+/// One page of `GET /v1/workspaces/{id}/envelopes`.
+#[derive(Debug, Clone, Default)]
+pub struct EnvelopePage {
+    /// `(server seq, opaque body)`, oldest first.
+    pub rows: Vec<(u64, serde_json::Value)>,
+    /// The relay holds envelopes past this page.
+    pub more: bool,
+    /// The `after` cursor for the next page.
+    pub next_after: u64,
+}
+
 /// Outcome of a cheap connectivity/auth probe. Every failure maps to a variant
 /// so the UI can tell "wrong URL / relay down" apart from "bad token".
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,7 +413,8 @@ impl RelayClient {
     /// Cheap connectivity + auth check: an authed GET of the envelope list.
     /// Never errors — maps every failure to a `RelayProbe` the UI can render.
     pub async fn probe(&self, workspace: &str) -> RelayProbe {
-        let url = format!("{}/v1/workspaces/{}/envelopes?after=0", self.base, workspace);
+        // limit=1: a probe only needs the status, never the room's history.
+        let url = format!("{}/v1/workspaces/{}/envelopes?after=0&limit=1", self.base, workspace);
         match self.authed(self.http.get(url)).send().await {
             Ok(resp) => {
                 let code = resp.status().as_u16();
@@ -412,6 +428,52 @@ impl RelayClient {
             }
             Err(e) => RelayProbe::Unreachable(e.to_string()),
         }
+    }
+
+    /// Fetch one page of raw opaque bodies past `after` (at most `limit`; the
+    /// relay may return fewer, bounded by its own page cap and byte budget).
+    ///
+    /// The relay marks a partial page with `X-Hive-More: true` and the cursor to
+    /// continue from with `X-Hive-Next-After`. A relay that predates paging sends
+    /// neither and returns everything, so `more` is false and the page is the
+    /// whole tail — the caller is caught up either way.
+    pub async fn fetch_page(
+        &self,
+        workspace: &str,
+        after: u64,
+        limit: u32,
+    ) -> Result<EnvelopePage, RelayError> {
+        let url = format!(
+            "{}/v1/workspaces/{}/envelopes?after={}&limit={}",
+            self.base, workspace, after, limit
+        );
+        let resp = self.authed(self.http.get(url)).send().await?;
+        let header = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .map(str::to_owned)
+        };
+        let more = header("x-hive-more").is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1");
+        let next_header = header("x-hive-next-after").and_then(|v| v.parse::<u64>().ok());
+        let rows: Vec<serde_json::Value> = json_ok(resp).await?;
+        let rows: Vec<(u64, serde_json::Value)> = rows
+            .into_iter()
+            .map(|row| {
+                let seq = row.get("seq").and_then(serde_json::Value::as_u64).unwrap_or(0);
+                let body = row.get("body").cloned().unwrap_or(serde_json::Value::Null);
+                (seq, body)
+            })
+            .collect();
+        // Continue past the highest seq actually received; the header only
+        // matters for an (unexpected) empty page that still says "more".
+        let last = rows.iter().map(|(seq, _)| *seq).max().unwrap_or(after);
+        let next_after = last.max(next_header.unwrap_or(after)).max(after);
+        // A page that claims "more" but can't move the cursor would loop
+        // forever; treat it as caught up and let the next round retry.
+        let more = more && next_after > after;
+        Ok(EnvelopePage { rows, more, next_after })
     }
 
     /// Fetch raw opaque bodies past `after`, with their server sequences.

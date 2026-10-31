@@ -6,6 +6,11 @@
 //! depending on a separate relay crate/binary. It's **content-blind**: it stores
 //! whatever opaque JSON body it's handed, verbatim, exactly as a real relay does.
 //!
+//! `GET /envelopes` pages like the real relay: at most `limit` rows (clamped to
+//! the router's page cap, which is also the default), with `X-Hive-Next-After`
+//! and, when rows remain, `X-Hive-More: true`. [`router_with_page_cap`] sets a
+//! tiny cap so tests cross page boundaries with a handful of envelopes.
+//!
 //! Deliberately omitted: the SSE `/events` stream (the client degrades to polling
 //! on 404, which the tests rely on) and everything social/directory/admin, which
 //! no test here touches.
@@ -32,14 +37,32 @@ struct MockState {
     /// pairing code → opaque payload.
     pairings: HashMap<String, String>,
     pair_seq: u64,
+    /// Most envelopes one `GET /envelopes` returns (and the default limit).
+    page_cap: usize,
+    /// How many `GET /envelopes` requests were served (paging assertions).
+    envelope_gets: usize,
 }
+
+/// The real relay's default and maximum page size.
+pub const DEFAULT_PAGE_CAP: usize = 1000;
 
 type Shared = Arc<Mutex<MockState>>;
 
 /// A fresh mock relay router with its own in-memory state.
 pub fn router() -> Router {
-    let state: Shared = Arc::new(Mutex::new(MockState::default()));
-    Router::new()
+    router_with_page_cap(DEFAULT_PAGE_CAP)
+}
+
+/// A mock relay whose envelope pages hold at most `page_cap` rows.
+pub fn router_with_page_cap(page_cap: usize) -> Router {
+    router_with_stats(page_cap).0
+}
+
+/// Like [`router_with_page_cap`], plus a counter of `GET /envelopes` requests.
+pub fn router_with_stats(page_cap: usize) -> (Router, EnvelopeGets) {
+    let state: Shared = Arc::new(Mutex::new(MockState { page_cap: page_cap.max(1), ..Default::default() }));
+    let gets = EnvelopeGets(state.clone());
+    let router = Router::new()
         .route("/v1/health", get(|| async { "ok" }))
         .route(
             "/v1/workspaces/:ws/envelopes",
@@ -52,7 +75,18 @@ pub fn router() -> Router {
         .route("/v1/workspaces/:ws/presence", post(put_presence).get(list_presence))
         .route("/v1/pair", post(create_pair))
         .route("/v1/pair/:code", get(resolve_pair))
-        .with_state(state)
+        .with_state(state);
+    (router, gets)
+}
+
+/// Reads how many `GET /envelopes` requests a mock relay has served.
+#[derive(Clone)]
+pub struct EnvelopeGets(Shared);
+
+impl EnvelopeGets {
+    pub fn count(&self) -> usize {
+        self.0.lock().unwrap().envelope_gets
+    }
 }
 
 async fn push_envelope(
@@ -70,15 +104,20 @@ async fn push_envelope(
 struct AfterQuery {
     #[serde(default)]
     after: u64,
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 async fn list_envelopes(
     State(st): State<Shared>,
     Path(ws): Path<String>,
     Query(q): Query<AfterQuery>,
-) -> Json<Value> {
-    let st = st.lock().unwrap();
-    let rows: Vec<Value> = st
+) -> impl axum::response::IntoResponse {
+    let mut st = st.lock().unwrap();
+    st.envelope_gets += 1;
+    let cap = st.page_cap;
+    let limit = q.limit.filter(|n| *n > 0).map_or(cap, |n| n.min(cap));
+    let tail: Vec<(u64, &Value)> = st
         .envelopes
         .get(&ws)
         .map(|list| {
@@ -86,11 +125,22 @@ async fn list_envelopes(
                 .enumerate()
                 .map(|(i, body)| (i as u64 + 1, body))
                 .filter(|(seq, _)| *seq > q.after)
-                .map(|(seq, body)| json!({ "seq": seq, "body": body }))
                 .collect()
         })
         .unwrap_or_default();
-    Json(Value::Array(rows))
+    let more = tail.len() > limit;
+    let page: Vec<Value> = tail
+        .iter()
+        .take(limit)
+        .map(|(seq, body)| json!({ "seq": seq, "body": body }))
+        .collect();
+    let next = tail.get(limit.min(tail.len()).wrapping_sub(1)).map_or(q.after, |(seq, _)| *seq);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-hive-next-after", next.to_string().parse().unwrap());
+    if more {
+        headers.insert("x-hive-more", "true".parse().unwrap());
+    }
+    (headers, Json(Value::Array(page)))
 }
 
 #[derive(serde::Deserialize)]

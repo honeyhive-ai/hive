@@ -50,9 +50,9 @@ pub use mcp::{
 };
 pub use mentions::{parse_mentions, MentionTargets};
 pub use relay_client::{
-    AccountDevice, AccountIdentity, FetchedEnvelope, Friend, FriendPresence, FriendRequestOutcome,
+    AccountDevice, AccountIdentity, EnvelopePage, FetchedEnvelope, Friend, FriendPresence, FriendRequestOutcome,
     IncomingFriendRequest, InboxEvent, InviteEntry, IssuedInvite, IssuedRelayToken, MemberEntry,
-    RelayClient, RelayError, RelayProbe, RelayTokenEntry, RelayUserEntry,
+    RelayClient, RelayError, RelayProbe, RelayTokenEntry, RelayUserEntry, ENVELOPE_PAGE_LIMIT,
 };
 pub use remote_manifest::resolve_manifest_url;
 pub use sse::{next_backoff, parse_seq, SseConnectError, SseDecoder, SseStream};

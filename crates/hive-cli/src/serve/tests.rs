@@ -1678,3 +1678,36 @@ fn retired_box_messages_read_as_the_owner_via_the_box() {
     assert_eq!(v["author"], "Alex");
     assert!(v.get("via").is_none());
 }
+
+/// `sync_once` (a daemon's first sync, `hive sync`, a worker tick) pages
+/// through a room bigger than one relay page until it is caught up, instead
+/// of stopping after the first page.
+#[tokio::test]
+async fn sync_once_pages_through_a_large_room() {
+    let tmp = tempfile::tempdir().unwrap();
+    let relay = spawn(test_relay::router_with_page_cap(2)).await;
+    let room = format!("serve-test-{}", Uuid::new_v4());
+    let ws = crate::uuid_of_room(&room);
+
+    let desktop = config(&tmp.path().join("desktop"), &relay, &room);
+    let chat_id = {
+        let mut svc = open_service(&desktop).unwrap();
+        svc.ensure_self_member(workspace_config_session_id(ws), ws).unwrap();
+        let chat = svc.create_chat("general", ws, "gw").unwrap();
+        for i in 0..60 {
+            svc.post_user_message(chat.id, ws, format!("message {i}")).unwrap();
+        }
+        chat.id
+    };
+    let (pushed, _) = sync_once(&desktop).await.unwrap();
+    assert!(pushed > 60, "pushed {pushed}");
+
+    // Far more envelopes than one round (PULL_PAGES_PER_ROUND pages of 2).
+    let fresh = config(&tmp.path().join("fresh"), &relay, &room);
+    std::fs::create_dir_all(&fresh.data_dir).unwrap();
+    let (_, pulled) = sync_once(&fresh).await.unwrap();
+    assert_eq!(pulled, pushed, "the whole room in one sync_once");
+    let svc = open_service(&fresh).unwrap();
+    let chat = svc.load(chat_id).unwrap().expect("chat synced");
+    assert_eq!(chat.messages.len(), 60);
+}

@@ -18,7 +18,13 @@ use uuid::Uuid;
 use crate::event_store::EventStore;
 use crate::envelope_verifier::{build_roster, verdict_for};
 use crate::identity_verifier::{gate_ingest, shared_cache, IdentityMode, IngestAction, SharedIdentityCache};
-use crate::relay_client::{RelayClient, RelayError};
+use crate::relay_client::{RelayClient, RelayError, ENVELOPE_PAGE_LIMIT};
+
+/// Most relay pages one [`SyncEngine::pull_round`] fetches and applies. A room
+/// with more history than this catches up over several rounds
+/// ([`SyncEngine::is_behind`] says another round is due), so one round never
+/// holds the store or memory for an unbounded download.
+pub const PULL_PAGES_PER_ROUND: usize = 8;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -66,6 +72,20 @@ pub struct SyncEngine {
     /// `sync_cursor` on first use and persisted whenever it advances, so a
     /// restart resumes from the durable cursor instead of 0.
     last_fetched_seq: u64,
+    /// Where the next page starts while catching up across pages. It runs ahead
+    /// of `last_fetched_seq` when a not-yet-openable body holds the durable
+    /// cursor back, so paging still reaches the head; once caught up it resets
+    /// and the next round re-fetches from the durable cursor (the retry point).
+    page_after: Option<u64>,
+    /// The relay said more envelopes remain past the last page fetched.
+    behind: bool,
+    /// Lowest held (not-yet-openable / identity-pending) seq seen on an earlier
+    /// page of the current multi-page walk. `apply_fetched` caps the cursor
+    /// below it, so a later page that holds nothing can't advance the durable
+    /// cursor past a held body on an earlier page (which would skip it).
+    walk_hold: Option<u64>,
+    /// Envelopes requested per page.
+    page_limit: u32,
     /// Whether durable sync state (cursor + pushed set) has been loaded from the
     /// store yet. Guards a one-time seed on the first store-bearing call.
     loaded: bool,
@@ -118,6 +138,10 @@ impl SyncEngine {
             seen: HashSet::new(),
             scanned_row: 0,
             last_fetched_seq: 0,
+            page_after: None,
+            behind: false,
+            walk_hold: None,
+            page_limit: ENVELOPE_PAGE_LIMIT,
             loaded: false,
             pending: Vec::new(),
             keyring: BTreeMap::new(),
@@ -254,14 +278,57 @@ impl SyncEngine {
         Ok(to_push.len())
     }
 
-    /// Fetch remote envelopes past the cursor and ingest the unseen ones.
-    /// Returns how many were newly applied.
+    /// Fetch remote envelopes past the cursor and ingest the unseen ones, one
+    /// bounded round (see [`SyncEngine::pull_round`]). Returns how many were
+    /// newly applied.
     pub async fn pull(&mut self, store: &mut EventStore) -> Result<usize, SyncError> {
+        self.pull_round(store).await
+    }
+
+    /// Fetch and apply up to [`PULL_PAGES_PER_ROUND`] pages, each applied (and
+    /// its cursor persisted) before the next is fetched, so progress survives an
+    /// interruption and only one page is in memory at a time. Stops early once
+    /// caught up; otherwise [`SyncEngine::is_behind`] stays true and the caller
+    /// should run another round soon.
+    pub async fn pull_round(&mut self, store: &mut EventStore) -> Result<usize, SyncError> {
         // Load the durable cursor before fetching so a fresh engine resumes from
         // it rather than re-fetching the whole room from 0.
         self.ensure_loaded(store)?;
-        let fetched = self.fetch_new().await?;
-        self.apply_fetched(store, &fetched)
+        let mut applied = 0;
+        for _ in 0..PULL_PAGES_PER_ROUND {
+            let fetched = self.fetch_new().await?;
+            applied += self.apply_fetched(store, &fetched)?;
+            if !self.behind {
+                break;
+            }
+        }
+        Ok(applied)
+    }
+
+    /// Pull rounds until caught up, or `max_rounds` rounds have run. For
+    /// one-shot callers (a CLI sync, a daemon's first sync) that need the whole
+    /// room before they act. Returns how many events were newly applied.
+    pub async fn catch_up(&mut self, store: &mut EventStore, max_rounds: usize) -> Result<usize, SyncError> {
+        let mut applied = self.pull_round(store).await?;
+        for _ in 1..max_rounds {
+            if !self.behind {
+                break;
+            }
+            applied += self.pull_round(store).await?;
+        }
+        Ok(applied)
+    }
+
+    /// The relay holds envelopes past what this engine has fetched: another
+    /// pull round is due.
+    pub fn is_behind(&self) -> bool {
+        self.behind
+    }
+
+    /// Envelopes to request per page (tests use a small value).
+    pub fn with_page_limit(mut self, limit: u32) -> Self {
+        self.page_limit = limit.max(1);
+        self
     }
 
     /// One-time seed of durable sync state (cursor + pushed set) from the store,
@@ -388,11 +455,27 @@ impl SyncEngine {
         !self.keyring.is_empty()
     }
 
-    /// Fetch raw remote bodies past the cursor (async; no store). The cursor is
-    /// **not** advanced here — it only moves in `apply_fetched`, so a body fetched
-    /// before its decryption key is available can be re-fetched and isn't lost.
-    pub async fn fetch_new(&self) -> Result<Vec<(u64, Value)>, SyncError> {
-        Ok(self.relay.fetch_values(&self.workspace, self.last_fetched_seq).await?)
+    /// Fetch the next page of raw remote bodies (async; no store). The durable
+    /// cursor is **not** advanced here — it only moves in `apply_fetched`, so a
+    /// body fetched before its decryption key is available can be re-fetched and
+    /// isn't lost. One page only: [`SyncEngine::is_behind`] says whether more
+    /// remain, and the next call continues after this page.
+    ///
+    /// Callers that construct a fresh engine must load the durable cursor first
+    /// (`take_unpushed` / `pull_round` do), or the first page starts at 0.
+    pub async fn fetch_new(&mut self) -> Result<Vec<(u64, Value)>, SyncError> {
+        let after = match self.page_after {
+            Some(p) if self.behind => p.max(self.last_fetched_seq),
+            _ => {
+                // A fresh walk from the durable cursor: it re-meets any held body.
+                self.walk_hold = None;
+                self.last_fetched_seq
+            }
+        };
+        let page = self.relay.fetch_page(&self.workspace, after, self.page_limit).await?;
+        self.behind = page.more;
+        self.page_after = page.more.then_some(page.next_after);
+        Ok(page.rows)
     }
 
     /// Decode + ingest fetched bodies into the store (sync; no IO awaits), then
@@ -458,6 +541,10 @@ impl SyncEngine {
 
         if foreign > 0 {
             tracing::warn!(room = %self.workspace, foreign, "dropped fetched events stamped with another workspace");
+        }
+        // A body held on an earlier page of this walk still caps the cursor.
+        if let Some(h) = self.walk_hold {
+            retry_at = Some(retry_at.map_or(h, |r| r.min(h)));
         }
 
         // Verify-on-ingest (S1): build the trust roster from what we already hold
@@ -539,6 +626,9 @@ impl SyncEngine {
                 self.last_fetched_seq = self.last_fetched_seq.max(seq);
             }
         }
+        // Carry the hold to the next page of this walk; a walk that reached the
+        // head (or a direct call) drops it — the next walk starts at the cursor.
+        self.walk_hold = if self.behind { retry_at } else { None };
 
         // Persist the durable dedup markers, and the cursor iff it advanced —
         // this is what lets a restart resume from here instead of seq 0. The
@@ -1580,5 +1670,162 @@ mod tests {
             store.has_event(content.event_id).unwrap(),
             "content converges once its trust arrives in a later pull — no permanent wedge"
         );
+    }
+
+    // --- Paged pull (a room larger than one relay page) ---
+
+    /// A mock relay whose pages hold at most `cap` envelopes.
+    async fn spawn_paged_relay(cap: usize) -> (String, crate::test_relay::EnvelopeGets) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (router, gets) = crate::test_relay::router_with_stats(cap);
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}"), gets)
+    }
+
+    /// One chat: a snapshot + `n` messages = `n + 1` envelopes.
+    fn seed_long_chat(store: &mut EventStore, n: usize) -> Uuid {
+        let (sid, wid) = seed_chat(store);
+        for i in 0..n {
+            store
+                .ingest(&SessionEventEnvelope::new(
+                    sid,
+                    wid,
+                    2 + i as i64,
+                    SessionEvent::MessageAppended {
+                        message: ChatMessage::new(MessageRole::User, "A", format!("msg {i}")),
+                    },
+                ))
+                .unwrap();
+        }
+        sid
+    }
+
+    /// A new device joining a room bigger than one relay page gets all of it:
+    /// a round is bounded to PULL_PAGES_PER_ROUND pages and says it is behind,
+    /// the next round continues, and the durable cursor ends at the head.
+    #[tokio::test]
+    async fn pull_rounds_page_through_a_room_larger_than_one_page() {
+        let (base, gets) = spawn_paged_relay(3).await;
+        let workspace = Uuid::new_v4().to_string();
+        let key = hive_core::derive_workspace_key("paged room");
+
+        let mut store_a = EventStore::open_in_memory().unwrap();
+        let sid = seed_long_chat(&mut store_a, 40); // 41 envelopes = 14 pages of 3
+        let mut a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
+        assert_eq!(a.push_new(&store_a).await.unwrap(), 41);
+
+        let mut store_b = EventStore::open_in_memory().unwrap();
+        let mut b = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
+        let before = gets.count();
+        let first = b.pull_round(&mut store_b).await.unwrap();
+        assert_eq!(first, 3 * PULL_PAGES_PER_ROUND, "one round = a bounded number of pages");
+        assert_eq!(gets.count() - before, PULL_PAGES_PER_ROUND);
+        assert!(b.is_behind(), "more pages remain");
+        assert_eq!(store_b.sync_cursor(&workspace).unwrap(), first as u64, "progress is durable per page");
+
+        let second = b.pull_round(&mut store_b).await.unwrap();
+        assert_eq!(first + second, 41);
+        assert!(!b.is_behind(), "caught up");
+        assert_eq!(b.cursor(), 41);
+        let session = store_b.load_session(sid).unwrap().expect("chat synced");
+        assert_eq!(session.messages.len(), 40);
+
+        // Caught up: the next round is a single empty page.
+        let before = gets.count();
+        assert_eq!(b.pull_round(&mut store_b).await.unwrap(), 0);
+        assert_eq!(gets.count() - before, 1);
+
+        // `catch_up` (one-shot callers) gets the whole room in one call.
+        let mut store_c = EventStore::open_in_memory().unwrap();
+        let mut c = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
+        assert_eq!(c.catch_up(&mut store_c, 100).await.unwrap(), 41);
+        assert!(!c.is_behind());
+        assert_eq!(store_c.load_session(sid).unwrap().unwrap().messages.len(), 40);
+
+        // A restarted engine resumes from the durable cursor, not from 0.
+        let mut c2 = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
+        assert_eq!(c2.pull_round(&mut store_c).await.unwrap(), 0);
+        assert_eq!(c2.cursor(), 41);
+    }
+
+    /// The client's own page size is honored too (smaller than the relay cap).
+    #[tokio::test]
+    async fn pull_honors_the_client_page_limit() {
+        let (base, gets) = spawn_paged_relay(1000).await;
+        let workspace = Uuid::new_v4().to_string();
+        let key = hive_core::derive_workspace_key("client limit");
+        let mut store_a = EventStore::open_in_memory().unwrap();
+        seed_long_chat(&mut store_a, 9); // 10 envelopes
+        let mut a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
+        a.push_new(&store_a).await.unwrap();
+
+        let mut store_b = EventStore::open_in_memory().unwrap();
+        let mut b = SyncEngine::unscoped(RelayClient::new(&base), &workspace)
+            .with_key(key)
+            .with_page_limit(4);
+        let before = gets.count();
+        assert_eq!(b.pull_round(&mut store_b).await.unwrap(), 10);
+        assert_eq!(gets.count() - before, 3, "4 + 4 + 2");
+        assert!(!b.is_behind());
+    }
+
+    /// A body that can't be opened yet holds the durable cursor (the retry
+    /// point) — paging must still walk past it to the head in the same catch-up,
+    /// instead of re-fetching the same first page forever. Once caught up, the
+    /// next round re-fetches from the retry point, and the body converges when
+    /// its key arrives.
+    #[tokio::test]
+    async fn paging_walks_past_a_held_body_and_retries_it_later() {
+        let (base, _gets) = spawn_paged_relay(2).await;
+        let workspace = Uuid::new_v4().to_string();
+        let held = hive_core::derive_workspace_key("held epoch 0");
+        let missing = hive_core::e2ee::generate_workspace_key().unwrap();
+
+        // seq 1: a snapshot sealed under epoch 7 (not held yet).
+        let session = ChatSession::new("Shared", Uuid::new_v4(), "anthropic");
+        let (sid, wid) = (session.id, session.workspace_id);
+        let snap = SessionEventEnvelope::new(sid, wid, 1, SessionEvent::SessionSnapshot { session: Box::new(session) });
+        let relay = RelayClient::new(&base);
+        let sealed = seal_symmetric(&missing, 7, &serde_json::to_vec(&snap).unwrap()).unwrap();
+        relay.push_value(&workspace, &serde_json::to_value(sealed).unwrap()).await.unwrap();
+        // seqs 2..=7: openable messages in another chat.
+        let mut store_a = EventStore::open_in_memory().unwrap();
+        let other = seed_long_chat(&mut store_a, 5);
+        let mut a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(held);
+        assert_eq!(a.push_new(&store_a).await.unwrap(), 6);
+
+        let mut store_b = EventStore::open_in_memory().unwrap();
+        let mut b = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(held);
+        assert_eq!(b.catch_up(&mut store_b, 10).await.unwrap(), 6, "every openable event applied");
+        assert!(!b.is_behind(), "reached the head despite the held body");
+        assert_eq!(b.cursor(), 0, "durable cursor still at the retry point");
+        assert_eq!(store_b.load_session(other).unwrap().unwrap().messages.len(), 5);
+
+        // The key arrives: the next round starts at the retry point again.
+        b.add_key(7, missing);
+        b.catch_up(&mut store_b, 10).await.unwrap();
+        assert!(store_b.has_event(snap.event_id).unwrap(), "held body converges");
+        assert_eq!(b.cursor(), 7);
+        assert_eq!(store_b.sync_cursor(&workspace).unwrap(), 7);
+    }
+
+    /// The probe asks for one envelope, never the room's history.
+    #[tokio::test]
+    async fn probe_fetches_one_envelope() {
+        let (base, _gets) = spawn_paged_relay(1000).await;
+        let workspace = Uuid::new_v4().to_string();
+        let key = hive_core::derive_workspace_key("probe");
+        let mut store_a = EventStore::open_in_memory().unwrap();
+        seed_long_chat(&mut store_a, 4);
+        let mut a = SyncEngine::unscoped(RelayClient::new(&base), &workspace).with_key(key);
+        a.push_new(&store_a).await.unwrap();
+        let page = RelayClient::new(&base).fetch_page(&workspace, 0, 1).await.unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert!(page.more);
+        assert_eq!(page.next_after, 1);
+        assert_eq!(RelayClient::new(&base).probe(&workspace).await, crate::relay_client::RelayProbe::Ok);
     }
 }

@@ -227,8 +227,21 @@ fn purge_foreign_workspaces(cfg: &Config) -> Result<()> {
 async fn sync_once(cfg: &Config) -> Result<(usize, usize)> {
     let mut engine = sync_engine(cfg)?;
     let mut store = EventStore::open(cfg.data_dir.join("hive.db"))?;
-    sync_round(&mut engine, &mut store).await
+    let (pushed, mut pulled) = sync_round(&mut engine, &mut store).await?;
+    // A one-shot sync (a daemon's first sync, `hive sync`, a worker tick) needs
+    // the whole room before it acts: keep paging until caught up. Each round is
+    // bounded and persists its cursor, so the cap only limits one call.
+    if engine.is_behind() {
+        pulled += engine.catch_up(&mut store, SYNC_ONCE_MAX_ROUNDS).await?;
+    }
+    Ok((pushed, pulled))
 }
+
+/// Pull rounds one `sync_once` may run (each up to
+/// `hive_runtime::sync_engine::PULL_PAGES_PER_ROUND` pages of
+/// `ENVELOPE_PAGE_LIMIT`): far beyond any real room, so it only stops a
+/// runaway loop; the next call continues from the persisted cursor.
+const SYNC_ONCE_MAX_ROUNDS: usize = 250;
 
 /// The relay client this config syncs through.
 fn relay_client(cfg: &Config) -> Result<RelayClient> {
@@ -256,8 +269,8 @@ async fn sync_round(engine: &mut SyncEngine, store: &mut EventStore) -> Result<(
     let to_push = engine.take_unpushed(store)?;
     let pushed = to_push.len();
     engine.push_envelopes(&to_push).await?;
-    let fetched = engine.fetch_new().await?;
-    let pulled = engine.apply_fetched(store, &fetched)?;
+    // One bounded round of relay pages; `engine.is_behind()` says another is due.
+    let pulled = engine.pull_round(store).await?;
     Ok((pushed, pulled))
 }
 

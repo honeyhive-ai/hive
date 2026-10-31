@@ -877,7 +877,10 @@ async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
                     shared.refresh();
                     shared.worker_kick.notify_one();
                 }
-                if stream.is_some() {
+                if engine.is_behind() {
+                    // Mid catch-up (a large room): next round of pages now.
+                    Duration::ZERO
+                } else if stream.is_some() {
                     SYNC_SAFETY_POLL
                 } else {
                     shared.opts.sync_every

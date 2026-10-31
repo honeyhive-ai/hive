@@ -10779,8 +10779,10 @@ async fn sync_pull_once(
     let outcome: Result<usize, hive_runtime::SyncError> = async {
         let to_push = eng.take_unpushed(store)?;
         eng.push_envelopes(&to_push).await?;
-        let fetched = eng.fetch_new().await?;
-        eng.apply_fetched(store, &fetched)
+        // One bounded round of relay pages; a room with more history leaves
+        // the engine `is_behind`, and the live loop's local tick runs the next
+        // round within LOCAL_WRITES (the fallback poll does on its tick).
+        eng.pull_round(store).await
     }
     .await;
     match outcome {
@@ -11078,9 +11080,11 @@ async fn run_sync_loop(app: AppHandle, settings: Arc<Mutex<LiveSettings>>, db_pa
                                 // Something was stored since the last round (marked
                                 // before it, so a write during a round still counts):
                                 // push it now. A pull's own rows cost one empty round.
+                                // Also continues a multi-round catch-up (a new
+                                // device downloading a large room) page by page.
                                 _ = local.tick() => {
                                     let now = store.max_row_id().unwrap_or(pushed_through);
-                                    if now > pushed_through {
+                                    if now > pushed_through || eng.is_behind() {
                                         pushed_through = now;
                                         let _ = sync_pull_once(
                                             &app, eng, &mut store, &mut last_sync_err,
