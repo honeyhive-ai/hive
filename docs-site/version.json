@@ -1,6 +1,6 @@
 {
-  "tag": "v1.15.1",
-  "name": "Hive 1.15.1",
+  "tag": "v1.16.0",
+  "name": "Hive 1.16.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes: a timed-out run_command now stops the command and everything it started on Linux too (previously its child processes kept running), and TLS certificate dependencies are updated for security advisories (rustls-webpki, webpki-roots)."
+  "notes": "Security: relay sync now uploads only the connected room's own workspace (v1.0.0 to v1.15.1 also uploaded other local workspaces, encrypted under that room's key) and purges foreign events locally once; upgrade all devices. Features: phone remote access through an end-to-end encrypted relay tunnel, host dashboards, push, proposal collaboration and @hive from the phone. Fixes: presence-based host liveness, single hand-off replies, relay envelope paging."
 }
