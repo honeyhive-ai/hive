@@ -310,6 +310,21 @@ fn preview_text_cuts_on_char_boundaries() {
 }
 
 #[test]
+fn preview_text_flattens_markdown_before_the_cut() {
+    let md = "## Workers\n\n| Worker | Load | State |\n|---|---:|:---:|\n| **gpu-a** | 41% | `idle` |\n| gpu-b | 97% | busy |\n\n- see [dashboard](https://example.com/d)";
+    assert_eq!(
+        preview_text(md),
+        "Workers Worker: gpu-a · Load: 41% · State: idle; Worker: gpu-b · Load: 97% · State: busy • see dashboard"
+    );
+    // A wide table: the cut lands in the flattened text, not in `|---|` rows.
+    let wide = format!("| A | B |\n|---|---|\n{}", "| alpha | beta |\n".repeat(40));
+    let p = preview_text(&wide);
+    assert!(p.starts_with("A: alpha · B: beta; A: alpha"), "{p}");
+    assert!(!p.contains('|') && !p.contains("---"));
+    assert!(p.ends_with('…') && p.chars().count() <= PREVIEW_CHARS + 1);
+}
+
+#[test]
 fn push_plaintext_previews_on_and_off() {
     let c = reply("Done: refactored the parser.\nAll tests pass.");
     let on = push_plaintext(&c, true, 7, 1_800_000_000);

@@ -38,6 +38,7 @@ pub mod frame;
 pub mod keys;
 pub mod noise;
 pub mod phones;
+pub mod plain;
 pub mod push;
 pub mod session;
 
@@ -783,10 +784,13 @@ pub struct PushContent {
     pub fixed_body: String,
 }
 
-/// The first [`PREVIEW_CHARS`] characters of `s`: whitespace runs collapsed
-/// to one space, control characters dropped, cut on a character boundary,
-/// `…` appended when cut.
+/// The first [`PREVIEW_CHARS`] characters of `s` as plain text: markdown
+/// flattened first ([`plain::markdown_to_plain`] — a table's pipes and
+/// separator row would otherwise use up the budget), then whitespace runs
+/// collapsed to one space, control characters dropped, cut on a character
+/// boundary, `…` appended when cut.
 pub fn preview_text(s: &str) -> String {
+    let s = plain::markdown_to_plain(s);
     let mut out = String::new();
     let mut n = 0;
     let mut pending_space = false;
