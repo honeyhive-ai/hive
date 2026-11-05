@@ -235,7 +235,7 @@ async fn tool_loop_turn(
     settings: &ToolSettings,
     on_delta: impl FnMut(String),
 ) -> Result<TurnReply> {
-    use hive_runtime::agent_tools::{builtin_policy, tool_round_budget, CompositeTools, MAX_OFFERED_TOOLS};
+    use hive_runtime::agent_tools::{builtin_policy, tool_hints, tool_round_budget, CompositeTools, MAX_OFFERED_TOOLS};
     use hive_runtime::git_worktree::{chat_worktree, is_git_repo, LazyTurnWorktree};
     use std::sync::Arc;
 
@@ -269,8 +269,8 @@ async fn tool_loop_turn(
         }
         _ => None,
     };
-    let tools =
-        CompositeTools::new(builtin, mcp, MAX_OFFERED_TOOLS).allow_mcp_after_reads(settings.mcp_after_reads);
+    let tools = CompositeTools::with_hints(builtin, mcp, MAX_OFFERED_TOOLS, &tool_hints(system, turns))
+        .allow_mcp_after_reads(settings.mcp_after_reads);
     dispatch::warm_context_probe(rt).await;
     let rounds = tool_round_budget(rt.provider, rt.max_tool_rounds);
     let set = (!tools.is_empty()).then(|| dispatch::ToolSet { defs: tools.defs(), executor: &tools, max_rounds: rounds });

@@ -7812,10 +7812,13 @@ async fn run_prepared_turn(
         None
     };
     let http_tools = (builtin.is_some() || mcp_tools.is_some()).then(|| {
-        hive_runtime::agent_tools::CompositeTools::new(
+        // Tools the agent's prompt, skills or the user's message name are
+        // offered first when the cap trims.
+        hive_runtime::agent_tools::CompositeTools::with_hints(
             builtin,
             mcp_tools,
             hive_runtime::agent_tools::MAX_OFFERED_TOOLS,
+            &hive_runtime::agent_tools::tool_hints(&system, &turns),
         )
     });
     let tool_rounds = hive_runtime::agent_tools::tool_round_budget(

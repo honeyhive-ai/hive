@@ -4,9 +4,12 @@
 //!
 //! - Names never collide: a built-in name wins and the MCP tool of the same
 //!   name is dropped (and logged).
-//! - At most [`MAX_OFFERED_TOOLS`] are offered, built-ins first — small open
-//!   models pick worse from a long list, and every definition costs prompt
-//!   tokens on every round. What's dropped is logged.
+//! - At most [`MAX_OFFERED_TOOLS`] are offered — small open models pick worse
+//!   from a long list, and every definition costs prompt tokens on every
+//!   round. Built-ins come first, but [`MCP_RESERVED_SLOTS`] are held for MCP
+//!   tools; MCP tools named in the agent's prompt, its skills or the user's
+//!   message are preferred, the rest go round-robin across servers (see
+//!   `select_tools`). Whatever the cap drops is logged at warn level.
 //! - A call is routed to whichever source offered that name. A built-in name
 //!   the policy left out still goes to [`BuiltinTools`], which refuses it with
 //!   a clear message; anything else unknown is an error result.
@@ -86,55 +89,167 @@ fn def_name(def: &Value) -> &str {
     def.get("name").and_then(Value::as_str).unwrap_or("")
 }
 
+/// Slots kept for MCP tools when there are any, so the built-ins can never
+/// crowd them out wholesale. Never more than half the cap.
+pub const MCP_RESERVED_SLOTS: usize = 4;
+
+/// The outcome of [`select_tools`].
+#[derive(Debug, Default)]
+struct Selection {
+    /// Offered definitions: built-ins first, then MCP.
+    defs: Vec<Value>,
+    routes: Vec<(String, Source)>,
+    /// MCP names dropped because a built-in or earlier tool has that name.
+    collisions: Vec<String>,
+    /// Names dropped by the cap (built-in or MCP).
+    over_cap: Vec<String>,
+}
+
+/// The MCP server a namespaced tool name (`<server>__<tool>`) belongs to;
+/// the whole name when it has no namespace.
+fn mcp_server(name: &str) -> &str {
+    name.split_once("__").map_or(name, |(server, _)| server)
+}
+
+/// Whether `hints` (already lowercased) names this MCP tool: its full
+/// namespaced name, or its bare tool name when that is identifier-like (has
+/// `_` or `-`, so a plain word such as "search" or "status" in prose doesn't
+/// count). Whole words only.
+fn mentioned(hints: &str, name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    let has_word = |needle: &str| {
+        !needle.is_empty()
+            && hints.match_indices(needle).any(|(i, _)| {
+                let before = hints[..i].chars().next_back();
+                let after = hints[i + needle.len()..].chars().next();
+                !before.is_some_and(is_word) && !after.is_some_and(is_word)
+            })
+    };
+    has_word(&name) || name.split_once("__").is_some_and(|(_, bare)| bare.contains(['_', '-']) && has_word(bare))
+}
+
+/// Pick the tools to offer under `max_tools`:
+///
+/// 1. MCP names that collide with a built-in (or repeat) are dropped.
+/// 2. Up to [`MCP_RESERVED_SLOTS`] slots (at most half the cap) are held for
+///    MCP tools when there are any; built-ins fill the rest in their own
+///    order (read-only first) and MCP tools get every slot left over.
+/// 3. MCP tools named in `hints` come first; the rest are taken round-robin
+///    across servers (each server's first tool, then each one's second, …)
+///    so one large server can't push another server out entirely.
+///
+/// Everything that doesn't fit is reported in `over_cap`.
+fn select_tools(builtin_defs: Vec<Value>, mcp_defs: Vec<Value>, max_tools: usize, hints: &str) -> Selection {
+    use std::collections::{HashSet, VecDeque};
+    let mut sel = Selection::default();
+    let mut seen = HashSet::new();
+    let builtins: Vec<Value> =
+        builtin_defs.into_iter().filter(|d| !def_name(d).is_empty() && seen.insert(def_name(d).to_string())).collect();
+    let mut mcp = Vec::new();
+    for def in mcp_defs {
+        let name = def_name(&def).to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if BuiltinTools::is_builtin(&name) || !seen.insert(name.clone()) {
+            sel.collisions.push(name);
+            continue;
+        }
+        mcp.push(def);
+    }
+
+    let reserve = mcp.len().min(MCP_RESERVED_SLOTS).min(max_tools / 2);
+    let builtin_slots = builtins.len().min(max_tools - reserve);
+    let mcp_slots = max_tools - builtin_slots;
+
+    for (i, def) in builtins.into_iter().enumerate() {
+        let name = def_name(&def).to_string();
+        if i < builtin_slots {
+            sel.routes.push((name, Source::Builtin));
+            sel.defs.push(def);
+        } else {
+            sel.over_cap.push(name);
+        }
+    }
+
+    // Mentioned first (in listed order), then round-robin by server
+    // (servers in first-listed order).
+    let hints = hints.to_ascii_lowercase();
+    let (mut ordered, rest): (Vec<Value>, Vec<Value>) = mcp.into_iter().partition(|d| mentioned(&hints, def_name(d)));
+    let mut servers: Vec<(String, VecDeque<Value>)> = Vec::new();
+    for def in rest {
+        let server = mcp_server(def_name(&def)).to_string();
+        match servers.iter_mut().find(|(s, _)| *s == server) {
+            Some((_, q)) => q.push_back(def),
+            None => servers.push((server, VecDeque::from([def]))),
+        }
+    }
+    while servers.iter().any(|(_, q)| !q.is_empty()) {
+        for (_, q) in &mut servers {
+            if let Some(def) = q.pop_front() {
+                ordered.push(def);
+            }
+        }
+    }
+    for (i, def) in ordered.into_iter().enumerate() {
+        let name = def_name(&def).to_string();
+        if i < mcp_slots {
+            sel.routes.push((name, Source::Mcp));
+            sel.defs.push(def);
+        } else {
+            sel.over_cap.push(name);
+        }
+    }
+    sel
+}
+
+/// The text [`CompositeTools::with_hints`] looks for tool names in: the
+/// system prompt (the agent's instructions and loaded skills) plus the
+/// latest user message.
+pub fn tool_hints(system: &str, turns: &[crate::ChatTurn]) -> String {
+    let last_user = turns.iter().rev().find(|t| t.role == "user").map_or("", |t| t.content.as_str());
+    format!("{system}\n{last_user}")
+}
+
 impl<M: ToolExecutor> CompositeTools<M> {
     /// Merge `builtin` (its policy-allowed defs) with `mcp` (`defs` + the
-    /// executor that runs them), capped at `max_tools`.
+    /// executor that runs them), capped at `max_tools`. See
+    /// [`CompositeTools::with_hints`]; this is that with no hints.
     pub fn new(builtin: Option<BuiltinTools>, mcp: Option<(Vec<Value>, M)>, max_tools: usize) -> Self {
-        let mut defs = Vec::new();
-        let mut routes = HashMap::new();
-        let mut dropped = Vec::new();
-        let mut offer = |def: Value, source: Source, defs: &mut Vec<Value>, dropped: &mut Vec<String>| {
-            let name = def_name(&def).to_string();
-            if name.is_empty() {
-                return;
-            }
-            if routes.contains_key(&name) || (source == Source::Mcp && BuiltinTools::is_builtin(&name)) {
-                tracing::warn!(target: "dispatch", tool = %name, "MCP tool name collides with a built-in tool; the built-in wins");
-                dropped.push(name);
-                return;
-            }
-            if defs.len() >= max_tools {
-                dropped.push(name);
-                return;
-            }
-            routes.insert(name, source);
-            defs.push(def);
+        Self::with_hints(builtin, mcp, max_tools, "")
+    }
+
+    /// Like [`CompositeTools::new`], but MCP tools named in `hints` (the
+    /// agent's prompt and skills, the user's message — see [`tool_hints`])
+    /// are offered first when the cap has to trim. Selection is
+    /// `select_tools`.
+    pub fn with_hints(builtin: Option<BuiltinTools>, mcp: Option<(Vec<Value>, M)>, max_tools: usize, hints: &str) -> Self {
+        let builtin_defs = builtin.as_ref().map(BuiltinTools::defs).unwrap_or_default();
+        let (mcp_defs, mcp) = match mcp {
+            Some((defs, exec)) => (defs, Some(exec)),
+            None => (Vec::new(), None),
         };
-        if let Some(b) = &builtin {
-            for def in b.defs() {
-                offer(def, Source::Builtin, &mut defs, &mut dropped);
-            }
+        let sel = select_tools(builtin_defs, mcp_defs, max_tools, hints);
+        for name in &sel.collisions {
+            tracing::warn!(target: "dispatch", tool = %name, "MCP tool name collides with a built-in or earlier tool; the first one wins");
         }
-        let mcp = mcp.map(|(mcp_defs, exec)| {
-            for def in mcp_defs {
-                offer(def, Source::Mcp, &mut defs, &mut dropped);
-            }
-            exec
-        });
-        let over_cap: Vec<&String> = dropped.iter().filter(|n| !BuiltinTools::is_builtin(n)).collect();
-        if !over_cap.is_empty() {
-            tracing::info!(
+        if !sel.over_cap.is_empty() {
+            tracing::warn!(
                 target: "dispatch",
-                offered = defs.len(),
+                offered = sel.defs.len(),
                 cap = max_tools,
-                dropped = ?over_cap,
-                "tool set trimmed for this turn"
+                dropped = ?sel.over_cap,
+                "tool cap reached: these tools are NOT offered this turn (name one in the agent's prompt or a skill to prefer it)"
             );
         }
+        let routes = sel.routes.into_iter().collect();
+        let mut dropped = sel.collisions;
+        dropped.extend(sel.over_cap);
         Self {
             builtin,
             mcp,
-            defs,
+            defs: sel.defs,
             routes,
             dropped,
             read_workspace: AtomicBool::new(false),
@@ -177,6 +292,13 @@ impl<M: ToolExecutor> CompositeTools<M> {
 /// own they send nothing out — MCP lookups before the first read work, and
 /// MCP-only research turns are unaffected. MCP results also carry
 /// [`UNTRUSTED_RESULT_HEADER`].
+///
+/// The guard can't tell an exfiltrating MCP tool from a harmless one, so it
+/// also refuses e.g. a status/dashboard lookup asked about later in a turn
+/// that already read a file — the model is told why and answers with what it
+/// has; asking again in a fresh turn (or calling the MCP tool before reading)
+/// works. The desktop never opts out; `hive serve` / the worker opt out with
+/// `HIVE_MCP_AFTER_READS=1`.
 impl<M: ToolExecutor> ToolExecutor for CompositeTools<M> {
     async fn call(&self, name: &str, input: &Value) -> (String, bool) {
         let route = self.routes.get(name).copied().or_else(|| {
@@ -445,6 +567,120 @@ mod tests {
         let (out, err) = c.call("srv__t19", &json!({})).await;
         assert!(err, "{out}");
         assert!(c.mcp.as_ref().unwrap().calls.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn builtin_defs(n: usize) -> Vec<Value> {
+        crate::builtin_tools::all_defs().into_iter().take(n).collect()
+    }
+
+    fn sel_names(sel: &Selection) -> Vec<String> {
+        sel.defs.iter().map(|d| def_name(d).to_string()).collect()
+    }
+
+    fn defs(names: &[&str]) -> Vec<Value> {
+        names.iter().map(|n| mcp_def(n)).collect()
+    }
+
+    #[test]
+    fn under_the_cap_everything_is_offered_in_order() {
+        let sel = select_tools(builtin_defs(6), defs(&["a__x", "a__y", "b__z"]), 16, "");
+        assert_eq!(sel.defs.len(), 9);
+        assert!(sel.over_cap.is_empty() && sel.collisions.is_empty());
+        assert_eq!(&sel_names(&sel)[6..], &["a__x", "b__z", "a__y"], "round-robin across servers");
+    }
+
+    #[test]
+    fn one_more_tool_never_drops_a_whole_server() {
+        // 6 built-ins + one big server + one small one, over the cap: the
+        // small server's tool survives instead of being the silent tail.
+        let mut mcp: Vec<String> = (0..10).map(|i| format!("big__t{i}")).collect();
+        mcp.push("small__panel".into());
+        let mcp_refs: Vec<&str> = mcp.iter().map(String::as_str).collect();
+        let sel = select_tools(builtin_defs(6), defs(&mcp_refs), 16, "");
+        let n = sel_names(&sel);
+        assert_eq!(n.len(), 16);
+        assert!(n.contains(&"small__panel".to_string()), "{n:?}");
+        assert_eq!(sel.over_cap, vec!["big__t9".to_string()]);
+    }
+
+    #[test]
+    fn round_robin_is_fair_across_three_servers() {
+        let mcp = defs(&["a__1", "a__2", "a__3", "a__4", "b__1", "b__2", "c__1", "c__2", "c__3"]);
+        let sel = select_tools(vec![], mcp, 6, "");
+        assert_eq!(sel_names(&sel), vec!["a__1", "b__1", "c__1", "a__2", "b__2", "c__2"]);
+        assert_eq!(sel.over_cap, vec!["a__3", "c__3", "a__4"]);
+    }
+
+    #[test]
+    fn mentioned_tools_are_preferred() {
+        let mcp = defs(&["a__1", "a__2", "a__3", "b__open_panel", "b__other"]);
+        // Bare identifier-like name, any case, whole word.
+        let sel = select_tools(vec![], mcp.clone(), 2, "Use Open_Panel for status checks.");
+        assert_eq!(sel_names(&sel), vec!["b__open_panel", "a__1"]);
+        // Full namespaced name.
+        let sel = select_tools(vec![], mcp.clone(), 2, "call b__other first");
+        assert_eq!(sel_names(&sel), vec!["b__other", "a__1"]);
+        // Part of a longer word, or a plain bare word: not a mention.
+        let sel = select_tools(vec![], mcp.clone(), 2, "reopen_panels; a__10");
+        assert_eq!(sel_names(&sel), vec!["a__1", "b__open_panel"]);
+        let sel = select_tools(vec![], defs(&["a__1", "b__status"]), 1, "what is the status?");
+        assert_eq!(sel_names(&sel), vec!["a__1"]);
+    }
+
+    #[test]
+    fn reserve_keeps_mcp_slots_when_builtins_would_fill_the_cap() {
+        // Cap 6 with 6 built-ins: 3 slots (half the cap) held for MCP.
+        let sel = select_tools(builtin_defs(6), defs(&["a__1", "a__2", "a__3", "a__4"]), 6, "");
+        let n = sel_names(&sel);
+        assert_eq!(n, vec!["read_file", "list_dir", "search", "a__1", "a__2", "a__3"]);
+        assert_eq!(sel.over_cap.len(), 4, "3 built-ins + 1 MCP: {:?}", sel.over_cap);
+        // Reserve only takes what MCP needs: one MCP tool, one held slot.
+        let sel = select_tools(builtin_defs(6), defs(&["a__1"]), 6, "");
+        assert_eq!(sel.defs.len(), 6);
+        assert_eq!(sel_names(&sel).last().unwrap(), "a__1");
+        // No MCP: the built-ins get the whole cap.
+        let sel = select_tools(builtin_defs(6), vec![], 6, "");
+        assert_eq!(sel.defs.len(), 6);
+        assert!(sel.over_cap.is_empty());
+        // At the default cap the reserve never costs a built-in.
+        let mcp: Vec<String> = (0..30).map(|i| format!("s{}__t{i}", i % 3)).collect();
+        let mcp_refs: Vec<&str> = mcp.iter().map(String::as_str).collect();
+        let sel = select_tools(builtin_defs(6), defs(&mcp_refs), MAX_OFFERED_TOOLS, "");
+        assert_eq!(sel.defs.len(), MAX_OFFERED_TOOLS);
+        assert_eq!(sel.routes.iter().filter(|(_, s)| *s == Source::Builtin).count(), 6);
+    }
+
+    #[test]
+    fn collisions_and_duplicates_are_not_offered_and_tiny_caps_hold() {
+        let sel = select_tools(builtin_defs(3), defs(&["read_file", "a__1", "a__1", ""]), 16, "");
+        assert_eq!(sel_names(&sel), vec!["read_file", "list_dir", "search", "a__1"]);
+        assert_eq!(sel.collisions, vec!["read_file", "a__1"]);
+        assert_eq!(select_tools(builtin_defs(6), defs(&["a__1"]), 0, "").defs.len(), 0);
+        let sel = select_tools(builtin_defs(6), defs(&["a__1"]), 1, "");
+        assert_eq!(sel_names(&sel), vec!["read_file"], "half of 1 reserves nothing");
+    }
+
+    #[test]
+    fn hints_are_the_system_prompt_and_last_user_message() {
+        use crate::ChatTurn;
+        let turns = vec![ChatTurn::user("old ask"), ChatTurn { role: "assistant".into(), content: "x".into() }, ChatTurn::user("open the panel")];
+        let h = tool_hints("agent prompt", &turns);
+        assert!(h.contains("agent prompt") && h.contains("open the panel") && !h.contains("old ask"));
+    }
+
+    #[tokio::test]
+    async fn with_hints_prefers_a_named_tool_end_to_end() {
+        let root = temp_root("hints");
+        let b = BuiltinTools::new(builtin_policy(&root, true, false, true)).unwrap();
+        let mut mcp_defs: Vec<Value> = (0..12).map(|i| mcp_def(&format!("big__t{i}"))).collect();
+        mcp_defs.push(mcp_def("lab__show_board"));
+        let c = CompositeTools::with_hints(Some(b), Some((mcp_defs, FakeMcp { calls: Mutex::new(vec![]) })), 8, "Check show_board when asked about the lab.");
+        let n = names(&c);
+        assert_eq!(n.len(), 8);
+        assert_eq!(n.iter().filter(|x| BuiltinTools::is_builtin(x)).count(), 4, "4 slots held for MCP");
+        assert_eq!(n[4], "lab__show_board");
+        assert!(!c.call("lab__show_board", &json!({})).await.1);
         let _ = std::fs::remove_dir_all(&root);
     }
 
