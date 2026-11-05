@@ -1,6 +1,6 @@
 {
-  "tag": "v1.16.0",
-  "name": "Hive 1.16.0",
+  "tag": "v1.16.1",
+  "name": "Hive 1.16.1",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Security: relay sync now uploads only the connected room's own workspace (v1.0.0 to v1.15.1 also uploaded other local workspaces, encrypted under that room's key) and purges foreign events locally once; upgrade all devices. Features: phone remote access through an end-to-end encrypted relay tunnel, host dashboards, push, proposal collaboration and @hive from the phone. Fixes: presence-based host liveness, single hand-off replies, relay envelope paging."
+  "notes": "Fixes: the desktop answers every addressed message that arrives in one sync batch; agents answering from a queue see the chat only up to the message they answer; push previews are plain text; hive remote status shows live connection age; new hive --version."
 }
