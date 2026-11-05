@@ -1,6 +1,6 @@
 {
-  "tag": "v1.16.1",
-  "name": "Hive 1.16.1",
+  "tag": "v1.17.0",
+  "name": "Hive 1.17.0",
   "url": "https://github.com/honeyhive-ai/hive/releases/latest",
-  "notes": "Fixes: the desktop answers every addressed message that arrives in one sync batch; agents answering from a queue see the chat only up to the message they answer; push previews are plain text; hive remote status shows live connection age; new hive --version."
+  "notes": "Features: a built-in Hive dashboard section on every host (agents, proposals, workflows, turns, host/relay/push status), dashboard panels backed by MCP tools, a table panel kind and hive dashboard metrics. Fixes: local agents no longer silently lose MCP tools at the 16-tool limit; MCP errors surface the server's message."
 }
