@@ -1,0 +1,71 @@
+# hive serve dashboard without a home lab: copy to dashboard.toml in the serve
+# data dir (HIVE_DATA_DIR, or set HIVE_DASHBOARD_FILE), then run
+#   hive dashboard check
+# The built-in Hive section (agents, proposals, workflows, turns, this host)
+# shows above these sections; `builtin = false` hides it. Format reference
+# and the list of hive metrics: docs/dashboard.md, `hive dashboard metrics`.
+
+title = "Dashboard"
+
+# MCP tools panels may call, each by exact "<server>/<tool>" name (servers
+# come from HIVE_MCP_CONFIG). A panel calls its tool on a timer while the
+# dashboard is open, so list only tools that read. Delete this table and the
+# "Code" section if you don't use MCP.
+[mcp]
+allow = ["github/list_pull_requests"]
+
+# ── The team's queue (workspace metrics, no setup) ─────────────────────────
+[[section]]
+title = "Review"
+
+[[section.panel]]
+title = "Waiting on me"
+metric = "proposals.awaiting_me"
+thresholds = [{ value = 1, level = "warn" }]
+
+[[section.panel]]
+title = "Open proposals"
+metric = "proposals.open"
+
+[[section.panel]]
+title = "Review queue"
+kind = "table"
+metric = "proposals.list"
+limit = 5
+
+[[section.panel]]
+title = "Replies per agent, 7 days"
+kind = "bar"
+metric = "turns.by_agent_7d"
+limit = 6
+
+# ── Code (an MCP server, e.g. GitHub's, in HIVE_MCP_CONFIG as "github") ────
+[[section]]
+title = "Code"
+optional = true      # hidden while the tool fails (e.g. no token yet)
+
+[[section.panel]]
+title = "Open pull requests"
+kind = "table"
+source = "mcp"
+server = "github"
+tool = "list_pull_requests"
+args = { owner = "acme", repo = "web", state = "open" }
+columns = [
+  { label = "#", key = "number" },
+  { label = "Title", key = "title" },
+  { label = "Author", key = "/user/login" },
+]
+limit = 10
+refresh = "5m"
+
+# ── A service health check (any JSON endpoint the host can reach) ──────────
+[[section]]
+title = "Services"
+optional = true
+
+[[section.panel]]
+title = "API"
+kind = "status"
+url = "http://127.0.0.1:8080/healthz"
+path = "/status"

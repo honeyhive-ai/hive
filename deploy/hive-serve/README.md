@@ -17,6 +17,7 @@ Files here:
 | `mcp.toml.example` | `~/.config/hive-serve/mcp.toml` (optional) |
 | `dashboard.toml.example` | `$HIVE_DATA_DIR/dashboard.toml` (optional: the app's dashboard tab, [`docs/dashboard.md`](../../docs/dashboard.md)) |
 | `dashboard-solar.toml.example` | append to `dashboard.toml` (optional solar section) |
+| `dashboard-team.toml.example` | `$HIVE_DATA_DIR/dashboard.toml` (optional: a dashboard without a home lab: workspace metrics, an MCP-backed table, a health check) |
 
 ## 1. Build on the box
 

@@ -5,6 +5,10 @@
 # query itself, so Prometheus and the URLs below never face the phone.
 # Format reference: docs/dashboard.md.
 #
+# The built-in Hive section (agents, proposals, workflows, turns, this host)
+# shows above these sections; add `builtin = false` (or "bottom") next to
+# `title` to hide or move it. No home lab? See dashboard-team.toml.example.
+#
 # Metric names below are the usual exporter names (node_exporter, llama.cpp
 # server --metrics, Prometheus' own `up`). Rename them to match your setup and
 # delete what you don't run: an `optional` section with no data is hidden.

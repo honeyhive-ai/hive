@@ -21,7 +21,7 @@ API plus a Server-Sent Events stream.
                                            │   └─ tool loop ── OpenAI wire ──▶ llama.cpp   desktop app
                                            │      (built-in file tools + MCP)   gateway    (same workspace)
                                            ├─ ntfy notifier ──▶ self-hosted ntfy
-                                           └─ /v1/dashboard ──▶ Prometheus, JSON URLs (host side)
+                                           └─ /v1/dashboard ──▶ workspace metrics, Prometheus, JSON URLs, MCP tools (host side)
 ```
 
 ## Components
@@ -178,14 +178,18 @@ Field notes:
   `workflowRuns = [{id, name, status: "running"|"awaitingGate"|"completed"|"failed"|"halted"|"canceled", startedAt, updatedAt, stepsDone, stepsTotal, initiator?}]`,
   newest first, at most 10. `skills = [{id, name, summary, sourceUrl?, agentIds?}]`
   and `vaults = [{label, url, agentIds?}]` (`agentIds` absent = every agent).
-- `/v1/dashboard` is what the host owner configures in `dashboard.toml` in
-  the data dir (format, panel kinds and examples in [dashboard.md](dashboard.md)).
-  `Panel = {id, title, kind: "stat"|"gauge"|"timeseries"|"bar"|"list"|"status"|"text", unit?, value?, text?, level?: "ok"|"warn"|"critical", sparkline?: [{t, v}], series?: [{name, points: [{t, v}]}], rows?: [{label, value?, text?, up?, level?}], min?, max?, thresholds?: [{value, level}], refreshSeconds, updatedAt, error?}`.
-  The host evaluates every panel (Prometheus or a JSON URL on its network,
-  never a command) with a per-panel timeout and cache; a failing panel carries
-  `error` and the rest still render. With no file, a host with
-  `HIVE_PROMETHEUS_URL` set serves a generated lab dashboard (the old
-  `/v1/lab/status` content), and any other host an empty one
+- `/v1/dashboard` is a built-in "Hive" section (workspace metrics: agents,
+  proposals, workflow runs, turns, this host's status) plus what the host
+  owner configures in `dashboard.toml` in the data dir (format, panel kinds,
+  metrics and examples in [dashboard.md](dashboard.md)).
+  `Panel = {id, title, kind: "stat"|"gauge"|"timeseries"|"bar"|"list"|"status"|"text"|"table", unit?, value?, text?, level?: "ok"|"warn"|"critical", sparkline?: [{t, v}], series?: [{name, points: [{t, v}]}], rows?: [{label, value?, text?, up?, level?}], columns?: [{label, align?: "leading"|"center"|"trailing"}], cells?: [[string|number|bool|null]], min?, max?, thresholds?: [{value, level}], refreshSeconds, updatedAt, error?}`.
+  The host evaluates every panel (a workspace metric, Prometheus, a JSON URL
+  on its network, or an MCP tool the file allow-lists) with a per-panel
+  timeout and cache; a failing panel carries `error` and the rest still
+  render. With no file, a host serves the Hive section, plus a generated lab
+  dashboard (the old `/v1/lab/status` content) below it when
+  `HIVE_PROMETHEUS_URL` is set. Only `builtin = false` with no sections of
+  its own (or a host older than the built-in section) gives an empty one
   (`sections: []`). The app hides its dashboard tab when the dashboard is
   empty, and falls back to `/v1/lab/status` only when `/v1/dashboard` is 404
   (an older host).
