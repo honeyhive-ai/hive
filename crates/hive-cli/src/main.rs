@@ -1081,6 +1081,7 @@ fn usage() -> ! {
     eprintln!(
         "hive — headless Hive client\n\n\
          USAGE:\n  \
+         hive --version\n  \
          hive whoami\n  \
          hive chats\n  \
          hive new [title]\n  \
@@ -1134,8 +1135,12 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cfg = config();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if matches!(args.first().map(String::as_str), Some("--version" | "-V" | "version")) {
+        println!("hive {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    let cfg = config();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = &args[args.len().min(1)..];
     // `hive <cmd> --help` prints usage instead of running the command (a bare
