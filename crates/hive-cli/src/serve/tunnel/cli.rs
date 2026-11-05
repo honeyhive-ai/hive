@@ -49,18 +49,50 @@ pub fn remote_status(data_dir: &Path) -> Result<()> {
         None => println!("host id:   (no keys yet)"),
     }
     if let Some(st) = read_json::<LiveStatus>(&dir.join("status.json"))? {
-        let age = super::now().saturating_sub(st.at);
-        println!(
-            "serve:     {} (status {}, push {}, updated {age}s ago){}",
-            if st.connected { "connected" } else { "not connected" },
-            if st.status.is_empty() { "-" } else { st.status.as_str() },
-            if st.push { "available" } else { "unavailable" },
-            st.last_error.map(|e| format!(", last error: {e}")).unwrap_or_default()
-        );
+        println!("serve:     {}", describe_status(&st, super::now()));
     }
     let phones = Registry::load(&dir)?.list();
     println!("phones:    {} active, {} revoked", phones.iter().filter(|p| p.is_active()).count(), phones.iter().filter(|p| !p.is_active()).count());
     Ok(())
+}
+
+/// `secs` as a short age: `45s`, `12m`, `6h 33m`, `3d 4h`.
+fn short_age(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h {}m", s / 3600, s % 3600 / 60),
+        s => format!("{}d {}h", s / 86_400, s % 86_400 / 3600),
+    }
+}
+
+/// The `serve:` line of `hive remote status`. Connected shows how long the
+/// relay link has been up, not when the file last changed (a link that stays
+/// up never changes it, so "updated 6h ago" read like a stale file). A file
+/// whose heartbeat stopped was left by a `hive serve` that isn't running.
+pub(crate) fn describe_status(st: &LiveStatus, now: u64) -> String {
+    let detail = format!(
+        "status {}, push {}",
+        if st.status.is_empty() { "-" } else { st.status.as_str() },
+        if st.push { "available" } else { "unavailable" }
+    );
+    let error = st.last_error.as_ref().map(|e| format!(", last error: {e}")).unwrap_or_default();
+    let beat = (st.heartbeat > 0).then(|| now.saturating_sub(st.heartbeat));
+    if let Some(b) = beat.filter(|b| *b > 3 * super::STATUS_HEARTBEAT.as_secs()) {
+        let was = if st.connected { "connected" } else { "not connected" };
+        return format!("unknown: hive serve last reported {} ago ({was}, {detail}) — is it running?{error}", short_age(b));
+    }
+    if st.connected {
+        match (st.connected_since, beat) {
+            (Some(since), Some(b)) => {
+                format!("connected for {} ({detail}, checked {} ago){error}", short_age(now.saturating_sub(since)), short_age(b))
+            }
+            // A status file from before connection age was recorded.
+            _ => format!("connected ({detail}, last change {} ago){error}", short_age(now.saturating_sub(st.at))),
+        }
+    } else {
+        format!("not connected ({detail}, since {} ago){error}", short_age(now.saturating_sub(st.at)))
+    }
 }
 
 /// `hive remote reset`: new host keys (new host id); every phone must re-pair.
@@ -123,4 +155,55 @@ pub fn phones_revoke(data_dir: &Path, who: Option<&str>, token_file: &Path, keep
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    fn st(connected: bool) -> LiveStatus {
+        LiveStatus { connected, status: "active".into(), push: true, ..Default::default() }
+    }
+
+    #[test]
+    fn connected_shows_live_connection_age_not_last_change() {
+        let now = 1_000_000;
+        let mut s = st(true);
+        s.at = now - 23_589;
+        s.connected_since = Some(now - 23_589);
+        s.heartbeat = now - 12;
+        assert_eq!(describe_status(&s, now), "connected for 6h 33m (status active, push available, checked 12s ago)");
+    }
+
+    #[test]
+    fn a_stopped_serve_is_not_reported_connected() {
+        let now = 1_000_000;
+        let mut s = st(true);
+        s.at = now - 7200;
+        s.connected_since = Some(now - 7200);
+        s.heartbeat = now - 300;
+        let line = describe_status(&s, now);
+        assert!(line.starts_with("unknown: hive serve last reported 5m ago (connected,"), "{line}");
+        assert!(line.contains("is it running?"));
+    }
+
+    #[test]
+    fn down_and_legacy_files_read_sensibly() {
+        let now = 1_000_000;
+        let mut down = st(false);
+        down.push = false;
+        down.at = now - 45;
+        down.heartbeat = now - 5;
+        down.last_error = Some("relay unreachable".into());
+        assert_eq!(
+            describe_status(&down, now),
+            "not connected (status active, push unavailable, since 45s ago), last error: relay unreachable"
+        );
+        // Written by an older hive serve: no heartbeat, no connection time.
+        let mut legacy = st(true);
+        legacy.at = now - 90_000;
+        assert_eq!(describe_status(&legacy, now), "connected (status active, push available, last change 1d 1h ago)");
+        assert_eq!(short_age(59), "59s");
+        assert_eq!(short_age(3599), "59m");
+    }
 }

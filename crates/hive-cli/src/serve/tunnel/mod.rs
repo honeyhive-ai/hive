@@ -280,8 +280,20 @@ pub struct LiveStatus {
     pub push: bool,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// When any of the above last changed.
     pub at: u64,
+    /// When the current relay connection came up (`None` while down).
+    #[serde(default)]
+    pub connected_since: Option<u64>,
+    /// When `hive serve` last rewrote this file, at least every
+    /// [`STATUS_HEARTBEAT`] while it runs: a connected file with an old
+    /// heartbeat was left by a `hive serve` that stopped without saying so.
+    #[serde(default)]
+    pub heartbeat: u64,
 }
+
+/// How often a running `hive serve` refreshes `status.json`'s heartbeat.
+pub const STATUS_HEARTBEAT: Duration = Duration::from_secs(30);
 
 // ── Enrollment windows + pending hand-off ────────────────────────────────────
 
@@ -469,7 +481,10 @@ impl TunnelHost {
                 r.1 = None;
             }
         }
-        self.update_status(|s| s.connected = connected);
+        self.update_status(|s| {
+            s.connected = connected;
+            s.connected_since = connected.then(now);
+        });
     }
 
     pub(crate) fn update_status(&self, f: impl FnOnce(&mut LiveStatus)) {
@@ -477,6 +492,22 @@ impl TunnelHost {
             let mut s = Self::lock(&self.status);
             f(&mut s);
             s.at = now();
+            s.heartbeat = s.at;
+            s.clone()
+        };
+        let _ = write_json(&self.dir.join("status.json"), &snapshot);
+    }
+
+    /// Refresh the heartbeat in `status.json` if it's [`STATUS_HEARTBEAT`]
+    /// old, leaving `at` (the last change) alone.
+    pub(crate) fn status_heartbeat(&self) {
+        let t = now();
+        let snapshot = {
+            let mut s = Self::lock(&self.status);
+            if s.at == 0 || t.saturating_sub(s.heartbeat) < STATUS_HEARTBEAT.as_secs() {
+                return;
+            }
+            s.heartbeat = t;
             s.clone()
         };
         let _ = write_json(&self.dir.join("status.json"), &snapshot);
@@ -640,6 +671,7 @@ impl TunnelHost {
     /// Pick up what `hive pair` / `hive phones revoke` left in `pending/`, and
     /// expire stale windows. Called every [`PENDING_POLL`].
     pub fn poll_pending(&self) {
+        self.status_heartbeat();
         let t = now();
         let mut expired = Vec::new();
         for (eid, w) in Self::lock(&self.windows).iter() {
