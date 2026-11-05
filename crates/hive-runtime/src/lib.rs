@@ -9,6 +9,7 @@ pub mod agent_tools;
 pub mod attachment_blob;
 pub mod builtin_tools;
 pub mod chat_service;
+pub mod cli_detect;
 pub mod context;
 pub mod device_enroll;
 pub mod directives;

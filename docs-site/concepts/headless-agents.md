@@ -269,10 +269,11 @@ once, and the work stays correct:
 
   A single worker drains serially, so add processes to scale throughput.
 
-  **Write access is opt-in.** A worker's claude agents are **read-only by
-  default** (they answer but don't edit). Set
+  **Write access is opt-in.** A worker's claude, agy and copilot agents are
+  **read-only by default** (they answer but don't edit). Set
   `HIVE_WORKER_PERMISSION_MODE=acceptEdits` (write files) or `bypassPermissions`
-  (also run shell commands) to let them edit — only then does a worker turn
+  (also run shell commands) to let them edit (`runCommands` — edits plus
+  commands — applies to agy / copilot) — only then does a worker turn
   isolate a worktree and produce a review-gated proposal. Run the worker from
   within the repo checkout it should work on (its cwd is the base for the
   worktree). A headless worker with `bypassPermissions` is powerful — grant it

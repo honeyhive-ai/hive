@@ -284,6 +284,10 @@ fn parse_provider(s: &str) -> Result<ModelProviderKind, ConfigError> {
         "aider" => Ok(ModelProviderKind::Aider),
         "pi" => Ok(ModelProviderKind::Pi),
         "claudecode" => Ok(ModelProviderKind::ClaudeCode),
+        "codex" => Ok(ModelProviderKind::Codex),
+        "hermes" => Ok(ModelProviderKind::Hermes),
+        "antigravity" | "agy" => Ok(ModelProviderKind::Antigravity),
+        "copilot" | "githubcopilot" => Ok(ModelProviderKind::Copilot),
         _ => Err(ConfigError::InvalidProvider(s.to_string())),
     }
 }
@@ -507,6 +511,29 @@ mod tests {
         assert_eq!(rt.model_id, "qwen3.5:latest");
         assert_eq!(rt.request_keep_alive.as_deref(), Some("-1"));
         assert!(rt.capabilities.supports_tools);
+    }
+
+    #[test]
+    fn subscription_cli_runtimes_parse() {
+        let toml = r#"
+[[runtimes]]
+id = "gemini-pro"
+provider = "antigravity"
+kind = "local"
+endpoint = "agy"
+preferred_model = ""
+
+[[runtimes]]
+id = "copilot"
+provider = "github-copilot"
+kind = "local"
+endpoint = ""
+"#;
+        let cfg = load_from_str(toml).unwrap();
+        assert_eq!(cfg.runtimes[0].provider_kind, ModelProviderKind::Antigravity);
+        assert_eq!(cfg.runtimes[0].endpoint, "agy");
+        assert_eq!(cfg.runtimes[1].provider_kind, ModelProviderKind::Copilot);
+        assert!(load_from_str("[[runtimes]]\nid = \"x\"\nprovider = \"agy\"\nkind = \"local\"\nendpoint = \"\"\n").is_ok());
     }
 
     #[test]

@@ -139,8 +139,10 @@ export function PermissionsSection() {
       )}
       <p className="text-xs opacity-50">
         The setting below controls the <code>claude</code> CLI's permission mode (it runs headless,
-        so it can't show an approval prompt). Other agents gate file access their own way: aider/pi
-        via their flags, and API/MCP-backed agents via built-in-tool consent + per-tool MCP trust.
+        so it can't show an approval prompt), and the same tier for the subscription CLIs{" "}
+        <code>agy</code> (Google Antigravity) and <code>copilot</code> (GitHub Copilot), mapped to their
+        own flags. Other agents gate file access their own way: aider/pi via their flags, and
+        API/MCP-backed agents via built-in-tool consent + per-tool MCP trust.
       </p>
       <label className="block text-xs opacity-60">Claude Code permission mode</label>
       <SelectField

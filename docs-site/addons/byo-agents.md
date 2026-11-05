@@ -51,6 +51,60 @@ endpoint uses `provider = "custom"`, which talks over HTTP rather than
 spawning a binary.) To wire a different CLI, extend the per-provider dispatch
 in `crates/hive-runtime/src/provider/dispatch.rs`.
 
+## Subscription CLIs: Google Antigravity and GitHub Copilot
+
+Use a **Google AI Pro / Ultra** or **GitHub Copilot** subscription the same
+way Claude Code uses a Claude subscription: Hive runs the vendor's official CLI
+headless and streams its reply, text and tool steps included. The login stays
+in the CLI's own config / OS keychain — Hive never reads, copies or syncs it,
+so these runtimes are keyless.
+
+| | Google Antigravity CLI | GitHub Copilot CLI |
+|---|---|---|
+| Binary | `agy` | `copilot` |
+| Install | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | `brew install --cask copilot-cli` or `npm install -g @github/copilot` |
+| Sign in (in a terminal on the host) | run `agy` once → Sign in with Google | `copilot login` (headless hosts: `COPILOT_GITHUB_TOKEN` = a fine-grained token with *Copilot Requests*) |
+| Models | `agy models` | `--model` ids from the CLI's `/model` picker; blank = the CLI default |
+
+**Gemini CLI no longer serves Google AI Pro / Ultra sign-ins** (it stopped
+serving individual Google accounts on 2026-06-18; API-key and Code Assist
+Standard/Enterprise use is unaffected). Hive detects a `gemini` binary only to
+point you at `agy`.
+
+**Detect and add.** *Settings → Models → LLM providers → Subscription CLIs*
+lists each CLI with its version and sign-in state, the exact login command when
+it isn't signed in, and a one-click **Add runtime** (optionally with a model).
+Copilot's sign-in is read from its config (`loggedInUsers`) or the presence of
+its token env vars; Antigravity keeps its Google sign-in in the keychain, so
+**Check Google sign-in** runs `agy models` (read-only, no quota) to confirm it.
+Detection never signs in or out.
+
+**Permissions follow Hive's Claude Code setting** (*Settings → Permissions*),
+mapped to each CLI's own flags; headless, anything not granted is denied
+rather than prompted:
+
+| Hive tier | `agy` | `copilot` |
+|---|---|---|
+| default (read-only) | no flags — edits and commands need approval, which headless mode denies | `--allow-tool=read --deny-tool=write --deny-tool=shell` |
+| accept edits | `--mode accept-edits` | `--allow-tool=read --allow-tool=write --deny-tool=shell` |
+| run commands | `--mode auto` (edits + safe, reversible commands in the sandbox; risky ones still denied) | `--allow-tool=read --allow-tool=write --allow-tool=shell` |
+| bypass | `--dangerously-skip-permissions` | `--allow-all-tools` (paths and URLs still verified; never `--yolo`) |
+
+As with Claude Code, a raised tier makes the turn run in an isolated git
+worktree and come back as a review-gated proposal.
+
+**Errors are specific.** A missing login says which command to run; a usage
+limit (Google AI quota, Copilot premium requests / AI credits) says so instead
+of failing silently. Copilot bills premium models at several requests per turn
+— set a cheaper model on the runtime if that matters.
+
+**On `hive serve` / `hive worker` hosts.** Install and sign in to the CLI on
+that host, then `hive setup` lists it (with sign-in state) and
+`hive setup --apply` defines `antigravity` / `copilot` runtimes, or
+`hive add-runtime copilot "Copilot" copilot <model>`. The worker's tier is
+`HIVE_WORKER_PERMISSION_MODE` (`acceptEdits`, `runCommands`,
+`bypassPermissions`; read-only when unset).
+
 ## Configuring as a runtime
 
 In **Settings → Models → Add runtime**, or directly in TOML:
@@ -83,6 +137,8 @@ The provider determines how Hive talks to the binary:
 | `aider`       | stdin                              | interactive CLI; prompt piped in              |
 | `pi`          | positional arg (`-p … "<prompt>"`) | `-p --no-session --offline --mode text`; adds `--provider`/`--model` and a temp Ollama provider config when an Ollama base URL is set |
 | `claude-code` | stdin, stream-json                 | `-p --output-format stream-json --include-partial-messages` |
+| `antigravity` | positional arg (`--print "<prompt>"`), stream-json | `--output-format stream-json --disable-slash-commands`; `--model` from the runtime; permission tier flags (below) |
+| `copilot`     | positional arg (`-p "<prompt>"`), JSONL | `--output-format json --stream on --no-ask-user --no-color`; `--model` from the runtime; permission tier flags (below) |
 
 For agents that need a different invocation, the per-provider wiring lives in
 `crates/hive-runtime/src/provider/dispatch.rs` (with the generic spawn/stream

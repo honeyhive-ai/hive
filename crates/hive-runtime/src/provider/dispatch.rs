@@ -239,7 +239,11 @@ impl ResolvedRuntime {
     pub fn is_subprocess(&self) -> bool {
         matches!(
             self.provider,
-            ModelProviderKind::Aider | ModelProviderKind::Pi | ModelProviderKind::ClaudeCode
+            ModelProviderKind::Aider
+                | ModelProviderKind::Pi
+                | ModelProviderKind::ClaudeCode
+                | ModelProviderKind::Antigravity
+                | ModelProviderKind::Copilot
         )
     }
 }
@@ -284,6 +288,8 @@ pub fn provider_label(provider: ModelProviderKind) -> &'static str {
         ModelProviderKind::ClaudeCode => "claude-code",
         ModelProviderKind::Codex => "codex",
         ModelProviderKind::Hermes => "hermes",
+        ModelProviderKind::Antigravity => "antigravity",
+        ModelProviderKind::Copilot => "copilot",
     }
 }
 
@@ -532,6 +538,40 @@ pub async fn stream_with_tools<E: ToolExecutor>(
                 system,
                 turns,
                 on_delta,
+            )
+            .await
+        }
+        ModelProviderKind::Antigravity => {
+            // Google AI Pro / Ultra via the `agy` CLI (its own Google sign-in).
+            // endpoint = the binary (default "agy"); model → --model; args =
+            // the permission tier (+ runtime flags).
+            super::antigravity::stream_reply(
+                &rt.endpoint,
+                &rt.model,
+                &rt.args,
+                working_dir,
+                extra_env,
+                system,
+                turns,
+                on_delta,
+                on_activity,
+            )
+            .await
+        }
+        ModelProviderKind::Copilot => {
+            // GitHub Copilot via the `copilot` CLI (its own login). endpoint =
+            // the binary (default "copilot"); model → --model; args = the
+            // permission tier (+ runtime flags).
+            super::copilot::stream_reply(
+                &rt.endpoint,
+                &rt.model,
+                &rt.args,
+                working_dir,
+                extra_env,
+                system,
+                turns,
+                on_delta,
+                on_activity,
             )
             .await
         }
@@ -876,5 +916,51 @@ mod tests {
         // gpt-oss under any naming gets low effort.
         rt.model = "GPT_OSS-20B-Q4_K_M".into();
         assert_eq!(openai_request_extras(&rt)["reasoning_effort"], "low");
+    }
+}
+
+/// Live smoke test for the subscription CLIs: one tiny prompt through the real
+/// `agy` / `copilot` on this machine. Ignored by default (needs the CLI
+/// installed and signed in, and spends a little quota):
+/// `HIVE_LIVE_CLI=antigravity HIVE_LIVE_MODEL=<id> cargo test -p hive-runtime --lib live_cli_smoke -- --ignored --nocapture`
+#[cfg(test)]
+mod live_cli {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_cli_smoke() {
+        let provider = match std::env::var("HIVE_LIVE_CLI").as_deref() {
+            Ok("antigravity") => ModelProviderKind::Antigravity,
+            Ok("copilot") => ModelProviderKind::Copilot,
+            _ => return,
+        };
+        let args = match provider {
+            ModelProviderKind::Antigravity => super::super::antigravity::permission_args("default"),
+            _ => super::super::copilot::permission_args("default"),
+        };
+        let rt = ResolvedRuntime {
+            provider,
+            model: std::env::var("HIVE_LIVE_MODEL").unwrap_or_default(),
+            endpoint: String::new(),
+            api_key: None,
+            args,
+            model_provider_id: None,
+            model_base_url: None,
+            context_window_tokens: None,
+            keep_alive: None,
+            think: None,
+            tools: false,
+            max_tool_rounds: None,
+            allow_remote_file_tools: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let turns = vec![ChatTurn { role: "user".into(), content: "Reply with the word ok and nothing else.".into() }];
+        let mut deltas = 0;
+        let mut acts = 0;
+        let started = std::time::Instant::now();
+        let out = stream(&rt, None, &turns, dir.path().to_str(), &[], 256, |_| deltas += 1, |_| acts += 1).await;
+        println!("{provider:?}: {:?} in {:?} ({deltas} deltas, {acts} activity events)", out, started.elapsed());
+        assert!(out.unwrap().to_lowercase().contains("ok"));
     }
 }

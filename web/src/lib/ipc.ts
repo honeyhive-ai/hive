@@ -555,6 +555,29 @@ export interface DetectedProviderDto {
 }
 export const detectProviders = () => invoke<DetectedProviderDto[]>("detect_providers");
 
+/// A subscription CLI agent on this machine (Google `agy`, GitHub `copilot`,
+/// or a legacy `gemini` explained): installed, version, sign-in state, and
+/// the exact login / install command. Detection never changes auth state;
+/// `probe` also runs `agy models` (read-only) to confirm the Google sign-in.
+export interface DetectedCliDto {
+  id: string; // "antigravity" | "copilot" | "gemini"
+  provider: string | null; // add_runtime provider; null = can't be driven
+  label: string;
+  binary: string;
+  installed: boolean;
+  path: string | null;
+  version: string | null;
+  login: "loggedIn" | "notLoggedIn" | "unknown";
+  loginDetail: string;
+  loginCommand: string;
+  installCommand: string;
+  supported: boolean;
+  note: string;
+  models: string[];
+}
+export const detectCliRuntimes = (probe = false) =>
+  invoke<DetectedCliDto[]>("detect_cli_runtimes", { probe });
+
 /// Portable config (hive.toml): export the current runtime/agent/MCP setup +
 /// defaults as TOML (no secrets), or import one to stamp a setup. import returns
 /// a human summary.

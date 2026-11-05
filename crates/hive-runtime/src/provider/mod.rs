@@ -5,14 +5,19 @@
 //! - `ollama` — native Ollama API (`/api/chat`, `/api/show`, `/api/tags`, `/api/ps`, `/api/pull`, `/api/delete`): num_ctx, keep_alive, think, capability probe, model management
 //! - `http` — connect/idle/retry policy shared by the HTTP clients
 //! - `subprocess` — external CLI agents: aider/pi/claude-code (Phase 5 follow-up)
+//! - `antigravity` / `copilot` — Google's `agy` and GitHub's `copilot` CLIs
+//!   (subscription logins), on the shared `cli_agent` plumbing
 //! - `thinking` — splits a reasoning model's `<think>` output from its reply
 //! - `dispatch` — resolves + routes a turn to the right client by runtime
 
 use std::time::Duration;
 
 pub mod anthropic;
+pub mod antigravity;
 pub mod claude_code;
+pub mod cli_agent;
 pub mod codex;
+pub mod copilot;
 pub mod dispatch;
 pub mod http;
 pub mod ollama;

@@ -51,6 +51,7 @@ import { toast, errMsg } from "@/components/Toast";
 import { confirmThen } from "@/lib/confirm";
 import { loadTemplates, addTemplate, removeTemplate, type PromptTemplate } from "@/lib/templates";
 import { quickTaskOptions } from "@/lib/utilityRuntime";
+import { CliRuntimesPanel } from "@/components/settings/CliRuntimesPanel";
 
 /// Models & runtimes: providers + their credentials, the runtimes (models)
 /// built on them, reusable agent personas, prompt templates, and the context
@@ -250,6 +251,7 @@ function ProvidersSection() {
   return (
     <Section title="LLM providers">
       <DetectPanel onConfigured={() => qc.invalidateQueries({ queryKey: ["runtimes"] })} />
+      <CliRuntimesPanel />
       <p className="text-xs opacity-50">
         A provider is a backend + how to reach it (key and/or base URL). Add the ones you use — the
         rest stay tucked away. Models (below) pick a provider; agents pick a model.
@@ -586,7 +588,7 @@ function RuntimesSection() {
   // `location` doesn't drive any behavior (dispatch routes by provider +
   // endpoint); we derive it from the endpoint just for the list label.
   const deriveLocation = () => {
-    if (["claude-code", "pi", "aider", "codex", "hermes"].includes(runtimeProvider)) return "local";
+    if (["claude-code", "pi", "aider", "codex", "hermes", "antigravity", "copilot"].includes(runtimeProvider)) return "local";
     const ep = `${runtimeEndpoint} ${runtimeBaseUrl}`.toLowerCase();
     return /localhost|127\.0\.0\.1|0\.0\.0\.0|::1/.test(ep) ? "local" : "remote";
   };
@@ -946,13 +948,15 @@ function RuntimesSection() {
             <option value="aider">Aider</option>
             <option value="codex">Codex</option>
             <option value="hermes">Hermes (generic CLI)</option>
+            <option value="antigravity">Google Antigravity CLI (agy)</option>
+            <option value="copilot">GitHub Copilot CLI</option>
           </select>
         </div>
         <input
           value={runtimeEndpoint}
           onChange={(e) => setRuntimeEndpoint(e.target.value)}
           placeholder={
-            ["pi", "aider", "codex", "hermes"].includes(runtimeProvider)
+            ["pi", "aider", "codex", "hermes", "antigravity", "copilot"].includes(runtimeProvider)
               ? "Executable path (blank = found on PATH)"
               : "Endpoint URL"
           }

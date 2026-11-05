@@ -498,7 +498,12 @@ fn provider_kind(s: &str) -> Result<ModelProviderKind> {
         // Any OpenAI-compatible server (a llama.cpp gateway): keyless when the
         // endpoint is local / LAN / tailnet, and runs the agent tool loop.
         "custom" => ModelProviderKind::Custom,
-        other => bail!("unknown provider '{other}' (anthropic|openai|openrouter|ollama|custom)"),
+        // Subscription CLIs on the worker host (their own login; keyless).
+        "claude-code" | "claudecode" => ModelProviderKind::ClaudeCode,
+        "codex" => ModelProviderKind::Codex,
+        "antigravity" | "agy" => ModelProviderKind::Antigravity,
+        "copilot" => ModelProviderKind::Copilot,
+        other => bail!("unknown provider '{other}' (anthropic|openai|openrouter|ollama|custom|claude-code|codex|antigravity|copilot)"),
     })
 }
 
@@ -558,6 +563,9 @@ fn cmd_setup(cfg: &Config, apply: bool) -> Result<()> {
         .unwrap_or(false);
     let claude = on_path("claude");
     let codex = on_path("codex");
+    // `true`: also confirm agy's Google sign-in with `agy models` (read-only,
+    // no quota) — this is an explicit, interactive command.
+    let clis = hive_runtime::cli_detect::detect_cli_agents(&hive_runtime::cli_detect::DetectEnv::from_process(), true);
 
     println!("Detected on this box:");
     for (env_var, provider, model) in [
@@ -581,6 +589,23 @@ fn cmd_setup(cfg: &Config, apply: bool) -> Result<()> {
     if codex {
         println!("  ✓ codex CLI (keyless)");
     }
+    for c in &clis {
+        if !c.installed {
+            continue;
+        }
+        let version = c.version.as_deref().map(|v| format!(" {v}")).unwrap_or_default();
+        if !c.supported {
+            println!("  ! {}{version} — {}", c.label, c.note);
+            continue;
+        }
+        use hive_runtime::cli_detect::LoginState;
+        let login = match c.login {
+            LoginState::LoggedIn => c.login_detail.clone(),
+            LoginState::NotLoggedIn => format!("NOT signed in — run `{}` in a terminal on this box", c.login_command),
+            LoginState::Unknown => format!("sign-in unknown — if a turn fails, run `{}` in a terminal on this box", c.login_command),
+        };
+        println!("  ✓ {} ({}){version}, keyless — {login}", c.label, c.binary);
+    }
 
     if apply {
         let mut svc = open_service(cfg)?;
@@ -599,6 +624,12 @@ fn cmd_setup(cfg: &Config, apply: bool) -> Result<()> {
         if codex {
             svc.add_workspace_runtime(ws, WorkspaceRuntime::new("codex", "Codex", ModelProviderKind::Codex, ""))?;
             n += 1;
+        }
+        for c in clis.iter().filter(|c| c.installed && c.supported) {
+            if let Some(kind) = hive_runtime::cli_detect::provider_for(&c.id) {
+                svc.add_workspace_runtime(ws, WorkspaceRuntime::new(c.id.as_str(), c.label.as_str(), kind, ""))?;
+                n += 1;
+            }
         }
         println!("\nDefined {n} keyless runtime(s). Run the add-runtime line(s) above for key-backed providers, then `hive sync` to share.");
     } else {
@@ -1424,6 +1455,8 @@ mod cli_tests {
     fn custom_provider_is_accepted() {
         assert_eq!(provider_kind("custom").unwrap(), ModelProviderKind::Custom);
         assert_eq!(provider_kind("Custom").unwrap(), ModelProviderKind::Custom);
+        assert_eq!(provider_kind("agy").unwrap(), ModelProviderKind::Antigravity);
+        assert_eq!(provider_kind("copilot").unwrap(), ModelProviderKind::Copilot);
         assert!(provider_kind("nope").is_err());
     }
 }

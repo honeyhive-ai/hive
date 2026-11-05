@@ -25,6 +25,8 @@ fn provider_display(provider: ModelProviderKind) -> &'static str {
         ModelProviderKind::Aider => "aider CLI",
         ModelProviderKind::Pi => "pi CLI",
         ModelProviderKind::Hermes => "hermes CLI",
+        ModelProviderKind::Antigravity => "Google Antigravity CLI (agy)",
+        ModelProviderKind::Copilot => "GitHub Copilot CLI",
     }
 }
 

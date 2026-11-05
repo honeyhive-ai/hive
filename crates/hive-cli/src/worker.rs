@@ -89,10 +89,37 @@ fn worker_claude_args() -> Vec<String> {
     }
 }
 
+/// The worker's permission tier (`HIVE_WORKER_PERMISSION_MODE`), read-only
+/// (`default`) unless raised. Also accepts `runCommands` for the
+/// subscription CLIs.
+fn worker_permission_mode() -> String {
+    match std::env::var("HIVE_WORKER_PERMISSION_MODE").as_deref() {
+        Ok(m @ ("acceptEdits" | "runCommands" | "bypassPermissions")) => m.to_string(),
+        _ => "default".to_string(),
+    }
+}
+
+/// Permission-tier args for a runtime on this worker: Claude Code's
+/// `--permission-mode`, or the `agy` / `copilot` equivalents.
+fn worker_args(provider: ModelProviderKind, mode: &str) -> Vec<String> {
+    match provider {
+        ModelProviderKind::ClaudeCode => worker_claude_args(),
+        ModelProviderKind::Antigravity => hive_runtime::provider::antigravity::permission_args(mode),
+        ModelProviderKind::Copilot => hive_runtime::provider::copilot::permission_args(mode),
+        _ => Vec::new(),
+    }
+}
+
 /// Whether a keyless runtime is usable: native Ollama, or an OpenAI-wire
 /// server on this machine / the LAN / the tailnet (a llama.cpp gateway).
+/// Subscription CLI agents (claude / codex / agy / copilot) are keyless too:
+/// their login lives in the CLI's own config on this host.
 fn keyless_ok(wr: &WorkspaceRuntime) -> bool {
     wr.provider == ModelProviderKind::Ollama
+        || matches!(
+            wr.provider,
+            ModelProviderKind::ClaudeCode | ModelProviderKind::Codex | ModelProviderKind::Antigravity | ModelProviderKind::Copilot
+        )
         || (matches!(wr.provider, ModelProviderKind::Custom | ModelProviderKind::HiveDaemon)
             && hive_core::endpoint::endpoint_is_local_server(&wr.endpoint))
 }
@@ -155,12 +182,9 @@ pub fn agent_workspace_runtime(
     if api_key.is_none() && !keyless_ok(wr) {
         bail!("workspace runtime '{}' has no secret on this box (provision HIVE_WS_SECRET_…)", wr.name);
     }
-    // claude-code honors --permission-mode; other providers ignore args here.
-    let args = if wr.provider == ModelProviderKind::ClaudeCode {
-        worker_claude_args()
-    } else {
-        Vec::new()
-    };
+    // claude-code / agy / copilot take the worker's permission tier; other
+    // providers ignore args here.
+    let args = worker_args(wr.provider, &worker_permission_mode());
     let rt = ResolvedRuntime {
         provider: wr.provider,
         model: wr.model.clone(),
@@ -397,6 +421,7 @@ async fn run_turn(
     // that can actually write: a write-mode claude or aider/pi/codex/hermes.
     let write_capable = match rt.provider {
         ModelProviderKind::ClaudeCode => rt.args.iter().any(|a| a == "acceptEdits" || a == "bypassPermissions"),
+        ModelProviderKind::Antigravity | ModelProviderKind::Copilot => worker_permission_mode() != "default",
         ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes => true,
         _ => false,
     };
@@ -588,6 +613,21 @@ credential = { kind = "none" }
         all.extend(rts);
         assert_eq!(runtime_for(&all, &agent("desktop-local-id")).unwrap().name, "WS");
         assert!(runtime_for(&[], &agent("x")).is_none());
+    }
+
+    #[test]
+    fn subscription_clis_are_keyless_and_read_only_by_default() {
+        for p in [ModelProviderKind::Antigravity, ModelProviderKind::Copilot, ModelProviderKind::ClaudeCode] {
+            let wr = WorkspaceRuntime::new("cli", "CLI", p, "");
+            let (rt, _) = agent_workspace_runtime(&[wr], &agent("cli")).unwrap();
+            assert!(rt.api_key.is_none());
+            assert!(!rt.runs_agent_tools(), "CLI agents bring their own tools");
+        }
+        let d = worker_args(ModelProviderKind::Copilot, "default");
+        assert!(d.contains(&"--deny-tool=shell".to_string()));
+        assert!(worker_args(ModelProviderKind::Antigravity, "default").is_empty());
+        assert_eq!(worker_args(ModelProviderKind::Antigravity, "acceptEdits"), vec!["--mode", "accept-edits"]);
+        assert!(worker_args(ModelProviderKind::Ollama, "bypassPermissions").is_empty());
     }
 
     #[test]

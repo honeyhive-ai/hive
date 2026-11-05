@@ -807,6 +807,12 @@ impl LiveSettings {
     }
     /// Claude Code extra args for the configured permission mode (empty for
     /// "default" — read-only).
+    /// Extra args for a subscription CLI runtime (agy / copilot): Hive's
+    /// permission tier (the same setting as Claude Code), mapped to that
+    /// CLI's flags. Empty for every other provider.
+    fn cli_permission_args(&self, provider: ModelProviderKind) -> Vec<String> {
+        cli_permission_args(provider, &self.claude_permission_mode)
+    }
     fn claude_args(&self) -> Vec<String> {
         let mut args = match self.claude_permission_mode.as_str() {
             "acceptEdits" => vec!["--permission-mode".into(), "acceptEdits".into()],
@@ -830,6 +836,16 @@ impl LiveSettings {
             args.push(m.to_string());
         }
         args
+    }
+}
+
+/// The permission-tier flags for a subscription CLI runtime (see
+/// `hive_runtime::provider::{antigravity, copilot}::permission_args`).
+fn cli_permission_args(provider: ModelProviderKind, mode: &str) -> Vec<String> {
+    match provider {
+        ModelProviderKind::Antigravity => hive_runtime::provider::antigravity::permission_args(mode),
+        ModelProviderKind::Copilot => hive_runtime::provider::copilot::permission_args(mode),
+        _ => Vec::new(),
     }
 }
 
@@ -2318,6 +2334,8 @@ fn provider_name(kind: ModelProviderKind) -> &'static str {
         ModelProviderKind::ClaudeCode => "claude-code",
         ModelProviderKind::Codex => "codex",
         ModelProviderKind::Hermes => "hermes",
+        ModelProviderKind::Antigravity => "antigravity",
+        ModelProviderKind::Copilot => "copilot",
     }
 }
 
@@ -2335,6 +2353,8 @@ fn parse_provider_kind(input: &str) -> Result<ModelProviderKind, String> {
         "claudecode" => Ok(ModelProviderKind::ClaudeCode),
         "codex" => Ok(ModelProviderKind::Codex),
         "hermes" => Ok(ModelProviderKind::Hermes),
+        "antigravity" | "agy" => Ok(ModelProviderKind::Antigravity),
+        "copilot" | "githubcopilot" => Ok(ModelProviderKind::Copilot),
         other => Err(format!("unknown provider {other}")),
     }
 }
@@ -2381,6 +2401,8 @@ fn provider_config_name(kind: ModelProviderKind) -> &'static str {
         ModelProviderKind::ClaudeCode => "claude-code",
         ModelProviderKind::Codex => "codex",
         ModelProviderKind::Hermes => "hermes",
+        ModelProviderKind::Antigravity => "antigravity",
+        ModelProviderKind::Copilot => "copilot",
     }
 }
 
@@ -2958,28 +2980,28 @@ impl AppState {
     /// the default Anthropic runtime.
     fn resolve_runtime(&self, runtime_id: &str) -> ResolvedRuntime {
         // Live settings: API key (overrides env) + Claude Code permission mode.
-        let (settings_key, claude_args, provider_keys, provider_base_urls) = {
+        let (settings_key, claude_args, provider_keys, provider_base_urls, permission_mode) = {
             let s = self.settings.lock().unwrap();
             (
                 s.api_key.clone(),
                 s.claude_args(),
                 s.provider_keys.clone(),
                 s.provider_base_urls.clone(),
+                s.claude_permission_mode.clone(),
             )
         };
         let runtimes = self.combined_runtimes();
         if let Some(rt) = runtimes.iter().find(|r| r.id == runtime_id) {
             let provider = rt.provider_kind;
-            let endpoint = if matches!(
-                provider,
-                ModelProviderKind::Aider | ModelProviderKind::Pi | ModelProviderKind::ClaudeCode | ModelProviderKind::Codex | ModelProviderKind::Hermes
-            ) {
+            let endpoint = if provider.is_cli_agent() {
                 // subprocess: endpoint is the program (config endpoint or the
                 // provider name as the command)
                 if rt.endpoint.is_empty() {
                     match provider {
                         // the official Claude Code binary is `claude`
                         ModelProviderKind::ClaudeCode => "claude".to_string(),
+                        // Google's Antigravity CLI binary is `agy`.
+                        ModelProviderKind::Antigravity => "agy".to_string(),
                         other => format!("{other:?}").to_lowercase(),
                     }
                 } else {
@@ -2998,7 +3020,7 @@ impl AppState {
             let args = if provider == ModelProviderKind::ClaudeCode {
                 claude_args.clone()
             } else {
-                Vec::new()
+                cli_permission_args(provider, &permission_mode)
             };
             // Per-provider key → legacy global key → env.
             let api_key = provider_key.or(settings_key).or_else(|| api_key_for(provider));
@@ -7650,10 +7672,7 @@ async fn run_prepared_turn(
     // Git commit attribution: credit the human who drove this turn as the
     // commit author (+ other thread participants as co-authors), so commits a
     // subprocess agent makes on this host aren't credited to the host owner.
-    let git_subprocess = matches!(
-        responder.runtime.provider,
-        ModelProviderKind::ClaudeCode | ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes
-    );
+    let git_subprocess = responder.runtime.provider.is_cli_agent();
     let humans: Vec<hive_core::ActorIdentity> = if git_subprocess {
         session
             .messages
@@ -7692,7 +7711,8 @@ async fn run_prepared_turn(
     // roots run in place (no worktree). Isolating from HEAD means an isolated
     // turn starts from the last commit, not the main tree's uncommitted WIP.
     let write_capable = match responder.runtime.provider {
-        ModelProviderKind::ClaudeCode => {
+        // Read-only at the default tier; any raised tier may write.
+        p if p.follows_permission_mode() => {
             state.settings.lock().unwrap().claude_permission_mode != "default"
         }
         ModelProviderKind::Pi | ModelProviderKind::Aider | ModelProviderKind::Codex | ModelProviderKind::Hermes => true,
@@ -7760,14 +7780,7 @@ async fn run_prepared_turn(
     // an in-place turn's edits are already applied.
     if worktree.is_none()
         && lazy_worktree.is_none()
-        && !matches!(
-            responder.runtime.provider,
-            ModelProviderKind::ClaudeCode
-                | ModelProviderKind::Pi
-                | ModelProviderKind::Aider
-                | ModelProviderKind::Codex
-                | ModelProviderKind::Hermes
-        )
+        && !responder.runtime.provider.is_cli_agent()
         && state.combined_mcp_servers().iter().any(|s| s.enabled)
         && hive_runtime::git_worktree::is_git_repo(std::path::Path::new(&workspace_root))
     {
@@ -9477,9 +9490,9 @@ async fn probe_provider(
     base_url: Option<String>,
 ) -> Result<RuntimeTestDto, String> {
     let provider = parse_provider_kind(&kind)?;
-    let (settings_key, provider_keys, provider_base_urls, claude_args) = {
+    let (settings_key, provider_keys, provider_base_urls, claude_args, cli_args) = {
         let s = state.settings.lock().unwrap();
-        (s.api_key.clone(), s.provider_keys.clone(), s.provider_base_urls.clone(), s.claude_args())
+        (s.api_key.clone(), s.provider_keys.clone(), s.provider_base_urls.clone(), s.claude_args(), s.cli_permission_args(provider))
     };
     let cfg = provider_config_name(provider);
     // A key passed in wins (test-before-save, e.g. from onboarding); otherwise
@@ -9535,7 +9548,7 @@ async fn probe_provider(
         model,
         endpoint,
         api_key,
-        args: if provider == ModelProviderKind::ClaudeCode { claude_args } else { Vec::new() },
+        args: if provider == ModelProviderKind::ClaudeCode { claude_args } else { cli_args },
         model_provider_id: None,
         model_base_url: base,
         context_window_tokens: None,
@@ -13073,6 +13086,8 @@ fn provider_catalog() -> Vec<(ModelProviderKind, &'static str, bool, bool, &'sta
         (Aider, "aider (CLI)", false, false, "Local `aider` agent"),
         (Codex, "Codex (CLI)", false, false, "OpenAI `codex` CLI — headless `codex exec`, uses its own login"),
         (Hermes, "Hermes (generic CLI)", false, false, "Any stdin-driven CLI agent; set the executable + flags on the runtime"),
+        (Antigravity, "Google Antigravity (CLI)", false, false, "Google `agy` CLI — Google AI Pro / Ultra via its own Sign in with Google"),
+        (Copilot, "GitHub Copilot (CLI)", false, false, "GitHub `copilot` CLI — uses its own `copilot login`"),
     ]
 }
 
@@ -13329,6 +13344,21 @@ fn detect_providers(state: State<AppState>) -> Vec<DetectedProviderDto> {
     }
 
     out
+}
+
+/// The subscription CLI agents on this machine (Google `agy`, GitHub
+/// `copilot`, and a legacy `gemini` explained): installed, version, sign-in
+/// state, and the exact login / install command. Never changes auth state;
+/// `probe` also runs `agy models` (read-only) to confirm the Google sign-in.
+/// Powers Settings → Models → "Subscription CLIs".
+#[tauri::command]
+async fn detect_cli_runtimes(probe: Option<bool>) -> Result<Vec<hive_runtime::cli_detect::DetectedCli>, String> {
+    let probe = probe.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        hive_runtime::cli_detect::detect_cli_agents(&hive_runtime::cli_detect::DetectEnv::from_process(), probe)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -14350,6 +14380,7 @@ pub fn run() {
             update_connection_settings,
             get_claude_code_model,
             set_claude_code_model,
+            detect_cli_runtimes,
             list_claude_code_models,
             set_default_runtime,
             get_context_commands,
@@ -14879,7 +14910,7 @@ mod dispatch_target_tests {
 
 #[cfg(test)]
 mod runtime_fallback_tests {
-    use super::provider_needs_key;
+    use super::{cli_permission_args, parse_provider_kind, provider_config_name, provider_name, provider_needs_key};
     use hive_core::ModelProviderKind as P;
 
     #[test]
@@ -14916,6 +14947,23 @@ mod runtime_fallback_tests {
     }
 
     #[test]
+    fn subscription_cli_runtimes_round_trip_and_take_the_permission_tier() {
+        for p in [P::Antigravity, P::Copilot] {
+            assert_eq!(parse_provider_kind(provider_name(p)).unwrap(), p);
+            assert_eq!(parse_provider_kind(provider_config_name(p)).unwrap(), p);
+        }
+        assert_eq!(parse_provider_kind("agy").unwrap(), P::Antigravity);
+        // Default tier: agy gets no flags (headless soft-denies edits and
+        // commands), copilot denies write + shell. Never an allow-all.
+        assert!(cli_permission_args(P::Antigravity, "default").is_empty());
+        let c = cli_permission_args(P::Copilot, "default");
+        assert!(c.contains(&"--deny-tool=write".to_string()) && c.contains(&"--deny-tool=shell".to_string()));
+        assert_eq!(cli_permission_args(P::Antigravity, "acceptEdits"), vec!["--mode", "accept-edits"]);
+        assert!(cli_permission_args(P::ClaudeCode, "bypassPermissions").is_empty(), "claude keeps its own args");
+        assert!(cli_permission_args(P::Ollama, "bypassPermissions").is_empty());
+    }
+
+    #[test]
     fn subprocess_and_local_providers_need_no_key() {
         // These run without a supplied key, so no fallback ever triggers.
         for p in [
@@ -14924,6 +14972,8 @@ mod runtime_fallback_tests {
             P::Aider,
             P::Pi,
             P::Hermes,
+            P::Antigravity,
+            P::Copilot,
             P::Ollama,
             P::HiveDaemon,
         ] {

@@ -27,6 +27,36 @@ pub enum ModelProviderKind {
     /// stdin, the reply comes back on stdout. Binary + flags are configured on
     /// the runtime, so any such agent can be wired without new code.
     Hermes,
+    /// Google's Antigravity CLI (`agy -p …`), driven headless. This is the CLI
+    /// that serves Google AI Pro / Ultra sign-ins since Gemini CLI stopped
+    /// serving individual accounts (2026-06-18). Uses its own login.
+    Antigravity,
+    /// GitHub's Copilot CLI (`copilot -p …`), driven headless. Uses its own
+    /// `copilot login` (or a token in its documented env vars).
+    Copilot,
+}
+
+impl ModelProviderKind {
+    /// True for CLI coding agents Hive runs as a subprocess, which bring their
+    /// own tools and (for the subscription CLIs) their own login.
+    pub fn is_cli_agent(self) -> bool {
+        matches!(
+            self,
+            Self::Aider
+                | Self::Pi
+                | Self::ClaudeCode
+                | Self::Codex
+                | Self::Hermes
+                | Self::Antigravity
+                | Self::Copilot
+        )
+    }
+
+    /// CLI agents whose permission tier follows Hive's Claude Code permission
+    /// setting (read-only by default; edits / commands / bypass when raised).
+    pub fn follows_permission_mode(self) -> bool {
+        matches!(self, Self::ClaudeCode | Self::Antigravity | Self::Copilot)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -128,6 +158,17 @@ mod tests {
         assert_eq!(json, "\"openAI\"");
         let back: ModelProviderKind = serde_json::from_str("\"openAI\"").unwrap();
         assert_eq!(back, ModelProviderKind::OpenAI);
+    }
+
+    #[test]
+    fn cli_runtime_kinds_round_trip() {
+        for (kind, raw) in [(ModelProviderKind::Antigravity, "\"antigravity\""), (ModelProviderKind::Copilot, "\"copilot\"")] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), raw);
+            assert_eq!(serde_json::from_str::<ModelProviderKind>(raw).unwrap(), kind);
+            assert!(kind.is_cli_agent() && kind.follows_permission_mode());
+        }
+        assert!(!ModelProviderKind::Ollama.is_cli_agent());
+        assert!(!ModelProviderKind::Codex.follows_permission_mode());
     }
 
     #[test]
