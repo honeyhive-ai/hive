@@ -7528,6 +7528,22 @@ async fn run_turn(
     workspace_id: Uuid,
     responder: &Responder,
 ) -> Result<TurnOutcome, String> {
+    run_turn_answering(app, state, session_id, workspace_id, responder, None).await
+}
+
+/// [`run_turn`] answering a specific message: the responder sees the
+/// transcript up to and including `trigger` (not what was posted after it,
+/// such as the next user message of the same sync batch, addressed to someone
+/// else), and the reply is stamped as answering it. `None` → the whole
+/// transcript, answering its last message.
+async fn run_turn_answering(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    session_id: Uuid,
+    workspace_id: Uuid,
+    responder: &Responder,
+    trigger: Option<Uuid>,
+) -> Result<TurnOutcome, String> {
     // Hard whole-turn backstop. `run_prepared_turn` already bounds the streaming
     // phase (idle + wall-clock), but NOT the setup (context assembly, git worktree
     // creation) or teardown (diff capture, worktree commit/remove) around it — a
@@ -7549,10 +7565,13 @@ async fn run_turn(
             .saturating_add(300),
     );
     let run = async {
-        let session = {
+        let mut session = {
             let svc = state.service.lock().unwrap();
             svc.load(session_id).map_err(map_err)?.ok_or("unknown session")?
         };
+        if let Some(at) = trigger.and_then(|t| session.messages.iter().position(|m| m.id == t)) {
+            session.messages.truncate(at + 1);
+        }
         let (system, turns) = windowed_context(state, session_id, &session, responder).await;
         run_prepared_turn(app, state, session_id, workspace_id, responder, &session, system, turns)
             .await
@@ -8431,77 +8450,142 @@ async fn maybe_respond(
     session_id: String,
 ) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let started = std::time::Instant::now();
+    respond_once(&app, &state, sid, None, false).await
+}
+
+/// Whether `trigger` (a user message) already has an answer: a later reply
+/// stamped with its id. A peer that predates exact trigger stamping stamped
+/// the last non-streaming row, which is a System row when one trails the
+/// user turn, so a reply to a System row directly after `trigger` counts too.
+/// Deliberately exact otherwise: a reply to a *later* user message (another
+/// agent answering the next post in the same sync batch) does not answer
+/// this one.
+fn user_turn_answered(session: &ChatSession, trigger: Uuid) -> bool {
+    let Some(at) = session.messages.iter().position(|m| m.id == trigger) else {
+        return true; // Gone (deleted): nothing to answer.
+    };
+    let keys: Vec<Uuid> = std::iter::once(trigger)
+        .chain(session.messages[at + 1..].iter().take_while(|m| m.role == MessageRole::System).map(|m| m.id))
+        .collect();
+    session.messages[at + 1..].iter().any(|m| {
+        matches!(m.role, MessageRole::Assistant | MessageRole::Agent)
+            && m.reply_to_message_id.is_some_and(|id| keys.contains(&id))
+    })
+}
+
+/// The user messages among `arrived` (what one sync pull brought into this
+/// chat) that may still need an answer, in transcript order: unanswered, and
+/// not claimed by another device. Ownership, addressing and the claim are
+/// checked per trigger when it runs ([`respond_once`]).
+///
+/// Two posts a few ms apart ("@hive …" then "@coder …" through `hive serve`)
+/// land in one pull. Looking only at the chat's last message answered the
+/// second and silently dropped the first.
+fn synced_user_triggers(session: &ChatSession, arrived: &[Uuid], my_device: Uuid) -> Vec<Uuid> {
+    session
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User && arrived.contains(&m.id))
+        .filter(|m| session.turn_claims.get(&m.id).is_none_or(|d| *d == my_device))
+        .filter(|m| !user_turn_answered(session, m.id))
+        .map(|m| m.id)
+        .collect()
+}
+
+/// What [`respond_once`] would run: the session's workspace, the responder,
+/// and the message it answers.
+type ResponsePlan = (Uuid, Responder, Uuid);
+
+/// Decide whether this device answers `trigger` (a user message) — or, with
+/// `None`, the chat's trailing message (an unanswered user turn, or an agent
+/// reply handing off to an agent this device runs).
+fn plan_response(state: &AppState, sid: Uuid, trigger: Option<Uuid>) -> Result<Option<ResponsePlan>, String> {
     let local_actor_id = state.local_actor_id();
     let local_host_id = state.local_host_id();
-
-    // Decide whether there's an unanswered user message we own the response to.
-    let plan: Option<(Uuid, Responder, Uuid)> = {
-        let svc = state.service.lock().unwrap();
-        let Some(session) = svc.load(sid).map_err(map_err)? else {
-            return Ok(());
-        };
-        let last = session
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m.role != MessageRole::System);
-        // In a solo workspace (≤1 human) there is no *other* device to defer the
-        // turn to, so this device always answers — regardless of the responder's
-        // recorded owner. Without this, a churned local identity (e.g. the author
-        // id changes from a device/anon id to the GitHub account id on sign-in,
-        // via `set_author_account`) leaves a chat whose `creator_actor_id` no
-        // longer matches `local_actor_id`: `owns_responder` returns false and the
-        // primary silently never answers ("thinking…" forever, nothing logged).
-        // The cross-device ownership split only matters in a real multi-human room.
-        let local_only = state.is_local_only_ws(session.workspace_id);
-        let links = device_links_of(&svc, session.workspace_id);
-        let runs_here = |responder: &Responder| {
-            let binding = host_binding(&responder.host_id, &local_host_id);
-            runs_here_linked(local_only, &links, &session, &local_actor_id, &responder.owner_actor_id, binding)
-        };
-        match last {
-            Some(m) if m.role == MessageRole::User => match dispatch_target(&m.body, &session, local_only, &links) {
-                Some(target) => {
-                    let agent = match target {
-                        DispatchTarget::Agent(id) => {
-                            session.workspace_agents.iter().find(|a| a.id == id).cloned()
-                        }
-                        DispatchTarget::Primary => None,
-                    };
-                    let responder = responder_for(&state, &session, agent.as_ref());
-                    let owns = runs_here(&responder);
-                    if !owns {
-                        tracing::info!(
-                            target: "dispatch",
-                            responder = %responder.author,
-                            owner = %responder.owner_actor_id,
-                            local = %local_actor_id,
-                            "skipping turn: responder runs on another device or host"
-                        );
-                    }
-                    owns.then_some((session.workspace_id, responder, m.id))
-                }
-                None => None,
-            },
-            // #4: the trailing message is an agent reply that may @mention an
-            // agent THIS device owns (a cross-device cascade the inline loop on
-            // the replying device couldn't run). Bound the chain depth so an
-            // A↔B cascade across devices can't loop forever, and never re-answer
-            // as the replier itself.
-            // Exactly one agent is handed the turn (`cascade_target`, the rule
-            // every host's queue uses); it runs here only if it's ours.
-            Some(m) if matches!(m.role, MessageRole::Assistant | MessageRole::Agent) => {
-                hive_runtime::cascade_target(&session, m).and_then(|a| {
-                    let responder = responder_for(&state, &session, Some(a));
-                    runs_here(&responder).then_some((session.workspace_id, responder, m.id))
-                })
-            }
-            _ => None,
-        }
+    let svc = state.service.lock().unwrap();
+    let Some(session) = svc.load(sid).map_err(map_err)? else {
+        return Ok(None);
     };
+    let m = match trigger {
+        Some(t) => {
+            let Some(m) = session.messages.iter().find(|m| m.id == t) else { return Ok(None) };
+            if m.role != MessageRole::User
+                || session.turn_claims.get(&t).is_some_and(|d| *d != svc.device_id())
+                || user_turn_answered(&session, t)
+            {
+                return Ok(None);
+            }
+            m
+        }
+        None => match session.messages.iter().rev().find(|m| m.role != MessageRole::System) {
+            Some(m) => m,
+            None => return Ok(None),
+        },
+    };
+    // In a solo workspace (≤1 human) there is no *other* device to defer the
+    // turn to, so this device always answers — regardless of the responder's
+    // recorded owner. Without this, a churned local identity (e.g. the author
+    // id changes from a device/anon id to the GitHub account id on sign-in,
+    // via `set_author_account`) leaves a chat whose `creator_actor_id` no
+    // longer matches `local_actor_id`: `owns_responder` returns false and the
+    // primary silently never answers ("thinking…" forever, nothing logged).
+    // The cross-device ownership split only matters in a real multi-human room.
+    let local_only = state.is_local_only_ws(session.workspace_id);
+    let links = device_links_of(&svc, session.workspace_id);
+    let runs_here = |responder: &Responder| {
+        let binding = host_binding(&responder.host_id, &local_host_id);
+        runs_here_linked(local_only, &links, &session, &local_actor_id, &responder.owner_actor_id, binding)
+    };
+    Ok(match m.role {
+        MessageRole::User => match dispatch_target(&m.body, &session, local_only, &links) {
+            Some(target) => {
+                let agent = match target {
+                    DispatchTarget::Agent(id) => session.workspace_agents.iter().find(|a| a.id == id).cloned(),
+                    DispatchTarget::Primary => None,
+                };
+                let responder = responder_for(state, &session, agent.as_ref());
+                let owns = runs_here(&responder);
+                if !owns {
+                    tracing::info!(
+                        target: "dispatch",
+                        responder = %responder.author,
+                        owner = %responder.owner_actor_id,
+                        local = %local_actor_id,
+                        "skipping turn: responder runs on another device or host"
+                    );
+                }
+                owns.then_some((session.workspace_id, responder, m.id))
+            }
+            None => None,
+        },
+        // #4: the trailing message is an agent reply that may @mention an
+        // agent THIS device owns (a cross-device cascade the inline loop on
+        // the replying device couldn't run). Bound the chain depth so an
+        // A↔B cascade across devices can't loop forever, and never re-answer
+        // as the replier itself.
+        // Exactly one agent is handed the turn (`cascade_target`, the rule
+        // every host's queue uses); it runs here only if it's ours.
+        MessageRole::Assistant | MessageRole::Agent => hive_runtime::cascade_target(&session, m).and_then(|a| {
+            let responder = responder_for(state, &session, Some(a));
+            runs_here(&responder).then_some((session.workspace_id, responder, m.id))
+        }),
+        _ => None,
+    })
+}
 
-    let Some((workspace_id, responder, trigger_id)) = plan else {
+/// Answer one turn if this device owns it ([`plan_response`]). `wait` (the
+/// sync path, answering a batch in order) waits out a turn already running
+/// in the chat and then re-checks, instead of giving up — the earlier turn of
+/// the batch holds the chat while it runs.
+async fn respond_once(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    sid: Uuid,
+    trigger: Option<Uuid>,
+    wait: bool,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    let Some(mut plan) = plan_response(state, sid, trigger)? else {
         return Ok(());
     };
 
@@ -8509,11 +8593,26 @@ async fn maybe_respond(
     // guard frees the `responding` slot on drop — on the Ok path *and* if
     // `run_turn` panics — so a crashed turn can't wedge the chat as permanently
     // "already responding" until restart. Acquire failing means another dispatch
-    // already owns the slot; that's the benign double-dispatch case → no-op.
-    let _guard = match crate::workflows::SessionBusyGuard::acquire(&app, sid) {
-        Ok(g) => g,
-        Err(_) => return Ok(()),
+    // already owns the slot; that's the benign double-dispatch case → no-op
+    // (or, with `wait`, a turn to wait out before re-checking).
+    let deadline = started + std::time::Duration::from_secs(4 * 3600);
+    let _guard = loop {
+        match crate::workflows::SessionBusyGuard::acquire(app, sid) {
+            Ok(g) => break g,
+            Err(_) if wait && std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(_) => return Ok(()),
+        }
     };
+    if wait && started.elapsed() > std::time::Duration::from_millis(500) {
+        // The chat moved on while we waited (the trigger may be answered now).
+        match plan_response(state, sid, trigger)? {
+            Some(p) => plan = p,
+            None => return Ok(()),
+        }
+    }
+    let (workspace_id, responder, trigger_id) = plan;
     // Cross-device single-answer: ownership is account-scoped, so all of the
     // owner's online devices would otherwise answer. Claim the turn; if another
     // device already won the claim, back off.
@@ -8524,31 +8623,49 @@ async fn maybe_respond(
         }
     }
     tracing::info!(target: "dispatch", session = %sid, ms = started.elapsed().as_millis() as u64, "claimed turn");
-    let result = run_turn(&app, &state, sid, workspace_id, &responder).await;
-    result.map(|_| ())
+    run_turn_answering(app, state, sid, workspace_id, &responder, Some(trigger_id)).await.map(|_| ())
 }
 
-/// Run [`maybe_respond`] for each chat a sync pull added messages to, in the
-/// active workspace. Each runs on its own task; the per-chat busy guard and the
-/// turn claim keep a chat the UI is also dispatching from answering twice.
-fn dispatch_synced_sessions(app: &AppHandle, sessions: Vec<Uuid>) {
-    if sessions.is_empty() {
+/// Answer what a sync pull brought in: for each chat in the active workspace,
+/// every unanswered user message of the pull in order ([`synced_user_triggers`]),
+/// then the chat's trailing message (an agent hand-off). Each chat runs on its
+/// own task; the per-chat busy guard and the turn claim keep a chat the UI is
+/// also dispatching from answering twice. `arrived` is `(chat, message,
+/// signing device)` from [`hive_runtime::EventStore::messages_after`].
+fn dispatch_synced_messages(app: &AppHandle, arrived: Vec<(Uuid, Uuid, Option<Uuid>)>) {
+    if arrived.is_empty() {
         return;
     }
-    let active = app.state::<AppState>().active_workspace_id();
-    for sid in sessions {
-        let in_active = {
-            let state = app.state::<AppState>();
-            let svc = state.service.lock().unwrap();
-            matches!(svc.load(sid), Ok(Some(s)) if s.workspace_id == active)
-        };
-        if !in_active {
-            continue;
+    let state = app.state::<AppState>();
+    let active = state.active_workspace_id();
+    let my_device = state.service.lock().unwrap().device_id();
+    // Group by chat, keeping arrival order. This device's own posts are left
+    // to `send_message`, which answers (or defers) them as they're sent.
+    let mut by_chat: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
+    for (sid, mid, signer) in arrived {
+        let foreign = signer != Some(my_device);
+        match by_chat.iter_mut().find(|(s, _)| *s == sid) {
+            Some((_, ids)) => ids.extend(foreign.then_some(mid)),
+            None => by_chat.push((sid, foreign.then_some(mid).into_iter().collect())),
         }
+    }
+    for (sid, ids) in by_chat {
+        let triggers = {
+            let svc = state.service.lock().unwrap();
+            match svc.load(sid) {
+                Ok(Some(s)) if s.workspace_id == active => synced_user_triggers(&s, &ids, my_device),
+                _ => continue,
+            }
+        };
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let state = app.state::<AppState>();
-            if let Err(e) = maybe_respond(app.clone(), state, sid.to_string()).await {
+            for t in triggers {
+                if let Err(e) = respond_once(&app, &state, sid, Some(t), true).await {
+                    tracing::warn!(target: "dispatch", session = %sid, trigger = %t, "synced dispatch failed: {e}");
+                }
+            }
+            if let Err(e) = respond_once(&app, &state, sid, None, false).await {
                 tracing::warn!(target: "dispatch", session = %sid, "synced dispatch failed: {e}");
             }
         });
@@ -10800,8 +10917,10 @@ async fn sync_pull_once(
                 // so an @hive in a chat the phone just created (never opened
                 // here) went unanswered. `maybe_respond` keeps every gate —
                 // ownership, host binding, busy guard, the cross-device claim.
-                let touched = store.sessions_with_messages_after(before_row).unwrap_or_default();
-                dispatch_synced_sessions(app, touched);
+                // Every message of the pull, not only each chat's last: two
+                // posts a few ms apart arrive together and both need answers.
+                let arrived = store.messages_after(before_row).unwrap_or_default();
+                dispatch_synced_messages(app, arrived);
                 // Wake every live workflow driver so a stage suspended on a
                 // remote reply (or a remote gate vote) reacts within sync
                 // latency instead of on its safety-net poll.
@@ -16247,5 +16366,94 @@ mod mcp_bearer_tests {
         let preview: String = out.chars().take(400).collect();
         eprintln!("{tool} -> {} chars: {preview}", out.len());
         assert!(!out.trim().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod synced_dispatch_tests {
+    use super::{synced_user_triggers, user_turn_answered};
+    use hive_core::{session::ChatSession, ChatMessage, MessageRole};
+    use uuid::Uuid;
+
+    fn user(body: &str) -> ChatMessage {
+        ChatMessage::new(MessageRole::User, "Alex", body)
+    }
+
+    fn reply(author: &str, to: Uuid) -> ChatMessage {
+        let mut m = ChatMessage::new(MessageRole::Assistant, author, "done");
+        m.reply_to_message_id = Some(to);
+        m
+    }
+
+    /// The field bug: "@hive …" and "@coder …" posted ~20 ms apart through
+    /// `hive serve` arrive in one pull, the box's @coder claims and answers
+    /// the second. The first must still be dispatched here.
+    #[test]
+    fn two_posts_in_one_pull_both_get_considered() {
+        let (me, the_box) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut s = ChatSession::new("t", Uuid::nil(), "rt");
+        let earlier = user("hi");
+        let earlier_reply = reply("Hive", earlier.id);
+        let hive = user("@hive what's the status?");
+        let coder = user("@coder run the tests");
+        let (hive_id, coder_id) = (hive.id, coder.id);
+        s.messages = vec![earlier, earlier_reply, hive, coder];
+
+        // Both arrived, neither answered nor claimed yet: both, in order.
+        assert_eq!(synced_user_triggers(&s, &[hive_id, coder_id], me), vec![hive_id, coder_id]);
+
+        // The box claimed @coder's turn and its reply synced in the same pull:
+        // only @hive is left for this device.
+        s.turn_claims.insert(coder_id, the_box);
+        s.messages.push(reply("coder", coder_id));
+        assert!(!user_turn_answered(&s, hive_id), "a reply to the later post doesn't answer the earlier one");
+        assert!(user_turn_answered(&s, coder_id));
+        assert_eq!(synced_user_triggers(&s, &[hive_id, coder_id], me), vec![hive_id]);
+
+        // Answered once: never again.
+        s.turn_claims.insert(hive_id, me);
+        s.messages.push(reply("Hive", hive_id));
+        assert!(synced_user_triggers(&s, &[hive_id, coder_id], me).is_empty());
+    }
+
+    #[test]
+    fn only_the_pull_and_only_user_turns_are_considered() {
+        let me = Uuid::new_v4();
+        let mut s = ChatSession::new("t", Uuid::nil(), "rt");
+        let old = user("an old unanswered message");
+        let new = user("@hive new");
+        let agent = ChatMessage::new(MessageRole::Assistant, "coder", "@hive over to you");
+        let (old_id, new_id, agent_id) = (old.id, new.id, agent.id);
+        s.messages = vec![old, new, agent];
+        // History outside the pull is left alone; agent replies are the
+        // trailing-message path's job, not a user trigger.
+        assert_eq!(synced_user_triggers(&s, &[new_id, agent_id], me), vec![new_id]);
+        assert!(!synced_user_triggers(&s, &[old_id], me).is_empty(), "the old one only when it arrived now");
+    }
+
+    #[test]
+    fn claimed_elsewhere_is_skipped_claimed_here_is_rechecked() {
+        let me = Uuid::new_v4();
+        let mut s = ChatSession::new("t", Uuid::nil(), "rt");
+        let a = user("@hive a");
+        let a_id = a.id;
+        s.messages = vec![a];
+        s.turn_claims.insert(a_id, Uuid::new_v4());
+        assert!(synced_user_triggers(&s, &[a_id], me).is_empty());
+        s.turn_claims.insert(a_id, me);
+        assert_eq!(synced_user_triggers(&s, &[a_id], me), vec![a_id]);
+    }
+
+    #[test]
+    fn a_legacy_reply_stamped_on_a_trailing_system_row_counts() {
+        let mut s = ChatSession::new("t", Uuid::nil(), "rt");
+        let a = user("@hive a");
+        let sys = ChatMessage::new(MessageRole::System, "Hive", "joined");
+        let a_id = a.id;
+        let r = reply("Hive", sys.id);
+        s.messages = vec![a, sys, r];
+        assert!(user_turn_answered(&s, a_id));
+        // A deleted trigger has nothing left to answer.
+        assert!(user_turn_answered(&s, Uuid::new_v4()));
     }
 }

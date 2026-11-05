@@ -752,41 +752,51 @@ async fn cmd_agent(cfg: &Config, name: String, runtime_id: Option<String>) -> Re
             if id == workspace_config_session_id(s.workspace_id) {
                 continue; // the config log isn't a chat
             }
-            let Some(last) = s.messages.last() else { continue };
-            let respond =
-                last.role == MessageRole::User && !seen.contains(&last.id) && {
-                    let t = parse_mentions(&last.body, &s);
+            // Every new primary/un-mentioned user message, in order — not only
+            // the chat's last: two posts in one sync ("hi" then "@coder …")
+            // would otherwise drop the first.
+            let triggers: Vec<hive_core::ChatMessage> = s
+                .messages
+                .iter()
+                .filter(|m| m.role == MessageRole::User && !seen.contains(&m.id))
+                .filter(|m| {
+                    let t = parse_mentions(&m.body, &s);
                     t.primary || t.is_empty()
-                };
+                })
+                .filter(|m| {
+                    // Already answered (by another `hive agent`, or the desktop).
+                    !s.messages.iter().any(|r| r.role == MessageRole::Assistant && r.reply_to_message_id == Some(m.id))
+                })
+                .cloned()
+                .collect();
             seen.extend(s.messages.iter().map(|m| m.id));
-            if !respond {
-                continue;
+            for last in triggers {
+                // Non-Send store is held across .await — cmd_agent runs on a
+                // current-thread runtime (see run()), so this is allowed.
+                let mut turns = turns_for(&worker::through_trigger(&s, last.id), None, &name);
+                materialize_turns(cfg, &mut turns).await;
+                print!("↳ @{name} replying in {} … ", s.id);
+                // H1 gate: only execute MCP tools when the triggering author holds
+                // ≥ HIVE_MCP_MIN_ROLE (default Contributor). Unresolved author →
+                // fail closed. Under-privileged requesters still get a tool-free
+                // reply, but cannot drive tools on this worker's key.
+                let author_role = last.actor_identity.as_ref().map(|a| s.role_of(&a.id));
+                let min_role = reply::mcp_min_role();
+                let allow_mcp = reply::mcp_allowed_for(author_role, min_role);
+                if !allow_mcp {
+                    eprintln!(
+                        "withholding MCP tools for message {} — author role {:?} below minimum {:?}",
+                        last.id, author_role, min_role
+                    );
+                }
+                // MCP tools when HIVE_MCP_CONFIG provisions them and the gate allows,
+                // else a plain stream.
+                let reply = reply::generate_reply(&rt, &system, &turns, allow_mcp, None).await?;
+                let mid = svc.begin_assistant_message(s.id, s.workspace_id, name.clone(), rt_label.clone(), None, Some(last.id))?;
+                svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
+                seen.insert(mid);
+                println!("done");
             }
-            // Non-Send store is held across .await — cmd_agent runs on a
-            // current-thread runtime (see run()), so this is allowed.
-            let mut turns = turns_for(&s, None, &name);
-            materialize_turns(cfg, &mut turns).await;
-            print!("↳ @{name} replying in {} … ", s.id);
-            // H1 gate: only execute MCP tools when the triggering author holds
-            // ≥ HIVE_MCP_MIN_ROLE (default Contributor). Unresolved author →
-            // fail closed. Under-privileged requesters still get a tool-free
-            // reply, but cannot drive tools on this worker's key.
-            let author_role = last.actor_identity.as_ref().map(|a| s.role_of(&a.id));
-            let min_role = reply::mcp_min_role();
-            let allow_mcp = reply::mcp_allowed_for(author_role, min_role);
-            if !allow_mcp {
-                eprintln!(
-                    "withholding MCP tools for message {} — author role {:?} below minimum {:?}",
-                    last.id, author_role, min_role
-                );
-            }
-            // MCP tools when HIVE_MCP_CONFIG provisions them and the gate allows,
-            // else a plain stream.
-            let reply = reply::generate_reply(&rt, &system, &turns, allow_mcp, None).await?;
-            let mid = svc.begin_assistant_message(s.id, s.workspace_id, name.clone(), rt_label.clone(), None, Some(last.id))?;
-            svc.complete_assistant_message(s.id, s.workspace_id, mid, reply)?;
-            seen.insert(mid);
-            println!("done");
         }
         drop(svc);
         if cfg.relay_url.is_some() {

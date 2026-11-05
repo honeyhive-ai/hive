@@ -20,7 +20,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
-use hive_core::{workspace_config_session_id, ModelProviderKind, WorkspaceAgent, WorkspaceRuntime};
+use hive_core::{workspace_config_session_id, ChatSession, ModelProviderKind, WorkspaceAgent, WorkspaceRuntime};
 use hive_runtime::{pending_mentions, resolve_workspace_credential, turns_for, ChatService, PendingMention, ResolvedRuntime};
 use uuid::Uuid;
 
@@ -319,6 +319,19 @@ fn turn_timeout() -> Duration {
 /// Answer one claimed mention end to end: placeholder, streamed reply (with
 /// throttled crash-recovery checkpoints), final body, and the turn's file
 /// changes as a proposal.
+/// `s` as of the message being answered: the agent replies to *that* message
+/// ("Reply to the latest message"), not to a later post in the same burst
+/// addressed to someone else ("@hive …" then "@coder …" sent together, each
+/// answered on its own host). The cascade trigger is the trailing reply, so
+/// nothing is cut there.
+pub(crate) fn through_trigger(s: &ChatSession, trigger: Uuid) -> ChatSession {
+    let mut s = s.clone();
+    if let Some(at) = s.messages.iter().position(|m| m.id == trigger) {
+        s.messages.truncate(at + 1);
+    }
+    s
+}
+
 async fn run_turn(
     ctx: &WorkerCtx<'_>,
     svc: &Mutex<ChatService>,
@@ -337,7 +350,7 @@ async fn run_turn(
         return Ok(());
     };
     let (rt, rt_label) = agent_workspace_runtime(runtimes, &agent)?;
-    let mut turns = turns_for(&s, Some(agent.id), &agent.name);
+    let mut turns = turns_for(&through_trigger(&s, pm.message_id), Some(agent.id), &agent.name);
     crate::materialize_turns(ctx.cfg, &mut turns).await;
     let system = format!(
         "You are @{}, an agent in a Hive workspace chat. Reply to the latest message concisely and helpfully.\n\n{}",
@@ -505,6 +518,30 @@ mod tests {
 
     fn agent(rt: &str) -> WorkspaceAgent {
         WorkspaceAgent::new("coder", rt)
+    }
+
+    /// Two posts in one burst ("@coder …" then "@hive …"): the box's queue
+    /// sees the @coder mention even though it isn't the chat's last message,
+    /// and @coder answers it without the later @hive post as its "latest".
+    #[test]
+    fn a_burst_of_posts_queues_each_mention_and_answers_it_in_context() {
+        use hive_core::{ChatMessage, MessageRole};
+        let mut s = ChatSession::new("t", Uuid::nil(), "rt");
+        let coder = agent("gw");
+        let coder_id = coder.id;
+        s.workspace_agents = vec![coder];
+        let ask = ChatMessage::new(MessageRole::User, "Alex", "@coder run the tests");
+        let other = ChatMessage::new(MessageRole::User, "Alex", "@hive what's the status?");
+        let ask_id = ask.id;
+        s.messages = vec![ask, other];
+        let queued = pending_mentions(&s);
+        assert_eq!(queued.len(), 1);
+        assert_eq!((queued[0].message_id, queued[0].agent_id), (ask_id, coder_id));
+        let seen = turns_for(&through_trigger(&s, ask_id), Some(coder_id), "coder");
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(format!("{seen:?}").contains("run the tests") && !format!("{seen:?}").contains("status"));
+        // Unknown trigger (deleted): the transcript is left whole.
+        assert_eq!(through_trigger(&s, Uuid::new_v4()).messages.len(), 2);
     }
 
     #[test]

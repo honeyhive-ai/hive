@@ -316,6 +316,25 @@ impl EventStore {
         Ok(out)
     }
 
+    /// The messages appended after row `after`, as `(session, message, signing
+    /// device)` in arrival order: what one sync pull brought in, message by
+    /// message. A pull can carry several user turns for one chat (two posts a
+    /// few ms apart); dispatch must consider each of them, not only the
+    /// chat's last. The signer lets the caller skip its own device's posts.
+    pub fn messages_after(&self, after: i64) -> Result<Vec<(Uuid, Uuid, Option<Uuid>)>> {
+        Ok(self
+            .query_envelopes(
+                "SELECT envelope_json FROM events WHERE row_id > ?1 AND kind = 'messageAppended' ORDER BY row_id ASC",
+                [after],
+            )?
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                SessionEvent::MessageAppended { message } => Some((e.session_id, message.id, e.signer_device_id)),
+                _ => None,
+            })
+            .collect())
+    }
+
     /// Whether this workspace already carries a device certificate binding
     /// `device_id` to `account_id` — so identity publication stays idempotent
     /// (and re-publishes once when the account id changes, e.g. GitHub sign-in).
@@ -870,6 +889,20 @@ mod tests {
         assert_eq!(e2.sequence, 2);
         assert_eq!(e3.sequence, 3);
         assert_eq!(store.max_sequence(sid).unwrap(), Some(3));
+    }
+
+    #[test]
+    fn messages_after_lists_every_message_a_pull_added_in_order() {
+        let (mut store, sid, wid) = seeded_store();
+        let before = store.max_row_id().unwrap();
+        let a = ChatMessage::new(MessageRole::User, "Alex", "@hive status?");
+        let b = ChatMessage::new(MessageRole::User, "Alex", "@coder run the tests");
+        let (a_id, b_id) = (a.id, b.id);
+        store.append(sid, wid, SessionEvent::MessageAppended { message: a }).unwrap();
+        store.append(sid, wid, SessionEvent::SessionTitleChanged { title: "x".into() }).unwrap();
+        store.append(sid, wid, SessionEvent::MessageAppended { message: b }).unwrap();
+        assert_eq!(store.messages_after(before).unwrap(), vec![(sid, a_id, None), (sid, b_id, None)]);
+        assert!(store.messages_after(store.max_row_id().unwrap()).unwrap().is_empty());
     }
 
     #[test]
