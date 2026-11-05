@@ -208,6 +208,19 @@ impl McpRegistry {
         tool: &str,
         arguments: &Value,
     ) -> Result<String, McpError> {
+        Ok(parse_tool_result(&self.call_tool_result(server_id, tool, arguments).await?))
+    }
+
+    /// Call a tool on an enabled server (gate-enforced) and return the whole
+    /// `tools/call` result object (`content`, `structuredContent`, `isError`),
+    /// for callers that read structured output. A JSON-RPC `error` reply is
+    /// an [`McpError::Protocol`] carrying the server's message.
+    pub async fn call_tool_result(
+        &self,
+        server_id: &str,
+        tool: &str,
+        arguments: &Value,
+    ) -> Result<Value, McpError> {
         let spec = self.enabled_spec(server_id)?;
         match &spec.transport {
             McpTransport::Http { url } => {
@@ -356,7 +369,7 @@ async fn call_tool_http(
     auth: Option<&str>,
     tool: &str,
     arguments: &Value,
-) -> Result<String, McpError> {
+) -> Result<Value, McpError> {
     let http = reqwest::Client::new();
     let (_, session) =
         http_send(&http, url, auth, None, &jsonrpc_request(1, "initialize", initialize_params())).await?;
@@ -368,10 +381,20 @@ async fn call_tool_http(
         &jsonrpc_request(2, "tools/call", tools_call_params(tool, arguments)),
     )
     .await?;
-    let result = value
-        .get("result")
-        .ok_or_else(|| McpError::Protocol("missing result".into()))?;
-    Ok(parse_tool_result(result))
+    rpc_result(value)
+}
+
+/// The `result` of a JSON-RPC reply, or its `error` message.
+fn rpc_result(mut value: Value) -> Result<Value, McpError> {
+    if let Some(result) = value.get_mut("result") {
+        return Ok(result.take());
+    }
+    match value.get("error") {
+        Some(e) => Err(McpError::Protocol(
+            e.get("message").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| e.to_string()),
+        )),
+        None => Err(McpError::Protocol("missing result".into())),
+    }
 }
 
 async fn call_tool_stdio(
@@ -379,14 +402,17 @@ async fn call_tool_stdio(
     args: &[String],
     tool: &str,
     arguments: &Value,
-) -> Result<String, McpError> {
+) -> Result<Value, McpError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::process::Command;
 
     let mut cmd = Command::new(command);
+    // A caller that gives up (a timeout drops this future) must not leave the
+    // server process running.
     cmd.args(args)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
     crate::provider::subprocess::suppress_console_window(&mut cmd);
     let mut child = cmd
         .spawn()
@@ -415,11 +441,8 @@ async fn call_tool_stdio(
     {
         if let Ok(value) = serde_json::from_str::<Value>(&line) {
             if value.get("id").and_then(Value::as_u64) == Some(2) {
-                if let Some(result) = value.get("result") {
-                    let text = parse_tool_result(result);
-                    let _ = child.kill().await;
-                    return Ok(text);
-                }
+                let _ = child.kill().await;
+                return rpc_result(value);
             }
         }
     }
@@ -432,9 +455,12 @@ async fn list_tools_stdio(command: &str, args: &[String]) -> Result<Vec<McpTool>
     use tokio::process::Command;
 
     let mut cmd = Command::new(command);
+    // A caller that gives up (a timeout drops this future) must not leave the
+    // server process running.
     cmd.args(args)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true);
     crate::provider::subprocess::suppress_console_window(&mut cmd);
     let mut child = cmd
         .spawn()
@@ -494,6 +520,15 @@ pub fn tools_as_provider_json(tools: &[McpTool]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rpc_result_takes_the_result_or_the_error_message() {
+        let ok = rpc_result(json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [], "isError": false}})).unwrap();
+        assert_eq!(ok, json!({"content": [], "isError": false}));
+        let err = rpc_result(json!({"jsonrpc": "2.0", "id": 2, "error": {"code": -32602, "message": "unknown tool"}}));
+        assert!(matches!(err, Err(McpError::Protocol(m)) if m == "unknown tool"));
+        assert!(matches!(rpc_result(json!({"id": 2})), Err(McpError::Protocol(m)) if m == "missing result"));
+    }
 
     #[test]
     fn jsonrpc_request_shape() {
