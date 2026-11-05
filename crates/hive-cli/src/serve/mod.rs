@@ -36,6 +36,7 @@ use crate::{env_opt, open_service, sync_once, uuid_of_room, Config};
 pub mod api;
 pub mod appearance;
 pub mod dashboard;
+pub mod dashboard_hive;
 pub mod hub;
 pub mod lab;
 pub mod notify;
@@ -321,6 +322,143 @@ pub struct Shared {
     /// Host liveness from the relay's presence channel (see
     /// [`hive_runtime::host_presence`]), refreshed by `presence_loop`.
     pub presence: hive_runtime::HostPresence,
+    /// The last successful relay sync round and the latest failure since.
+    sync_status: Mutex<(Option<time::OffsetDateTime>, Option<String>)>,
+    /// (chat, agent) turns this box's worker has queued or is running.
+    busy: Mutex<HashSet<(Uuid, Uuid)>>,
+    /// The dashboard's workspace snapshot, reused for a few seconds.
+    hive_snapshot: Mutex<Option<(std::time::Instant, Arc<dashboard_hive::HiveSnapshot>)>>,
+    /// MCP servers for `source = "mcp"` dashboard panels (`HIVE_MCP_CONFIG`,
+    /// read at start), or why there are none.
+    pub dashboard_mcp: std::result::Result<hive_runtime::McpRegistry, String>,
+}
+
+/// How long a dashboard snapshot of the workspace is reused.
+const HIVE_SNAPSHOT_TTL: Duration = Duration::from_secs(3);
+
+/// The live chats of workspace `ws` (config log and archived chats excluded).
+pub fn chats_of(svc: &ChatService, ws: Uuid) -> Result<Vec<ChatSession>> {
+    let config = workspace_config_session_id(ws);
+    let mut out = Vec::new();
+    for id in svc.store().list_session_ids()? {
+        if id == config {
+            continue;
+        }
+        if let Ok(Some(s)) = svc.load(id) {
+            if s.workspace_id == ws && !s.archived && id != workspace_config_session_id(s.workspace_id) {
+                out.push(s);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Gather a dashboard snapshot of workspace `ws` from the store.
+#[allow(clippy::too_many_arguments)]
+pub fn hive_snapshot(
+    svc: &ChatService,
+    ws: Uuid,
+    this_host_id: &str,
+    this_host_label: &str,
+    presence: &hive_runtime::HostPresence,
+    busy_here: &HashSet<Uuid>,
+    host: dashboard_hive::HostState,
+) -> Result<dashboard_hive::HiveSnapshot> {
+    let chats = chats_of(svc, ws)?;
+    let config_id = workspace_config_session_id(ws);
+    let config = svc.load(config_id)?.unwrap_or_else(|| {
+        let mut empty = ChatSession::new("", ws, "");
+        empty.id = config_id;
+        empty
+    });
+    let now = Timestamp::now();
+    let hosts: Vec<(WorkspaceHost, bool)> = svc
+        .list_hosts(ws)?
+        .into_iter()
+        .map(|h| {
+            let on = h.id == this_host_id || presence.is_online(&h, &now);
+            (h, on)
+        })
+        .collect();
+    let me = svc.author().id.clone();
+    Ok(dashboard_hive::HiveSnapshot::compute(&dashboard_hive::HiveInputs {
+        now: now.inner(),
+        offset: dashboard_hive::local_offset(),
+        me: &me,
+        this_host_id,
+        this_host_label,
+        chats: &chats,
+        config: &config,
+        hosts: &hosts,
+        busy_here,
+        host,
+    }))
+}
+
+impl dashboard::HiveProvider for Shared {
+    fn snapshot(&self) -> Result<Arc<dashboard_hive::HiveSnapshot>> {
+        let mut cached = self.hive_snapshot.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, snap)) = cached.as_ref() {
+            if at.elapsed() < HIVE_SNAPSHOT_TTL {
+                return Ok(snap.clone());
+            }
+        }
+        let busy: HashSet<Uuid> = self.busy.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(_, a)| *a).collect();
+        let (last_ok, err) = self.sync_status.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let remote = self.tunnel.as_ref().map(|t| {
+            let live = t.live_status();
+            let phones: Vec<_> = t.registry.list().into_iter().filter(|p| p.is_active()).collect();
+            dashboard_hive::RemoteState {
+                connected: live.connected,
+                push: t.push_available.load(Ordering::SeqCst),
+                phones: phones.len(),
+                phones_with_push: phones.iter().filter(|p| p.push_enabled).count(),
+            }
+        });
+        let host = dashboard_hive::HostState {
+            serving: true,
+            relay_configured: self.cfg.relay_url.is_some(),
+            last_sync_ok: last_ok,
+            sync_error: err,
+            remote,
+            ntfy: self.opts.ntfy.is_some(),
+        };
+        let snap = {
+            let svc = self.lock();
+            Arc::new(hive_snapshot(&svc, self.ws, &self.host_id, &self.opts.label, &self.presence, &busy, host)?)
+        };
+        *cached = Some((std::time::Instant::now(), snap.clone()));
+        Ok(snap)
+    }
+}
+
+impl Shared {
+    /// The dashboard's sources: Prometheus/HTTP, this workspace, MCP.
+    pub fn dashboard_sources(&self) -> dashboard::Sources<'_> {
+        dashboard::Sources {
+            http: &self.http,
+            prometheus_url: &self.opts.prometheus_url,
+            hive: Some(self),
+            mcp: self.dashboard_mcp.as_ref().map_err(String::as_str),
+        }
+    }
+
+    fn sync_ok(&self) {
+        *self.sync_status.lock().unwrap_or_else(|e| e.into_inner()) = (Some(time::OffsetDateTime::now_utc()), None);
+    }
+
+    fn sync_failed(&self, e: &str) {
+        self.sync_status.lock().unwrap_or_else(|e| e.into_inner()).1 = Some(e.to_string());
+    }
+}
+
+/// The MCP servers dashboard panels may use (see [`Shared::dashboard_mcp`]).
+pub fn dashboard_mcp_registry() -> std::result::Result<hive_runtime::McpRegistry, String> {
+    match crate::mcp_config::load_from_env() {
+        Ok(specs) if specs.is_empty() => Err("no MCP servers are configured on this host (HIVE_MCP_CONFIG)".into()),
+        Ok(specs) => Ok(hive_runtime::McpRegistry::new(specs)),
+        Err(e) => Err(format!("HIVE_MCP_CONFIG: {e:#}")),
+    }
 }
 
 /// Why a revoked box refuses writes.
@@ -360,20 +498,7 @@ impl Shared {
 
     /// The workspace's live (non-archived) chats, config log excluded.
     pub fn workspace_chats(&self) -> Result<Vec<ChatSession>> {
-        let svc = self.lock();
-        let config = workspace_config_session_id(self.ws);
-        let mut out = Vec::new();
-        for id in svc.store().list_session_ids()? {
-            if id == config {
-                continue;
-            }
-            if let Ok(Some(s)) = svc.load(id) {
-                if s.workspace_id == self.ws && !s.archived && id != workspace_config_session_id(s.workspace_id) {
-                    out.push(s);
-                }
-            }
-        }
-        Ok(out)
+        chats_of(&self.lock(), self.ws)
     }
 
     /// Whose device this box currently is.
@@ -606,6 +731,13 @@ struct ServeSink(Arc<Shared>);
 
 impl TurnSink for ServeSink {
     fn status(&self, chat: Uuid, agent: Uuid, state: TurnState, detail: Option<&str>) {
+        {
+            let mut busy = self.0.busy.lock().unwrap_or_else(|e| e.into_inner());
+            match state {
+                TurnState::Queued | TurnState::Running => busy.insert((chat, agent)),
+                TurnState::Done | TurnState::Error => busy.remove(&(chat, agent)),
+            };
+        }
         let mut data = json!({ "chatId": chat, "agentId": agent, "state": state.as_str() });
         if let Some(d) = detail {
             data["detail"] = json!(d);
@@ -690,8 +822,9 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
     }
     // Pull the workspace first, so registering below extends the real config
     // log instead of seeding a competing one.
+    let mut first_sync = None;
     if cfg.relay_url.is_some() {
-        if let Err(e) = sync_once(&cfg).await {
+        if let Err(e) = sync_once(&cfg).await.inspect(|_| first_sync = Some(time::OffsetDateTime::now_utc())) {
             // With no local copy of the workspace config yet, registering would
             // seed a competing config log naming this box Owner. Fail instead;
             // systemd restarts us until the relay is reachable.
@@ -764,6 +897,10 @@ pub async fn start(cfg: Config, opts: ServeOptions) -> Result<ServeHandle> {
         revisions: Mutex::new(HashMap::new()),
         standing: Mutex::new(standing),
         presence: hive_runtime::HostPresence::new(),
+        sync_status: Mutex::new((first_sync, None)),
+        busy: Mutex::new(HashSet::new()),
+        hive_snapshot: Mutex::new(None),
+        dashboard_mcp: dashboard_mcp_registry(),
         cfg,
         opts,
     });
@@ -872,6 +1009,7 @@ async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
         let wait = match crate::sync_round(&mut engine, &mut store).await {
             Ok((_, pulled)) => {
                 fails = 0;
+                shared.sync_ok();
                 if pulled > 0 {
                     shared.refresh_standing();
                     shared.refresh();
@@ -889,6 +1027,7 @@ async fn sync_loop(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
             Err(_) if shared.stopping() => return,
             Err(e) => {
                 fails = fails.saturating_add(1);
+                shared.sync_failed(&format!("{e:#}"));
                 let secs = crate::sync_backoff_secs(fails);
                 eprintln!("sync: {e} — retrying in {secs}s");
                 Duration::from_secs(secs)

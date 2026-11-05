@@ -993,8 +993,7 @@ async fn lab_status(State(s): S) -> Response {
 
 async fn dashboard_view(State(s): S) -> Json<Value> {
     let loaded = dashboard::load(&s.opts.dashboard_file, s.opts.prometheus_configured);
-    let src = dashboard::Sources { http: &s.http, prometheus_url: &s.opts.prometheus_url };
-    Json(dashboard::render(&loaded, &src, Some(&s.dashboard_cache)).await)
+    Json(dashboard::render(&loaded, &s.dashboard_sources(), Some(&s.dashboard_cache)).await)
 }
 
 fn to_event(ev: super::hub::SseEvent) -> Event {

@@ -3,17 +3,21 @@
 //! The owner describes sections of panels in `dashboard.toml` in the serve
 //! data dir (or `HIVE_DASHBOARD_FILE`); the format is in `docs/dashboard.md`.
 //! The host evaluates every panel itself — Prometheus instant/range queries
-//! against `HIVE_PROMETHEUS_URL`, or a GET of a JSON URL on the host's network
-//! plus a JSON pointer — and serves the results, so the phone never talks to
-//! Prometheus or those URLs. Nothing here runs a command.
+//! against `HIVE_PROMETHEUS_URL`, a GET of a JSON URL on the host's network
+//! plus a JSON pointer, a named metric of the workspace (`hive`, see
+//! `dashboard_hive.rs`), or a call of an MCP tool the file allow-lists — and
+//! serves the results, so the phone never talks to any of them.
 //!
 //! Each panel has its own timeout and cache lifetime (`refresh`), and a panel
 //! that fails carries an `error` instead of failing the response. A config
-//! that doesn't parse yields an empty dashboard with a top-level `error`.
+//! that doesn't parse yields a dashboard with a top-level `error` (and the
+//! built-in section).
 //!
-//! With no config file, a host whose `HIVE_PROMETHEUS_URL` is set gets
-//! [`default_config`] (the old `/v1/lab/status` content, sections that have no
-//! data dropped); any other host gets an empty dashboard, which the app hides.
+//! Every dashboard starts with the built-in "Hive" section unless the file
+//! says `builtin = false`. With no config file, that section is the whole
+//! dashboard, plus [`default_config`]'s lab sections (the old `/v1/lab/status`
+//! content, sections that have no data dropped) when `HIVE_PROMETHEUS_URL` is
+//! set.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -24,6 +28,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use super::dashboard_hive::{self as hive, HiveSnapshot, MetricValue, Shape};
 use super::lab;
 
 /// The config file name in the serve data dir.
@@ -38,6 +43,14 @@ const ERROR_RETRY: Duration = Duration::from_secs(5);
 const MAX_SERIES: usize = 3;
 const MAX_POINTS: u64 = 1_000;
 const MAX_JSON_BYTES: usize = 1 << 20;
+/// MCP panels: a tool call can spawn a process, so they default to a slower
+/// refresh and a longer timeout, and are never called more often than this.
+const MCP_DEFAULT_REFRESH: Duration = Duration::from_secs(60);
+const MCP_MIN_REFRESH: Duration = Duration::from_secs(10);
+const MCP_DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Table panels show at most this many rows (`limit`, default 20).
+const DEFAULT_TABLE_ROWS: usize = 20;
+const MAX_ROWS: usize = 200;
 
 // ── Config ─────────────────────────────────────────────────────────────────
 
@@ -53,8 +66,57 @@ pub struct DashboardConfig {
     /// Default per-panel timeout, e.g. "3s".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// The built-in "Hive" section: shown above the file's sections unless
+    /// `false`; `"bottom"` shows it below them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<Builtin>,
+    /// MCP tools panels may call (`source = "mcp"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpConfig>,
     #[serde(default, rename = "section", skip_serializing_if = "Vec::is_empty")]
     pub sections: Vec<SectionConfig>,
+}
+
+/// `builtin = true | false | "top" | "bottom"`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum Builtin {
+    On(bool),
+    At(BuiltinPosition),
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltinPosition {
+    Top,
+    Bottom,
+}
+
+impl DashboardConfig {
+    /// Where the built-in section goes, `None` when it's off.
+    pub fn builtin_position(&self) -> Option<BuiltinPosition> {
+        match &self.builtin {
+            None | Some(Builtin::On(true)) => Some(BuiltinPosition::Top),
+            Some(Builtin::On(false)) => None,
+            Some(Builtin::At(p)) => Some(*p),
+        }
+    }
+}
+
+/// `[mcp]`: the tools dashboard panels may call, each named exactly as
+/// `"<server>/<tool>"`. No wildcards: a panel calls its tool on a timer, so
+/// every tool is opted in by name.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl McpConfig {
+    fn allows(&self, server: &str, tool: &str) -> bool {
+        self.allow.iter().any(|a| a.trim() == format!("{server}/{tool}"))
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -91,6 +153,8 @@ pub enum Kind {
     Text,
     /// Up/down rows.
     Status,
+    /// Columns and rows of cells (http_json, mcp, hive).
+    Table,
 }
 
 impl Kind {
@@ -103,6 +167,7 @@ impl Kind {
             Kind::List => "list",
             Kind::Text => "text",
             Kind::Status => "status",
+            Kind::Table => "table",
         }
     }
 
@@ -116,6 +181,37 @@ impl Kind {
 pub enum SourceKind {
     Prometheus,
     HttpJson,
+    /// A named metric of the workspace this host serves.
+    Hive,
+    /// A tool on one of the host's MCP servers (`HIVE_MCP_CONFIG`).
+    Mcp,
+}
+
+impl SourceKind {
+    /// Reads a JSON document and picks values with `path` pointers.
+    fn is_json(self) -> bool {
+        matches!(self, SourceKind::HttpJson | SourceKind::Mcp)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Align {
+    Leading,
+    Center,
+    Trailing,
+}
+
+/// A table column: `key` picks the cell from each item (a key, or a JSON
+/// pointer such as `/user/login`); default: the label.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ColumnConfig {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<Align>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -142,6 +238,9 @@ pub struct RowConfig {
     pub query: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// A number metric (hive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
@@ -184,9 +283,28 @@ pub struct PanelConfig {
     pub kind: Kind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unit: Option<String>,
-    /// Default: `http_json` when `url` is set, else `prometheus`.
+    /// Default: `http_json` when `url` is set, `hive` when `metric` is,
+    /// `mcp` when `tool` is, else `prometheus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<SourceKind>,
+    /// A named workspace metric (hive), e.g. "proposals.open".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metric: Option<String>,
+    /// MCP server id from `HIVE_MCP_CONFIG` (mcp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
+    /// MCP tool name (mcp); `<server>/<tool>` must be in `[mcp] allow`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// MCP tool arguments (mcp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Map<String, Value>>,
+    /// Table columns; default: the keys of the first item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<ColumnConfig>,
+    /// At most this many rows (list, bar, status, table; table default 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
     /// PromQL (prometheus).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
@@ -243,7 +361,31 @@ pub struct PanelConfig {
 
 impl PanelConfig {
     pub fn source(&self) -> SourceKind {
-        self.source.unwrap_or(if self.url.is_some() { SourceKind::HttpJson } else { SourceKind::Prometheus })
+        self.source.unwrap_or(if self.url.is_some() {
+            SourceKind::HttpJson
+        } else if self.metric.is_some() || self.rows.iter().any(|r| r.metric.is_some()) {
+            SourceKind::Hive
+        } else if self.tool.is_some() || self.server.is_some() {
+            SourceKind::Mcp
+        } else {
+            SourceKind::Prometheus
+        })
+    }
+
+    /// How long a result is reused.
+    pub fn refresh(&self, defaults: &DashboardConfig) -> Result<Duration> {
+        if self.source() == SourceKind::Mcp {
+            let d = dur_or(self.refresh.as_deref(), MCP_DEFAULT_REFRESH)?;
+            return Ok(d.max(MCP_MIN_REFRESH));
+        }
+        dur_or(self.refresh.as_deref().or(defaults.refresh.as_deref()), DEFAULT_REFRESH)
+    }
+
+    pub fn timeout(&self, defaults: &DashboardConfig) -> Result<Duration> {
+        if self.source() == SourceKind::Mcp {
+            return dur_or(self.timeout.as_deref(), MCP_DEFAULT_TIMEOUT);
+        }
+        dur_or(self.timeout.as_deref().or(defaults.timeout.as_deref()), DEFAULT_TIMEOUT)
     }
 }
 
@@ -285,9 +427,9 @@ pub fn config_path(data_dir: &Path) -> PathBuf {
 #[derive(Debug, Clone)]
 pub enum Loaded {
     Config(DashboardConfig),
-    /// No file: the generated default (Prometheus configured) or nothing.
+    /// No file: the built-in section, plus the lab sections when Prometheus
+    /// is configured.
     Default(DashboardConfig),
-    Empty,
     Invalid(String),
 }
 
@@ -298,13 +440,11 @@ pub fn load(path: &Path, prometheus_configured: bool) -> Loaded {
             Ok(cfg) => Loaded::Config(cfg),
             Err(e) => Loaded::Invalid(format!("{}: {e}", path.display())),
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if prometheus_configured {
-                Loaded::Default(default_config(lab::temp_queries()))
-            } else {
-                Loaded::Empty
-            }
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Loaded::Default(if prometheus_configured {
+            default_config(lab::temp_queries())
+        } else {
+            DashboardConfig::default()
+        }),
         Err(e) => Loaded::Invalid(format!("{}: {e}", path.display())),
     }
 }
@@ -373,12 +513,34 @@ pub fn validate_panel(p: &PanelConfig, defaults: &DashboardConfig) -> Result<()>
     if p.title.trim().is_empty() {
         bail!("needs a title");
     }
-    let timeout = dur_or(p.timeout.as_deref().or(defaults.timeout.as_deref()), DEFAULT_TIMEOUT)?;
+    let timeout = p.timeout(defaults)?;
     if timeout > MAX_TIMEOUT {
         bail!("timeout is at most {}s", MAX_TIMEOUT.as_secs());
     }
     if dur_or(p.refresh.as_deref().or(defaults.refresh.as_deref()), DEFAULT_REFRESH)? < MIN_REFRESH {
         bail!("refresh is at least 1s");
+    }
+    if p.source() == SourceKind::Mcp && p.refresh.as_deref().map(parse_duration).transpose()?.is_some_and(|r| r < MCP_MIN_REFRESH) {
+        bail!("an mcp panel's refresh is at least {}s (each refresh calls the tool)", MCP_MIN_REFRESH.as_secs());
+    }
+    if p.limit == Some(0) || p.limit.is_some_and(|l| l > MAX_ROWS) {
+        bail!("limit is 1 to {MAX_ROWS}");
+    }
+    if !p.columns.is_empty() && p.kind != Kind::Table {
+        bail!("columns are for table panels");
+    }
+    if p.columns.iter().any(|c| c.label.trim().is_empty()) {
+        bail!("every column needs a label");
+    }
+    let src = p.source();
+    if src != SourceKind::Hive && (p.metric.is_some() || p.rows.iter().any(|r| r.metric.is_some())) {
+        bail!("metric is for hive panels (source = \"hive\")");
+    }
+    if src != SourceKind::Mcp && (p.server.is_some() || p.tool.is_some() || p.args.is_some()) {
+        bail!("server/tool/args are for mcp panels (source = \"mcp\")");
+    }
+    if p.kind == Kind::Table && src == SourceKind::Prometheus {
+        bail!("table panels read http_json, mcp or hive sources");
     }
     if let Some(r) = p.round {
         if r > 10 {
@@ -399,8 +561,22 @@ pub fn validate_panel(p: &PanelConfig, defaults: &DashboardConfig) -> Result<()>
             bail!("gauge needs min < max");
         }
     }
-    let src = p.source();
     match src {
+        SourceKind::Hive => return validate_hive(p),
+        SourceKind::Mcp => {
+            need(&p.server, "a server (an id from HIVE_MCP_CONFIG)")?;
+            need(&p.tool, "a tool")?;
+            let (server, tool) = (p.server.as_deref().unwrap_or_default(), p.tool.as_deref().unwrap_or_default());
+            if !defaults.mcp.as_ref().is_some_and(|m| m.allows(server, tool)) {
+                bail!("add \"{server}/{tool}\" to [mcp] allow to let this panel call it");
+            }
+            if p.query.is_some() || p.url.is_some() {
+                bail!("query/url aren't for mcp panels; pick values with path");
+            }
+            for path in [&p.path].into_iter().chain(p.rows.iter().map(|r| &r.path)).chain(p.series.iter().map(|s| &s.path)).flatten() {
+                check_pointer(path)?;
+            }
+        }
         SourceKind::HttpJson => {
             need(&p.url, "a url (http_json)")?;
             let url = p.url.as_deref().unwrap_or_default();
@@ -423,7 +599,7 @@ pub fn validate_panel(p: &PanelConfig, defaults: &DashboardConfig) -> Result<()>
     }
     let row_or_series_ok = |q: &Option<String>, path: &Option<String>| match src {
         SourceKind::Prometheus => need(q, "a query"),
-        SourceKind::HttpJson => path.as_deref().map(check_pointer).unwrap_or_else(|| bail!("needs a path")),
+        _ => path.as_deref().map(check_pointer).unwrap_or_else(|| bail!("needs a path")),
     };
     match p.kind {
         Kind::Timeseries => {
@@ -446,11 +622,8 @@ pub fn validate_panel(p: &PanelConfig, defaults: &DashboardConfig) -> Result<()>
             }
         }
         k if k.has_rows() => {
-            if p.rows.is_empty() {
-                match src {
-                    SourceKind::Prometheus => need(&p.query, "a query or rows")?,
-                    SourceKind::HttpJson => {}
-                }
+            if p.rows.is_empty() && src == SourceKind::Prometheus {
+                need(&p.query, "a query or rows")?;
             }
             for r in &p.rows {
                 if r.label.trim().is_empty() {
@@ -460,6 +633,16 @@ pub fn validate_panel(p: &PanelConfig, defaults: &DashboardConfig) -> Result<()>
             }
         }
         Kind::Text if p.text.is_some() => {}
+        Kind::Table => {
+            if !p.rows.is_empty() || !p.series.is_empty() {
+                bail!("table panels use path and columns, not rows/series");
+            }
+            for c in &p.columns {
+                if let Some(k) = c.key.as_deref().filter(|k| k.starts_with('/')) {
+                    check_pointer(k)?;
+                }
+            }
+        }
         _ => {
             if src == SourceKind::Prometheus {
                 need(&p.query, "a query")?;
@@ -476,6 +659,47 @@ pub fn validate_panel(p: &PanelConfig, defaults: &DashboardConfig) -> Result<()>
         range_step(s.range.as_deref(), s.step.as_deref(), "1h")?;
     } else if p.sparkline == Some(Sparkline::On(true)) && src != SourceKind::Prometheus {
         bail!("sparklines need a prometheus source");
+    }
+    Ok(())
+}
+
+fn validate_hive(p: &PanelConfig) -> Result<()> {
+    if p.query.is_some() || p.url.is_some() || p.path.is_some() {
+        bail!("query/url/path aren't for hive panels; use metric");
+    }
+    if p.sparkline.is_some() || !p.series.is_empty() || p.kind == Kind::Timeseries {
+        bail!("hive metrics are current values: no timeseries or sparklines");
+    }
+    if !p.rows.is_empty() {
+        if !p.kind.has_rows() {
+            bail!("rows are for bar, list and status panels");
+        }
+        if p.metric.is_some() {
+            bail!("set metric on the panel or on each row, not both");
+        }
+        for r in &p.rows {
+            if r.label.trim().is_empty() {
+                bail!("every row needs a label");
+            }
+            let m = r.metric.as_deref().unwrap_or_default();
+            match hive::metric_info(m) {
+                Some(i) if i.shape == Shape::Number => {}
+                Some(_) => bail!("row '{}': metric {m} isn't a number", r.label),
+                None => bail!("row '{}': needs a number metric (hive dashboard metrics lists them)", r.label),
+            }
+        }
+        return Ok(());
+    }
+    if p.kind == Kind::Text && p.text.is_some() {
+        return Ok(());
+    }
+    need(&p.metric, "a metric (hive dashboard metrics lists them)")?;
+    let m = p.metric.as_deref().unwrap_or_default();
+    let Some(info) = hive::metric_info(m) else {
+        bail!("unknown hive metric '{m}' (hive dashboard metrics lists them)");
+    };
+    if !info.shape.fits(p.kind) {
+        bail!("metric {m} fits {} panels, not {}", info.shape.kinds(), p.kind.as_str());
     }
     Ok(())
 }
@@ -499,6 +723,16 @@ fn range_step(range: Option<&str>, step: Option<&str>, default_range: &str) -> R
 /// Every problem in the config, prefixed with where it is. Empty = valid.
 pub fn validate(cfg: &DashboardConfig) -> Vec<String> {
     let mut out = Vec::new();
+    if let Some(m) = &cfg.mcp {
+        for a in &m.allow {
+            let ok = a.split_once('/').is_some_and(|(s, t)| {
+                !s.trim().is_empty() && !t.trim().is_empty() && !t.contains('/') && !a.contains(['*', '?', '['])
+            });
+            if !ok {
+                out.push(format!("[mcp] allow: '{a}' must be \"<server>/<tool>\", one exact tool (no wildcards)"));
+            }
+        }
+    }
     for (what, v) in [("refresh", &cfg.refresh), ("timeout", &cfg.timeout)] {
         if let Some(Err(e)) = v.as_deref().map(parse_duration) {
             out.push(format!("{what}: {e}"));
@@ -532,10 +766,27 @@ pub fn validate(cfg: &DashboardConfig) -> Vec<String> {
 
 // ── Evaluation ─────────────────────────────────────────────────────────────
 
+/// The workspace metrics behind `source = "hive"` and the built-in section.
+pub trait HiveProvider: Send + Sync {
+    fn snapshot(&self) -> Result<std::sync::Arc<HiveSnapshot>>;
+}
+
 /// Where panels get their data.
 pub struct Sources<'a> {
     pub http: &'a reqwest::Client,
     pub prometheus_url: &'a str,
+    /// `None`: no workspace to read (no built-in section, hive panels fail).
+    pub hive: Option<&'a dyn HiveProvider>,
+    /// The host's MCP servers (`HIVE_MCP_CONFIG`), or why there are none.
+    pub mcp: std::result::Result<&'a hive_runtime::McpRegistry, &'a str>,
+}
+
+impl<'a> Sources<'a> {
+    /// Prometheus and HTTP only.
+    #[cfg(test)]
+    pub fn new(http: &'a reqwest::Client, prometheus_url: &'a str) -> Self {
+        Self { http, prometheus_url, hive: None, mcp: Err("no MCP servers are configured on this host (HIVE_MCP_CONFIG)") }
+    }
 }
 
 fn now_iso() -> String {
@@ -661,6 +912,81 @@ async fn fetch_json(src: &Sources<'_>, url: &str, timeout: Duration) -> Result<V
         }
     }
     serde_json::from_slice(&body).context("reply isn't JSON")
+}
+
+/// Call the panel's MCP tool and read its result as a JSON document.
+async fn call_mcp(p: &PanelConfig, src: &Sources<'_>) -> Result<McpDoc> {
+    let registry = src.mcp.map_err(|e| anyhow::anyhow!("{e}"))?;
+    let server = p.server.as_deref().unwrap_or_default();
+    let tool = p.tool.as_deref().unwrap_or_default();
+    match registry.servers.iter().find(|s| s.id == server) {
+        None => {
+            let known: Vec<&str> = registry.servers.iter().map(|s| s.id.as_str()).collect();
+            bail!("no MCP server '{server}' in HIVE_MCP_CONFIG (it has: {})", if known.is_empty() { "none".into() } else { known.join(", ") });
+        }
+        Some(s) if !s.enabled => bail!("MCP server '{server}' is disabled in HIVE_MCP_CONFIG"),
+        Some(_) => {}
+    }
+    let args = Value::Object(p.args.clone().unwrap_or_default());
+    let result = registry.call_tool_result(server, tool, &args).await.map_err(|e| anyhow::anyhow!("MCP {server}/{tool}: {e}"))?;
+    mcp_doc(&result)
+}
+
+/// An MCP tool result: its JSON (structured content, or text that parses as
+/// JSON) and its text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpDoc {
+    pub json: Value,
+    pub text: String,
+}
+
+/// Read a `tools/call` result: `isError` is an error; `structuredContent`
+/// wins; else the `text` (and `resource.text`) items of `content` — one item
+/// that parses as JSON is that JSON, several that all parse are an array of
+/// them, anything else is a JSON string of the joined text.
+pub fn mcp_doc(result: &Value) -> Result<McpDoc> {
+    let mut texts: Vec<String> = Vec::new();
+    let mut size = 0usize;
+    for item in result.get("content").and_then(Value::as_array).into_iter().flatten() {
+        let t = match item.get("type").and_then(Value::as_str) {
+            Some("text") => item.get("text").and_then(Value::as_str),
+            Some("resource") => item.pointer("/resource/text").and_then(Value::as_str),
+            _ => None,
+        };
+        if let Some(t) = t {
+            size += t.len();
+            if size > MAX_JSON_BYTES {
+                bail!("the tool's result is larger than 1 MiB");
+            }
+            texts.push(t.to_string());
+        }
+    }
+    let text = texts.join("\n");
+    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+        let msg: String = text.trim().chars().take(200).collect();
+        bail!("the tool reported an error: {}", if msg.is_empty() { "no details" } else { &msg });
+    }
+    if let Some(sc) = result.get("structuredContent").filter(|v| !v.is_null()) {
+        return Ok(McpDoc { json: sc.clone(), text });
+    }
+    if texts.is_empty() {
+        bail!("the tool returned no text");
+    }
+    let parsed: Vec<Option<Value>> = texts.iter().map(|t| serde_json::from_str::<Value>(t.trim()).ok()).collect();
+    let json = match parsed.as_slice() {
+        [Some(v)] => v.clone(),
+        many if many.len() > 1 && many.iter().all(Option::is_some) => Value::Array(many.iter().flatten().cloned().collect()),
+        _ => Value::String(text.clone()),
+    };
+    Ok(McpDoc { json, text })
+}
+
+/// The JSON document of an http_json or mcp panel.
+async fn fetch_doc(p: &PanelConfig, src: &Sources<'_>, timeout: Duration) -> Result<Value> {
+    match p.source() {
+        SourceKind::Mcp => Ok(call_mcp(p, src).await?.json),
+        _ => fetch_json(src, p.url.as_deref().unwrap_or_default(), timeout).await,
+    }
 }
 
 fn pointer<'v>(doc: &'v Value, path: Option<&str>) -> Result<&'v Value> {
@@ -791,8 +1117,9 @@ async fn rows(p: &PanelConfig, src: &Sources<'_>, timeout: Duration) -> Result<V
                 _ => Ok(out),
             }
         }
-        SourceKind::HttpJson => {
-            let doc = fetch_json(src, p.url.as_deref().unwrap_or_default(), timeout).await?;
+        SourceKind::Hive => bail!("hive rows are read in fill"),
+        SourceKind::HttpJson | SourceKind::Mcp => {
+            let doc = fetch_doc(p, src, timeout).await?;
             if !p.rows.is_empty() {
                 let out: Vec<(String, Raw)> = p
                     .rows
@@ -837,12 +1164,164 @@ async fn rows(p: &PanelConfig, src: &Sources<'_>, timeout: Duration) -> Result<V
 async fn single(p: &PanelConfig, src: &Sources<'_>, timeout: Duration) -> Result<Raw> {
     match p.source() {
         SourceKind::Prometheus => Ok(Raw::Num(instant_one(src, p.query.as_deref().unwrap_or_default(), timeout).await?)),
-        SourceKind::HttpJson => {
-            let doc = fetch_json(src, p.url.as_deref().unwrap_or_default(), timeout).await?;
+        SourceKind::Hive => bail!("hive values are read in fill"),
+        SourceKind::Mcp if p.kind == Kind::Text && p.path.is_none() => {
+            // A text panel with no path shows what the tool said.
+            let doc = call_mcp(p, src).await?;
+            match &doc.json {
+                Value::Number(_) => raw_of(&doc.json).context("not a number"),
+                _ => Ok(Raw::Str(doc.text.trim().to_string())),
+            }
+        }
+        SourceKind::HttpJson | SourceKind::Mcp => {
+            let doc = fetch_doc(p, src, timeout).await?;
             let at = pointer(&doc, p.path.as_deref())?;
             raw_of(at).with_context(|| format!("{} isn't a number or string", p.path.as_deref().unwrap_or("/")))
         }
     }
+}
+
+/// A table cell: strings, numbers and booleans as they are, null as null,
+/// anything else as compact JSON (clipped).
+fn cell_of(v: Option<&Value>) -> Value {
+    match v {
+        None | Some(Value::Null) => Value::Null,
+        Some(v @ (Value::String(_) | Value::Bool(_))) => v.clone(),
+        Some(Value::Number(n)) => n.as_f64().filter(|f| f.is_finite()).map(|f| json!(f)).unwrap_or(Value::Null),
+        Some(other) => {
+            let s = other.to_string();
+            json!(if s.chars().count() > 200 { format!("{}…", s.chars().take(199).collect::<String>()) } else { s })
+        }
+    }
+}
+
+fn column_value<'v>(item: &'v Value, key: &str) -> Option<&'v Value> {
+    if key.starts_with('/') {
+        item.pointer(key)
+    } else {
+        item.get(key)
+    }
+}
+
+/// Columns and cells of a table from the array at the panel's `path`.
+fn table_from_doc(p: &PanelConfig, doc: &Value) -> Result<(Vec<Value>, Vec<Vec<Value>>)> {
+    let at = pointer(doc, p.path.as_deref())?;
+    let items: &[Value] = match at {
+        Value::Array(a) => a,
+        _ => bail!("expected an array at {}", p.path.as_deref().unwrap_or("/")),
+    };
+    let limit = p.limit.unwrap_or(DEFAULT_TABLE_ROWS);
+    let columns: Vec<ColumnConfig> = if p.columns.is_empty() {
+        match items.first() {
+            Some(Value::Object(o)) => o.keys().take(8).map(|k| ColumnConfig { label: k.clone(), key: Some(k.clone()), align: None }).collect(),
+            _ => vec![ColumnConfig { label: p.title.clone(), key: None, align: None }],
+        }
+    } else {
+        p.columns.clone()
+    };
+    let cells: Vec<Vec<Value>> = items
+        .iter()
+        .take(limit)
+        .map(|item| {
+            columns
+                .iter()
+                .map(|c| match (&c.key, item) {
+                    (_, Value::Object(_)) => cell_of(column_value(item, c.key.as_deref().unwrap_or(&c.label))),
+                    (None, scalar) if columns.len() == 1 => cell_of(Some(scalar)),
+                    _ => Value::Null,
+                })
+                .collect()
+        })
+        .collect();
+    Ok((table_columns(&columns, &cells), cells))
+}
+
+/// Column headers; a column whose every non-null cell is a number aligns
+/// trailing unless the config says otherwise.
+fn table_columns(columns: &[ColumnConfig], cells: &[Vec<Value>]) -> Vec<Value> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let numeric = cells.iter().any(|r| r.get(i).is_some_and(Value::is_number))
+                && cells.iter().all(|r| r.get(i).is_none_or(|v| v.is_number() || v.is_null()));
+            let align = c.align.or(numeric.then_some(Align::Trailing));
+            let mut v = json!({ "label": c.label });
+            if let Some(a) = align {
+                v["align"] = json!(a);
+            }
+            v
+        })
+        .collect()
+}
+
+fn set_number(out: &mut Map<String, Value>, p: &PanelConfig, v: f64) {
+    let v = Transform::of(p).apply(v);
+    out.insert("value".into(), json!(v));
+    if let Some(l) = level_for(v, &p.thresholds) {
+        out.insert("level".into(), json!(l));
+    }
+}
+
+/// Evaluate a hive panel from the workspace snapshot.
+fn fill_hive(p: &PanelConfig, src: &Sources<'_>, out: &mut Map<String, Value>) -> Result<()> {
+    if p.kind == Kind::Text {
+        if let Some(t) = &p.text {
+            out.insert("text".into(), json!(t));
+            return Ok(());
+        }
+    }
+    let provider = src.hive.context("no workspace to read on this host")?;
+    let snap = provider.snapshot()?;
+    let tf = Transform::of(p);
+    let row_json = |label: &str, value: Option<f64>, text: Option<&str>, up: Option<bool>| {
+        let mut r = json!({ "label": label });
+        if let Some(v) = value {
+            let v = tf.apply(v);
+            r["value"] = json!(v);
+            if let Some(l) = level_for(v, &p.thresholds) {
+                r["level"] = json!(l);
+            }
+        }
+        if let Some(t) = text {
+            r["text"] = json!(t);
+        }
+        if p.kind == Kind::Status {
+            r["up"] = json!(up.unwrap_or_else(|| value.is_some_and(|v| is_up(p, &Raw::Num(v)))));
+        }
+        r
+    };
+    if !p.rows.is_empty() {
+        let mut rows = Vec::new();
+        for r in &p.rows {
+            match snap.metric(r.metric.as_deref().unwrap_or_default())? {
+                MetricValue::Num(v) => rows.push(row_json(&r.label, Some(v), None, None)),
+                _ => bail!("row '{}': not a number", r.label),
+            }
+        }
+        out.insert("rows".into(), Value::Array(rows));
+        return Ok(());
+    }
+    match (p.kind, snap.metric(p.metric.as_deref().unwrap_or_default())?) {
+        (Kind::Stat | Kind::Gauge | Kind::Text, MetricValue::Num(v)) => set_number(out, p, v),
+        (Kind::Text, MetricValue::Text(t)) => {
+            out.insert("text".into(), json!(t));
+        }
+        (Kind::Bar | Kind::List | Kind::Status, MetricValue::Rows(rows)) => {
+            let limit = p.limit.unwrap_or(MAX_ROWS);
+            let rows: Vec<Value> =
+                rows.iter().take(limit).map(|r| row_json(&r.label, r.value, r.text.as_deref(), r.up)).collect();
+            out.insert("rows".into(), Value::Array(rows));
+        }
+        (Kind::Table, MetricValue::Table { columns, cells }) => {
+            let cells: Vec<Vec<Value>> = cells.into_iter().take(p.limit.unwrap_or(DEFAULT_TABLE_ROWS)).collect();
+            let cols: Vec<ColumnConfig> = columns.into_iter().map(|label| ColumnConfig { label, key: None, align: None }).collect();
+            out.insert("columns".into(), Value::Array(table_columns(&cols, &cells)));
+            out.insert("cells".into(), json!(cells));
+        }
+        (k, _) => bail!("metric {} doesn't fit a {} panel", p.metric.as_deref().unwrap_or_default(), k.as_str()),
+    }
+    Ok(())
 }
 
 fn points_json(pts: &[(f64, f64)], tf: &Transform) -> Value {
@@ -851,6 +1330,9 @@ fn points_json(pts: &[(f64, f64)], tf: &Transform) -> Value {
 
 /// Evaluate a panel's data into `out`.
 async fn fill(p: &PanelConfig, src: &Sources<'_>, timeout: Duration, out: &mut Map<String, Value>) -> Result<()> {
+    if p.source() == SourceKind::Hive {
+        return fill_hive(p, src, out);
+    }
     let tf = Transform::of(p);
     match p.kind {
         Kind::Stat | Kind::Gauge => {
@@ -909,8 +1391,8 @@ async fn fill(p: &PanelConfig, src: &Sources<'_>, timeout: Duration, out: &mut M
                     )
                     .await
                 }
-                SourceKind::HttpJson => {
-                    let doc = fetch_json(src, p.url.as_deref().unwrap_or_default(), timeout).await?;
+                _ => {
+                    let doc = fetch_doc(p, src, timeout).await?;
                     series
                         .iter()
                         .map(|s| json_points(pointer(&doc, s.path.as_deref())?, p.value_key.as_deref()))
@@ -936,6 +1418,7 @@ async fn fill(p: &PanelConfig, src: &Sources<'_>, timeout: Duration, out: &mut M
             let rows = rows(p, src, timeout).await?;
             let arr: Vec<Value> = rows
                 .into_iter()
+                .take(p.limit.unwrap_or(usize::MAX))
                 .map(|(label, raw)| {
                     let mut r = json!({ "label": label });
                     if p.kind == Kind::Status {
@@ -956,6 +1439,12 @@ async fn fill(p: &PanelConfig, src: &Sources<'_>, timeout: Duration, out: &mut M
                 .collect();
             out.insert("rows".into(), Value::Array(arr));
         }
+        Kind::Table => {
+            let doc = fetch_doc(p, src, timeout).await?;
+            let (columns, cells) = table_from_doc(p, &doc)?;
+            out.insert("columns".into(), Value::Array(columns));
+            out.insert("cells".into(), json!(cells));
+        }
     }
     Ok(())
 }
@@ -967,7 +1456,7 @@ fn down_rows(p: &PanelConfig) -> Option<Value> {
     }
     let labels: Vec<String> = if p.rows.is_empty() {
         // A single-target check (one URL, or a query with no label split).
-        if p.source() == SourceKind::HttpJson || p.label.is_none() {
+        if p.source().is_json() || p.label.is_none() {
             vec![p.title.clone()]
         } else {
             return None;
@@ -996,12 +1485,12 @@ pub async fn eval_panel(id: &str, p: &PanelConfig, defaults: &DashboardConfig, s
     if !p.thresholds.is_empty() {
         out.insert("thresholds".into(), json!(p.thresholds));
     }
-    let refresh = dur_or(p.refresh.as_deref().or(defaults.refresh.as_deref()), DEFAULT_REFRESH).unwrap_or(DEFAULT_REFRESH);
+    let refresh = p.refresh(defaults).unwrap_or(DEFAULT_REFRESH);
     out.insert("refreshSeconds".into(), json!(refresh.as_secs_f64()));
     let result = match validate_panel(p, defaults) {
         Err(e) => Err(e.context("invalid panel")),
         Ok(()) => {
-            let timeout = dur_or(p.timeout.as_deref().or(defaults.timeout.as_deref()), DEFAULT_TIMEOUT).unwrap_or(DEFAULT_TIMEOUT);
+            let timeout = p.timeout(defaults).unwrap_or(DEFAULT_TIMEOUT);
             match tokio::time::timeout(timeout + Duration::from_millis(250), fill(p, src, timeout, &mut out)).await {
                 Ok(r) => r,
                 Err(_) => Err(anyhow::anyhow!("timed out after {}s", timeout.as_secs_f64())),
@@ -1018,25 +1507,62 @@ pub async fn eval_panel(id: &str, p: &PanelConfig, defaults: &DashboardConfig, s
     Value::Object(out)
 }
 
-/// Cached panel results: key → (when, value, lifetime).
+type Flight = std::sync::Arc<tokio::sync::Mutex<()>>;
+
+/// Cached panel results: key → (when, value, lifetime), plus one in-flight
+/// evaluation per key, so concurrent requests for a stale panel wait for one
+/// evaluation instead of each running it (an MCP tool is never called more
+/// often than its panel's refresh).
 #[derive(Default)]
-pub struct Cache(Mutex<HashMap<String, (Instant, Value, Duration)>>);
+pub struct Cache {
+    entries: Mutex<HashMap<String, (Instant, Value, Duration)>>,
+    flights: Mutex<HashMap<String, Flight>>,
+}
 
 impl Cache {
     fn get(&self, key: &str) -> Option<Value> {
-        let m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let m = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         m.get(key).filter(|(at, _, ttl)| at.elapsed() < *ttl).map(|(_, v, _)| v.clone())
     }
 
     fn put(&self, key: String, v: Value, ttl: Duration) {
-        let mut m = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut m = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         m.retain(|_, (at, _, ttl)| at.elapsed() < *ttl * 4);
         m.insert(key, (Instant::now(), v, ttl));
     }
+
+    fn flight(&self, key: &str) -> Flight {
+        let mut f = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        f.retain(|_, m| std::sync::Arc::strong_count(m) > 1);
+        f.entry(key.to_string()).or_default().clone()
+    }
 }
 
-/// Evaluate a whole config (panels concurrently; fresh cache entries reused).
+/// The config as evaluated: the file's sections plus the built-in "Hive"
+/// section where `builtin` puts it (when there's a workspace to read).
+pub fn with_builtin(cfg: &DashboardConfig, snap: Option<&HiveSnapshot>) -> DashboardConfig {
+    let mut out = cfg.clone();
+    if let Some(pos) = cfg.builtin_position() {
+        let section = hive::builtin_section(snap);
+        match pos {
+            BuiltinPosition::Top => out.sections.insert(0, section),
+            BuiltinPosition::Bottom => out.sections.push(section),
+        }
+    }
+    out
+}
+
+/// Evaluate a whole config (panels concurrently; fresh cache entries reused),
+/// with the built-in section when `src` has a workspace.
 pub async fn evaluate(cfg: &DashboardConfig, src: &Sources<'_>, cache: Option<&Cache>) -> Value {
+    let expanded;
+    let cfg = match src.hive {
+        Some(h) if cfg.builtin_position().is_some() => {
+            expanded = with_builtin(cfg, h.snapshot().ok().as_deref());
+            &expanded
+        }
+        _ => cfg,
+    };
     let ids = panel_ids(cfg);
     let futs = cfg.sections.iter().zip(&ids).map(|(s, ids)| async move {
         if let Some(q) = s.show_when.as_deref() {
@@ -1059,15 +1585,23 @@ pub async fn evaluate(cfg: &DashboardConfig, src: &Sources<'_>, cache: Option<&C
         }
         let panels = futures_util::future::join_all(s.panels.iter().zip(ids).map(|(p, id)| async move {
             let key = format!("{}|{id}|{}", src.prometheus_url, serde_json::to_string(p).unwrap_or_default());
-            if let Some(v) = cache.and_then(|c| c.get(&key)) {
+            let Some(c) = cache else {
+                return eval_panel(id, p, cfg, src).await;
+            };
+            if let Some(v) = c.get(&key) {
+                return v;
+            }
+            let flight = c.flight(&key);
+            let _turn = flight.lock().await;
+            if let Some(v) = c.get(&key) {
                 return v;
             }
             let v = eval_panel(id, p, cfg, src).await;
-            if let Some(c) = cache {
-                let refresh = v["refreshSeconds"].as_f64().map(Duration::from_secs_f64).unwrap_or(DEFAULT_REFRESH);
-                let ttl = if v.get("error").is_some() { refresh.min(ERROR_RETRY) } else { refresh };
-                c.put(key, v.clone(), ttl);
-            }
+            let refresh = v["refreshSeconds"].as_f64().map(Duration::from_secs_f64).unwrap_or(DEFAULT_REFRESH);
+            // A failed panel is retried sooner, except an MCP tool: it is
+            // never called more often than its refresh.
+            let ttl = if v.get("error").is_some() && p.source() != SourceKind::Mcp { refresh.min(ERROR_RETRY) } else { refresh };
+            c.put(key, v.clone(), ttl);
             v
         }))
         .await;
@@ -1085,7 +1619,7 @@ pub async fn evaluate(cfg: &DashboardConfig, src: &Sources<'_>, cache: Option<&C
         .sections
         .iter()
         .flat_map(|s| &s.panels)
-        .map(|p| p.refresh.as_deref().and_then(|r| parse_duration(r).ok()).unwrap_or(default_refresh))
+        .map(|p| p.refresh(cfg).unwrap_or(default_refresh))
         .min()
         .unwrap_or(default_refresh);
     json!({
@@ -1101,9 +1635,9 @@ pub async fn render(loaded: &Loaded, src: &Sources<'_>, cache: Option<&Cache>) -
     let (mut v, source) = match loaded {
         Loaded::Config(c) => (evaluate(c, src, cache).await, "config"),
         Loaded::Default(c) => (evaluate(c, src, cache).await, "default"),
-        Loaded::Empty => (evaluate(&DashboardConfig::default(), src, None).await, "none"),
         Loaded::Invalid(e) => {
-            let mut v = evaluate(&DashboardConfig::default(), src, None).await;
+            // The built-in section still shows, with the problem above it.
+            let mut v = evaluate(&DashboardConfig::default(), src, cache).await;
             v["error"] = json!(e);
             (v, "config")
         }
@@ -1174,6 +1708,8 @@ pub fn default_config(temps: Vec<(String, String)>) -> DashboardConfig {
         title: Some("Lab".into()),
         refresh: Some("10s".into()),
         timeout: Some("2s".into()),
+        builtin: None,
+        mcp: None,
         sections: vec![
             SectionConfig {
                 title: "Power".into(),
@@ -1197,7 +1733,7 @@ pub fn default_config(temps: Vec<(String, String)>) -> DashboardConfig {
                 optional: true,
                 show_when: None,
                 panels: vec![PanelConfig {
-                    rows: temps.into_iter().map(|(label, q)| RowConfig { label, query: Some(q), path: None }).collect(),
+                    rows: temps.into_iter().map(|(label, q)| RowConfig { label, query: Some(q), ..RowConfig::default() }).collect(),
                     max: Some(100.0),
                     round: Some(0),
                     thresholds: temp_thresholds,
@@ -1230,15 +1766,63 @@ pub fn default_config(temps: Vec<(String, String)>) -> DashboardConfig {
 
 /// The default config as TOML (a starting point for `dashboard.toml`).
 pub fn default_toml() -> Result<String> {
-    Ok(toml::to_string(&default_config(lab::temp_queries()))?)
+    Ok(format!(
+        "# The built-in \"Hive\" section shows above these sections; `builtin = false`\n\
+         # turns it off, `builtin = \"bottom\"` moves it below them.\n{}",
+        toml::to_string(&default_config(lab::temp_queries()))?
+    ))
+}
+
+/// `hive dashboard metrics`: the `hive` source's metrics.
+pub fn metrics_help() -> String {
+    let mut out = String::from("Metrics for panels with source = \"hive\" (metric = \"…\"):\n\n");
+    for (shape, head) in [
+        (Shape::Number, "Numbers (stat, gauge, text, or a row of list/bar/status):"),
+        (Shape::Text, "Text (text):"),
+        (Shape::Rows, "Rows (bar, list, status):"),
+        (Shape::Table, "Tables (table):"),
+    ] {
+        out.push_str(head);
+        out.push('\n');
+        for m in hive::METRICS.iter().filter(|m| m.shape == shape) {
+            out.push_str(&format!("  {:<28} {}\n", m.name, m.about));
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// A dashboard snapshot read straight from the store, for `hive dashboard
+/// check` (not serving: live host state reads unknown).
+struct StoreHive(Result<std::sync::Arc<HiveSnapshot>, String>);
+
+impl HiveProvider for StoreHive {
+    fn snapshot(&self) -> Result<std::sync::Arc<HiveSnapshot>> {
+        self.0.clone().map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+fn store_hive(cfg: &crate::Config) -> Option<StoreHive> {
+    if !cfg.data_dir.join("hive.db").exists() {
+        return None;
+    }
+    let snap = (|| -> Result<HiveSnapshot> {
+        let svc = crate::open_service(cfg)?;
+        let host_id = svc.device_id().to_string();
+        let label = crate::env_opt("HIVE_SERVE_LABEL").unwrap_or_else(|| "this host".into());
+        let host = hive::HostState { serving: false, relay_configured: cfg.relay_url.is_some(), ..Default::default() };
+        let ws = crate::uuid_of_room(&cfg.room);
+        super::hive_snapshot(&svc, ws, &host_id, &label, &hive_runtime::HostPresence::new(), &HashSet::new(), host)
+    })();
+    Some(StoreHive(snap.map(std::sync::Arc::new).map_err(|e| format!("{e:#}"))))
 }
 
 // ── `hive dashboard` ───────────────────────────────────────────────────────
 
 /// `hive dashboard check [--file PATH]`: validate, evaluate once, print.
 /// Fails when the config is invalid or any panel has an error.
-pub fn cmd_check(data_dir: &Path, file: Option<String>) -> Result<()> {
-    let path = file.map(PathBuf::from).unwrap_or_else(|| config_path(data_dir));
+pub fn cmd_check(config: &crate::Config, file: Option<String>) -> Result<()> {
+    let path = file.map(PathBuf::from).unwrap_or_else(|| config_path(&config.data_dir));
     let prometheus_url = crate::env_opt("HIVE_PROMETHEUS_URL");
     let loaded = load(&path, prometheus_url.is_some());
     let cfg = match &loaded {
@@ -1247,15 +1831,12 @@ pub fn cmd_check(data_dir: &Path, file: Option<String>) -> Result<()> {
             c.clone()
         }
         Loaded::Default(c) => {
-            println!("no {} — the generated default (HIVE_PROMETHEUS_URL is set):", path.display());
+            if prometheus_url.is_some() {
+                println!("no {}: the built-in Hive section and the generated lab default (HIVE_PROMETHEUS_URL is set):", path.display());
+            } else {
+                println!("no {}: the built-in Hive section only:", path.display());
+            }
             c.clone()
-        }
-        Loaded::Empty => {
-            println!(
-                "no {} and HIVE_PROMETHEUS_URL isn't set: the dashboard is empty (the app hides its tab).",
-                path.display()
-            );
-            return Ok(());
         }
         Loaded::Invalid(e) => bail!("{e}"),
     };
@@ -1266,7 +1847,18 @@ pub fn cmd_check(data_dir: &Path, file: Option<String>) -> Result<()> {
     let http = reqwest::Client::builder().connect_timeout(Duration::from_secs(3)).build()?;
     let base = prometheus_url.unwrap_or_else(|| "http://127.0.0.1:9090".into());
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-    let out = rt.block_on(render(&loaded, &Sources { http: &http, prometheus_url: &base }, None));
+    let hive_src = store_hive(config);
+    if hive_src.is_none() && cfg.builtin_position().is_some() {
+        println!("(no workspace in {}: the built-in Hive section is left out)", config.data_dir.display());
+    }
+    let mcp = super::dashboard_mcp_registry();
+    let src = Sources {
+        http: &http,
+        prometheus_url: &base,
+        hive: hive_src.as_ref().map(|h| h as &dyn HiveProvider),
+        mcp: mcp.as_ref().map_err(String::as_str),
+    };
+    let out = rt.block_on(render(&loaded, &src, None));
     println!("title: {}", out["title"].as_str().unwrap_or_default());
     let mut errors = 0;
     for s in out["sections"].as_array().into_iter().flatten() {
@@ -1282,7 +1874,8 @@ pub fn cmd_check(data_dir: &Path, file: Option<String>) -> Result<()> {
         }
     }
     let shown: usize = out["sections"].as_array().map(|a| a.len()).unwrap_or(0);
-    let hidden = cfg.sections.len().saturating_sub(shown);
+    let builtin = usize::from(hive_src.is_some() && cfg.builtin_position().is_some());
+    let hidden = (cfg.sections.len() + builtin).saturating_sub(shown);
     if hidden > 0 {
         println!("\n({hidden} optional section(s) hidden: no data)");
     }
@@ -1308,6 +1901,10 @@ fn summarize(p: &Value) -> String {
             .map(|s| format!("{}: {} points", s["name"].as_str().unwrap_or_default(), s["points"].as_array().map(|a| a.len()).unwrap_or(0)))
             .collect::<Vec<_>>()
             .join(", ");
+    }
+    if let Some(cells) = p.get("cells").and_then(Value::as_array) {
+        let cols = p["columns"].as_array().map(|c| c.iter().filter_map(|c| c["label"].as_str()).collect::<Vec<_>>().join(" | ")).unwrap_or_default();
+        return format!("{} row(s) [{cols}]", cells.len());
     }
     if let Some(rows) = p.get("rows").and_then(Value::as_array) {
         return rows
@@ -1413,7 +2010,7 @@ mod tests {
 
     async fn eval(p: &PanelConfig, prom: &str) -> Value {
         let http = reqwest::Client::new();
-        eval_panel("p", p, &DashboardConfig::default(), &Sources { http: &http, prometheus_url: prom }).await
+        eval_panel("p", p, &DashboardConfig::default(), &Sources::new(&http, prom)).await
     }
 
     #[test]
@@ -1684,7 +2281,7 @@ mod tests {
         )
         .unwrap();
         let http = reqwest::Client::new();
-        let src = Sources { http: &http, prometheus_url: &prom };
+        let src = Sources::new(&http, &prom);
         let cache = Cache::default();
         let v = evaluate(&cfg, &src, Some(&cache)).await;
         assert_eq!(v["title"], "Home");
@@ -1704,20 +2301,21 @@ mod tests {
     async fn loading_default_empty_and_invalid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(FILE_NAME);
-        assert!(matches!(load(&path, false), Loaded::Empty));
-        assert!(matches!(load(&path, true), Loaded::Default(_)));
+        assert!(matches!(load(&path, false), Loaded::Default(c) if c.sections.is_empty()), "no file, no Prometheus: built-in only");
+        assert!(matches!(load(&path, true), Loaded::Default(c) if c.sections.len() == 4));
         std::fs::write(&path, "title = [").unwrap();
         let Loaded::Invalid(e) = load(&path, true) else { panic!("invalid TOML") };
         assert!(e.contains(FILE_NAME));
         let http = reqwest::Client::new();
-        let src = Sources { http: &http, prometheus_url: "http://127.0.0.1:9" };
+        let src = Sources::new(&http, "http://127.0.0.1:9");
         let v = render(&Loaded::Invalid(e), &src, None).await;
         assert_eq!(v["sections"], json!([]));
         assert!(v["error"].as_str().unwrap().contains(FILE_NAME));
-        let empty = render(&Loaded::Empty, &src, None).await;
+        // Without a workspace to read there is no built-in section either.
+        let empty = render(&Loaded::Default(DashboardConfig::default()), &src, None).await;
         assert_eq!(empty["sections"], json!([]));
         assert_eq!(empty["title"], DEFAULT_TITLE);
-        assert_eq!(empty["source"], "none");
+        assert_eq!(empty["source"], "default");
         std::fs::write(&path, "title = \"Mine\"\n[[section]]\ntitle = \"S\"\n[[section.panel]]\ntitle = \"x\"\nquery = \"q\"").unwrap();
         assert!(matches!(load(&path, true), Loaded::Config(c) if c.title.as_deref() == Some("Mine")));
     }
@@ -1735,7 +2333,7 @@ mod tests {
         // Against an empty Prometheus every section drops out: an empty dashboard.
         let (prom, _) = fake_prometheus().await;
         let http = reqwest::Client::new();
-        let v = render(&Loaded::Default(cfg), &Sources { http: &http, prometheus_url: &prom }, None).await;
+        let v = render(&Loaded::Default(cfg), &Sources::new(&http, &prom), None).await;
         assert_eq!(v["source"], "default");
         assert_eq!(v["title"], "Lab");
         let shown: Vec<&str> = v["sections"].as_array().unwrap().iter().map(|s| s["title"].as_str().unwrap()).collect();
@@ -1748,10 +2346,400 @@ mod tests {
         for (name, text) in [
             ("dashboard.toml.example", include_str!("../../../../deploy/hive-serve/dashboard.toml.example")),
             ("dashboard-solar.toml.example", include_str!("../../../../deploy/hive-serve/dashboard-solar.toml.example")),
+            ("dashboard-team.toml.example", include_str!("../../../../deploy/hive-serve/dashboard-team.toml.example")),
         ] {
             let cfg = parse(text).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(validate(&cfg), Vec::<String>::new(), "{name}");
             assert!(!cfg.sections.is_empty(), "{name}");
         }
+    }
+
+    // ── Built-in section, hive source, MCP source, tables ──
+
+    struct FakeHive(Arc<HiveSnapshot>);
+
+    impl HiveProvider for FakeHive {
+        fn snapshot(&self) -> Result<Arc<HiveSnapshot>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn fake_hive() -> FakeHive {
+        use super::super::dashboard_hive::tests::{fixture, snapshot_of};
+        let host = hive::HostState { serving: true, relay_configured: true, last_sync_ok: Some(time::OffsetDateTime::now_utc()), ..Default::default() };
+        FakeHive(Arc::new(snapshot_of(&fixture(), host)))
+    }
+
+    fn titles(v: &Value) -> Vec<String> {
+        v["sections"].as_array().unwrap().iter().map(|s| s["title"].as_str().unwrap().to_string()).collect()
+    }
+
+    fn panel_by_id<'v>(v: &'v Value, id: &str) -> &'v Value {
+        v["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|s| s["panels"].as_array().unwrap())
+            .find(|p| p["id"] == id)
+            .unwrap_or_else(|| panic!("no panel {id}: {v}"))
+    }
+
+    #[tokio::test]
+    async fn builtin_section_shows_first_by_default_and_can_be_moved_or_dropped() {
+        let (prom, _) = fake_prometheus().await;
+        let http = reqwest::Client::new();
+        let hive = fake_hive();
+        let src = Sources { hive: Some(&hive), ..Sources::new(&http, &prom) };
+        let mine = "title = \"Home\"\n[[section]]\ntitle = \"Power\"\n[[section.panel]]\ntitle = \"Power\"\nquery = \"power\"\n";
+
+        let v = evaluate(&parse(mine).unwrap(), &src, None).await;
+        assert_eq!(titles(&v), ["Hive", "Power"], "an existing config (no builtin key) gets the Hive section on top");
+        assert_eq!(v["title"], "Home");
+        let hive_panels = v["sections"][0]["panels"].as_array().unwrap();
+        assert!(hive_panels.iter().all(|p| p.get("error").is_none()), "{v}");
+        assert_eq!(panel_by_id(&v, "hive-agents-online")["value"], json!(3.0));
+        assert_eq!(panel_by_id(&v, "hive-awaiting-me")["level"], "warn");
+        assert_eq!(panel_by_id(&v, "hive-workflows-failed")["level"], "critical");
+        let host = panel_by_id(&v, "hive-host");
+        assert_eq!(host["kind"], "status");
+        assert_eq!(host["rows"][0], json!({"label": "Hive serve", "up": true, "text": "Online"}));
+        assert_eq!(host["rows"][1]["text"], "Synced 0 s ago");
+
+        let bottom = evaluate(&parse(&format!("builtin = \"bottom\"\n{mine}")).unwrap(), &src, None).await;
+        assert_eq!(titles(&bottom), ["Power", "Hive"]);
+        let on = evaluate(&parse(&format!("builtin = true\n{mine}")).unwrap(), &src, None).await;
+        assert_eq!(titles(&on), ["Hive", "Power"]);
+        let off = evaluate(&parse(&format!("builtin = false\n{mine}")).unwrap(), &src, None).await;
+        assert_eq!(titles(&off), ["Power"]);
+        assert!(parse(&format!("builtin = \"middle\"\n{mine}")).is_err());
+
+        // No file and no Prometheus: just the Hive section.
+        let v = render(&Loaded::Default(DashboardConfig::default()), &src, None).await;
+        assert_eq!((titles(&v), v["title"].clone(), v["source"].clone()), (vec!["Hive".to_string()], json!("Dashboard"), json!("default")));
+        // A file that doesn't parse: the error, and still the Hive section.
+        let v = render(&Loaded::Invalid("dashboard.toml: bad".into()), &src, None).await;
+        assert_eq!(titles(&v), ["Hive"]);
+        assert_eq!(v["error"], "dashboard.toml: bad");
+        // No file, Prometheus set: Hive, then the lab sections that have data.
+        let v = render(&Loaded::Default(default_config(vec![("Server".into(), "temp_a".into())])), &src, None).await;
+        assert_eq!(titles(&v), ["Hive", "Temperatures"]);
+    }
+
+    #[tokio::test]
+    async fn hive_panels_in_a_config() {
+        let http = reqwest::Client::new();
+        let hive = fake_hive();
+        let src = Sources { hive: Some(&hive), ..Sources::new(&http, "http://127.0.0.1:9") };
+        let cfg = parse(
+            r#"
+            builtin = false
+            [[section]]
+            title = "Team"
+            [[section.panel]]
+            title = "Awaiting me"
+            source = "hive"
+            metric = "proposals.awaiting_me"
+            [[section.panel]]
+            title = "Review queue"
+            kind = "list"
+            rows = [{ label = "Open", metric = "proposals.open" }, { label = "Mine to review", metric = "proposals.awaiting_me" }]
+            [[section.panel]]
+            title = "Agents"
+            kind = "status"
+            metric = "agents"
+            [[section.panel]]
+            title = "Proposals"
+            kind = "table"
+            metric = "proposals.list"
+            limit = 2
+            [[section.panel]]
+            title = "Sync"
+            kind = "text"
+            metric = "sync.last"
+            [[section.panel]]
+            title = "Busiest"
+            kind = "bar"
+            metric = "turns.by_agent_7d"
+            limit = 1
+            "#,
+        )
+        .unwrap();
+        assert_eq!(validate(&cfg), Vec::<String>::new());
+        assert_eq!(cfg.sections[0].panels[1].source(), SourceKind::Hive, "rows with metrics imply hive");
+        let v = evaluate(&cfg, &src, None).await;
+        assert_eq!(titles(&v), ["Team"]);
+        let p = |id: &str| panel_by_id(&v, id).clone();
+        assert_eq!(p("team-awaiting-me")["value"], json!(2.0));
+        assert_eq!(p("team-review-queue")["rows"], json!([{"label": "Open", "value": 4.0}, {"label": "Mine to review", "value": 2.0}]));
+        let agents = p("team-agents");
+        assert_eq!(agents["rows"].as_array().unwrap().len(), 4);
+        assert_eq!(agents["rows"][2], json!({"label": "tester", "up": false, "text": "Offline"}));
+        let table = p("team-proposals");
+        assert_eq!(table["columns"], json!([{"label": "Proposal"}, {"label": "Chat"}, {"label": "Approvals"}]));
+        assert_eq!(table["cells"].as_array().unwrap().len(), 2, "limit");
+        assert_eq!(table["cells"][0][0], "Newest");
+        assert!(p("team-sync")["text"].as_str().unwrap().starts_with("Synced"));
+        assert_eq!(p("team-busiest")["rows"].as_array().unwrap().len(), 1);
+
+        // No workspace (e.g. a check without a store): the panel says so.
+        let bare = evaluate(&cfg, &Sources::new(&http, "http://127.0.0.1:9"), None).await;
+        assert_eq!(panel_by_id(&bare, "team-awaiting-me")["error"], "no workspace to read on this host");
+    }
+
+    #[test]
+    fn hive_validation_says_what_to_fix() {
+        let bad = |p: &str| format!("{:#}", validate_panel(&panel(p), &DashboardConfig::default()).unwrap_err());
+        assert!(bad("title = \"x\"\nsource = \"hive\"").contains("needs a metric"));
+        assert!(bad("title = \"x\"\nmetric = \"tokens.today\"").contains("unknown hive metric"));
+        assert!(bad("title = \"x\"\nkind = \"list\"\nmetric = \"proposals.open\"").contains("fits stat, gauge or text"));
+        assert!(bad("title = \"x\"\nmetric = \"agents\"").contains("fits bar, list or status"));
+        assert!(bad("title = \"x\"\nkind = \"timeseries\"\nmetric = \"turns.today\"").contains("current values"));
+        assert!(bad("title = \"x\"\nmetric = \"turns.today\"\nsparkline = true").contains("current values"));
+        assert!(bad("title = \"x\"\nkind = \"list\"\nrows = [{label = \"a\", metric = \"agents\"}]").contains("isn't a number"));
+        assert!(bad("title = \"x\"\nquery = \"up\"\nmetric = \"turns.today\"\nsource = \"prometheus\"").contains("metric is for hive"));
+        assert!(bad("title = \"x\"\nmetric = \"turns.today\"\nkind = \"list\"\ncolumns = [{label = \"a\"}]").contains("columns are for table"));
+        assert!(bad("title = \"x\"\nkind = \"table\"\nquery = \"up\"").contains("table panels read"));
+    }
+
+    /// A fake MCP server over streamable HTTP: `initialize`, then `tools/call`
+    /// by name. Counts tool calls.
+    async fn fake_mcp() -> (String, Arc<AtomicUsize>) {
+        async fn rpc(State(n): State<Arc<AtomicUsize>>, Json(req): Json<Value>) -> Json<Value> {
+            let id = req["id"].clone();
+            if req["method"] == "initialize" {
+                return Json(json!({"jsonrpc": "2.0", "id": id, "result": {"protocolVersion": "2024-11-05", "capabilities": {}}}));
+            }
+            n.fetch_add(1, Ordering::SeqCst);
+            let text = |t: &str| json!({"content": [{"type": "text", "text": t}]});
+            let result = match req["params"]["name"].as_str().unwrap_or_default() {
+                "list_prs" => {
+                    let state = req["params"]["arguments"]["state"].as_str().unwrap_or("?").to_string();
+                    text(&json!({"state": state, "items": [
+                        {"number": 128, "title": "Fix login redirect", "user": {"login": "alex"}, "draft": false},
+                        {"number": 131, "title": "Bump deps", "user": {"login": "bot"}, "draft": true},
+                        {"number": 133, "title": "Docs", "user": null}
+                    ]}).to_string())
+                }
+                "structured" => json!({"content": [{"type": "text", "text": "Up: 2 of 3"}], "structuredContent": {"up": 2, "services": [{"name": "api", "status": "ok"}, {"name": "db", "status": "down"}]}}),
+                "count" => text("42"),
+                "note" => text("Backups ran at 02:00"),
+                "two" => json!({"content": [{"type": "text", "text": "{\"a\": 1}"}, {"type": "text", "text": "{\"a\": 2}"}]}),
+                "broken" => json!({"content": [{"type": "text", "text": "rate limited"}], "isError": true}),
+                "slow" => {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    text("late")
+                }
+                _ => return Json(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": "unknown tool"}})),
+            };
+            Json(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+        }
+        let n = Arc::new(AtomicUsize::new(0));
+        let r = Router::new().route("/mcp", axum::routing::post(rpc)).with_state(n.clone());
+        (format!("{}/mcp", spawn(r).await), n)
+    }
+
+    fn registry(url: &str) -> hive_runtime::McpRegistry {
+        hive_runtime::McpRegistry::new(vec![
+            hive_runtime::McpServerSpec { id: "gh".into(), transport: hive_runtime::McpTransport::Http { url: url.into() }, enabled: true, auth: None },
+            hive_runtime::McpServerSpec { id: "off".into(), transport: hive_runtime::McpTransport::Http { url: url.into() }, enabled: false, auth: None },
+        ])
+    }
+
+    const MCP_ALLOW: &str = "[mcp]\nallow = [\"gh/list_prs\", \"gh/structured\", \"gh/count\", \"gh/note\", \"gh/two\", \"gh/broken\", \"gh/slow\", \"gh/missing\", \"off/count\", \"nope/count\"]\n";
+
+    #[tokio::test]
+    async fn mcp_panels_map_text_json_and_tables() {
+        let (url, calls) = fake_mcp().await;
+        let reg = registry(&url);
+        let http = reqwest::Client::new();
+        let src = Sources { mcp: Ok(&reg), ..Sources::new(&http, "http://127.0.0.1:9") };
+        let cfg = parse(&format!(
+            r##"builtin = false
+            {MCP_ALLOW}            [[section]]
+            title = "Code"
+            [[section.panel]]
+            title = "Open pull requests"
+            kind = "table"
+            source = "mcp"
+            server = "gh"
+            tool = "list_prs"
+            args = {{ owner = "acme", repo = "web", state = "open" }}
+            path = "/items"
+            columns = [{{ label = "#", key = "number" }}, {{ label = "Title", key = "title" }}, {{ label = "Author", key = "/user/login" }}, {{ label = "Draft", key = "draft", align = "center" }}]
+            [[section.panel]]
+            title = "Auto columns"
+            kind = "table"
+            server = "gh"
+            tool = "list_prs"
+            args = {{ state = "all" }}
+            path = "/items"
+            limit = 1
+            [[section.panel]]
+            title = "State"
+            kind = "text"
+            server = "gh"
+            tool = "list_prs"
+            args = {{ state = "closed" }}
+            path = "/state"
+            [[section.panel]]
+            title = "Answer"
+            server = "gh"
+            tool = "count"
+            [[section.panel]]
+            title = "Note"
+            kind = "text"
+            server = "gh"
+            tool = "note"
+            [[section.panel]]
+            title = "Up"
+            kind = "gauge"
+            max = 3
+            server = "gh"
+            tool = "structured"
+            path = "/up"
+            [[section.panel]]
+            title = "Services"
+            kind = "status"
+            server = "gh"
+            tool = "structured"
+            path = "/services"
+            value_key = "status"
+            [[section.panel]]
+            title = "Both"
+            kind = "list"
+            server = "gh"
+            tool = "two"
+            rows = [{{ label = "first", path = "/0/a" }}, {{ label = "second", path = "/1/a" }}]
+            "##
+        ))
+        .unwrap();
+        assert_eq!(validate(&cfg), Vec::<String>::new());
+        assert_eq!(cfg.sections[0].panels[1].source(), SourceKind::Mcp, "tool implies mcp");
+        let v = evaluate(&cfg, &src, None).await;
+        let p = |id: &str| panel_by_id(&v, id).clone();
+        let prs = p("code-open-pull-requests");
+        assert!(prs.get("error").is_none(), "{prs}");
+        assert_eq!(
+            prs["columns"],
+            json!([{"label": "#", "align": "trailing"}, {"label": "Title"}, {"label": "Author"}, {"label": "Draft", "align": "center"}])
+        );
+        assert_eq!(prs["cells"][0], json!([128.0, "Fix login redirect", "alex", false]));
+        assert_eq!(prs["cells"][2], json!([133.0, "Docs", null, null]));
+        assert_eq!(prs["refreshSeconds"], json!(60.0), "mcp panels default to a 60 s refresh");
+        let auto = p("code-auto-columns");
+        assert_eq!(auto["columns"].as_array().unwrap().len(), 4, "the keys of the first item: {auto}");
+        assert_eq!(auto["cells"].as_array().unwrap().len(), 1);
+        assert!(auto["cells"][0].as_array().unwrap().contains(&json!("{\"login\":\"alex\"}")), "objects become compact JSON: {auto}");
+        assert_eq!(p("code-state")["text"], "closed", "args reach the tool");
+        assert_eq!(p("code-answer")["value"], json!(42.0));
+        assert_eq!(p("code-note")["text"], "Backups ran at 02:00");
+        assert_eq!(p("code-up")["value"], json!(2.0), "structuredContent wins over text");
+        assert_eq!(
+            p("code-services")["rows"],
+            json!([{"label": "api", "up": true, "text": "ok"}, {"label": "db", "up": false, "text": "down"}])
+        );
+        assert_eq!(p("code-both")["rows"], json!([{"label": "first", "value": 1.0}, {"label": "second", "value": 2.0}]));
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn mcp_failures_are_panel_errors_and_respect_refresh() {
+        let (url, calls) = fake_mcp().await;
+        let reg = registry(&url);
+        let http = reqwest::Client::new();
+        let src = Sources { mcp: Ok(&reg), ..Sources::new(&http, "http://127.0.0.1:9") };
+        let one = |tool: &str, server: &str, extra: &str| {
+            parse(&format!("builtin = false\n{MCP_ALLOW}[[section]]\ntitle = \"S\"\n[[section.panel]]\ntitle = \"x\"\nserver = \"{server}\"\ntool = \"{tool}\"\n{extra}")).unwrap()
+        };
+        let err = |v: &Value| v["sections"][0]["panels"][0]["error"].as_str().unwrap_or_default().to_string();
+        assert!(err(&evaluate(&one("broken", "gh", ""), &src, None).await).contains("reported an error: rate limited"));
+        assert!(err(&evaluate(&one("missing", "gh", ""), &src, None).await).contains("unknown tool"));
+        assert!(err(&evaluate(&one("count", "off", ""), &src, None).await).contains("disabled"));
+        assert!(err(&evaluate(&one("count", "nope", ""), &src, None).await).contains("no MCP server 'nope'"));
+        assert!(err(&evaluate(&one("slow", "gh", "timeout = \"300ms\""), &src, None).await).contains("timed out"));
+        let unconfigured = Sources::new(&http, "http://127.0.0.1:9");
+        assert!(err(&evaluate(&one("count", "gh", ""), &unconfigured, None).await).contains("HIVE_MCP_CONFIG"));
+
+        // Cached for its refresh, errors included, and concurrent requests
+        // for a stale panel share one call.
+        let cache = Cache::default();
+        let before = calls.load(Ordering::SeqCst);
+        let cfg = one("count", "gh", "refresh = \"10m\"");
+        let (a, b) = tokio::join!(evaluate(&cfg, &src, Some(&cache)), evaluate(&cfg, &src, Some(&cache)));
+        assert_eq!(a["sections"][0]["panels"][0]["value"], json!(42.0));
+        assert_eq!(b["sections"][0]["panels"][0]["value"], json!(42.0));
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1, "one call for two concurrent requests");
+        evaluate(&cfg, &src, Some(&cache)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1, "fresh: no call");
+        let broken = one("broken", "gh", "");
+        evaluate(&broken, &src, Some(&cache)).await;
+        evaluate(&broken, &src, Some(&cache)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), before + 2, "a failing tool isn't retried before its refresh");
+    }
+
+    #[test]
+    fn mcp_tools_must_be_allow_listed_by_exact_name() {
+        let bad = |cfg: &str| validate(&parse(cfg).unwrap()).join("\n");
+        let panel = "[[section]]\ntitle = \"S\"\n[[section.panel]]\ntitle = \"x\"\nserver = \"gh\"\ntool = \"list_prs\"\n";
+        assert!(bad(panel).contains("add \"gh/list_prs\" to [mcp] allow"));
+        assert!(bad(&format!("[mcp]\nallow = [\"gh/other\"]\n{panel}")).contains("add \"gh/list_prs\""));
+        for wild in ["gh/*", "*", "gh", "*/list_prs", "gh/list_*", "gh/a/b"] {
+            let e = bad(&format!("[mcp]\nallow = [\"{wild}\", \"gh/list_prs\"]\n{panel}"));
+            assert!(e.contains("no wildcards"), "{wild}: {e}");
+        }
+        assert_eq!(bad(&format!("[mcp]\nallow = [\"gh/list_prs\"]\n{panel}")), "");
+        assert!(bad(&format!("[mcp]\nallow = [\"gh/list_prs\"]\n{panel}refresh = \"5s\"\n")).contains("at least 10s"));
+        assert!(bad(&format!("[mcp]\nallow = [\"gh/list_prs\"]\n{panel}query = \"q\"\n")).contains("query/url"));
+        assert!(bad("[[section]]\ntitle = \"S\"\n[[section.panel]]\ntitle = \"x\"\nsource = \"mcp\"\ntool = \"t\"\n").contains("needs a server"));
+        assert!(parse("[mcp]\nallow = []\ncommand = \"x\"\n").is_err(), "unknown keys in [mcp] are rejected");
+    }
+
+    #[test]
+    fn mcp_results_become_documents() {
+        let d = mcp_doc(&json!({"content": [{"type": "text", "text": " [1, 2] "}]})).unwrap();
+        assert_eq!(d.json, json!([1, 2]));
+        let d = mcp_doc(&json!({"content": [{"type": "text", "text": "hello"}, {"type": "image", "data": "…"}]})).unwrap();
+        assert_eq!((d.json, d.text), (json!("hello"), "hello".to_string()));
+        let d = mcp_doc(&json!({"content": [{"type": "resource", "resource": {"uri": "x", "mimeType": "application/json", "text": "{\"n\": 3}"}}]})).unwrap();
+        assert_eq!(d.json, json!({"n": 3}));
+        let d = mcp_doc(&json!({"content": [{"type": "text", "text": "{\"a\":1}"}, {"type": "text", "text": "not json"}]})).unwrap();
+        assert_eq!(d.json, json!("{\"a\":1}\nnot json"));
+        assert!(mcp_doc(&json!({"content": []})).unwrap_err().to_string().contains("no text"));
+        assert!(mcp_doc(&json!({"content": [], "isError": true})).unwrap_err().to_string().contains("no details"));
+        let big = "x".repeat(MAX_JSON_BYTES + 1);
+        assert!(mcp_doc(&json!({"content": [{"type": "text", "text": big}]})).is_err());
+    }
+
+    #[tokio::test]
+    async fn http_json_tables() {
+        let j = fake_json().await;
+        let v = eval(&panel(&format!("title = \"Disks\"\nkind = \"table\"\nurl = \"{j}/doc\"\npath = \"/disks\"\ncolumns = [{{label = \"Disk\", key = \"name\"}}, {{label = \"Used\", key = \"used\"}}]")), "http://127.0.0.1:9").await;
+        assert!(v.get("error").is_none(), "{v}");
+        // "0.25" is a string, so the column isn't all numbers: no auto alignment.
+        assert_eq!(v["columns"], json!([{"label": "Disk"}, {"label": "Used"}]));
+        assert_eq!(v["cells"], json!([["sda", 0.5], ["sdb", "0.25"], [null, null]]));
+        let not_array = eval(&panel(&format!("title = \"x\"\nkind = \"table\"\nurl = \"{j}/doc\"\npath = \"/fans\"")), "http://127.0.0.1:9").await;
+        assert!(not_array["error"].as_str().unwrap().contains("expected an array"));
+    }
+
+    #[test]
+    fn existing_configs_parse_and_validate_unchanged() {
+        // Every config a host could have written before built-ins/MCP still
+        // parses to the same thing and validates; none of them sets builtin,
+        // so the built-in section shows on top.
+        for (name, text) in [
+            ("dashboard.toml.example", include_str!("../../../../deploy/hive-serve/dashboard.toml.example")),
+            ("dashboard-solar.toml.example", include_str!("../../../../deploy/hive-serve/dashboard-solar.toml.example")),
+        ] {
+            let cfg = parse(text).unwrap();
+            assert_eq!(cfg.builtin, None, "{name}");
+            assert_eq!(cfg.builtin_position(), Some(BuiltinPosition::Top), "{name}");
+            for p in cfg.sections.iter().flat_map(|s| &s.panels) {
+                assert!(matches!(p.source(), SourceKind::Prometheus | SourceKind::HttpJson), "{name}: {}", p.title);
+            }
+        }
+        let printed = default_toml().unwrap();
+        let back = parse(&printed).unwrap();
+        assert_eq!(back, default_config(lab::temp_queries()));
     }
 }

@@ -1108,7 +1108,8 @@ fn usage() -> ! {
          phone remote access through a relay tunnel (off by default)\n  \
          hive phones list | revoke <pid|name> [--keep-token]   phones paired over the relay\n  \
          hive dashboard check [--file PATH]   validate dashboard.toml and evaluate it once\n  \
-         hive dashboard default         print the generated default dashboard as TOML\n\n\
+         hive dashboard default         print the generated default dashboard as TOML\n  \
+         hive dashboard metrics         list the built-in hive metrics panels can show\n\n\
          Setup:\n  \
          hive enroll <hivews1:invite> [--token <hrt1>]   one-shot: save the workspace connection\n  \
          hive join <invite-code>        redeem a relay invite to self-enroll this box's identity\n  \
@@ -1135,6 +1136,8 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    // Before any thread starts: the only time Linux lets us read it.
+    serve::dashboard_hive::init_local_offset();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if matches!(args.first().map(String::as_str), Some("--version" | "-V" | "version")) {
         println!("hive {}", env!("CARGO_PKG_VERSION"));
@@ -1373,12 +1376,16 @@ fn run() -> Result<()> {
             }
         }
         "dashboard" => match positional.first().map(|s| s.as_str()) {
-            Some("check") => serve::dashboard::cmd_check(&cfg.data_dir, flag_val("--file")),
+            Some("check") => serve::dashboard::cmd_check(&cfg, flag_val("--file")),
             Some("default") => {
                 print!("{}", serve::dashboard::default_toml()?);
                 Ok(())
             }
-            _ => bail!("usage: hive dashboard <check [--file PATH] | default>"),
+            Some("metrics") => {
+                print!("{}", serve::dashboard::metrics_help());
+                Ok(())
+            }
+            _ => bail!("usage: hive dashboard <check [--file PATH] | default | metrics>"),
         },
         "bind-repo" => repos::cmd_bind_repo(
             &cfg.data_dir,

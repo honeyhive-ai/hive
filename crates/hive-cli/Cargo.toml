@@ -31,7 +31,7 @@ futures-util = "0.3"
 getrandom = "0.2"
 qrcodegen = "1.8"
 tracing.workspace = true
-time.workspace = true
+time = { workspace = true, features = ["local-offset"] }
 # Relay tunnel (`hive-tunnel/1`, docs/relay-tunnel.md): Noise IK/IKpsk1 (snow),
 # Ed25519 host signing key + credentials, HKDF/SHA-256 derivations,
 # ChaCha20-Poly1305 for end-to-end push, the control/accept WebSockets

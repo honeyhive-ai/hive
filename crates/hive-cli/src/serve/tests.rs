@@ -527,12 +527,18 @@ async fn auth_is_required_except_for_bare_health() {
     let r = h.client.get(format!("{}/v1/lab/status", h.base)).bearer_auth(&h.token).send().await.unwrap();
     assert_eq!(r.headers()["deprecation"], "true", "lab status is deprecated");
 
-    // No dashboard.toml and no HIVE_PROMETHEUS_URL: an empty dashboard (the
-    // app hides its tab).
+    // No dashboard.toml and no HIVE_PROMETHEUS_URL: the built-in Hive
+    // section alone.
     let d = h.get("/v1/dashboard").await;
-    assert_eq!(d["sections"], json!([]), "{d}");
+    let titles: Vec<&str> = d["sections"].as_array().unwrap().iter().map(|s| s["title"].as_str().unwrap()).collect();
+    assert_eq!(titles, ["Hive"], "{d}");
     assert_eq!(d["title"], "Dashboard");
-    assert_eq!(d["source"], "none");
+    assert_eq!(d["source"], "default");
+    let host = d["sections"][0]["panels"].as_array().unwrap().iter().find(|p| p["id"] == "hive-host").unwrap().clone();
+    let labels: Vec<&str> = host["rows"].as_array().unwrap().iter().map(|r| r["label"].as_str().unwrap()).collect();
+    assert_eq!(labels, ["Hive serve", "Relay sync", "Push"]);
+    assert_eq!(host["rows"][1]["up"], true, "the start-up sync counts: {host}");
+    assert_eq!(host["rows"][2]["text"], "ntfy");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -572,7 +578,20 @@ query = "sum(power_watts)"
     let d = h.get("/v1/dashboard").await;
     assert_eq!(d["title"], "Home");
     assert_eq!(d["source"], "config");
-    let panels = d["sections"][0]["panels"].as_array().unwrap();
+    // The built-in Hive section comes first (the file has no `builtin` key),
+    // read from this box's own workspace.
+    assert_eq!(d["sections"][0]["title"], "Hive");
+    let hive = d["sections"][0]["panels"].as_array().unwrap();
+    assert!(hive.iter().all(|p| p.get("error").is_none()), "{}", d["sections"][0]);
+    let agents_online = hive.iter().find(|p| p["id"] == "hive-agents-online").unwrap();
+    // The harness's one agent runs on its owner's desktop, which never
+    // registered a host here: not counted as online.
+    assert_eq!(agents_online["value"], json!(0.0), "{agents_online}");
+    let open = hive.iter().find(|p| p["id"] == "hive-proposals-open").unwrap();
+    assert_eq!(open["value"], json!(0.0));
+    let host = hive.iter().find(|p| p["id"] == "hive-host").unwrap();
+    assert_eq!(host["rows"][0], json!({"label": "Hive serve", "up": true, "text": "Online"}));
+    let panels = d["sections"][1]["panels"].as_array().unwrap();
     assert_eq!(panels[0]["id"], "gpu-temp");
     assert_eq!(panels[0]["value"], json!(61.5));
     assert_eq!(panels[0]["max"], json!(110.0));
