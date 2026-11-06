@@ -4,4 +4,8 @@ import type { WorkflowNodeDto } from "./WorkflowNodeDto";
 /**
  * A workflow definition (DAG of stages) available in a chat.
  */
-export type WorkflowDefinitionDto = { id: string, name: string, description: string, inputLabel: string | null, nodes: Array<WorkflowNodeDto>, };
+export type WorkflowDefinitionDto = { id: string, name: string, description: string, inputLabel: string | null, nodes: Array<WorkflowNodeDto>, 
+/**
+ * Paused: listed, but no new run can start.
+ */
+disabled: boolean, };

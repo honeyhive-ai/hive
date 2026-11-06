@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  listAgents,
   listWorkflows,
   listWorkflowRuns,
   removeWorkflow,
-  addWorkflowPreset,
+  setWorkflowEnabled,
+  workflowChangeRequest,
+  sendMessage,
   startWorkflowRun,
   cancelWorkflowRun,
   resumeWorkflowRun,
@@ -13,6 +16,7 @@ import {
   onChatStream,
   onWorkspaceSynced,
   type WorkflowDefinitionDto,
+  type WorkflowNodeDto,
   type WorkflowRunDto,
   type WorkflowNodeRunDto,
 } from "@/lib/ipc";
@@ -46,40 +50,77 @@ export function statusLabel(status: string): string {
   return status.replace(/([A-Z])/g, " $1").toLowerCase();
 }
 
-function blankDraft(): WorkflowDefinitionDto {
-  return {
-    id: "",
-    name: "",
-    description: "",
-    inputLabel: null,
-    nodes: [
-      {
-        id: "stage-1",
-        name: "Stage 1",
-        dependsOn: [],
-        kind: "agent",
-        agentId: null,
-        promptTemplate: "{{input}}",
-        gateTitle: null,
-        gateBody: null,
-        requiredApprovals: null,
-        onReject: null,
-        rejectTarget: null,
-        x: null,
-        y: null,
-      },
-    ],
-  };
+/// Stages in an order a person reads top to bottom: dependencies first,
+/// ties in stored order. A malformed graph (it can't be: definitions are
+/// validated) falls back to stored order. Exported for tests.
+export function readingOrder(nodes: WorkflowNodeDto[]): WorkflowNodeDto[] {
+  const placed = new Set<string>();
+  const out: WorkflowNodeDto[] = [];
+  const ids = new Set(nodes.map((n) => n.id));
+  let progress = true;
+  while (out.length < nodes.length && progress) {
+    progress = false;
+    for (const n of nodes) {
+      if (placed.has(n.id)) continue;
+      if (n.dependsOn.every((d) => placed.has(d) || !ids.has(d))) {
+        placed.add(n.id);
+        out.push(n);
+        progress = true;
+      }
+    }
+  }
+  return out.length === nodes.length ? out : nodes;
 }
 
-export function WorkflowsPane({
-  sessionId,
-  onEditWorkflow,
+/// A read-only rendering of a definition's stages: who runs each one, what
+/// it waits for, its prompt, and how a gate decides. Shared by the Workflows
+/// pane and workflow proposals in the Review pane.
+export function WorkflowStages({
+  nodes,
+  agentName,
 }: {
-  sessionId: string;
-  /// Opens the DAG editor in the main canvas (App owns that view).
-  onEditWorkflow: (def: WorkflowDefinitionDto) => void;
+  nodes: WorkflowNodeDto[];
+  agentName: (agentId: string) => string | undefined;
 }) {
+  return (
+    <ol className="mt-2 flex flex-col gap-1.5">
+      {readingOrder(nodes).map((n, i) => (
+        <li key={n.id} className="rounded-lg border px-2.5 py-1.5 text-xs" style={{ borderColor: "var(--hive-line)" }}>
+          <div className="flex flex-wrap items-baseline gap-x-1.5">
+            <span className="opacity-50">{i + 1}.</span>
+            <span className="font-medium">
+              {n.kind === "gate" ? "◈ " : ""}
+              {n.name}
+            </span>
+            <span className="opacity-55">
+              {n.kind === "gate"
+                ? `approval gate · ${n.requiredApprovals ?? 1} approval${(n.requiredApprovals ?? 1) === 1 ? "" : "s"}`
+                : n.agentId
+                  ? `@${agentName(n.agentId) ?? "agent not in this chat"}`
+                  : "primary runtime"}
+            </span>
+            {n.dependsOn.length > 0 && <span className="opacity-45">after {n.dependsOn.join(", ")}</span>}
+          </div>
+          {n.kind === "gate" ? (
+            <div className="mt-0.5 opacity-70">
+              {n.gateTitle}
+              {" · "}
+              {n.onReject === "routeTo" && n.rejectTarget ? `reject retries from ${n.rejectTarget}` : "reject halts the run"}
+            </div>
+          ) : (
+            n.promptTemplate && (
+              <div className="mt-0.5 max-h-32 overflow-auto whitespace-pre-wrap break-words opacity-70">
+                {n.promptTemplate}
+              </div>
+            )
+          )}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+export function WorkflowsPane({ sessionId }: { sessionId: string }) {
   const qc = useQueryClient();
   const workflows = useQuery({
     queryKey: ["workflows", sessionId],
@@ -89,9 +130,11 @@ export function WorkflowsPane({
     queryKey: ["workflow-runs", sessionId],
     queryFn: () => listWorkflowRuns(sessionId),
   });
-
-  const [runTarget, setRunTarget] = useState<string | null>(null);
-  const [runInput, setRunInput] = useState("");
+  const agents = useQuery({
+    queryKey: ["agents", sessionId],
+    queryFn: () => listAgents(sessionId),
+  });
+  const agentName = (id: string) => agents.data?.find((a) => a.id === id)?.name;
 
   // Live run updates: the engine emits workflow://run on every persisted
   // transition; gates also create proposals and stages post chat messages.
@@ -107,8 +150,8 @@ export function WorkflowsPane({
     };
   }, [sessionId, qc]);
 
-  // Agents can author definitions via a [[workflow: …]] reply directive, so a
-  // completed turn may have added one; remote teammates' edits land via sync.
+  // An approved workflow proposal adds a definition (here or on a teammate's
+  // device, arriving via sync), so refresh after turns and syncs.
   useEffect(() => {
     const unlistenStream = onChatStream((e) => {
       if (e.sessionId === sessionId && e.phase !== "delta") {
@@ -125,93 +168,24 @@ export function WorkflowsPane({
     };
   }, [sessionId, qc]);
 
-  async function start(wf: WorkflowDefinitionDto) {
-    const input = runInput.trim();
-    if (!input) return;
-    try {
-      await startWorkflowRun(sessionId, wf.id, input);
-      setRunTarget(null);
-      setRunInput("");
-      qc.invalidateQueries({ queryKey: ["workflow-runs", sessionId] });
-    } catch (e) {
-      toast.error(errMsg(e));
-    }
-  }
-
-  async function addPreset(preset: string) {
-    try {
-      await addWorkflowPreset(sessionId, preset);
-      qc.invalidateQueries({ queryKey: ["workflows", sessionId] });
-    } catch (e) {
-      toast.error(errMsg(e));
-    }
-  }
-
   return (
     <RailFrame
       title="Workflows"
-      subtitle="Multi-stage agent pipelines with approval gates — synced with this chat."
+      subtitle="Multi-stage agent pipelines with approval gates. Agents write them; you approve, run and pause them."
     >
       <Section title="Definitions">
         <Stack>
           {(workflows.data ?? []).map((wf) => (
-            <div key={wf.id} className="rounded-xl border px-4 py-3" style={panelStyle}>
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="truncate font-semibold">{wf.name}</div>
-                  <div className="text-xs opacity-55">
-                    {wf.nodes.length} stage{wf.nodes.length === 1 ? "" : "s"}
-                  </div>
-                </div>
-                <div className="flex shrink-0 gap-1 text-xs">
-                  <Button onClick={() => setRunTarget(runTarget === wf.id ? null : wf.id)}>Run</Button>
-                  <Button onClick={() => onEditWorkflow(wf)}>Edit</Button>
-                  <Button
-                    onClick={() =>
-                      confirmThen(`Remove workflow “${wf.name}”?`, async () => {
-                        await removeWorkflow(sessionId, wf.id);
-                        qc.invalidateQueries({ queryKey: ["workflows", sessionId] });
-                      })
-                    }
-                  >
-                    Remove
-                  </Button>
-                </div>
-              </div>
-              {wf.description && <p className="mt-1.5 text-xs leading-5 opacity-70">{wf.description}</p>}
-              {runTarget === wf.id && (
-                <div className="mt-2 flex gap-2">
-                  <input
-                    autoFocus
-                    value={runInput}
-                    onChange={(e) => setRunInput(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && start(wf)}
-                    placeholder={wf.inputLabel ?? "What should this run do?"}
-                    className="min-w-0 flex-1 rounded-xl border px-3 py-1.5 text-sm outline-none"
-                    style={fieldStyle}
-                  />
-                  <Button variant="primary" disabled={!runInput.trim()} onClick={() => start(wf)}>
-                    Start
-                  </Button>
-                </div>
-              )}
-            </div>
+            <DefinitionCard key={wf.id} sessionId={sessionId} wf={wf} agentName={agentName} />
           ))}
           {workflows.isError ? (
             <ErrorState text="Couldn't load workflows." onRetry={() => void workflows.refetch()} />
           ) : (
             (workflows.data ?? []).length === 0 && (
-              <EmptyHint text="No workflows yet. Start from a preset below, or build your own." />
+              <EmptyHint text="No workflows yet. Ask an agent in this chat to set one up, e.g. “build a workflow that drafts, reviews, and waits for my approval”. It arrives in the Review pane; approve it and it shows up here." />
             )
           )}
         </Stack>
-        <div className="mt-2 flex flex-wrap gap-2">
-          <Button variant="primary" onClick={() => onEditWorkflow(blankDraft())}>
-            New workflow
-          </Button>
-          <Button onClick={() => addPreset("reviewGate")}>+ Review gate</Button>
-          <Button onClick={() => addPreset("fanOutVote")}>+ Fan-out + vote</Button>
-        </div>
       </Section>
 
       <Section title="Runs">
@@ -227,6 +201,142 @@ export function WorkflowsPane({
         </Stack>
       </Section>
     </RailFrame>
+  );
+}
+
+type Open = "none" | "run" | "change";
+
+function DefinitionCard({
+  sessionId,
+  wf,
+  agentName,
+}: {
+  sessionId: string;
+  wf: WorkflowDefinitionDto;
+  agentName: (agentId: string) => string | undefined;
+}) {
+  const qc = useQueryClient();
+  const [open, setOpen] = useState<Open>("none");
+  const [showStages, setShowStages] = useState(false);
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  function toggle(which: Open) {
+    setOpen((o) => (o === which ? "none" : which));
+    setText("");
+  }
+
+  async function act(fn: () => Promise<unknown>, after?: () => void) {
+    setBusy(true);
+    try {
+      await fn();
+      after?.();
+      qc.invalidateQueries({ queryKey: ["workflows", sessionId] });
+      qc.invalidateQueries({ queryKey: ["workflow-runs", sessionId] });
+    } catch (e) {
+      toast.error(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function submit() {
+    const value = text.trim();
+    if (!value) return;
+    if (open === "run") {
+      void act(() => startWorkflowRun(sessionId, wf.id, value), () => toggle("run"));
+    } else if (open === "change") {
+      void act(
+        async () => {
+          const message = await workflowChangeRequest(sessionId, wf.id, value);
+          await sendMessage(sessionId, message);
+        },
+        () => {
+          toggle("change");
+          toast.success("Asked the agent. Its revision will arrive in the Review pane.");
+          qc.invalidateQueries({ queryKey: ["chat", sessionId] });
+        },
+      );
+    }
+  }
+
+  return (
+    <div className="rounded-xl border px-4 py-3" style={panelStyle}>
+      <div className="flex items-start justify-between gap-2">
+        <button
+          type="button"
+          className="min-w-0 text-left"
+          onClick={() => setShowStages((v) => !v)}
+          aria-expanded={showStages}
+        >
+          <div className="flex items-center gap-1.5">
+            <span className="truncate font-semibold">{wf.name}</span>
+            {wf.disabled && (
+              <span className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium" style={statusTone("pending")}>
+                paused
+              </span>
+            )}
+          </div>
+          <div className="text-xs opacity-55">
+            {wf.nodes.length} stage{wf.nodes.length === 1 ? "" : "s"} · {showStages ? "hide" : "show"} stages
+          </div>
+        </button>
+        <div className="flex shrink-0 flex-wrap justify-end gap-1 text-xs">
+          <Button disabled={busy || wf.disabled} onClick={() => toggle("run")}>
+            Run
+          </Button>
+          <Button
+            disabled={busy}
+            aria-label={`${wf.disabled ? "Resume" : "Pause"} workflow ${wf.name}`}
+            onClick={() => act(() => setWorkflowEnabled(sessionId, wf.id, wf.disabled))}
+          >
+            {wf.disabled ? "Resume" : "Pause"}
+          </Button>
+          <Button
+            disabled={busy}
+            onClick={() =>
+              confirmThen(`Delete workflow “${wf.name}”? Past runs stay in the history.`, () =>
+                act(() => removeWorkflow(sessionId, wf.id)),
+              )
+            }
+          >
+            Delete
+          </Button>
+        </div>
+      </div>
+      {wf.description && <p className="mt-1.5 text-xs leading-5 opacity-70">{wf.description}</p>}
+      {showStages && <WorkflowStages nodes={wf.nodes} agentName={agentName} />}
+      {open !== "none" && (
+        <div className="mt-2 flex gap-2">
+          <input
+            autoFocus
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && submit()}
+            placeholder={
+              open === "run" ? (wf.inputLabel ?? "What should this run do?") : "What should change?"
+            }
+            aria-label={open === "run" ? "Run input" : "Requested change"}
+            className="min-w-0 flex-1 rounded-xl border px-3 py-1.5 text-sm outline-none"
+            style={fieldStyle}
+          />
+          <Button variant="primary" disabled={busy || !text.trim()} onClick={submit}>
+            {open === "run" ? "Start" : "Ask"}
+          </Button>
+        </div>
+      )}
+      {open !== "change" && (
+        <button
+          type="button"
+          className="mt-2 text-xs font-medium hover:underline"
+          style={{ color: "var(--hive-accent-cool)" }}
+          onClick={() => toggle("change")}
+          disabled={busy}
+        >
+          Ask an agent to change this
+        </button>
+      )}
+    </div>
   );
 }
 

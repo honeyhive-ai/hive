@@ -89,7 +89,7 @@ import {
   IconPlus,
 } from "@/lib/icons";
 import { PANES, type UtilityPane } from "@/lib/panes";
-import { WorkflowsPane } from "@/components/WorkflowsPane";
+import { WorkflowsPane, WorkflowStages } from "@/components/WorkflowsPane";
 
 // Re-exported from the shared pane source so existing
 // `import type { UtilityPane } from "@/components/RightRail"` keeps working.
@@ -103,7 +103,6 @@ export function RightRail({
   onChangePane,
   onClose,
   showPaneRail = true,
-  onEditWorkflow,
 }: {
   width: number;
   sessionId: string;
@@ -115,8 +114,6 @@ export function RightRail({
   /// Show the pane's own icon rail. Hidden when the sidebar is visible, since
   /// the sidebar's Workspace list already switches panes (F10).
   showPaneRail?: boolean;
-  /// Opens the DAG editor in the main canvas (owned by App).
-  onEditWorkflow: (def: import("@/lib/ipc").WorkflowDefinitionDto) => void;
 }) {
   // Escape closes the pane — a keyboard alternative to the Tools toggle and the
   // header ✕. Ignored while typing so it never eats a composer/​input Escape.
@@ -203,9 +200,7 @@ export function RightRail({
         {pane === "people" && <PeoplePane sessionId={sessionId} />}
         {pane === "vaults" && <VaultsPane sessionId={sessionId} />}
         {pane === "skills" && <SkillsPane sessionId={sessionId} />}
-        {pane === "workflows" && (
-          <WorkflowsPane sessionId={sessionId} onEditWorkflow={onEditWorkflow} />
-        )}
+        {pane === "workflows" && <WorkflowsPane sessionId={sessionId} />}
         {pane === "context" && <ContextPane sessionId={sessionId} activeRuntimeId={activeRuntimeId} />}
         {pane === "activity" && <ActivityPane />}
       </div>
@@ -1210,7 +1205,13 @@ function ProposalCard({
   // Bulky detail (body + diff) collapses; active proposals open by default (you're
   // reviewing them), settled ones start collapsed (they're history).
   const [expanded, setExpanded] = useState(!settled);
-  const hasDetail = Boolean(proposal.body) || Boolean(proposal.diff);
+  const hasDetail = Boolean(proposal.body) || Boolean(proposal.diff) || Boolean(proposal.workflow);
+  // A workflow proposal renders its stages; they name agents by id.
+  const agents = useQuery({
+    queryKey: ["agents", sessionId],
+    queryFn: () => listAgents(sessionId),
+    enabled: Boolean(proposal.workflow),
+  });
 
   // Write the freshly-projected proposal straight into the cache so the card
   // reflects the new status/approvals the instant the vote returns — the old code
@@ -1236,7 +1237,7 @@ function ProposalCard({
     mutationFn: () => implementProposal(sessionId, proposal.id),
     onSuccess: () => {
       onChanged();
-      toast.success("Sent to the agent to implement.");
+      toast.success(proposal.workflow ? "Workflow added." : "Sent to the agent to implement.");
     },
     onError: (e) => toast.error(`Couldn't implement: ${errMsg(e)}`),
   });
@@ -1319,7 +1320,22 @@ function ProposalCard({
 
       {expanded && (
         <>
-          {proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>}
+          {proposal.workflow ? (
+            <>
+              {proposal.workflow.description && (
+                <p className="mt-2 text-sm leading-6 opacity-75">{proposal.workflow.description}</p>
+              )}
+              <div className="mt-2 text-xs opacity-55">
+                Approving adds this workflow to the Workflows pane. Runs still start only when someone presses Run.
+              </div>
+              <WorkflowStages
+                nodes={proposal.workflow.nodes}
+                agentName={(id) => agents.data?.find((a) => a.id === id)?.name}
+              />
+            </>
+          ) : (
+            proposal.body && <p className="mt-2 text-sm leading-6 opacity-75">{proposal.body}</p>
+          )}
           {/* A fileDiff proposal (from an agent's isolated worktree) carries a
               unified diff. It's cramped in this narrow pane, so offer opening it
               full-width in the Diff canvas; the inline per-file view stays as a
@@ -2796,9 +2812,8 @@ function ContextPane({
 }
 
 // ─── Back-compat shims (retained deliberately) ───────────────────────────────
-// `SubtleSelectField`, `Stack`, `panelStyle` and `fieldStyle` are still imported
-// by WorkflowsPane.tsx and WorkflowBuilder.tsx, which are out of scope for this
-// task. ui.tsx has no `Stack` and its `SubtleSelectField` shape differs, and its
+// `Stack`, `panelStyle` and `fieldStyle` are still imported by WorkflowsPane.tsx,
+// and `SubtleSelectField` is kept for the same reason it always was. ui.tsx has no `Stack` and its `SubtleSelectField` shape differs, and its
 // same-named `panelStyle`/`fieldStyle` tokens carry *swapped* panel/mist
 // semantics — re-exporting them would invert contrast in those files and in this
 // pane. So these keep RightRail's original values. RightRail's own new code

@@ -1285,17 +1285,19 @@ export type { WorkflowNodeRunDto } from "@/bindings/WorkflowNodeRunDto";
 export const listWorkflows = (sessionId: string) =>
   invoke<WorkflowDefinitionDto[]>("list_workflows", { sessionId });
 
-/// Create or update a definition (empty id ⇒ backend assigns one). The backend
-/// re-validates the DAG authoritatively and returns the saved definition.
-export const saveWorkflow = (sessionId: string, definition: WorkflowDefinitionDto) =>
-  invoke<WorkflowDefinitionDto>("save_workflow", { sessionId, definition });
-
 export const removeWorkflow = (sessionId: string, workflowId: string) =>
   invoke<void>("remove_workflow", { sessionId, workflowId });
 
-/// Instantiate a built-in preset: "reviewGate" | "fanOutVote".
-export const addWorkflowPreset = (sessionId: string, preset: string) =>
-  invoke<WorkflowDefinitionDto>("add_workflow_preset", { sessionId, preset });
+/// Pause (`enabled: false`) or resume a workflow. A paused workflow stays
+/// listed but can't start a run.
+export const setWorkflowEnabled = (sessionId: string, workflowId: string, enabled: boolean) =>
+  invoke<void>("set_workflow_enabled", { sessionId, workflowId, enabled });
+
+/// The chat message for "Ask an agent to change this": the request plus the
+/// current definition, marked so the agent's answer is filed as a revision.
+/// Send it with `sendMessage`.
+export const workflowChangeRequest = (sessionId: string, workflowId: string, request: string) =>
+  invoke<string>("workflow_change_request", { sessionId, workflowId, request });
 
 export const listWorkflowRuns = (sessionId: string) =>
   invoke<WorkflowRunDto[]>("list_workflow_runs", { sessionId });

@@ -10,11 +10,8 @@ import {
   getChat,
   listChats,
   getContextTelemetry,
-  listAgents,
   listRuntimes,
   maybeRespond,
-  saveWorkflow,
-  type WorkflowDefinitionDto,
   notifyMentions,
   onChatStream,
   pickWorkspaceFolder,
@@ -39,10 +36,6 @@ const DiffView = lazy(() => import("@/components/DiffView").then((m) => ({ defau
 // Lazy so Monaco + xterm (the code view's heavy deps) only load when it opens.
 const CodeView = lazy(() => import("@/components/editor/CodeView").then((m) => ({ default: m.CodeView })));
 import type { CodeViewIntent } from "@/components/editor/CodeView";
-// Lazy so react-flow only loads when the workflow editor opens.
-const WorkflowBuilder = lazy(() =>
-  import("@/components/WorkflowBuilder").then((m) => ({ default: m.WorkflowBuilder })),
-);
 import { SettingsView, parseSettingsTab, type SettingsTab } from "@/components/SettingsView";
 import { RightRail } from "@/components/RightRail";
 import { Onboarding } from "@/components/Onboarding";
@@ -153,11 +146,6 @@ export function App() {
   const [pendingDiffPath, setPendingDiffPath] = useState<string | null>(null);
   // A snippet the editor asked to drop into the chat composer ("Send selection").
   const [composerSeed, setComposerSeed] = useState<string | null>(null);
-  // Workflow-editor takeover of the main canvas. Keyed to its chat so
-  // switching chats hides (not destroys) an in-progress draft.
-  const [workflowDraft, setWorkflowDraft] = useState<
-    { sessionId: string; def: WorkflowDefinitionDto } | null
-  >(null);
   const [utilityPane, setUtilityPane] = useState<UtilityPane>("tools");
   // Pane visibility persists — a focused layout should survive restarts.
   const [showUtilityPane, setShowUtilityPane] = useState(
@@ -234,7 +222,6 @@ export function App() {
   function startTour() {
     tourSnapshot.current = { mode, utility: showUtilityPane, view };
     setSettingsOpen(false);
-    setWorkflowDraft(null);
     setView("workspace");
     setTourOpen(true);
   }
@@ -269,28 +256,6 @@ export function App() {
     queryFn: () => getContextTelemetry(selectedId ?? ""),
     enabled: Boolean(selectedId),
   });
-  // Roster for the workflow editor's per-stage agent select.
-  const workflowAgents = useQuery({
-    queryKey: ["agents", workflowDraft?.sessionId],
-    queryFn: () => listAgents(workflowDraft?.sessionId ?? ""),
-    enabled: Boolean(workflowDraft),
-  });
-  const [savingWorkflow, setSavingWorkflow] = useState(false);
-
-  async function handleSaveWorkflow(draft: WorkflowDefinitionDto) {
-    if (!workflowDraft) return;
-    setSavingWorkflow(true);
-    try {
-      await saveWorkflow(workflowDraft.sessionId, draft);
-      qc.invalidateQueries({ queryKey: ["workflows", workflowDraft.sessionId] });
-      setWorkflowDraft(null);
-    } catch (e) {
-      toast.error(`Couldn't save workflow: ${errMsg(e)}`);
-    } finally {
-      setSavingWorkflow(false);
-    }
-  }
-
   // Apply the resolved palette whenever the accent or the light/dark mode
   // changes, and re-resolve live when the OS appearance flips (mode = auto).
   useEffect(() => {
@@ -1106,25 +1071,7 @@ export function App() {
             <div className="flex min-h-0 min-w-0 flex-1 overflow-hidden">
               <div className="min-w-0 flex-1">
                 <PaneErrorBoundary label="This view">
-                {workflowDraft && workflowDraft.sessionId === selectedId ? (
-                  <Suspense
-                    fallback={
-                      <div className="flex h-full items-center justify-center opacity-50">
-                        Loading workflow editor…
-                      </div>
-                    }
-                  >
-                    <WorkflowBuilder
-                      key={workflowDraft.def.id || "new"}
-                      initial={workflowDraft.def}
-                      agents={workflowAgents.data ?? []}
-                      saving={savingWorkflow}
-                      onSave={handleSaveWorkflow}
-                      onClose={() => setWorkflowDraft(null)}
-                    />
-                  </Suspense>
-                ) : (
-                  <>
+                <>
                 {mode === "chat" && (
                   <ChatView
                     sessionId={selectedId}
@@ -1166,8 +1113,7 @@ export function App() {
                     />
                   </Suspense>
                 )}
-                  </>
-                )}
+                </>
                 </PaneErrorBoundary>
               </div>
 
@@ -1190,9 +1136,6 @@ export function App() {
                       // Workspace list (F10) — only show it when the sidebar is
                       // hidden, so panes stay reachable without doubling nav.
                       showPaneRail={!sidebarVisible}
-                      onEditWorkflow={(def) =>
-                        selectedId && setWorkflowDraft({ sessionId: selectedId, def })
-                      }
                     />
                   </PaneErrorBoundary>
                 </>

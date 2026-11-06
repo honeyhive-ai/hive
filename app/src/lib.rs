@@ -15737,6 +15737,34 @@ mod finalize_proposal_tests {
     }
 
     #[test]
+    fn workflow_stages_can_target_subscription_cli_agents() {
+        // Stages address agents by roster name, whatever runtime backs them,
+        // so Antigravity and Copilot agents work like any other.
+        let mut svc = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+        let agy = WorkspaceAgent::new("Gemini", "antigravity");
+        let cop = WorkspaceAgent::new("Pilot", "copilot");
+        let (agy_id, cop_id) = (agy.id, cop.id);
+        svc.add_agent(chat.id, wid, agy).unwrap();
+        svc.add_agent(chat.id, wid, cop).unwrap();
+        let session = svc.load(chat.id).unwrap().unwrap();
+        let json = r#"{"name": "Cross-check", "stages": [
+            {"id": "draft", "agent": "gemini", "prompt": "Draft {{input}}"},
+            {"id": "attack", "agent": "Pilot", "prompt": "Attack {{nodes.draft.output}}", "after": ["draft"]}]}"#;
+        let def = crate::workflows::definition_from_directive(json, &session).unwrap();
+        let ids: Vec<Option<Uuid>> = def
+            .nodes
+            .iter()
+            .map(|n| match &n.kind {
+                hive_core::WorkflowNodeKind::Agent { agent_id, .. } => *agent_id,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec![Some(agy_id), Some(cop_id)]);
+    }
+
+    #[test]
     fn propose_workflow_tool_payloads_file_through_the_same_path() {
         let mut svc = service();
         let wid = Uuid::new_v4();

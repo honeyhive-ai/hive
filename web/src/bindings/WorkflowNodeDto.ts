@@ -20,8 +20,4 @@ gateTitle: string | null, gateBody: string | null, requiredApprovals: number | n
 /**
  * "halt" | "routeTo"
  */
-onReject: string | null, rejectTarget: string | null, 
-/**
- * Builder-canvas position (px); null ⇒ auto-layout.
- */
-x: number | null, y: number | null, };
+onReject: string | null, rejectTarget: string | null, };

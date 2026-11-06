@@ -288,21 +288,6 @@ select optgroup {
   background-color: var(--hive-panel);
 }
 
-/* Workflow builder canvas (react-flow): token-theme the parts we don't own.
-   Custom stage nodes style themselves; this covers edges + chrome. */
-.workflow-canvas .react-flow__edge.selected path.react-flow__edge-path,
-.workflow-canvas .react-flow__edge:focus path.react-flow__edge-path {
-  stroke: var(--hive-accent-cool);
-}
-.workflow-canvas .react-flow__node {
-  cursor: grab;
-}
-.workflow-canvas .react-flow__attribution {
-  background: transparent;
-  color: var(--hive-ink);
-  opacity: 0.35;
-}
-
 /* Syntax highlighting (highlight.js) — token colors derived from the app's
    theme vars so they adapt to every palette + light/dark with no separate dark
    rules. Kept deliberately restrained: a few hue families over the code fg. */
