@@ -750,6 +750,10 @@ struct DirectiveWorkflow {
     description: String,
     #[serde(default)]
     input_label: Option<String>,
+    /// Id or name of an existing definition in the chat this one revises; on
+    /// approval it replaces that definition (same id) instead of adding one.
+    #[serde(default)]
+    revises: Option<String>,
     #[serde(default, alias = "nodes")]
     stages: Vec<DirectiveStage>,
 }
@@ -835,9 +839,11 @@ fn relax_json(src: &str) -> String {
     out
 }
 
-/// Parse an agent's `[[workflow: …]]` payload into a validated definition.
-/// Agent names resolve against the session roster; everything else goes
-/// through the same `validate()` the builder uses.
+/// Parse an agent's `[[workflow: …]]` payload (or a `propose_workflow` tool
+/// call) into a validated definition. Agent names resolve against the session
+/// roster, `revises` against its definitions (the result then keeps that
+/// definition's id, so approving it replaces it); everything else goes
+/// through `hive_core::workflow::validate`.
 pub(crate) fn definition_from_directive(
     json: &str,
     session: &ChatSession,
@@ -909,16 +915,65 @@ pub(crate) fn definition_from_directive(
             y: None,
         });
     }
+    let revised = match dw.revises.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        None => None,
+        Some(target) => Some(
+            session
+                .workflow_definitions
+                .iter()
+                .find(|d| d.id.to_string() == target || d.name.eq_ignore_ascii_case(target))
+                .ok_or_else(|| {
+                    let names: Vec<&str> = session.workflow_definitions.iter().map(|d| d.name.as_str()).collect();
+                    format!(
+                        "\"revises\" names no workflow in this chat ({target:?}; workflows: {})",
+                        if names.is_empty() { "none".into() } else { names.join(", ") }
+                    )
+                })?,
+        ),
+    };
+    if dw.name.trim().is_empty() {
+        return Err("a workflow needs a \"name\"".into());
+    }
     let def = wf::WorkflowDefinition {
-        id: Uuid::new_v4(),
+        id: revised.map_or_else(Uuid::new_v4, |d| d.id),
         name: dw.name,
         description: dw.description,
         input_label: dw.input_label.filter(|l| !l.trim().is_empty()),
         nodes,
-        created_at: Timestamp::now(),
+        created_at: revised.map_or_else(Timestamp::now, |d| d.created_at),
+        disabled: revised.is_some_and(|d| d.disabled),
     };
     wf::validate(&def)?;
     Ok(def)
+}
+
+/// File an agent-authored definition as a reviewable proposal. The vote that
+/// approves it adds the definition (see `ChatService::vote_on_proposal`).
+/// Returns the proposal's title.
+pub(crate) fn file_workflow_proposal(
+    svc: &mut hive_runtime::ChatService,
+    session: &ChatSession,
+    workspace_id: Uuid,
+    def: wf::WorkflowDefinition,
+    author_actor_id: &str,
+    producing_agent_id: Option<Uuid>,
+) -> Result<String, String> {
+    let revising = session.workflow_definitions.iter().any(|d| d.id == def.id);
+    let title = if revising {
+        format!("Revise workflow \u{201c}{}\u{201d}", def.name)
+    } else {
+        format!("Add workflow \u{201c}{}\u{201d}", def.name)
+    };
+    let body = wf::describe_definition(&def, &agent_name_in(session));
+    let mut proposal = ActionProposal::workflow(title.clone(), author_actor_id, body, def);
+    proposal.producing_agent_id = producing_agent_id;
+    svc.upsert_proposal(session.id, workspace_id, proposal).map_err(map_err)?;
+    Ok(title)
+}
+
+/// Roster lookup for rendering a stage's agent by name.
+pub(crate) fn agent_name_in(session: &ChatSession) -> impl Fn(Uuid) -> Option<String> + '_ {
+    move |id| session.workspace_agents.iter().find(|a| a.id == id).map(|a| a.name.clone())
 }
 
 /// Mirror of the frontend's slugify, for defaulted stage ids.
@@ -978,8 +1033,6 @@ fn node_dto(n: &wf::WorkflowNode) -> WorkflowNodeDto {
         required_approvals: None,
         on_reject: None,
         reject_target: None,
-        x: n.x,
-        y: n.y,
     };
     match &n.kind {
         WorkflowNodeKind::Agent { agent_id, prompt_template } => WorkflowNodeDto {
@@ -1015,64 +1068,8 @@ pub(crate) fn definition_dto(def: &wf::WorkflowDefinition) -> WorkflowDefinition
         description: def.description.clone(),
         input_label: def.input_label.clone(),
         nodes: def.nodes.iter().map(node_dto).collect(),
+        disabled: def.disabled,
     }
-}
-
-pub(crate) fn definition_from_dto(
-    dto: &WorkflowDefinitionDto,
-) -> Result<wf::WorkflowDefinition, String> {
-    let id = if dto.id.trim().is_empty() {
-        Uuid::new_v4()
-    } else {
-        Uuid::parse_str(&dto.id).map_err(map_err)?
-    };
-    let mut nodes = Vec::with_capacity(dto.nodes.len());
-    for n in &dto.nodes {
-        let kind = match n.kind.as_str() {
-            "agent" => WorkflowNodeKind::Agent {
-                agent_id: match n.agent_id.as_deref() {
-                    None | Some("") => None,
-                    Some(s) => Some(Uuid::parse_str(s).map_err(map_err)?),
-                },
-                prompt_template: n.prompt_template.clone().unwrap_or_default(),
-            },
-            "gate" => WorkflowNodeKind::Gate {
-                title_template: n
-                    .gate_title
-                    .clone()
-                    .filter(|t| !t.trim().is_empty())
-                    .unwrap_or_else(|| n.name.clone()),
-                body_template: n.gate_body.clone().unwrap_or_default(),
-                required_approvals: n.required_approvals.unwrap_or(1).max(1),
-                on_reject: match n.on_reject.as_deref() {
-                    Some("routeTo") => wf::GateRejectPolicy::RouteTo {
-                        node: n
-                            .reject_target
-                            .clone()
-                            .ok_or_else(|| format!("gate '{}': routeTo needs a target stage", n.name))?,
-                    },
-                    _ => wf::GateRejectPolicy::Halt,
-                },
-            },
-            other => return Err(format!("unknown stage kind {other:?}")),
-        };
-        nodes.push(wf::WorkflowNode {
-            id: n.id.clone(),
-            name: n.name.clone(),
-            depends_on: n.depends_on.clone(),
-            kind,
-            x: n.x,
-            y: n.y,
-        });
-    }
-    Ok(wf::WorkflowDefinition {
-        id,
-        name: dto.name.clone(),
-        description: dto.description.clone(),
-        input_label: dto.input_label.clone().filter(|l| !l.trim().is_empty()),
-        nodes,
-        created_at: Timestamp::now(),
-    })
 }
 
 pub(crate) fn run_dto(run: &wf::WorkflowRun, driver_alive: bool) -> WorkflowRunDto {
@@ -1127,21 +1124,6 @@ pub(crate) fn list_workflows(
 }
 
 #[tauri::command]
-pub(crate) fn save_workflow(
-    state: State<AppState>,
-    session_id: String,
-    definition: WorkflowDefinitionDto,
-) -> Result<WorkflowDefinitionDto, String> {
-    let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let def = definition_from_dto(&definition)?;
-    wf::validate(&def)?;
-    let mut svc = state.service.lock().unwrap();
-    svc.save_workflow_definition(sid, state.active_workspace_id(), def.clone())
-        .map_err(map_err)?;
-    Ok(definition_dto(&def))
-}
-
-#[tauri::command]
 pub(crate) fn remove_workflow(
     state: State<AppState>,
     session_id: String,
@@ -1153,22 +1135,54 @@ pub(crate) fn remove_workflow(
     svc.remove_workflow_definition(sid, state.active_workspace_id(), wfid).map_err(map_err)
 }
 
+/// Pause (`enabled: false`) or resume a workflow. A paused workflow stays
+/// listed but can't start a run; runs already going are unaffected.
 #[tauri::command]
-pub(crate) fn add_workflow_preset(
+pub(crate) fn set_workflow_enabled(
     state: State<AppState>,
     session_id: String,
-    preset: String,
-) -> Result<WorkflowDefinitionDto, String> {
+    workflow_id: String,
+    enabled: bool,
+) -> Result<(), String> {
     let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
-    let def = match preset.as_str() {
-        "reviewGate" => wf::preset_review_gate(),
-        "fanOutVote" => wf::preset_fan_out_vote(),
-        other => return Err(format!("unknown preset {other:?}")),
-    };
+    let wfid = Uuid::parse_str(&workflow_id).map_err(map_err)?;
     let mut svc = state.service.lock().unwrap();
-    svc.save_workflow_definition(sid, state.active_workspace_id(), def.clone())
-        .map_err(map_err)?;
-    Ok(definition_dto(&def))
+    svc.set_workflow_enabled(sid, state.active_workspace_id(), wfid, enabled).map_err(map_err)
+}
+
+/// The chat message behind "Ask an agent to change this": the person's
+/// request plus the current definition as the directive JSON an agent edits,
+/// with `revises` set so its answer is filed as a revision of this one. The
+/// pane sends it like any message, so whichever agent answers files the
+/// revision for review.
+#[tauri::command]
+pub(crate) fn workflow_change_request(
+    state: State<AppState>,
+    session_id: String,
+    workflow_id: String,
+    request: String,
+) -> Result<String, String> {
+    let sid = Uuid::parse_str(&session_id).map_err(map_err)?;
+    let wfid = Uuid::parse_str(&workflow_id).map_err(map_err)?;
+    let request = request.trim();
+    if request.is_empty() {
+        return Err("say what should change".into());
+    }
+    let svc = state.service.lock().unwrap();
+    let session = svc.load(sid).map_err(map_err)?.ok_or("unknown session")?;
+    let def = session.workflow_definitions.iter().find(|d| d.id == wfid).ok_or("unknown workflow")?;
+    Ok(change_request_message(&session, def, request))
+}
+
+pub(crate) fn change_request_message(session: &ChatSession, def: &wf::WorkflowDefinition, request: &str) -> String {
+    let json = serde_json::to_string_pretty(&wf::directive_json(def, &agent_name_in(session)))
+        .unwrap_or_default();
+    format!(
+        "Please revise the workflow \u{201c}{}\u{201d}: {request}\n\n\
+         Propose the whole revised definition as a workflow (keep \"revises\" as it is so it replaces this one). \
+         The current definition:\n\n```json\n{json}\n```",
+        def.name
+    )
 }
 
 #[tauri::command]
@@ -1216,6 +1230,9 @@ pub(crate) fn start_workflow_run(
             .ok_or("unknown workflow")?;
         (def, session)
     };
+    if def.disabled {
+        return Err(format!("\u{201c}{}\u{201d} is paused \u{2014} resume it to run it", def.name));
+    }
     wf::validate(&def)?;
     ensure_stages_runnable(&session, &def)?;
 

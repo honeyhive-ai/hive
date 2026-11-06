@@ -375,6 +375,7 @@ async fn people_channels_and_chat_details() {
                 y: None,
             }],
             created_at: hive_core::Timestamp::now(),
+            disabled: false,
         };
         let me = svc.author().id.clone();
         svc.upsert_workflow_run(chat.id, ws, hive_core::workflow::new_run(&def, "now", me)).unwrap();

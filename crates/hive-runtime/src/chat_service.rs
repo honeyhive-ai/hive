@@ -1441,6 +1441,71 @@ impl ChatService {
         Ok(())
     }
 
+    /// Pause or resume a workflow definition: a paused one stays listed but
+    /// can't start a new run. Errors on an unknown id.
+    pub fn set_workflow_enabled(
+        &mut self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        definition_id: Uuid,
+        enabled: bool,
+    ) -> Result<()> {
+        let mut definitions = self
+            .load(session_id)?
+            .map(|s| s.workflow_definitions)
+            .unwrap_or_default();
+        let Some(def) = definitions.iter_mut().find(|d| d.id == definition_id) else {
+            return Err(ChatError::NotFound("workflow".into()));
+        };
+        if def.disabled == !enabled {
+            return Ok(());
+        }
+        def.disabled = !enabled;
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::WorkflowDefinitionsUpdated { definitions },
+        )?;
+        Ok(())
+    }
+
+    /// Carry out an approved workflow proposal: save its definition (replacing
+    /// the one with the same id, for a revision) and mark the proposal Applied.
+    /// Returns the applied proposal, or `None` when there is nothing to apply
+    /// (unknown, not a workflow proposal, not approved, superseded, or already
+    /// applied). Idempotent by definition id, so two devices applying the same
+    /// approval leave one copy.
+    pub fn apply_workflow_proposal(
+        &mut self,
+        session_id: Uuid,
+        workspace_id: Uuid,
+        proposal_id: Uuid,
+    ) -> Result<Option<ActionProposal>> {
+        let Some(session) = self.load(session_id)? else {
+            return Ok(None);
+        };
+        let Some(proposal) = session.proposals.iter().find(|p| p.id == proposal_id) else {
+            return Ok(None);
+        };
+        let Some(def) = proposal.workflow.as_deref() else {
+            return Ok(None);
+        };
+        if !proposal.ready_to_apply() {
+            return Ok(None);
+        }
+        let mut definitions = session.workflow_definitions.clone();
+        hive_core::workflow::upsert_definition(&mut definitions, def.clone());
+        self.append_signed(
+            session_id,
+            workspace_id,
+            SessionEvent::WorkflowDefinitionsUpdated { definitions },
+        )?;
+        let mut applied = proposal.clone();
+        applied.status = hive_core::ProposalStatus::Applied;
+        self.upsert_proposal(session_id, workspace_id, applied.clone())?;
+        Ok(Some(applied))
+    }
+
     /// Persist a workflow run snapshot (create or update by id).
     pub fn upsert_workflow_run(
         &mut self,
@@ -1713,6 +1778,13 @@ impl ChatService {
         )?;
         // Locally-projected result for immediate UI feedback.
         proposal.cast_vote(approval);
+        // An agent-authored workflow is inert until someone runs it, so the
+        // vote that approves it also adds it — no separate Implement step.
+        if proposal.workflow.is_some() && proposal.ready_to_apply() {
+            if let Some(applied) = self.apply_workflow_proposal(session_id, workspace_id, proposal_id)? {
+                return Ok(Some(applied));
+            }
+        }
         Ok(Some(proposal))
     }
 
@@ -3394,6 +3466,102 @@ mod tests {
 
         svc.remove_workflow_definition(sid, wid, def.id).unwrap();
         assert!(svc.load(sid).unwrap().unwrap().workflow_definitions.is_empty());
+    }
+
+    fn workflow_proposal(author: &str, def: hive_core::WorkflowDefinition) -> ActionProposal {
+        ActionProposal::workflow(format!("Add workflow {}", def.name), author, "stages", def)
+    }
+
+    #[test]
+    fn approving_a_workflow_proposal_adds_the_definition() {
+        let (mut svc, _) = service();
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let (sid, wid) = (chat.id, chat.workspace_id);
+        let def = hive_core::workflow::preset_review_gate();
+        let p = workflow_proposal("agent-scout", def.clone());
+        let pid = p.id;
+        svc.upsert_proposal(sid, wid, p).unwrap();
+        assert!(svc.load(sid).unwrap().unwrap().workflow_definitions.is_empty(), "filing alone adds nothing");
+
+        // The authoring agent's own vote can't approve it.
+        let r = svc.vote_on_proposal(sid, wid, pid, "agent-scout", WorkspaceRole::Owner, true).unwrap().unwrap();
+        assert_eq!(r.status, hive_core::ProposalStatus::Open);
+        assert!(svc.load(sid).unwrap().unwrap().workflow_definitions.is_empty());
+
+        let r = svc.vote_on_proposal(sid, wid, pid, "human", WorkspaceRole::Owner, true).unwrap().unwrap();
+        assert_eq!(r.status, hive_core::ProposalStatus::Applied);
+        let s = svc.load(sid).unwrap().unwrap();
+        assert_eq!(s.workflow_definitions, vec![def.clone()]);
+        assert_eq!(s.proposals[0].status, hive_core::ProposalStatus::Applied);
+
+        // Applying again (another device's Implement) changes nothing.
+        assert!(svc.apply_workflow_proposal(sid, wid, pid).unwrap().is_none());
+        assert_eq!(svc.load(sid).unwrap().unwrap().workflow_definitions.len(), 1);
+    }
+
+    #[test]
+    fn rejecting_a_workflow_proposal_leaves_definitions_alone() {
+        let (mut svc, _) = service();
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let (sid, wid) = (chat.id, chat.workspace_id);
+        let p = workflow_proposal("agent", hive_core::workflow::preset_review_gate());
+        let pid = p.id;
+        svc.upsert_proposal(sid, wid, p).unwrap();
+        let r = svc.vote_on_proposal(sid, wid, pid, "human", WorkspaceRole::Owner, false).unwrap().unwrap();
+        assert_eq!(r.status, hive_core::ProposalStatus::Rejected);
+        assert!(svc.apply_workflow_proposal(sid, wid, pid).unwrap().is_none());
+        assert!(svc.load(sid).unwrap().unwrap().workflow_definitions.is_empty());
+    }
+
+    #[test]
+    fn an_approved_revision_replaces_an_existing_definition_in_place() {
+        let (mut svc, _) = service();
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let (sid, wid) = (chat.id, chat.workspace_id);
+        // Definitions saved before this change (by the old editor or an old
+        // directive) stay in place and can be revised.
+        let existing = hive_core::workflow::preset_review_gate();
+        let other = hive_core::workflow::preset_fan_out_vote();
+        svc.save_workflow_definition(sid, wid, existing.clone()).unwrap();
+        svc.save_workflow_definition(sid, wid, other.clone()).unwrap();
+
+        let mut revised = existing.clone();
+        revised.name = "Review gate v2".into();
+        let p = workflow_proposal("agent", revised.clone());
+        let pid = p.id;
+        svc.upsert_proposal(sid, wid, p).unwrap();
+        svc.vote_on_proposal(sid, wid, pid, "human", WorkspaceRole::Owner, true).unwrap();
+        let defs = svc.load(sid).unwrap().unwrap().workflow_definitions;
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0], revised, "same slot, same id");
+        assert_eq!(defs[1], other);
+    }
+
+    #[test]
+    fn a_plain_decision_vote_never_touches_definitions() {
+        let (mut svc, _) = service();
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let (sid, wid) = (chat.id, chat.workspace_id);
+        let p = ActionProposal::new("Ship it", hive_core::ProposalKind::Decision, "agent");
+        let pid = p.id;
+        svc.upsert_proposal(sid, wid, p).unwrap();
+        let r = svc.vote_on_proposal(sid, wid, pid, "human", WorkspaceRole::Owner, true).unwrap().unwrap();
+        assert_eq!(r.status, hive_core::ProposalStatus::Approved, "not auto-applied");
+        assert!(svc.apply_workflow_proposal(sid, wid, pid).unwrap().is_none());
+    }
+
+    #[test]
+    fn pausing_a_workflow_flags_it_and_unknown_ids_error() {
+        let (mut svc, _) = service();
+        let chat = svc.create_chat("Demo", Uuid::nil(), "anthropic").unwrap();
+        let (sid, wid) = (chat.id, chat.workspace_id);
+        let def = hive_core::workflow::preset_review_gate();
+        svc.save_workflow_definition(sid, wid, def.clone()).unwrap();
+        svc.set_workflow_enabled(sid, wid, def.id, false).unwrap();
+        assert!(svc.load(sid).unwrap().unwrap().workflow_definitions[0].disabled);
+        svc.set_workflow_enabled(sid, wid, def.id, true).unwrap();
+        assert!(!svc.load(sid).unwrap().unwrap().workflow_definitions[0].disabled);
+        assert!(svc.set_workflow_enabled(sid, wid, Uuid::new_v4(), false).is_err());
     }
 
     #[test]

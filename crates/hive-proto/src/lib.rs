@@ -176,6 +176,10 @@ pub struct ProposalDto {
     /// The newer version that superseded this one, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<String>,
+    /// An agent-authored workflow up for review: approving the proposal adds
+    /// it (or, when its id matches an existing workflow, replaces that one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowDefinitionDto>,
 }
 
 /// A chat as listed in the sidebar.
@@ -523,11 +527,6 @@ pub struct WorkflowNodeDto {
     pub on_reject: Option<String>,
     #[serde(default)]
     pub reject_target: Option<String>,
-    /// Builder-canvas position (px); null ⇒ auto-layout.
-    #[serde(default)]
-    pub x: Option<i32>,
-    #[serde(default)]
-    pub y: Option<i32>,
 }
 
 /// A workflow definition (DAG of stages) available in a chat.
@@ -541,6 +540,9 @@ pub struct WorkflowDefinitionDto {
     #[serde(default)]
     pub input_label: Option<String>,
     pub nodes: Vec<WorkflowNodeDto>,
+    /// Paused: listed, but no new run can start.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// Live state of one stage within a run.

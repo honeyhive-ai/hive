@@ -36,6 +36,7 @@ pub mod sse;
 pub mod sync_engine;
 pub mod tool_loop;
 pub mod vault_fetcher;
+pub mod workflow_tool;
 
 #[cfg(test)]
 mod test_relay;

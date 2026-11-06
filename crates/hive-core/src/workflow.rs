@@ -30,6 +30,10 @@ pub struct WorkflowDefinition {
     pub nodes: Vec<WorkflowNode>,
     #[serde(default)]
     pub created_at: Timestamp,
+    /// Paused: still listed (read-only), but no new run can start. Runs
+    /// already in flight are unaffected.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,8 +46,8 @@ pub struct WorkflowNode {
     #[serde(default)]
     pub depends_on: Vec<String>,
     pub kind: WorkflowNodeKind,
-    /// Canvas position (px) set by dragging in the builder; `None` means the
-    /// editor auto-lays the node out. Purely presentational.
+    /// Canvas position (px) from the retired visual builder. Kept so older
+    /// definitions round-trip unchanged; nothing reads it any more.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub x: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -539,6 +543,132 @@ pub fn render_template(template: &str, input: &str, outputs: &HashMap<String, St
     out
 }
 
+/// Add `def` to a definition set, or replace the one with the same id in
+/// place (an approved revision). Idempotent: applying the same definition
+/// twice leaves one copy.
+pub fn upsert_definition(defs: &mut Vec<WorkflowDefinition>, def: WorkflowDefinition) {
+    match defs.iter_mut().find(|d| d.id == def.id) {
+        Some(slot) => *slot = def,
+        None => defs.push(def),
+    }
+}
+
+/// The stages in an order a person can read top to bottom: dependency
+/// order where the graph allows it, else as stored.
+fn reading_order(def: &WorkflowDefinition) -> Vec<&WorkflowNode> {
+    match topo_order(def) {
+        Some(ids) => ids.iter().filter_map(|id| def.nodes.iter().find(|n| n.id == *id)).collect(),
+        None => def.nodes.iter().collect(),
+    }
+}
+
+/// A plain-text rendering of a definition: what a reviewer reads in a
+/// workflow proposal (and what older peers and the phone show as its body).
+/// `agent_name` resolves a stage's agent id to its roster name.
+pub fn describe_definition(def: &WorkflowDefinition, agent_name: &dyn Fn(Uuid) -> Option<String>) -> String {
+    let mut out = String::new();
+    if !def.description.trim().is_empty() {
+        out.push_str(def.description.trim());
+        out.push_str("\n\n");
+    }
+    if let Some(label) = def.input_label.as_deref().filter(|l| !l.trim().is_empty()) {
+        out.push_str(&format!("Input: {label}\n\n"));
+    }
+    for (i, node) in reading_order(def).into_iter().enumerate() {
+        let after = if node.depends_on.is_empty() {
+            String::new()
+        } else {
+            format!(" (after {})", node.depends_on.join(", "))
+        };
+        match &node.kind {
+            WorkflowNodeKind::Agent { agent_id, prompt_template } => {
+                let who = match agent_id {
+                    None => "primary runtime".to_string(),
+                    Some(id) => agent_name(*id)
+                        .map(|n| format!("@{n}"))
+                        .unwrap_or_else(|| "an agent not in this chat".into()),
+                };
+                out.push_str(&format!("{}. {} [{}], {who}{after}\n", i + 1, node.name, node.id));
+                for line in prompt_template.lines() {
+                    out.push_str("   > ");
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            WorkflowNodeKind::Gate { title_template, required_approvals, on_reject, .. } => {
+                let reject = match on_reject {
+                    GateRejectPolicy::Halt => "reject halts the run".to_string(),
+                    GateRejectPolicy::RouteTo { node } => format!("reject retries from {node}"),
+                };
+                let n = *required_approvals;
+                out.push_str(&format!(
+                    "{}. Approval gate {} [{}]{after}: \"{title_template}\", {n} approval{}, {reject}\n",
+                    i + 1,
+                    node.name,
+                    node.id,
+                    if n == 1 { "" } else { "s" },
+                ));
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// A definition as the `[[workflow: …]]` JSON an agent authors (agents by
+/// roster name), with `revises` set to its id: what "ask an agent to change
+/// this" hands the agent to edit.
+pub fn directive_json(def: &WorkflowDefinition, agent_name: &dyn Fn(Uuid) -> Option<String>) -> serde_json::Value {
+    use serde_json::{json, Map, Value};
+    let stages: Vec<Value> = def
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut s = Map::new();
+            s.insert("id".into(), json!(n.id));
+            s.insert("name".into(), json!(n.name));
+            match &n.kind {
+                WorkflowNodeKind::Agent { agent_id, prompt_template } => {
+                    s.insert("kind".into(), json!("agent"));
+                    if let Some(name) = agent_id.and_then(agent_name) {
+                        s.insert("agent".into(), json!(name));
+                    }
+                    s.insert("prompt".into(), json!(prompt_template));
+                }
+                WorkflowNodeKind::Gate { title_template, body_template, required_approvals, on_reject } => {
+                    s.insert("kind".into(), json!("gate"));
+                    s.insert("title".into(), json!(title_template));
+                    if !body_template.is_empty() {
+                        s.insert("body".into(), json!(body_template));
+                    }
+                    s.insert("approvals".into(), json!(required_approvals));
+                    s.insert(
+                        "onReject".into(),
+                        match on_reject {
+                            GateRejectPolicy::Halt => json!("halt"),
+                            GateRejectPolicy::RouteTo { node } => json!({ "retryFrom": node }),
+                        },
+                    );
+                }
+            }
+            if !n.depends_on.is_empty() {
+                s.insert("after".into(), json!(n.depends_on));
+            }
+            Value::Object(s)
+        })
+        .collect();
+    let mut out = Map::new();
+    out.insert("revises".into(), json!(def.id.to_string()));
+    out.insert("name".into(), json!(def.name));
+    if !def.description.is_empty() {
+        out.insert("description".into(), json!(def.description));
+    }
+    if let Some(label) = &def.input_label {
+        out.insert("inputLabel".into(), json!(label));
+    }
+    out.insert("stages".into(), Value::Array(stages));
+    Value::Object(out)
+}
+
 /// Preset: implement → critique → human approval gate (reject retries the
 /// implementation, bounded by [`MAX_NODE_ATTEMPTS`]).
 pub fn preset_review_gate() -> WorkflowDefinition {
@@ -550,6 +680,7 @@ pub fn preset_review_gate() -> WorkflowDefinition {
             .into(),
         input_label: Some("What should be implemented?".into()),
         created_at: Timestamp::now(),
+        disabled: false,
         nodes: vec![
             WorkflowNode {
                 id: "implement".into(),
@@ -623,6 +754,7 @@ pub fn preset_fan_out_vote() -> WorkflowDefinition {
             .into(),
         input_label: Some("What task should the agents attempt?".into()),
         created_at: Timestamp::now(),
+        disabled: false,
         nodes: vec![
             attempt(1),
             attempt(2),
@@ -688,6 +820,7 @@ mod tests {
             input_label: None,
             nodes,
             created_at: Timestamp::now(),
+            disabled: false,
         }
     }
 
@@ -928,5 +1061,90 @@ mod tests {
         assert!(json.contains("\"status\":\"running\""));
         let back: WorkflowRun = serde_json::from_str(&json).unwrap();
         assert_eq!(back, run);
+    }
+
+    #[test]
+    fn upsert_definition_adds_then_replaces_by_id() {
+        let mut defs = vec![];
+        let mut d = preset_review_gate();
+        upsert_definition(&mut defs, d.clone());
+        upsert_definition(&mut defs, d.clone());
+        assert_eq!(defs.len(), 1, "same id twice keeps one copy");
+        d.name = "Renamed".into();
+        upsert_definition(&mut defs, d.clone());
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "Renamed");
+        upsert_definition(&mut defs, preset_fan_out_vote());
+        assert_eq!(defs.len(), 2);
+    }
+
+    #[test]
+    fn describe_definition_reads_in_dependency_order() {
+        let agent_id = Uuid::new_v4();
+        let mut d = def(vec![
+            gate("ok", &["fix"], GateRejectPolicy::RouteTo { node: "fix".into() }),
+            agent("fix", &["scan"], "Fix {{nodes.scan.output}}"),
+            agent("scan", &[], "Scan {{input}}"),
+        ]);
+        if let WorkflowNodeKind::Agent { agent_id: a, .. } = &mut d.nodes[1].kind {
+            *a = Some(agent_id);
+        }
+        let text = describe_definition(&d, &|id| (id == agent_id).then(|| "Coder".to_string()));
+        let scan = text.find("[scan]").unwrap();
+        let fix = text.find("[fix]").unwrap();
+        let ok = text.find("[ok]").unwrap();
+        assert!(scan < fix && fix < ok, "{text}");
+        assert!(text.contains("@Coder"));
+        assert!(text.contains("primary runtime"));
+        assert!(text.contains("reject retries from fix"));
+        assert!(text.contains("   > Scan {{input}}"));
+    }
+
+    #[test]
+    fn directive_json_round_trips_names_and_revises() {
+        let d = preset_review_gate();
+        let v = directive_json(&d, &|_| None);
+        assert_eq!(v["revises"], d.id.to_string());
+        assert_eq!(v["stages"].as_array().unwrap().len(), d.nodes.len());
+        let gate = v["stages"].as_array().unwrap().iter().find(|s| s["kind"] == "gate").unwrap();
+        assert_eq!(gate["onReject"]["retryFrom"], "implement");
+    }
+
+    #[test]
+    fn disabled_defaults_off_and_is_omitted_when_off() {
+        let d = preset_review_gate();
+        let json = serde_json::to_string(&d).unwrap();
+        assert!(!json.contains("disabled"), "an older peer sees the same shape");
+        let mut paused = d.clone();
+        paused.disabled = true;
+        let back: WorkflowDefinition = serde_json::from_str(&serde_json::to_string(&paused).unwrap()).unwrap();
+        assert!(back.disabled);
+    }
+
+    #[test]
+    fn legacy_definitions_and_proposals_still_decode() {
+        // A definition saved by the retired builder: canvas positions, no
+        // `disabled`. It must load unchanged and validate.
+        let legacy = r#"{"id":"6f1c1f3e-8d0b-4a39-9d55-0c1f0b8f2a11","name":"Old","description":"",
+            "nodes":[{"id":"a","name":"A","dependsOn":[],"kind":{"kind":"agent","promptTemplate":"{{input}}"},"x":40,"y":80}],
+            "createdAt":"2026-01-01T00:00:00Z"}"#;
+        let d: WorkflowDefinition = serde_json::from_str(legacy).unwrap();
+        assert!(!d.disabled);
+        assert_eq!(d.nodes[0].x, Some(40));
+        assert!(validate(&d).is_ok());
+
+        // A proposal from before workflow proposals existed decodes with none.
+        let p = crate::proposals::ActionProposal::new("Ship", crate::proposals::ProposalKind::Decision, "a");
+        let mut v = serde_json::to_value(&p).unwrap();
+        v.as_object_mut().unwrap().remove("workflow");
+        let back: crate::proposals::ActionProposal = serde_json::from_value(v).unwrap();
+        assert!(back.workflow.is_none());
+
+        // A workflow proposal round-trips, and still reads as a decision.
+        let wp = crate::proposals::ActionProposal::workflow("Add", "a", "body", d.clone());
+        let json = serde_json::to_string(&wp).unwrap();
+        assert!(json.contains("\"kind\":\"decision\""));
+        let back: crate::proposals::ActionProposal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.workflow.as_deref(), Some(&d));
     }
 }

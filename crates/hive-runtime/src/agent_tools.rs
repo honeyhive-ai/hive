@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use crate::builtin_tools::{BuiltinTools, Policy};
 use crate::tool_loop::ToolExecutor;
+use crate::workflow_tool::{WorkflowTool, PROPOSE_WORKFLOW};
 
 /// Tools offered per turn, built-ins first.
 pub const MAX_OFFERED_TOOLS: usize = 16;
@@ -51,6 +52,7 @@ pub const CONTEXT_GUARD_FRACTION: f64 = 0.85;
 enum Source {
     Builtin,
     Mcp,
+    Workflow,
 }
 
 /// Built-in tools plus MCP tools behind one executor. See the module docs.
@@ -66,6 +68,8 @@ pub struct CompositeTools<M: ToolExecutor> {
     read_workspace: AtomicBool,
     /// Let MCP calls through even after the above (user opt-in).
     allow_mcp_after_reads: bool,
+    /// `propose_workflow`, when the turn offers it.
+    workflow: Option<WorkflowTool>,
 }
 
 /// Header put on every MCP result: the model sees where the text came from
@@ -254,7 +258,23 @@ impl<M: ToolExecutor> CompositeTools<M> {
             dropped,
             read_workspace: AtomicBool::new(false),
             allow_mcp_after_reads: false,
+            workflow: None,
         }
+    }
+
+    /// Offer `propose_workflow` first in the list. It is not counted by the
+    /// cap passed to [`CompositeTools::with_hints`], so a caller that adds it
+    /// passes one less (see [`crate::workflow_tool::wanted`]).
+    pub fn with_workflow_tool(mut self, tool: WorkflowTool) -> Self {
+        self.defs.insert(0, WorkflowTool::def());
+        self.routes.insert(PROPOSE_WORKFLOW.to_string(), Source::Workflow);
+        self.workflow = Some(tool);
+        self
+    }
+
+    /// Workflow payloads `propose_workflow` accepted this turn.
+    pub fn accepted_workflows(&self) -> Vec<String> {
+        self.workflow.as_ref().map(WorkflowTool::accepted).unwrap_or_default()
     }
 
     /// Turn off the exfiltration guard (see [`ToolExecutor::call`] below):
@@ -306,6 +326,9 @@ impl<M: ToolExecutor> ToolExecutor for CompositeTools<M> {
             // its own "not allowed" message rather than a bare "unknown".
             (BuiltinTools::is_builtin(name) && self.builtin.is_some()).then_some(Source::Builtin)
         });
+        if let (Some(Source::Workflow), Some(w)) = (route, &self.workflow) {
+            return w.call(input);
+        }
         match (route, &self.builtin, &self.mcp) {
             (Some(Source::Builtin), Some(b), _) => {
                 let (out, is_error) = b.call(name, input).await;
@@ -681,6 +704,30 @@ mod tests {
         assert_eq!(n.iter().filter(|x| BuiltinTools::is_builtin(x)).count(), 4, "4 slots held for MCP");
         assert_eq!(n[4], "lab__show_board");
         assert!(!c.call("lab__show_board", &json!({})).await.1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn propose_workflow_is_offered_first_and_routed_to_its_validator() {
+        let root = temp_root("wftool");
+        let b = BuiltinTools::new(builtin_policy(&root, false, false, false)).unwrap();
+        let tool = crate::workflow_tool::WorkflowTool::new(Box::new(|json: &str| {
+            if json.contains("\"bad\"") { Err("stage \"bad\" is wrong".into()) } else { Ok("Flow".into()) }
+        }));
+        let mcp = FakeMcp { calls: Mutex::new(vec![]) };
+        let c = CompositeTools::new(Some(b), Some((vec![mcp_def("a__b")], mcp)), 15).with_workflow_tool(tool);
+        let n = names(&c);
+        assert_eq!(n[0], "propose_workflow");
+        assert!(n.contains(&"a__b".to_string()));
+        let (out, err) = c.call("propose_workflow", &json!({"name": "Flow", "stages": [{"id": "bad"}]})).await;
+        assert!(err && out.contains("is wrong"), "{out}");
+        assert!(c.accepted_workflows().is_empty());
+        let (_, err) = c.call("propose_workflow", &json!({"name": "Flow", "stages": [{"id": "ok"}]})).await;
+        assert!(!err);
+        assert_eq!(c.accepted_workflows().len(), 1);
+        // Without the tool the name is simply unknown.
+        let plain: CompositeTools<FakeMcp> = CompositeTools::new(None, None, 16);
+        assert!(plain.call("propose_workflow", &json!({})).await.1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

@@ -684,6 +684,7 @@ pub(crate) mod tests {
             input_label: None,
             nodes: vec![],
             created_at: Timestamp::now(),
+            disabled: false,
         };
         let run = |status: WorkflowRunStatus, hours_ago: i64| {
             let mut r = workflow::new_run(&def, "go", ME);

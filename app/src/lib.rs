@@ -2295,6 +2295,7 @@ fn proposal_dto(p: &ActionProposal, members: &[hive_core::identity::WorkspaceMem
             .collect(),
         parent_id: p.parent_id.map(|id| id.to_string()),
         superseded_by: p.superseded_by.map(|id| id.to_string()),
+        workflow: p.workflow.as_deref().map(workflows::definition_dto),
     }
 }
 
@@ -5512,6 +5513,17 @@ async fn implement_proposal(
         return Err("not approved yet — it needs quorum before it can be implemented".into());
     }
 
+    // An agent-authored workflow: implementing it adds the definition. The
+    // approving vote normally did this already; this covers a quorum reached
+    // on a device that didn't (an older peer).
+    if proposal.workflow.is_some() {
+        let mut svc = state.service.lock().unwrap();
+        svc.apply_workflow_proposal(sid, workspace_id, pid).map_err(map_err)?;
+        drop(svc);
+        let _ = app.emit("workspace://synced", 1);
+        return Ok(());
+    }
+
     // A file-diff proposal carries the patch an agent produced in its isolated
     // worktree — apply it straight to the workspace root (no re-dispatch). If the
     // tree has drifted from the base the patch was cut against, git apply fails
@@ -7402,7 +7414,7 @@ async fn try_tool_loop(
             let root = state.workspace_root.lock().unwrap().clone();
             let mut svc = state.service.lock().unwrap();
             let body = finalize_reply(
-                &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &text, false,
+                &mut svc, session_id, workspace_id, message_id, &responder.author, responder.agent_id, &root, &text, false,
             )?;
             ("completed".to_string(), body)
         }
@@ -7460,6 +7472,7 @@ fn finalize_reply(
     workspace_id: Uuid,
     message_id: Uuid,
     author: &str,
+    agent_id: Option<Uuid>,
     workspace_root: &str,
     full: &str,
     edits_in_review: bool,
@@ -7481,26 +7494,27 @@ fn finalize_reply(
             let _ = svc.add_reaction(session_id, workspace_id, message_id, emoji.clone(), &actor);
         }
     }
-    // Agent-authored workflows: validate against the same rules as the
-    // builder, save on success, and leave a visible system note either way.
-    // Definitions are inert — only a human can start a run — so a bad or even
-    // malicious definition can't execute anything by itself.
+    // Agent-authored workflows: validated, then filed as a proposal for human
+    // review. Approving it adds the definition; nothing reaches the definition
+    // set (or runs) without a person's vote. A rejected payload leaves the
+    // reason in the chat, where the agent sees it next turn and can fix it.
     for json in &parsed.workflows {
         let session = svc.load(session_id).map_err(map_err)?.ok_or("unknown session")?;
         match workflows::definition_from_directive(json, &session) {
             Ok(def) => {
-                let note = format!(
-                    "🧩 {author} added the workflow “{}” — open the Workflows pane to run it.",
-                    def.name
+                let name = def.name.clone();
+                workflows::file_workflow_proposal(svc, &session, workspace_id, def, author, agent_id)?;
+                let _ = svc.post_system_note(
+                    session_id,
+                    workspace_id,
+                    format!("\u{1f4dd} {author} proposed the workflow \u{201c}{name}\u{201d} \u{2014} review it in the Review pane."),
                 );
-                svc.save_workflow_definition(session_id, workspace_id, def).map_err(map_err)?;
-                let _ = svc.post_system_note(session_id, workspace_id, note);
             }
             Err(e) => {
                 let _ = svc.post_system_note(
                     session_id,
                     workspace_id,
-                    format!("{author} suggested a workflow, but it couldn't be added ({e}) — no changes were made."),
+                    format!("{author} suggested a workflow, but it couldn't be filed ({e}) \u{2014} no changes were made."),
                 );
             }
         }
@@ -7824,15 +7838,33 @@ async fn run_prepared_turn(
     } else {
         None
     };
+    // `propose_workflow` rides along on a tool-using turn whose user asked for
+    // a workflow: it validates the definition in-turn against this chat (the
+    // `[[workflow:]]` directive only fails after the turn). It takes a slot
+    // from the cap rather than growing it.
+    let workflow_tool = {
+        let last_user = turns.iter().rev().find(|t| t.role == "user").map_or("", |t| t.content.as_str());
+        let wanted = (builtin.is_some() || mcp_tools.is_some()) && hive_runtime::workflow_tool::wanted(last_user);
+        let session = if wanted { state.service.lock().unwrap().load(session_id).ok().flatten() } else { None };
+        session.map(|session| {
+            hive_runtime::workflow_tool::WorkflowTool::new(Box::new(move |json: &str| {
+                workflows::definition_from_directive(json, &session).map(|d| d.name)
+            }))
+        })
+    };
     let http_tools = (builtin.is_some() || mcp_tools.is_some()).then(|| {
         // Tools the agent's prompt, skills or the user's message name are
         // offered first when the cap trims.
-        hive_runtime::agent_tools::CompositeTools::with_hints(
+        let tools = hive_runtime::agent_tools::CompositeTools::with_hints(
             builtin,
             mcp_tools,
-            hive_runtime::agent_tools::MAX_OFFERED_TOOLS,
+            hive_runtime::agent_tools::MAX_OFFERED_TOOLS - usize::from(workflow_tool.is_some()),
             &hive_runtime::agent_tools::tool_hints(&system, &turns),
-        )
+        );
+        match workflow_tool {
+            Some(tool) => tools.with_workflow_tool(tool),
+            None => tools,
+        }
     });
     let tool_rounds = hive_runtime::agent_tools::tool_round_budget(
         responder.runtime.provider,
@@ -7972,6 +8004,10 @@ async fn run_prepared_turn(
     match result {
         Ok(full) => {
             tracing::info!(target: "dispatch", chars = full.len(), "turn completed");
+            // Definitions `propose_workflow` accepted are filed exactly like a
+            // `[[workflow:]]` directive in the reply.
+            let accepted = http_tools.as_ref().map(|t| t.accepted_workflows()).unwrap_or_default();
+            let full = hive_runtime::workflow_tool::append_as_directives(&full, &accepted);
             // The isolated worktree's changes, read before the reply is
             // finalized so its directives know the edits are already in review.
             let captured = worktree
@@ -7982,7 +8018,7 @@ async fn run_prepared_turn(
                 let root = state.workspace_root.lock().unwrap().clone();
                 let mut svc = state.service.lock().unwrap();
                 finalize_reply(
-                    &mut svc, session_id, workspace_id, message_id, &responder.author, &root, &full,
+                    &mut svc, session_id, workspace_id, message_id, &responder.author, responder.agent_id, &root, &full,
                     captured.is_some(),
                 )
             };
@@ -14184,9 +14220,9 @@ pub fn run() {
             revoke_relay_token,
             set_relay_user_disabled,
             workflows::list_workflows,
-            workflows::save_workflow,
             workflows::remove_workflow,
-            workflows::add_workflow_preset,
+            workflows::set_workflow_enabled,
+            workflows::workflow_change_request,
             workflows::list_workflow_runs,
             workflows::start_workflow_run,
             workflows::cancel_workflow_run,
@@ -15593,7 +15629,7 @@ mod finalize_proposal_tests {
         let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude", None, None).unwrap();
 
         let body = "Done.\n[[propose: {\"title\": \"Bump timeout\", \"kind\": \"command\", \"body\": \"30s\", \"requiredApprovals\": 2}]]";
-        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", "/tmp/ws", body, false).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", None, "/tmp/ws", body, false).unwrap();
         assert_eq!(cleaned, "Done.");
 
         let session = svc.load(chat.id).unwrap().unwrap();
@@ -15621,7 +15657,7 @@ mod finalize_proposal_tests {
         // Edits captured as a diff proposal: the diff-less fileDiff directive
         // would duplicate it; other kinds still land.
         let mid = svc.begin_assistant_message(chat.id, wid, "Hive", "gw", None, None).unwrap();
-        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Hive", "/tmp/ws", body, true).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Hive", None, "/tmp/ws", body, true).unwrap();
         assert_eq!(cleaned, "Fixed it.");
         let titles: Vec<String> =
             svc.load(chat.id).unwrap().unwrap().proposals.iter().map(|p| p.title.clone()).collect();
@@ -15631,10 +15667,97 @@ mod finalize_proposal_tests {
         // only record of the proposed change, so it is kept.
         let chat2 = svc.create_chat("B", wid, "gw").unwrap();
         let mid = svc.begin_assistant_message(chat2.id, wid, "Hive", "gw", None, None).unwrap();
-        finalize_reply(&mut svc, chat2.id, wid, mid, "Hive", "/tmp/ws", body, false).unwrap();
+        finalize_reply(&mut svc, chat2.id, wid, mid, "Hive", None, "/tmp/ws", body, false).unwrap();
         let session = svc.load(chat2.id).unwrap().unwrap();
         assert_eq!(session.proposals.len(), 2);
         assert!(session.proposals.iter().any(|p| p.kind == ProposalKind::FileDiff));
+    }
+
+    const TRIAGE: &str = "Here you go.\n[[workflow: {\"name\": \"Triage\", \"stages\": [{\"id\": \"scan\", \"agent\": \"Scout\", \"prompt\": \"Scan {{input}}\"}, {\"id\": \"ok\", \"kind\": \"gate\", \"title\": \"Ship?\", \"after\": [\"scan\"]}]}]]";
+
+    #[test]
+    fn workflow_directive_files_a_proposal_and_adds_nothing_until_approved() {
+        let mut svc = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+        let scout = WorkspaceAgent::new("Scout", "ws-claude");
+        let scout_id = scout.id;
+        svc.add_agent(chat.id, wid, scout).unwrap();
+        let mid = svc.begin_assistant_message(chat.id, wid, "Scout", "ws-claude", Some(scout_id), None).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Scout", Some(scout_id), "/tmp/ws", TRIAGE, false).unwrap();
+        assert_eq!(cleaned, "Here you go.");
+
+        let s = svc.load(chat.id).unwrap().unwrap();
+        assert!(s.workflow_definitions.is_empty(), "no definition before review");
+        assert_eq!(s.proposals.len(), 1);
+        let p = &s.proposals[0];
+        assert_eq!(p.title, "Add workflow \u{201c}Triage\u{201d}");
+        assert_eq!(p.kind, ProposalKind::Decision);
+        assert_eq!(p.author_actor_id, "Scout");
+        assert_eq!(p.producing_agent_id, Some(scout_id));
+        assert!(p.body.contains("@Scout"), "{}", p.body);
+        let def = p.workflow.as_deref().unwrap().clone();
+
+        let pid = p.id;
+        let r = svc
+            .vote_on_proposal(chat.id, wid, pid, "u1", hive_core::WorkspaceRole::Owner, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.status, ProposalStatus::Applied);
+        assert_eq!(svc.load(chat.id).unwrap().unwrap().workflow_definitions, vec![def]);
+    }
+
+    #[test]
+    fn a_revision_keeps_the_definition_id_and_an_unknown_target_is_reported() {
+        let mut svc = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "anthropic").unwrap();
+        let existing = hive_core::workflow::preset_review_gate();
+        svc.save_workflow_definition(chat.id, wid, existing.clone()).unwrap();
+
+        let body = "[[workflow: {\"name\": \"Review gate v2\", \"revises\": \"review gate\", \"stages\": [{\"id\": \"do\", \"prompt\": \"{{input}}\"}]}]]";
+        let mid = svc.begin_assistant_message(chat.id, wid, "Hive", "gw", None, None).unwrap();
+        finalize_reply(&mut svc, chat.id, wid, mid, "Hive", None, "/tmp/ws", body, false).unwrap();
+        let s = svc.load(chat.id).unwrap().unwrap();
+        let p = &s.proposals[0];
+        assert!(p.title.starts_with("Revise workflow"), "{}", p.title);
+        assert_eq!(p.workflow.as_ref().unwrap().id, existing.id);
+        svc.vote_on_proposal(chat.id, wid, p.id, "u1", hive_core::WorkspaceRole::Owner, true).unwrap();
+        let defs = svc.load(chat.id).unwrap().unwrap().workflow_definitions;
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "Review gate v2");
+
+        let bad = "[[workflow: {\"name\": \"X\", \"revises\": \"nope\", \"stages\": [{\"id\": \"a\", \"prompt\": \"x\"}]}]]";
+        let mid = svc.begin_assistant_message(chat.id, wid, "Hive", "gw", None, None).unwrap();
+        finalize_reply(&mut svc, chat.id, wid, mid, "Hive", None, "/tmp/ws", bad, false).unwrap();
+        let s = svc.load(chat.id).unwrap().unwrap();
+        assert_eq!(s.proposals.len(), 1, "nothing filed");
+        let note = s.messages.iter().rev().find(|m| m.body.contains("couldn't be filed")).expect("a note");
+        assert!(note.body.contains("revises"), "{}", note.body);
+    }
+
+    #[test]
+    fn propose_workflow_tool_payloads_file_through_the_same_path() {
+        let mut svc = service();
+        let wid = Uuid::new_v4();
+        let chat = svc.create_chat("A", wid, "gw").unwrap();
+        let session = svc.load(chat.id).unwrap().unwrap();
+        let tool = hive_runtime::workflow_tool::WorkflowTool::new(Box::new(move |json: &str| {
+            crate::workflows::definition_from_directive(json, &session).map(|d| d.name)
+        }));
+        // Unknown agent: the error goes back to the model in-turn.
+        let (out, err) = tool.call(&serde_json::json!({"name": "T", "stages": [{"id": "a", "agent": "Ghost", "prompt": "x"}]}));
+        assert!(err && out.contains("Ghost"), "{out}");
+        let (_, err) = tool.call(&serde_json::json!({"name": "T", "stages": [{"id": "a", "prompt": "{{input}}"}]}));
+        assert!(!err);
+        let full = hive_runtime::workflow_tool::append_as_directives("Filed it.", &tool.accepted());
+        let mid = svc.begin_assistant_message(chat.id, wid, "Hive", "gw", None, None).unwrap();
+        let cleaned = finalize_reply(&mut svc, chat.id, wid, mid, "Hive", None, "/tmp/ws", &full, false).unwrap();
+        assert_eq!(cleaned, "Filed it.");
+        let s = svc.load(chat.id).unwrap().unwrap();
+        assert_eq!(s.proposals.len(), 1);
+        assert!(s.proposals[0].workflow.is_some());
+        assert!(s.workflow_definitions.is_empty());
     }
 
     #[test]

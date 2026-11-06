@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::identity::WorkspaceRole;
 use crate::time_util::Timestamp;
+use crate::workflow::WorkflowDefinition;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +117,12 @@ pub struct ActionProposal {
     /// knows who to re-dispatch. `None` = the chat's primary runtime (@hive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub producing_agent_id: Option<Uuid>,
+    /// An agent-authored workflow definition up for review. Approving the
+    /// proposal saves it to the chat's definition set (replacing the one with
+    /// the same id, for a revision). Carried on a `Decision` proposal rather
+    /// than a new kind so older peers still decode the event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<Box<WorkflowDefinition>>,
 }
 
 fn default_floor() -> WorkspaceRole {
@@ -146,6 +153,23 @@ impl ActionProposal {
             parent_id: None,
             superseded_by: None,
             producing_agent_id: None,
+            workflow: None,
+        }
+    }
+
+    /// A proposal to add (or, when `definition.id` matches an existing one,
+    /// revise) a workflow definition. `body` is the human-readable rendering
+    /// older peers and the phone show.
+    pub fn workflow(
+        title: impl Into<String>,
+        author_actor_id: impl Into<String>,
+        body: impl Into<String>,
+        definition: WorkflowDefinition,
+    ) -> Self {
+        Self {
+            body: body.into(),
+            workflow: Some(Box::new(definition)),
+            ..Self::new(title, ProposalKind::Decision, author_actor_id)
         }
     }
 
