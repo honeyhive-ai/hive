@@ -23,7 +23,7 @@ to review every uncommitted change:
 
 This is the human review surface for agent-made changes — read the
 diff here, then commit from your own terminal (or have an agent do it,
-subject to its [file-access permission mode](settings.md#team)).
+subject to its [file-access permission mode](settings.md#team-sync)).
 
 ## Status line (Settings → Workspace)
 

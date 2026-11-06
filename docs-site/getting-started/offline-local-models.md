@@ -161,6 +161,11 @@ For an HTTP runtime this offers two kinds of tools:
   **Settings → Permissions → Local model file tools**.
 - **Tools from your enabled MCP servers.**
 
+A turn is offered at most 16 tools. Some slots are held for MCP tools, and
+MCP tools named in the agent's instructions, its skills or your message are
+offered first; whatever doesn't fit is logged. See
+[MCP servers](../addons/mcp.md#local-models-at-most-16-tools-a-turn).
+
 The file tools send the contents of the files the model reads to the
 runtime's endpoint. Hive offers them only when the endpoint's host is on
 this machine or a private network:

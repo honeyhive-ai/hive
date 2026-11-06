@@ -40,16 +40,21 @@ quarantined, not applied.
 
 ## 2. Relay sync (HTTP/JSON)
 
-The relay (`crates/hive-relay/`) is a per-workspace forwarding mailbox keyed by
+The relay ([honeyhive-ai/relay](https://github.com/honeyhive-ai/relay)) is a per-workspace forwarding mailbox keyed by
 a **room id**. Devices on the same relay URL + room converge.
 
 - `GET  /v1/health` → `ok`
 - `POST /v1/workspaces/<room>/envelopes` → append signed envelopes to the room
-- `GET  /v1/workspaces/<room>/envelopes?after=<sequence>` → drain everything
-  newer than `<sequence>`
+- `GET  /v1/workspaces/<room>/envelopes?after=<sequence>&limit=<n>` → one
+  page of envelopes newer than `<sequence>`. A relay that has more marks the
+  page with `X-Hive-More: true` and the cursor to continue from in
+  `X-Hive-Next-After`; clients ask for pages of 500 and keep fetching until
+  caught up. A relay without paging returns everything and neither header.
 
 Clients push their unsynced envelopes and pull new ones on a short interval,
-deduping by `eventId` (so restarts / double-sends are harmless). When a
+deduping by `eventId` (so restarts / double-sends are harmless). A room
+carries only its own workspace: a client pushes only events stamped with
+that room's workspace id and drops any event stamped with another. When a
 **workspace key** is set, each envelope body is sealed with ChaCha20-Poly1305
 *before* upload — the relay only ever stores ciphertext. See
 [Self-hosting a relay](../networking/self-host.md).
@@ -74,9 +79,12 @@ guards against accidental drift.
 
 ## Roadmap (not in the current build)
 
-The relay also exposes `/v1/workspaces/<room>/{candidates,presence}` as
-groundwork, but the following are tracked follow-ups and **not wired** in the
-current Rust build — relay forwarding (above) is the multiuser path today:
+The relay also exposes `/v1/workspaces/<room>/{candidates,presence}`. The
+presence slots carry host liveness: each running host publishes a beat about
+every 30 seconds, sealed under the workspace key, and a host counts as online
+while its last beat is under 90 seconds old. The following are tracked
+follow-ups and **not wired** in the current Rust build — relay forwarding
+(above) is the multiuser path today:
 
 - **Direct peer-to-peer** — STUN / UDP hole-punch / TURN fallback and a
   length-prefixed peer-link frame protocol.

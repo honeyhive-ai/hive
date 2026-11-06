@@ -29,19 +29,23 @@ You need:
 
 ## Step 1 — Build
 
+The relay is a small Go service in its own repository,
+[github.com/honeyhive-ai/relay](https://github.com/honeyhive-ai/relay)
+(Go 1.22 or later):
+
 ```bash
-git clone https://github.com/honeyhive-ai/hive.git
-cd hive
-cargo build -p hive-relay --release
+git clone https://github.com/honeyhive-ai/relay.git
+cd relay
+go build -o hive-relay ./cmd/hive-relay
 ```
 
-The binary lands at `target/release/hive-relay`. It has no resource
-dependencies — copy it anywhere.
+The `hive-relay` binary has no resource dependencies; copy it anywhere.
+(The Docker one-liner above builds the same thing.)
 
 ## Step 2 — Run
 
 ```bash
-./target/release/hive-relay
+./hive-relay
 ```
 
 The bind address is chosen in this order:
@@ -229,6 +233,7 @@ Pairing-code redemption is **rate-limited** to blunt code enumeration.
 
 ## Where the source lives
 
-`crates/hive-relay/` (the axum service + routes). It depends only on
-`hive-core` types + a small async/HTTP stack, so lifting it into a standalone
-repo is a mechanical move when that fits your workflow.
+[github.com/honeyhive-ai/relay](https://github.com/honeyhive-ai/relay) (Go,
+MIT). It speaks the same `/v1` wire protocol the app and `hive` CLI use.
+For the phone's remote access (the relay tunnel) and push through your own
+relay, see [Remote access for your phone](remote-access.md#using-your-own-relay).

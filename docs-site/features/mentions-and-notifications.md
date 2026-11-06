@@ -29,6 +29,13 @@ notification — "*Name* mentioned you" — per message. Whether the app is
 focused or in the background, and whether the message was typed locally
 or arrived over sync, the trigger is the same.
 
+## On your phone
+
+With a `hive serve` host set up for the phone app, a mention of you (and a
+workflow waiting at an approval gate) can also reach your phone as a push
+notification. Previews are plain text, cut to a short line, and each phone
+can turn previews off. See [Hive on your phone](phone-app.md).
+
 ## Sidebar highlights
 
 The same mention lights up the sidebar so it's still there after the

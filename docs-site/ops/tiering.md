@@ -72,7 +72,7 @@ For any new paid/enterprise feature, place it in the first bucket that fits:
 | Issue/PR tracker connectors (GitHub/Linear/Jira) | free core | OSS client (MCP) |
 | Governance over agent writes to a tracker (audit, policy) | server | gated/enterprise relay |
 | The desktop app, BYO runtimes, MCP | free core | OSS client |
-| Reference relay (forwarding + E2EE) | free core | `crates/hive-relay` |
+| Reference relay (forwarding + E2EE) | free core | `honeyhive-ai/relay` |
 
 > **Enterprise = full RBAC + GHEC, on-prem.** The Enterprise tier is the
 > fully-RBAC profile: custom capability-based roles, GitHub Enterprise Cloud SSO
@@ -125,8 +125,8 @@ check to function.
 
 **Not yet — and probably never for the client.** Recommendation:
 
-- **Keep the OSS client + reference relay in this (public) monorepo.** They are
-  the free product; splitting them buys nothing and costs contributor clarity.
+- **Keep the OSS client and the reference relay public.** (The relay has since
+  moved to its own public repo, `honeyhive-ai/relay`, as a Go service.)
 - **When the first truly-proprietary code appears** (a vendor SSO/DLP SDK we
   can't open-source), put **only that** in a separate **private** repo — an
   `hive-relay-enterprise` crate that depends on the OSS `hive-core`/`hive-relay`
@@ -144,7 +144,7 @@ tiering is entirely a runtime/deployment concern.
 ## What stays free forever
 
 - The desktop client (all OSes).
-- The reference relay (`crates/hive-relay`, MIT) — forwarding + E2EE.
+- The reference relay (`honeyhive-ai/relay`, MIT) — forwarding + E2EE.
 - The protocol/wire specs.
 
 A team can run its own relay and never touch a paid tier.

@@ -28,6 +28,10 @@ the app data dir; the theme is stored locally per device.
   to **one member, two devices**. See
   [Identity & devices](../concepts/identity.md). Official builds ship
   with the OAuth App client id baked in; forks can paste their own.
+- **My devices** — devices that act as you in this workspace. **Add a
+  device** takes the enrollment code a `hive serve` box prints, so what you
+  do from your phone through that box is authored as you rather than as a
+  separate member. See [Running hive serve as your own device](../ops/serve-box.md).
 
 ## Appearance
 
@@ -56,7 +60,7 @@ own clone. Switching workspaces switches the folder the editor/terminal/
 Diff and agents operate on; a workspace you haven't linked yet shows a
 **link-a-folder** prompt in the Code/Diff canvas (you can still chat,
 review, and drive remote agents while it's unlinked). See
-[Workspaces](../concepts/workspaces.md#code-directories--per-chat-worktrees)
+[Workspaces](../concepts/workspaces.md#code-directories-per-chat-worktrees)
 and [Git integration](git.md).
 
 ## Team sync
@@ -137,7 +141,8 @@ LLM access is organized as a hierarchy:
 
 - **Providers** — `anthropic`, `openAI`, `openRouter`, `ollama`,
   `azure` (Azure OpenAI), `custom`, plus the CLI coding agents: `claude`
-  (**Claude Code**), `pi`, `aider`, **Codex** (OpenAI's `codex exec`), and
+  (**Claude Code**), `pi`, `aider`, **Codex** (OpenAI's `codex exec`),
+  **Google Antigravity** (`agy`), **GitHub Copilot** (`copilot`), and
   **Hermes** (any stdin-driven CLI — set the executable + flags on the
   runtime). API providers hold their **own API key** and optional base URL
   (so multiple providers can have distinct keys, including any generic
@@ -171,6 +176,21 @@ would answer right now — a running Ollama, CLI agents already on your
 `PATH` (`claude`, `codex`, `aider`, …), and API keys present in the
 environment — and offers to add each with one click, so a fresh install
 is usable without hand-typing config.
+
+### Subscription CLIs
+
+The **Subscription CLIs** panel (under **LLM providers**) looks for the
+Google Antigravity CLI (`agy`) and the GitHub Copilot CLI (`copilot`), so
+a Google AI Pro / Ultra or Copilot subscription can drive a runtime. For
+each it shows **not installed** (with the install command) or the installed
+version and sign-in state: **signed in**, **not signed in** (with the
+command to run in a terminal: `agy` or `copilot login`), or **sign-in not
+checked**. Antigravity's Google sign-in lives in the OS keychain, so it
+reads *not checked* until you click **Check Google sign-in**, which runs the
+read-only `agy models`. **Add runtime** adds a keyless runtime in one
+click, optionally with a model. A `gemini` binary is listed only to explain
+that Gemini CLI no longer serves Google AI Pro / Ultra sign-ins. See
+[Configuring a runtime](../getting-started/configuring-a-runtime.md#subscription-clis-google-antigravity-and-github-copilot).
 
 ### Testing a provider or model
 
@@ -210,12 +230,18 @@ How agents are allowed to touch files — and this differs **per agent
 type** (Claude Code is not the only agent that edits files):
 
 - **`claude` permission mode** — `Read-only` (default; proposes edits
-  but blocks writes), `Accept edits` (can write files), or **Bypass all
-  permissions** (also runs shell commands). Injected as
+  but blocks writes), **Edit files** (can write files), **Edit files & run
+  commands** (also build, test and git through the shell), or **Bypass all
+  permissions** (edits, commands and every tool). Injected as
   `--permission-mode` into the `claude` CLI, which runs headless and
   can't show an interactive prompt. Because bypass mode grants
   unattended file **and** shell execution, switching into it pops a
   **confirmation dialog** first — the same friction a data reset gets.
+- **`agy` and `copilot`** (the subscription CLIs) follow the same setting,
+  mapped to each CLI's own flags; anything a tier doesn't grant is denied,
+  since there's no one to prompt. See
+  [Bring-your-own agents](../addons/byo-agents.md#subscription-clis-google-antigravity-and-github-copilot)
+  for the exact flags.
 - **aider / pi** gate via their own flags.
 - **API/MCP-backed agents** can only call the MCP tools you've
   **enabled** on the Tools & MCP tab — an installed-but-disabled server

@@ -42,9 +42,11 @@ notification (the human broadcast never auto-runs a turn).
 conversation without a human in the loop: as long as each reply `@mentions`
 another agent, Hive keeps routing turns between them — and the chain continues
 even when the agents live on **different devices** or a headless
-[`hive worker`](../../crates/hive-cli/README.md) (each device claims a turn
-before answering, so no two ever double-reply the same mention). A cascade ends
-naturally the moment an agent *stops* mentioning another. A generous per-turn
+[`hive worker`](https://github.com/honeyhive-ai/hive/blob/main/crates/hive-cli/README.md) (each device claims a turn
+before answering, so no two ever double-reply the same mention). An agent's
+reply hands off to **exactly one** agent: the first other agent it
+`@mentions`. To refer to an agent without handing off, use its plain name.
+A cascade ends naturally the moment an agent *stops* mentioning another. A generous per-turn
 depth ceiling (`MAX_CASCADE_DEPTH`, currently 24 replies since the last human
 turn) is only a runaway/loop backstop — not a conversation limit — so genuine
 multi-agent discussions run their course, while an infinite `A ↔ B` loop is still

@@ -20,12 +20,18 @@ Open **Settings → Models** to add or edit.
 | `claude-code`     | Local `claude` CLI (uses your Claude Pro/Max sub) | depends on Claude CLI     | yes (Claude Code's own tools) |
 | `aider`           | Local `aider` CLI                                | depends on aider's config | yes (aider's own tools) |
 | `pi`              | Local `pi` CLI                                   | depends on pi's config    | yes (pi's own tools) |
+| `codex`           | Local `codex` CLI (OpenAI's `codex exec`)        | the CLI's own login       | yes (Codex's own tools) |
+| `antigravity`     | Local `agy` CLI (Google Antigravity; uses your Google AI Pro/Ultra sub) | the CLI's own Google sign-in | yes (the CLI's own tools) |
+| `copilot`         | Local `copilot` CLI (GitHub Copilot; uses your Copilot sub) | `copilot login` or a token env var | yes (the CLI's own tools) |
+| `hermes`          | Any stdin-driven CLI agent (set the executable and flags on the runtime) | depends on the CLI | the CLI's own |
 | `hive-daemon`     | Remote `hived` instance                          | bearer token              | passthrough |
 | `custom`          | OpenAI-compatible HTTP endpoint                   | varies                    | varies |
 
-`claude-code`, `aider`, and `pi` are the **subprocess** runtimes — Hive
-launches a local CLI. There is no generic `subprocess` provider; to
-point Hive at some other OpenAI-compatible server, use `custom`.
+`claude-code`, `aider`, `pi`, `codex`, `antigravity`, `copilot` and
+`hermes` are the **subprocess** runtimes: Hive launches a local CLI, which
+brings its own tools and its own login, so these runtimes need no API key
+in Hive. To point Hive at some other OpenAI-compatible server, use
+`custom`.
 
 ## Provider presets
 
@@ -134,6 +140,72 @@ Hive at the binary:
 For any other OpenAI-compatible server, don't install a binary — add a
 **Custom** runtime (`provider = "custom"`) and fill in the base URL, as
 described under [Provider presets](#provider-presets).
+
+## Subscription CLIs: Google Antigravity and GitHub Copilot
+
+If you pay for **Google AI Pro / Ultra** or **GitHub Copilot**, Hive can use
+that subscription through the vendor's own CLI, the same way the
+`claude-code` runtime uses a Claude subscription. Hive runs the CLI headless
+and streams its reply, including its tool steps. The sign-in stays in the
+CLI's own config or your OS keychain: Hive never reads, copies or syncs it.
+
+| | Google Antigravity | GitHub Copilot |
+|---|---|---|
+| Binary | `agy` | `copilot` |
+| Install | `curl -fsSL https://antigravity.google/cli/install.sh \| bash` | `brew install --cask copilot-cli` or `npm install -g @github/copilot` |
+| Sign in (in a terminal on the same machine) | run `agy` once and choose **Sign in with Google** | `copilot login` |
+
+!!! note "Gemini CLI"
+    Gemini CLI stopped serving Google AI Pro / Ultra and free personal
+    sign-ins on 2026-06-18 (API-key and Code Assist Standard/Enterprise use
+    is unaffected). Hive shows an installed `gemini` binary only to point
+    you at `agy`; it can't be added as a runtime.
+
+### Detection in Settings → Models
+
+**Settings → Models → LLM providers** has a **Subscription CLIs** panel that
+lists each CLI it looks for:
+
+- **not installed**: the panel shows the install command.
+- Installed: the binary's version and its sign-in state:
+    - **signed in**: for Copilot, a login in its `config.json`
+      (`~/.copilot`, or `$COPILOT_HOME`), or a token in `COPILOT_GITHUB_TOKEN`,
+      `GH_TOKEN` or `GITHUB_TOKEN`. Only the token's presence is checked,
+      never its value. A classic personal access token (`ghp_…`) reads as
+      not signed in, because Copilot CLI doesn't accept one.
+    - **not signed in**: the panel shows the command to run in a terminal
+      on this machine (`agy` or `copilot login`).
+    - **sign-in not checked**: Antigravity keeps its Google sign-in in the OS
+      keychain and has no status command, so the panel doesn't know until
+      you click **Check Google sign-in**. That runs `agy models`, which is
+      read-only and uses no quota, and also fills the model picker with the
+      models it lists.
+- **Add runtime** adds a keyless runtime for the CLI in one click. Type a
+  model first if you want one; blank uses the CLI's default. Once added,
+  the row reads **runtime added**.
+
+**Re-scan** checks again after you install or sign in. Detection never signs
+you in or out.
+
+Both CLIs follow Hive's permission setting for Claude Code (**Settings →
+Permissions**), mapped to each CLI's own flags; the default is read-only.
+The exact flags, and how to set these runtimes up on a `hive serve` or
+`hive worker` host (`hive setup`), are in
+[Bring-your-own agents](../addons/byo-agents.md#subscription-clis-google-antigravity-and-github-copilot).
+
+In TOML the providers are `antigravity` (or `agy`) and `copilot` (or
+`github-copilot`); `endpoint` is the binary, and blank means `agy` or
+`copilot` on your `PATH`:
+
+```toml
+[[runtimes]]
+id = "copilot"
+name = "GitHub Copilot CLI"
+provider = "copilot"
+kind = "local"
+endpoint = ""
+preferred_model = ""   # blank = the CLI's default model
+```
 
 ## Picking which runtime a chat uses
 

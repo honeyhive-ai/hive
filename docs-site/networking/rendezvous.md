@@ -2,7 +2,7 @@
 
 !!! note "Roadmap — not in the current build"
     Direct peer-to-peer (STUN candidate exchange + UDP hole-punch) is a tracked
-    follow-up. Today the relay (`crates/hive-relay/`) **forwards encrypted event
+    follow-up. Today the relay ([honeyhive-ai/relay](https://github.com/honeyhive-ai/relay)) **forwards encrypted event
     envelopes** between peers instead of brokering a direct connection — see
     [Self-hosting a relay](self-host.md). This page documents the planned
     rendezvous design.

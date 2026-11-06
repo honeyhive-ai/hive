@@ -15,7 +15,7 @@ entitlement on your org).
 
 ## Self-host (free, MIT)
 
-Run `hive-relay` yourself — the full source is in this repo. See
+Run `hive-relay` yourself — the full source is at [github.com/honeyhive-ai/relay](https://github.com/honeyhive-ai/relay). See
 [Self-hosting a relay](../networking/self-host.md) and the
 [small-team deployment guide](deployment.md).
 

@@ -73,10 +73,10 @@ they also lose *read* access to new traffic. Both together = full removal.
 
 ## Where it lives
 
-**OSS (`crates/hive-relay`, this repo):** only the seam — a public `WriteGuard`
+**OSS (`honeyhive-ai/relay`):** only the seam — a public `WriteGuard`
 trait + `RelayState::with_write_guard`, and `enforce_write` which delegates to the
-guard (or no-ops when none is set). No membership logic. `cargo test -p hive-relay`
-= 14 tests (incl. the seam: no-guard allows writes, a guard can reject them).
+guard (or no-ops when none is set). No membership logic. The relay's tests
+cover the seam (no guard allows writes, a guard can reject them).
 
 **Private (`honeyhive-ai/hive-relay-enterprise`):**
 - `src/membership.rs` — roles + guarded `claim`/`upsert`/`remove`.

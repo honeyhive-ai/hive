@@ -82,4 +82,4 @@ The redirect URI you register with the provider is always
     until you **enable** it, and Connect only runs the OAuth flow you
     initiate. Tokens are scoped to the OAuth app you create and can be
     revoked from the provider side at any time. Per-tool trust toggles in
-    the [Tools pane](mcp.md#trust-per-tool) still gate individual calls.
+    the [Tools pane](../concepts/tools-and-consent.md) still gate individual calls.

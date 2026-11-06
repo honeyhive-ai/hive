@@ -12,7 +12,7 @@ Documentation site: https://docs.apiaryhq.ai/ — pages below are the canonical 
 
 - [Install with Homebrew](https://docs.apiaryhq.ai/getting-started/homebrew/): Installing the Hive desktop app and CLI.
 - [First launch](https://docs.apiaryhq.ai/getting-started/first-launch/): First run, data directories, and resetting local data.
-- [Configuring a runtime](https://docs.apiaryhq.ai/getting-started/configuring-a-runtime/): Setting up LLM providers and CLI coding agents (claude, aider, pi, codex).
+- [Configuring a runtime](https://docs.apiaryhq.ai/getting-started/configuring-a-runtime/): Setting up LLM providers and CLI coding agents (claude, aider, pi, codex, Google Antigravity, GitHub Copilot).
 - [Your first chat](https://docs.apiaryhq.ai/getting-started/first-chat/): Sending a message and getting a first agent reply.
 
 ## Concepts
@@ -32,6 +32,8 @@ Documentation site: https://docs.apiaryhq.ai/ — pages below are the canonical 
 - [Multi-agent collaboration](https://docs.apiaryhq.ai/features/multi-agent/): Multiple agents in one chat and how they interact.
 - [Mentions & notifications](https://docs.apiaryhq.ai/features/mentions-and-notifications/): Addressing participants and how notifications work.
 - [Agentic workflows](https://docs.apiaryhq.ai/features/workflows/): Multi-stage agent pipelines and human-approval gates, including gate-routes-back loops. Agents author definitions as reviewable proposals; people approve, run and pause them.
+- [Hive on your phone](https://docs.apiaryhq.ai/features/phone-app/): The phone app over `hive serve`: chats, people and channels, proposal review, workflow approvals, push, Match host.
+- [Host dashboard](https://docs.apiaryhq.ai/features/dashboard/): The dashboard `hive serve` shows on the phone: built-in Hive section, dashboard.toml panels, MCP tool panels, tables.
 - [Scheduled agents](https://docs.apiaryhq.ai/features/scheduling/): Recurring, cron-like agent runs.
 - [Managing context](https://docs.apiaryhq.ai/features/voice-and-slash/): /summarize, /compact, and the context planner.
 - [Git integration](https://docs.apiaryhq.ai/features/git/): The Diff canvas, worktree isolation, and applying proposals.
@@ -53,11 +55,13 @@ Documentation site: https://docs.apiaryhq.ai/ — pages below are the canonical 
 - [Rendezvous relay](https://docs.apiaryhq.ai/networking/rendezvous/): How peers find each other over the internet.
 - [Self-hosting a relay](https://docs.apiaryhq.ai/networking/self-host/): Running your own relay, and managing relay access.
 - [TURN fallback](https://docs.apiaryhq.ai/networking/turn/): Relayed connectivity when P2P fails.
+- [Remote access for your phone](https://docs.apiaryhq.ai/networking/remote-access/): The relay tunnel, `hive pair`, `hive phones`, `hive remote`, self-hosted relays and push.
 
 ## Operations
 
 - [Building the dist](https://docs.apiaryhq.ai/ops/build/): Building the desktop app.
 - [Deploying for a small team](https://docs.apiaryhq.ai/ops/deployment/): Standing up Hive for a team.
+- [Running hive serve as your own device](https://docs.apiaryhq.ai/ops/serve-box/): `hive serve enroll`, host liveness, apply-on-approve, and the 1.16 sync privacy upgrade note.
 - [Pricing tiers](https://docs.apiaryhq.ai/ops/pricing/) and [Tiering (open-core)](https://docs.apiaryhq.ai/ops/tiering/): The open-core model.
 - [Managed service plan](https://docs.apiaryhq.ai/ops/managed-service/): The hosted option.
 - [Server-side membership](https://docs.apiaryhq.ai/ops/server-side-membership/): Relay-managed team membership.
@@ -65,6 +69,7 @@ Documentation site: https://docs.apiaryhq.ai/ — pages below are the canonical 
 
 ## Reference
 
+- [What's new](https://docs.apiaryhq.ai/reference/whats-new/): Changes since 1.15 with links.
 - [Configuration (TOML)](https://docs.apiaryhq.ai/reference/config-toml/): The `hive.config.toml` reference.
 - [Invite payload format](https://docs.apiaryhq.ai/reference/invite-payload/): The invite/enroll payload structure.
 - [Wire protocols](https://docs.apiaryhq.ai/reference/wire-protocols/): The `/v1` relay wire contract and token format.

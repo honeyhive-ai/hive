@@ -17,7 +17,8 @@ machine. Hive flips that:
 - **Multiple peers, one workspace.** Alice's Claude subscription and
   Bob's Ollama instance can both participate in the same chat,
   reviewing each other's proposals.
-- **Bring your own agent.** Aider, pi, Claude Code, or any CLI agent
+- **Bring your own agent.** Aider, pi, Claude Code, Codex, Google
+  Antigravity, GitHub Copilot, or any CLI agent
   you trust can act as a workspace participant. Hive doesn't recreate
   agent logic — it hosts what you bring.
 - **Local-first, P2P sync.** Workspaces sync directly between peers
@@ -63,7 +64,7 @@ machine. Hive flips that:
 ## Built with
 
 Hive is a **Tauri v2** desktop app — a Rust backend (`crates/hive-core`,
-`hive-runtime`, `hive-relay`, plus `app/`) with a React + TypeScript
+`hive-runtime`, `hive-cli`, plus `app/`) with a React + TypeScript
 frontend (`web/`). One codebase ships **macOS, Windows, and Linux**. State is an
 append-only event log in SQLite; replies stream from your chosen runtime (the
 `claude` CLI by default — bring your own subscription).
@@ -73,13 +74,13 @@ append-only event log in SQLite; replies stream from your chosen runtime (the
 Pre-release. The multi-runtime workspace + relay-forwarded multiuser sync are in
 place. Build from source with `cargo tauri build` (see
 [Building the dist](ops/build.md)); run a relay from
-[github.com/honeyhive-ai/relay](https://github.com/honeyhive-ai/relay) (or
-`cargo run -p hive-relay` locally against the in-repo reference crate).
+[github.com/honeyhive-ai/relay](https://github.com/honeyhive-ai/relay).
 Release builds are **unsigned** for now — run from source or click through your
 OS's first-launch prompt.
 
-The reference relay is MIT-licensed and lives at `crates/hive-relay/` (a small
-axum service). Direct peer-to-peer sync is implemented with **iroh** (see the
+The reference relay is MIT-licensed and lives in its own repository,
+[github.com/honeyhive-ai/relay](https://github.com/honeyhive-ai/relay) (a small
+Go service). Direct peer-to-peer sync is implemented with **iroh** (see the
 **Direct peers (P2P)** section in Settings) and falls back to relay forwarding
 when a direct connection can't be established. The collaborative-text CRDT is a
 tracked follow-up.

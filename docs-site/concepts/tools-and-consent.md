@@ -18,26 +18,37 @@ Two properties make this safe by default:
 - **Inert until enabled.** A newly added MCP server is disabled; its
   tools are never offered to a model until you flip it on. Enabling is
   an explicit, per-server action.
-- **Only Anthropic runtimes drive them through Hive.** Hive runs the
-  MCP tool loop for runtimes on the Anthropic API. Subprocess runtimes
-  (Claude Code, aider, pi) bring their own tools and their own
-  permissioning — see below.
+- **Only some runtimes drive them through Hive.** Hive runs the MCP tool
+  loop for runtimes on the Anthropic API, and for Ollama and local
+  OpenAI-compatible (`custom`) runtimes with **Supports tools** on (those
+  get at most 16 tools a turn; see
+  [MCP servers](../addons/mcp.md#local-models-at-most-16-tools-a-turn)).
+  Subprocess runtimes (Claude Code, Codex, aider, pi, Google Antigravity,
+  GitHub Copilot) bring their own tools and their own permissioning — see
+  below.
 
 Enabled servers show their connection status in the Tools pane.
 
-## File & command authority (Claude Code)
+## File & command authority (Claude Code and the subscription CLIs)
 
 When a chat runs on the **Claude Code** runtime, the agent edits files
 and runs commands through Claude Code itself, and you choose how much
-it may do without asking under **Settings → Team → Agent file access**
-(the `claude_permission_mode` setting):
+it may do under **Settings → Permissions** (the `claude_permission_mode`
+setting). Claude Code runs headless, so it can't prompt: whatever the mode
+doesn't allow is blocked.
 
-- **default** — Claude Code prompts for each edit/command in its own
-  flow.
-- **acceptEdits** — file edits are auto-accepted; commands still prompt.
-- **bypassPermissions** — no prompts (use only in a sandbox you trust).
+- **default** — read-only; edits and commands are blocked.
+- **acceptEdits** — file edits are allowed; commands are blocked.
+- **runCommands** — edits plus shell commands (build, test, git).
+- **bypassPermissions** — everything, without asking (use only in a
+  sandbox you trust).
 
-This is Claude Code's permission model, surfaced in Hive's settings —
+The **Google Antigravity** (`agy`) and **GitHub Copilot** (`copilot`)
+runtimes follow the same setting, mapped to each CLI's own permission
+flags; see
+[Bring-your-own agents](../addons/byo-agents.md#subscription-clis-google-antigravity-and-github-copilot).
+
+This is each CLI's own permission model, surfaced in Hive's settings —
 Hive does not intercept individual tool calls itself.
 
 ## The human review gate (proposals)

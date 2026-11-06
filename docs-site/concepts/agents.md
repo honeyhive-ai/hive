@@ -74,8 +74,9 @@ Different runtimes expose different capabilities:
 |---------------------|---------------------------------------------------------|
 | API providers       | Enabled MCP tools (whatever MCP servers you've turned on for the chat). |
 | Claude Code         | Claude Code's own tools, governed by its own permission mode. |
+| Google Antigravity (`agy`) / GitHub Copilot (`copilot`) | The CLI's own tools, with Hive's Claude Code permission setting mapped to the CLI's flags (read-only by default). Uses your Google AI Pro / Ultra or Copilot subscription; see [Subscription CLIs](../addons/byo-agents.md#subscription-clis-google-antigravity-and-github-copilot). |
 | aider / pi          | The agent's own internal tools. Hive captures stdout as the reply. |
-| Ollama              | Enabled MCP tools when the runtime's **Supports tools** switch is on and the model's capability probe reports tools; text only otherwise. |
+| Ollama / local OpenAI-compatible (`custom`) | Hive's built-in file tools (on a local or private endpoint) plus enabled MCP tools when the runtime's **Supports tools** switch is on (for Ollama, also when the model's capability probe reports tools); text only otherwise. At most 16 tools a turn, see [MCP servers](../addons/mcp.md#local-models-at-most-16-tools-a-turn). |
 | hive-daemon         | Text only (no tool calls in either direction yet). |
 
 MCP servers are inert until you enable them, so an API runtime starts with no

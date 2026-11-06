@@ -90,6 +90,11 @@ switches between them — the local "My workspace" and any team rooms
 you've joined; the ＋ at the bottom creates a new team room or joins one
 by invite code. The chat list is scoped to whichever workspace is active.
 
+Each team room carries **only its own workspace**. Hive pushes a room only
+the events of the workspace that room belongs to, and ignores events of
+any other workspace that arrive through it, so your local "My workspace"
+and your other teams never reach a room they aren't part of.
+
 ## Code directories & per-chat worktrees
 
 Each workspace links to a **folder on your device** — its code directory. The

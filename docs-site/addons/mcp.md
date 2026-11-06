@@ -121,6 +121,58 @@ See **[Linear & remote MCP servers (OAuth)](linear.md)** for the full
 walkthrough, including creating a Linear OAuth app and the `/linear`
 composer command.
 
+## Local models: at most 16 tools a turn
+
+Runtimes that use Hive's own tool loop (Ollama, and `custom` or
+`hive-daemon` OpenAI-compatible endpoints with **Supports tools** on; see
+[Offline setup with local models](../getting-started/offline-local-models.md#tools-and-mcp))
+are offered **at most 16 tools per turn**. Small open models choose worse
+from a long list, and every tool definition costs prompt tokens on every
+round. When Hive's built-in file tools and your enabled MCP servers add up
+to more than that, Hive picks:
+
+1. **Built-in tools first, but up to 4 slots are held for MCP tools**
+   whenever any MCP tool is enabled (never more than half the cap), so the
+   built-ins can't crowd your servers out. MCP tools also get every slot
+   the built-ins leave free.
+2. **MCP tools named in the turn come first**: tools named in the agent's
+   instructions, its loaded skills, or the user's latest message. Write the
+   full name (`github__list_pull_requests`, the server id, two
+   underscores, then the tool) or, when it contains `_` or `-`, just the
+   tool's own name (`list_pull_requests`). A plain word such as "search"
+   doesn't count.
+3. **The rest go round-robin across servers**: each server's first tool,
+   then each server's second, and so on, so one large server can't push
+   another out entirely.
+
+On the desktop, a turn whose message asks for a workflow also offers
+`propose_workflow`, which takes one of the 16 slots.
+
+Nothing is dropped silently. When the cap leaves tools out, Hive logs a
+warning (target `dispatch`) that reads `tool cap reached: these tools are
+NOT offered this turn`, with the names it dropped. On the desktop, open
+the log file from **Settings → Diagnostics**; on a `hive serve` or
+`hive worker` host, look at that process's log output. An MCP tool whose
+name collides with a built-in tool is dropped and logged too.
+
+To make sure a tool is offered:
+
+- Name it in the agent's instructions or in a skill the agent uses (for
+  example *"Use `search_docs` for questions about our docs"*), or in your
+  message.
+- Disable servers the agent doesn't need, or split a large server's tools
+  across smaller ones.
+
+The cap doesn't apply to CLI agents such as Claude Code, which bring their
+own tools.
+
+## When a tool call fails
+
+If an MCP server answers a call with an error, Hive passes on the server's
+own message (for example `unknown tool`) instead of waiting for a result
+that never comes. A stdio server is stopped when its call is abandoned, for
+example on a timeout.
+
 ## Health & status
 
 The **Tools** pane shows MCP connectivity:

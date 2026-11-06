@@ -62,7 +62,7 @@ access_remote_runtime = true
 id = "anthropic"
 name = "Anthropic"
 kind = "remote"                  # local | remote
-provider = "anthropic"           # ollama | openai | anthropic | openrouter | custom | hive-daemon | aider | pi | claude-code
+provider = "anthropic"           # ollama | openai | anthropic | openrouter | custom | hive-daemon | aider | pi | claude-code | codex | antigravity | copilot | hermes
 endpoint = "https://api.anthropic.com"
 models = ["claude-sonnet-4-5", "claude-opus-4-7"]
 preferred_model = "claude-sonnet-4-5"
@@ -156,7 +156,7 @@ One block per LLM or CLI agent. See
 |---------------------------------|----------|---------------------------------------------------|
 | `id`                            | string   | Workspace-unique identifier (required)            |
 | `name`                          | string   | Display label                                     |
-| `provider`                      | string   | `ollama` / `openai` / `anthropic` / `openrouter` / `custom` / `hive-daemon` / `aider` / `pi` / `claude-code` (required) |
+| `provider`                      | string   | `ollama` / `openai` / `anthropic` / `openrouter` / `custom` / `hive-daemon` / `aider` / `pi` / `claude-code` / `codex` / `antigravity` (or `agy`) / `copilot` (or `github-copilot`) / `hermes` (required) |
 | `kind`                          | string   | `local` / `remote` (default `remote`)             |
 | `endpoint`                      | string   | HTTP base URL, or the binary path for CLI agents  |
 | `metrics_endpoint`              | string   | Optional metrics URL                              |

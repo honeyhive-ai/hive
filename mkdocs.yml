@@ -96,6 +96,8 @@ nav:
       - Multi-agent collaboration: features/multi-agent.md
       - Mentions & notifications: features/mentions-and-notifications.md
       - Agentic workflows: features/workflows.md
+      - Hive on your phone: features/phone-app.md
+      - Host dashboard: features/dashboard.md
       - Scheduled agents: features/scheduling.md
       - Managing context: features/voice-and-slash.md
       - Git integration: features/git.md
@@ -108,6 +110,7 @@ nav:
       - Rendezvous relay: networking/rendezvous.md
       - Self-hosting a relay: networking/self-host.md
       - TURN fallback: networking/turn.md
+      - Remote access for your phone: networking/remote-access.md
   - Addons:
       - Bring-your-own agents: addons/byo-agents.md
       - Skills: addons/skills.md
@@ -116,12 +119,14 @@ nav:
   - Operations:
       - Building the dist: ops/build.md
       - Deploying for a small team: ops/deployment.md
+      - Running hive serve as your own device: ops/serve-box.md
       - Pricing tiers: ops/pricing.md
       - Tiering (open-core model): ops/tiering.md
       - Managed service plan: ops/managed-service.md
       - Server-side membership: ops/server-side-membership.md
       - Troubleshooting: ops/troubleshooting.md
   - Reference:
+      - What's new: reference/whats-new.md
       - Configuration (TOML): reference/config-toml.md
       - Invite payload format: reference/invite-payload.md
       - Wire protocols: reference/wire-protocols.md

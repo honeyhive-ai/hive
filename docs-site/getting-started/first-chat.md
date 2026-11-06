@@ -46,12 +46,14 @@ configured. MCP servers are **inert until you enable them** — add and
 switch them on under **Settings → Tools**. Until then a chat runs with
 no tools attached.
 
-File access for local CLI agents is governed by Claude Code's
-permission mode, set at **Settings → Team → Agent file access**:
+File access for Claude Code, and for the Google Antigravity (`agy`) and
+GitHub Copilot (`copilot`) CLIs, is governed by one permission mode, set
+at **Settings → Permissions**:
 
 - **default** — read-only; the agent's file writes are blocked.
 - **acceptEdits** — the agent may create and modify files in your
   workspace.
+- **runCommands** — edits plus shell commands such as build, test and git.
 - **bypassPermissions** — the agent may edit files *and* run shell
   commands without asking.
 

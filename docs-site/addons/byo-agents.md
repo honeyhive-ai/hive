@@ -2,8 +2,9 @@
 
 Hive doesn't ship hardcoded agent personas. Instead, a CLI agent you
 trust can become a workspace participant. Built-in support covers
-**aider**, **pi**, and **Claude Code** — the three CLI agents Hive knows
-how to spawn.
+**aider**, **pi**, **Claude Code**, **Codex**, the subscription CLIs
+**Google Antigravity** (`agy`) and **GitHub Copilot** (`copilot`), and
+**Hermes**, a generic provider for any stdin-driven CLI.
 
 ## Why BYO?
 
@@ -45,11 +46,13 @@ Pick whichever you like:
     # → /usr/local/bin/claude
     ```
 
-There is **no generic `subprocess` provider** — only `aider`, `pi`, and
-`claude-code` are spawned as CLI agents. (An OpenAI-compatible custom HTTP
-endpoint uses `provider = "custom"`, which talks over HTTP rather than
-spawning a binary.) To wire a different CLI, extend the per-provider dispatch
-in `crates/hive-runtime/src/provider/dispatch.rs`.
+The CLI agents Hive spawns are `aider`, `pi`, `claude-code`, `codex`,
+`antigravity`, `copilot`, and `hermes` (a generic stdin-in, stdout-out
+provider: set the executable and flags on the runtime). An
+OpenAI-compatible custom HTTP endpoint uses `provider = "custom"`, which
+talks over HTTP rather than spawning a binary. To give a different CLI
+first-class streaming, extend the per-provider dispatch in
+`crates/hive-runtime/src/provider/dispatch.rs`.
 
 ## Subscription CLIs: Google Antigravity and GitHub Copilot
 

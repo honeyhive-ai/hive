@@ -89,12 +89,13 @@ See `docs/packaging.md` in the repo for the full matrix.
 
 ## Building just the relay
 
-The relay is a separate binary in the same workspace:
+The relay lives in its own repository (Go):
 
 ```bash
-cargo build -p hive-relay --release      # → target/release/hive-relay
+git clone https://github.com/honeyhive-ai/relay.git && cd relay
+go build -o hive-relay ./cmd/hive-relay
 # or run it directly:
-cargo run -p hive-relay
+go run ./cmd/hive-relay
 ```
 
 See [Self-hosting a relay](../networking/self-host.md).

@@ -163,7 +163,7 @@ bound to `0.0.0.0:8443` so it's reachable at your Tailscale IP:8443.
 
 The relay's entitlement gate now supports **signed tokens**, not just a static
 allowlist, so the relay can read a subscriber's *plan limits and capabilities*
-out of the token itself (implemented in `crates/hive-relay/src/token.rs`).
+out of the token itself (implemented in the relay's `token.go`).
 
 **Asymmetric on purpose.** A billing/license backend holds an **Ed25519 private
 key** and mints tokens; the relay is configured with only the **public key**
