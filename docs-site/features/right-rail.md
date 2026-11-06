@@ -11,7 +11,7 @@ vertical icon strip you click to switch contents. Eight sections:
 | People    | Members, presence, roles, invites                               |
 | Vaults    | Reference-material sources mounted into the session             |
 | Skills    | Instruction bundles injected into participants' prompts         |
-| Workflows | Agent pipelines: definitions, live runs, gates — see [Agentic workflows](workflows.md) |
+| Workflows | Agent-written pipelines: read-only definitions (run, pause, delete, ask an agent to change), live runs, gates. See [Agentic workflows](workflows.md) |
 | Activity  | Streaming runtime activity for the workspace                    |
 
 ![Right rail with the Tools pane active](../images/right-rail.png){ width="800" }

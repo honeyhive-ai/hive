@@ -29,7 +29,7 @@ drop them into this folder, and the docs render.
 | `overview.png` | Full window: rail + sidebar + transcript + right rail (gallery hero) |
 | `onboarding-team.png` | Onboarding step 4 (Team & sync: local / join / relay) |
 | `workspace-bar-git.png` | Git status surface (header / Folder & Git) — verify placement |
-| `workflows-pane.png` / `workflow-builder.png` | Workflows pane + DAG builder |
+| `workflows-pane.png` | Workflows pane (read-only definitions + runs) |
 | `multi-agent-thread.png` | Two agents taking consecutive turns in one chat |
 | `schedules.png` | Settings → Schedules, one schedule configured |
 

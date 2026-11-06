@@ -48,7 +48,9 @@ a **proposal** — a titled change or decision — that lands in the
 quorum of them, when `required_approvals > 1`) approves it, and only
 then does clicking **Implement** dispatch it to an agent to carry out.
 [Workflows](../features/workflows.md) use exactly this mechanism for
-their approval gates.
+their approval gates, and for the workflows themselves: an agent's workflow
+is a proposal, and approving it adds the definition (which still runs only
+when a person starts it).
 
 ## Threat model
 

@@ -310,23 +310,21 @@ These shipped in 1.0 and their docs pages exist but don't embed a screenshot
 yet. Capture with the suggested names; we'll add the `![…]` refs when the pages
 are refreshed.
 
-### `workflows-pane.png` + `workflow-builder.png` — for `features/workflows.md`
+### `workflows-pane.png` (+ `workflow-proposal.png`) — for `features/workflows.md`
 
-The flagship 1.0 feature — the DAG workflow editor with gates.
+Workflows are agent-authored and the pane is read-only (there is no editor).
 
 **Recipe.**
-1. Open **Workflows** — from the right-rail **Workflows** pane (flow icon) or the
-   sidebar **Workflows** nav row.
-2. `workflows-pane.png`: the pane listing saved workflows + recent runs (with run
-   status badges). Seed one saved workflow + one completed run first.
-3. Click **New workflow** (or edit an existing one) to open the builder;
-   `workflow-builder.png` shows the node/step editor: per-step agent assignment,
-   dependencies, and **gate** conditions.
+1. Ask an agent in a chat to "build a workflow that drafts, reviews and waits
+   for my approval". `workflow-proposal.png`: the **Review** pane showing the
+   *Add workflow "…"* proposal with its stages listed.
+2. Approve it, then open the right-rail **Workflows** pane, expand **show
+   stages**, and start one run. `workflows-pane.png`: the definition with its
+   stages plus a run with stage chips.
 
-**Must be visible.** *(pane)* the workflow list + a run with a status badge;
-*(builder)* the "New/Edit workflow" header, ≥2 steps with agent assignments, and
-a gate. ⚠️ Verify the exact builder layout (node canvas vs. step list) against
-the live build.
+**Must be visible.** *(proposal)* the title, ≥2 stages with agent names and a
+gate; *(pane)* Run / Pause / Delete, "Ask an agent to change this", and a run
+with a status badge.
 
 ### `multi-agent-thread.png` — for `features/multi-agent.md`
 
@@ -399,7 +397,7 @@ Once the nine referenced shots exist, the docs build can return to strict mode
 ## Notes for an AI agent (e.g. Codex driving the desktop)
 
 - Hive is a **Tauri** app — one native window titled **`Hive`** wrapping a web
-  view. Settings, Friends, chats, and the Workflow builder are **in-window
+  view. Settings, Friends, and chats are **in-window
   views** (not separate OS windows/sheets), so navigate within the single
   window; don't hunt for a "Settings" child window.
 - Onboarding is **5 steps** with a 5-segment progress bar; it only appears on a

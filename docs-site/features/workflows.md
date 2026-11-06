@@ -11,54 +11,87 @@ pane — and the workflow definitions and run records sync **end-to-end
 encrypted** with the workspace, so teammates watch a run progress live and
 can vote its gates from their own devices.
 
-![The workflow builder — a multi-stage DAG with an approval gate](../images/workflow-builder.png){ width="900" }
+Agents write workflows; people approve, run and pause them. There is no
+hand-built editor: you describe the pipeline you want in the chat, an
+agent drafts the definition, and it arrives in the **Review** pane as a
+proposal. Approving it adds the workflow to the chat's **Workflows** pane.
 
-## Presets
+!!! info "Changed in 1.18"
+    Earlier versions had a visual DAG editor and two presets in the
+    Workflows pane, and an agent's workflow was saved without review. The
+    editor and presets are gone, and every agent-authored workflow (new or
+    revised) now goes through a proposal first. Workflows you already have
+    keep working unchanged: they stay listed, run, and can be paused,
+    deleted or revised by an agent.
 
-Open the **Workflows** pane in the right rail and add either preset — both
-are plain definitions you can edit afterwards:
+## Getting a workflow
 
-- **Review gate** — one agent implements your request, a second critiques
-  the result, then a gate holds the run until you approve. Rejecting the
-  gate sends the work back to the implementation stage for another pass
-  (bounded — three rejections halt the run).
-- **Fan-out + vote** — three agents attempt the task independently and in
-  parallel; a judge stage compares the results and declares a winner.
+Ask any agent in the chat, for example *"build me a workflow that triages
+new issues, drafts fixes, and holds them for my approval"*. The agent
+replies with a definition, and Hive:
 
-Presets run on the chat's Primary Runtime out of the box; edit a stage to
-pin it to any workspace agent instead (a local Ollama triage stage feeding
-a Claude implementation stage is the classic mix).
+1. **Checks it**: stage ids, dependencies (no cycles), template references
+   that point upstream, agent names that exist in the chat's roster, gate
+   rules. If something is wrong, the agent is told why. Local-model agents
+   using Hive's built-in tools get the error inside the same turn (through
+   the `propose_workflow` tool) and fix it before replying; other runtimes
+   see the error as a note in the chat and fix it on their next turn.
+2. **Files it as a proposal** in the **Review** pane: *Add workflow "…"*,
+   with the stages listed in the order they run, who runs each one, its
+   prompt, and how each gate decides.
+3. **Adds it when approved.** The approving vote adds the definition to the
+   **Workflows** pane. The authoring agent's own vote never counts. Reject
+   it, or add a change request and **Send to agent to revise**, and the
+   agent files a new version.
 
-## The DAG editor
+Approving a workflow doesn't run anything. A run only starts when someone
+presses **Run**. Agents get planning authority, never execution authority.
 
-**New workflow** (or **Edit** on any definition) opens the visual editor in
-the main canvas — the same area the Diff view uses — with the graph on the
-left and a stage inspector on the right:
+Workflow proposals show up on the phone too (as a decision with the
+stages as its text), and approving one there adds the workflow the same
+way. See [Hive on your phone](phone-app.md).
 
-- **The canvas is the DAG.** Execution flows top to bottom. Drag stages
-  anywhere (positions are saved with the definition and sync with it);
-  **drag from a stage's bottom handle to another's top handle** to add a
-  dependency edge; select an edge and press Delete to remove it. Pan
-  and zoom freely; **Auto-layout** rearranges everything by dependency
-  depth.
-- **The inspector** edits the selected stage: name, a stable id (what
-  templates reference), kind, and a *Runs after* list — the checkboxes and
-  the canvas edges are two views of the same dependencies.
-- **Agent stages** pick a responder (Primary Runtime or any workspace
-  agent) and a prompt template. `{{input}}` interpolates the run input;
-  `{{nodes.<id>.output}}` interpolates the full output of an upstream
-  stage — one-click chips above the prompt insert them for you.
-- **Gate stages** create a proposal when reached: title/body templates, a
-  required-approval count (quorum), and a rejection policy — halt the run,
-  or route back to an earlier stage and retry.
+## The Workflows pane
 
-The editor validates as you type (cycles, dangling references, template
-refs that don't point upstream) and the backend re-validates on save. A
-dependency edge without a `{{nodes.<id>.output}}` reference is still
-meaningful — it's pure ordering: gates have no output at all, stages that
-both edit the working tree need serializing, and a cheap check can
-short-circuit an expensive stage (a failed dependency skips everything
-downstream).
+Open **Workflows** in the right rail. For each workflow you get:
+
+- the name, description and a **paused** badge when it's paused;
+- **show stages**: each stage in order, the agent that runs it (or the
+  primary runtime), what it runs after, its prompt template, and for a
+  gate its approval count and what a rejection does;
+- **Run**: asks for the run input (the workflow's *input label*) and
+  starts it;
+- **Pause / Resume**: a paused workflow stays listed but can't be started.
+  Runs already going are unaffected;
+- **Delete**: removes the definition. Past runs stay in the history;
+- **Ask an agent to change this**: type what should change. Hive posts a
+  message to the chat with your request and the current definition, the
+  agent answers with a revision, and the revision arrives in the Review
+  pane as *Revise workflow "…"*. Approving it replaces the old definition
+  in place (same workflow, new stages). Runs already started keep the
+  version they started with.
+
+Below the definitions, **Runs** shows every run with a chip per stage
+(see [Running](#running)).
+
+## Stages, dependencies and templates
+
+- **Agent stages** run one turn of an agent from the chat's roster, or of
+  the chat's primary runtime when no agent is named. Any runtime works:
+  Claude Code, Codex, aider, pi, local models, and the Antigravity and
+  Copilot subscription CLIs ([Bring-your-own agents](../addons/byo-agents.md)).
+  A stage whose agent lives on another member's device or a worker runs
+  there.
+- **Prompt templates**: `{{input}}` is the run input;
+  `{{nodes.<id>.output}}` is the full output of an upstream stage.
+- **Gate stages** create a proposal when reached: a title and body, a
+  required approval count (quorum), and a rejection policy: halt the run,
+  or retry from an earlier stage.
+- **Dependencies** (`after`) make the DAG. Stages whose dependencies are
+  done run in parallel. A dependency without a template reference is still
+  useful as pure ordering: gates have no output, stages that both edit the
+  working tree need serializing, and a cheap check can short-circuit an
+  expensive stage (a failed dependency skips everything downstream).
 
 ## Loops (iterate until good)
 
@@ -74,21 +107,13 @@ after it), and have the redo stage read the reviewer's notes
 (`{{nodes.review.output}}`) so each pass acts on the feedback rather than
 retrying blind. Prefer one loop per workflow and keep the rest linear.
 
-`@hive` knows this pattern — ask it to *"draft, have the reviewer critique, and
-loop until I approve"* and it authors the gate-routes-back workflow for you (see
-below).
+`@hive` knows this pattern: ask it to *"draft, have the reviewer critique,
+and loop until I approve"* and it proposes the gate-routes-back workflow.
 
-## Agents can build workflows
+## The definition format
 
-Ask any agent in the chat — *"build me a workflow that triages new issues,
-drafts fixes, and holds them for my approval"* — and it can author one by
-ending its reply with a `[[workflow: {…}]]` directive. This works on
-**every** runtime (the claude CLI, aider, pi, local Ollama models), because
-it's plain text in the reply, not a tool call. Hive validates the
-definition with the same rules as the editor, saves it to the chat, and
-posts a note; a rejected attempt posts the reason instead.
-
-The directive an agent emits looks like this:
+What an agent writes (in a `[[workflow: {…}]]` reply directive, or as the
+input of the `propose_workflow` tool) looks like this:
 
 ```text
 [[workflow: {
@@ -107,16 +132,15 @@ The directive an agent emits looks like this:
 ```
 
 Stages address agents by their **roster name** (omit `agent` for the
-Primary Runtime), `after` declares dependencies, and `onReject` is
-`"halt"` or `{"retryFrom": "<stage id>"}`. Agent-authored definitions are
-**inert like any other**: they appear in the Workflows pane (and open in
-the DAG editor) but only a human can run them. Agents get planning
-authority, never execution authority.
+primary runtime), `after` declares dependencies, and `onReject` is
+`"halt"` or `{"retryFrom": "<stage id>"}`. A revision adds
+`"revises": "<workflow id or name>"` and carries the whole new definition.
+You never need to write this yourself, but it's what you're approving.
 
 ## Recipes
 
-Some shapes that work well — build them in the editor, or just describe
-them to an agent and let it author the definition:
+Some shapes that work well. Describe one to an agent and it proposes the
+definition:
 
 **Cost-tiered fixing.** A free local model does the wide, cheap work; the
 expensive frontier model only runs on what survives.
@@ -155,17 +179,23 @@ checker's notes already in the transcript.
 ## Running
 
 Hit **Run**, give it an input, and watch the run card: one chip per stage,
-colored by state, with the output preview on hover. Stage turns stream into
+colored by state; click a chip for its output, error and attempts. Stage turns stream into
 the transcript under a `[Workflow · name → stage]` header. Awaiting gates
 show approve/reject right on the card (they're also in the Review pane).
 Cancel stops a run between stages; **Resume** restarts a run that was
-interrupted (say, by an app restart) — finished stages keep their outputs.
+interrupted (say, by an app restart); finished stages keep their outputs.
+Gate approvals also reach your phone as a push notification when a
+`hive serve` host is set up ([Hive on your phone](phone-app.md)).
 
 ## Current limits
 
-- A run executes entirely on the device that starts it, so every stage's
-  agent must be runnable there (agents owned by other members are
-  rejected at start). Teammates still see the run live and vote gates.
+- Only a person starts a run; there is no schedule or event trigger for
+  workflows (use [Scheduled agents](scheduling.md) for timed single
+  turns).
 - Definitions belong to the chat they're created in.
 - Parallel stages share the chat transcript, so siblings can see each
-  other's prompts in context. The presets are written with this in mind.
+  other's prompts in context.
+- In a workspace with devices on older Hive versions, an older desktop
+  shows a workflow proposal as a plain decision: approving it there
+  doesn't add the workflow until a device on 1.18 or later applies it
+  (its **Implement** button does).

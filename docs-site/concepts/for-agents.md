@@ -51,9 +51,13 @@ mention someone when you actually need their input.
 ## Multi-stage work
 
 To set up a pipeline or a loop, author a workflow by ending a reply with
-a `[[workflow: {…}]]` directive (stages are agent turns or human-approval
-gates; a gate that routes back forms a bounded loop). Hive saves the
-definition; a human launches the run. See
+a `[[workflow: {…}]]` directive, or call the `propose_workflow` tool when
+you have it (it checks the definition in the same turn). Stages are agent
+turns or human-approval gates; a gate that routes back forms a bounded
+loop. Hive files the definition as a proposal in the Review pane; it is
+added only when a person approves it, and only a person starts a run. To
+change an existing workflow, propose the whole revised definition with
+`"revises": "<id or name>"`. See
 [Agentic workflows](../features/workflows.md).
 
 ## Reading the transcript

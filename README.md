@@ -110,14 +110,15 @@ planning authority and can **author** proposals, never execution authority.
 
 Compose agents into **DAG pipelines** where each stage is either an agent turn
 or a **human approval gate**. Stages with no unmet dependencies run in parallel;
-gates pause the run until enough people approve. Build them in a **visual DAG
-editor** (drag stages, wire dependency edges, template prompts with upstream
-stage outputs) — or just **ask an agent in chat to build one for you** on any
-runtime, since the directive is plain text, not a tool call. Definitions and run
+gates pause the run until enough people approve. **Agents write them**: ask an
+agent in chat for the pipeline you want, on any runtime, and its definition
+arrives in the Review pane as a proposal; approving it adds the workflow, and
+an agent can be asked to revise one the same way. The Workflows pane shows each
+definition's stages and lets you run, pause or delete it. Definitions and run
 records sync **end-to-end encrypted**, so teammates watch a run progress live and
-vote its gates **from their own devices**; a run **survives an app restart**
-(**Resume** picks up where it left off, finished stages keeping their outputs).
-Presets ship for a review gate and a fan-out-plus-vote.
+vote its gates **from their own devices** (or their phone); a run **survives an
+app restart** (**Resume** picks up where it left off, finished stages keeping
+their outputs).
 
 ### Headless agents & always-on workers
 

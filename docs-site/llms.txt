@@ -31,7 +31,7 @@ Documentation site: https://docs.apiaryhq.ai/ — pages below are the canonical 
 - [Right Rail](https://docs.apiaryhq.ai/features/right-rail/): The tools/review/people/context panes.
 - [Multi-agent collaboration](https://docs.apiaryhq.ai/features/multi-agent/): Multiple agents in one chat and how they interact.
 - [Mentions & notifications](https://docs.apiaryhq.ai/features/mentions-and-notifications/): Addressing participants and how notifications work.
-- [Agentic workflows](https://docs.apiaryhq.ai/features/workflows/): Multi-stage agent pipelines and human-approval gates, including gate-routes-back loops.
+- [Agentic workflows](https://docs.apiaryhq.ai/features/workflows/): Multi-stage agent pipelines and human-approval gates, including gate-routes-back loops. Agents author definitions as reviewable proposals; people approve, run and pause them.
 - [Scheduled agents](https://docs.apiaryhq.ai/features/scheduling/): Recurring, cron-like agent runs.
 - [Managing context](https://docs.apiaryhq.ai/features/voice-and-slash/): /summarize, /compact, and the context planner.
 - [Git integration](https://docs.apiaryhq.ai/features/git/): The Diff canvas, worktree isolation, and applying proposals.

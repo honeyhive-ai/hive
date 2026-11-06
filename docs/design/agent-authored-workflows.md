@@ -1,6 +1,8 @@
 # Agent-authored workflows
 
-Status: approved direction (owner), implemented on `feat/agent-workflows`.
+Status: approved direction (owner), implemented on `feat/agent-workflows`,
+based on `feat/cli-runtimes` (Antigravity and Copilot runtimes) for one
+v1.18.0 release.
 
 ## Summary
 
@@ -50,8 +52,8 @@ frozen copy of the old definition (that is how runs work today).
 Channels:
 
 1. **`[[workflow: {…}]]` reply directive — every runtime.** Claude Code,
-   Codex, aider, pi, Hermes, the HTTP/API runtimes, and whatever the
-   `feat/cli-runtimes` branch adds (Antigravity, Copilot, …) all produce
+   Codex, aider, pi, Hermes, the HTTP/API runtimes, and the Antigravity
+   (`agy`) and Copilot CLI runtimes from `feat/cli-runtimes` all produce
    reply text, and directives are parsed from reply text in
    `finalize_reply`. This is the universal path and needs nothing per
    runtime. Validation happens when the turn ends; a rejected payload posts
@@ -187,6 +189,17 @@ Kept:
 Added: `set_workflow_enabled` command, `propose_workflow` tool,
 `ActionProposal.workflow`, `WorkflowDefinition.disabled`,
 `ProposalDto.workflow`, `revises`.
+
+Trust note: the review step is enforced by Hive clients (the desktop files
+agent output as a proposal), not by event-log authorization.
+`WorkflowDefinitionsUpdated` keeps its Contributor floor, so a modified
+client with a Contributor key could still write definitions directly, as
+before this change. Definitions remain inert (a run needs a person), which
+is what bounds that.
+
+Stages target agents by roster name, so an agent on any runtime (including
+Antigravity and Copilot) can run a stage; nothing in the engine is
+runtime-specific.
 
 ## 6. Open questions for the owner
 
